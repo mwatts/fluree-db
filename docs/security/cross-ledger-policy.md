@@ -180,8 +180,9 @@ with at least one of:
   cleanest way to declare "use the configured policy"). Matching
   the class in D's config (e.g., `f:AccessPolicy`) is the
   natural choice.
-- `fluree-identity: <iri>` — an identity header. Identity-mode
-  has a different contract; see below.
+- `fluree-identity: <iri>` — an identity header. Under
+  cross-ledger the identity is bind-only; see
+  [Identity binding](#identity-binding-under-cross-ledger-policy).
 - `opts.policy` in the body — inline JSON-LD policy. This still
   merges with cross-ledger rules.
 
@@ -191,6 +192,48 @@ policy path, even with empty opts. Programmatic users don't see
 this gating. The write-side equivalent is
 `build_transact_policy_context` — see
 [Programmatic policy API (Rust)](programmatic-policy.md).
+
+## Identity binding under cross-ledger policy
+
+An identity on the request (`fluree-identity` header,
+`opts.identity`, or a verified credential's DID) is **bind-only**
+under a cross-ledger `f:policySource`:
+
+- The identity resolves against **D** (identities are a
+  data-ledger concept — M never contributes identity records) and
+  populates `?$identity` for any `f:query` rules in M's policy
+  set. An owner-only rule authored in M therefore works across
+  every governed data ledger, with each D binding its own
+  identities.
+- The identity **never selects rules**. Same-ledger identity-mode
+  loads policies via the identity's `f:policyClass` triples;
+  under cross-ledger those D-local triples are intentionally not
+  consulted — declaring a cross-ledger `f:policySource` makes M
+  the policy authority, and rule selection is exclusively the
+  policy-class filter chain:
+
+  1. the request's `policy_class` (when present),
+  2. else the config's `f:policyClass`,
+  3. else — for anonymous requests only — `{f:AccessPolicy}`.
+
+- Because the identity can't select rules, an identity-carrying
+  request with **no policy class anywhere** (request or config)
+  fails closed: the operator must name which classes govern.
+  In practice, setting `f:policyClass` in D's config (as in the
+  configuration example above) makes authenticated requests work
+  with no per-request changes.
+- An identity IRI with no subject node in D yields an unbound
+  `?$identity`: `f:query` rules referencing it match nothing, so
+  `f:required` rules deny — the same contract as same-ledger
+  identity-mode's unknown-identity case.
+
+One merge subtlety: an identity counts as a request policy input,
+so under the default `f:overrideControl` (`f:OverrideAll`) the
+request's options take precedence and the config's
+`f:defaultAllow` is **not** merged for identity-carrying requests
+(same long-standing contract as same-ledger reads). Send the
+`fluree-default-allow` header explicitly, or set a stricter
+override control if the config should always win.
 
 ## Cross-ledger uniqueness constraints
 
@@ -464,7 +507,7 @@ closed when configured:
 | `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. |
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
-| `opts.identity` + cross-ledger `f:policySource` | Request fails with a config error. Identity-mode loads policies via the identity's `f:policyClass` triples, which would have to resolve in D (the identity isn't an M concept); combining the two modes ambiguously is rejected rather than silently choosing one. Use `opts.policy_class` with cross-ledger configs. |
+| `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. |
 | `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
 | Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 

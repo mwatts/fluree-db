@@ -484,10 +484,15 @@ mode can be added without rewriting the failure taxonomy.
 - Reserved-feature rejection: `f:atT`, `f:trustPolicy`, and
   `f:rollbackGuard` are surfaced as `UnsupportedFeature` rather
   than silently ignored.
-- Identity-mode + cross-ledger policy combination fails closed
-  with a config error — the design's "M contributes rules, D
-  contributes identity" boundary is enforced at the request
-  surface.
+- Identity binding under cross-ledger policy: a request identity
+  is bind-only — it resolves against D to populate `?$identity`
+  for M's `f:query` rules and never selects rules (the design's
+  "M contributes rules, D contributes identity binding"
+  boundary). Rule selection is exclusively the policy-class
+  filter chain (request → config → `{f:AccessPolicy}` for
+  anonymous requests); an identity-carrying request with no
+  policy class anywhere fails closed with a config error rather
+  than silently defaulting.
 
 ### Reserved
 

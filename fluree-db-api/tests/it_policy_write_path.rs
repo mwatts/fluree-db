@@ -472,3 +472,280 @@ async fn cross_ledger_plus_identity_fails_closed_on_writes() {
         "expected fail-closed diagnostic mentioning both, got: {msg}"
     );
 }
+
+/// Identity + cross-ledger `f:policySource` works when a policy class is
+/// available (here from D's config): M's rules load via the class filter,
+/// the identity is bind-only, and enforcement applies. This is the common
+/// authenticated-deployment case — previously it failed closed even though
+/// the config named the governing class.
+#[tokio::test]
+async fn cross_ledger_identity_with_config_policy_class_enforced_on_writes() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "policy/write-xledger-idclass/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/m-policies";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:noSsnWrite
+                    rdf:type     f:AccessPolicy ;
+                    f:required   true ;
+                    f:onProperty ex:ssn ;
+                    f:action     f:modify ;
+                    f:allow      false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M policy graph");
+
+    let data_id = "policy/write-xledger-idclass/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    // The identity must exist as a subject in D for ?$identity binding.
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User", "ex:ssn": "111-11-1111"},
+                    {"@id": "ex:aliceIdentity", "ex:user": {"@id": "ex:alice"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed D data + identity");
+
+    let config_iri = config_graph_iri(data_id);
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger config with policyClass");
+    let ledger = r2.ledger;
+
+    // Identity-carrying request: must build (not fail closed) because the
+    // config's f:policyClass selects M's rules; the identity binds only.
+    //
+    // default_allow is set on the request: identity counts as a policy
+    // input, so under the default f:OverrideAll the request's options take
+    // precedence and the config's f:defaultAllow is NOT merged (same
+    // long-standing contract as same-ledger reads). Operators who want the
+    // config to always win set f:overrideControl accordingly.
+    let opts = GovernanceOptions {
+        identity: Some("http://example.org/ns/aliceIdentity".into()),
+        default_allow: true,
+        ..Default::default()
+    };
+    let ctx = build_transact_policy_context(
+        &fluree,
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+    )
+    .await
+    .expect("identity + config policyClass must not fail closed")
+    .expect("cross-ledger source must produce a policy context");
+
+    let cfg = test_index_config();
+    let denied_turtle = "@prefix ex: <http://example.org/ns/> .\nex:bob ex:ssn \"999-99-9999\" .\n";
+    let denied = fluree
+        .insert_turtle_with_opts(
+            ledger.clone(),
+            denied_turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &cfg,
+            Some(&ctx),
+        )
+        .await;
+    assert!(
+        denied.is_err(),
+        "M's modify-deny on ex:ssn must reject the identity-carrying write, got: {denied:?}"
+    );
+
+    let allowed_turtle = "@prefix ex: <http://example.org/ns/> .\nex:bob ex:name \"Bob\" .\n";
+    let allowed = fluree
+        .insert_turtle_with_opts(
+            ledger,
+            allowed_turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &cfg,
+            Some(&ctx),
+        )
+        .await;
+    assert!(
+        allowed.is_ok(),
+        "defaultAllow=true must let untargeted writes through, got: {:?}",
+        allowed.err()
+    );
+}
+
+/// The `?$identity` binding actually drives f:query rules from M: an
+/// owner-only modify rule in the model ledger allows the identity to write
+/// its own user's email and rejects writes to anyone else's. This pins the
+/// bind-only contract — the identity resolves in D and feeds `?$identity`,
+/// while the rule itself lives exclusively in M.
+#[tokio::test]
+async fn cross_ledger_identity_binding_drives_fquery_modify_rule() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "policy/write-xledger-fquery/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/m-policies";
+    // Full IRIs inside f:query — it executes against D, where prefixed
+    // names from M's turtle context wouldn't expand.
+    let owner_query =
+        r#"{"where": {"@id": "?$identity", "http://example.org/ns/user": {"@id": "?$this"}}}"#;
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:ownerEmailOnly
+                    rdf:type     f:AccessPolicy ;
+                    f:required   true ;
+                    f:onProperty ex:email ;
+                    f:action     f:modify ;
+                    f:query      """{owner_query}""" .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M owner-only f:query rule");
+
+    let data_id = "policy/write-xledger-fquery/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:email": "alice@flur.ee"},
+                    {"@id": "ex:bob",   "ex:email": "bob@flur.ee"},
+                    {"@id": "ex:aliceIdentity", "ex:user": {"@id": "ex:alice"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed D users + identity");
+
+    let config_iri = config_graph_iri(data_id);
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger config");
+    let ledger = r2.ledger;
+
+    let opts = GovernanceOptions {
+        identity: Some("http://example.org/ns/aliceIdentity".into()),
+        ..Default::default()
+    };
+    let ctx = build_transact_policy_context(
+        &fluree,
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+    )
+    .await
+    .expect("build")
+    .expect("cross-ledger source must produce a policy context");
+
+    let cfg = test_index_config();
+    // aliceIdentity owns ex:alice → writing alice's email matches the
+    // ?$identity → ex:user → ?$this chain and is allowed.
+    let own_turtle =
+        "@prefix ex: <http://example.org/ns/> .\nex:alice ex:email \"new-alice@flur.ee\" .\n";
+    let own = fluree
+        .insert_turtle_with_opts(
+            ledger.clone(),
+            own_turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &cfg,
+            Some(&ctx),
+        )
+        .await;
+    assert!(
+        own.is_ok(),
+        "identity must be able to write its own user's email via M's f:query rule, got: {:?}",
+        own.err()
+    );
+
+    // bob is not aliceIdentity's user → the required rule's f:query binds
+    // nothing → rejected.
+    let other_turtle =
+        "@prefix ex: <http://example.org/ns/> .\nex:bob ex:email \"hacked@flur.ee\" .\n";
+    let other = fluree
+        .insert_turtle_with_opts(
+            ledger,
+            other_turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &cfg,
+            Some(&ctx),
+        )
+        .await;
+    assert!(
+        other.is_err(),
+        "identity must NOT be able to write another user's email, got: {other:?}"
+    );
+}

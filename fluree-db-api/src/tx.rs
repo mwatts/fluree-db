@@ -2623,9 +2623,10 @@ impl crate::Fluree {
         // Build policy context with verified identity. Config-aware: a
         // configured `f:policySource` redirects the policy-rule lookup to
         // the declared graph, and config policy defaults merge in — same
-        // semantics as the consensus transact path. (A cross-ledger
-        // f:policySource fails closed here: identity-mode + cross-ledger is
-        // rejected in Phase 1a.)
+        // semantics as the consensus transact path. Under a cross-ledger
+        // f:policySource the verified identity is bind-only (?$identity);
+        // rule selection needs a f:policyClass in the ledger config, else
+        // this fails closed.
         let opts = crate::GovernanceOptions {
             identity: Some(verified.did.clone()),
             ..Default::default()

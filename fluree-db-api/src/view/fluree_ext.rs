@@ -696,12 +696,22 @@ impl Fluree {
                 self,
                 (**view.cross_ledger_resolved_ts()).clone(),
             );
-            // Identity-mode rejection (Phase 1a), PolicyRules dispatch, and
-            // the policy-class intersection filter all live in the shared
-            // helper so read and write paths can't drift.
+            // The class-filter chain, identity contract (bind-only, never a
+            // rule selector), and PolicyRules dispatch all live in the shared
+            // helper so read and write paths can't drift. The config's
+            // policy_class is passed separately: merge_policy_opts returns
+            // the request opts unchanged when the request carries any policy
+            // input and override is permitted, so an identity-only request
+            // would otherwise never see the config's f:policyClass.
+            let config_policy_class = view
+                .resolved_config
+                .as_ref()
+                .and_then(|c| c.policy.as_ref())
+                .and_then(|p| p.policy_class.as_deref());
             let restrictions = crate::policy_view::resolve_cross_ledger_policy_restrictions(
                 &view.snapshot,
                 &effective_opts,
+                config_policy_class,
                 source,
                 &mut ctx,
             )

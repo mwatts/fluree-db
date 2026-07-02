@@ -242,32 +242,60 @@ pub async fn build_policy_context(
 ///
 /// Shared between `wrap_policy` (read path) and
 /// [`build_transact_policy_context`] (write path) so both sides apply
-/// identical semantics: identity-mode rejection, `ArtifactKind::PolicyRules`
-/// dispatch, and the policy-class intersection filter.
+/// identical semantics: the class-filter chain, the identity contract, and
+/// the `ArtifactKind::PolicyRules` dispatch.
 ///
-/// The filter contract: the data ledger's configured `policy_class` set is
-/// applied as an exact-IRI intersection on the wire's restrictions, OR
-/// `{f:AccessPolicy}` when no policy_class is set. `f:AccessPolicy` is the
-/// canonical / baseline policy class — declaring `f:policySource`
-/// cross-ledger pulls those rules in automatically; custom-typed rules
-/// require an explicit `f:policyClass` in D's config to be enforced. This is
-/// the safer default than "load every structurally-policy-looking subject
-/// from M," which would silently include rules the operator never opted into.
+/// The filter contract: rules materialized from M are intersected (exact
+/// IRI) against the first non-empty entry in the chain
+///
+///   `effective_opts.policy_class` → `config_policy_class` →
+///   `{f:AccessPolicy}` (anonymous requests only).
+///
+/// `config_policy_class` is passed separately because `merge_policy_opts`
+/// returns the request opts unchanged when the request carries any policy
+/// input and override is permitted — an identity-only request would
+/// otherwise never see the config's `f:policyClass`.
+///
+/// The identity contract: an identity on the request **binds `?$identity`
+/// against D and never selects rules from M** — rule selection under
+/// cross-ledger is exclusively the class filter (M contributes rules, D
+/// contributes identity binding). Because the identity can't select rules,
+/// an identity-carrying request with no policy class anywhere fails closed
+/// rather than silently falling back to the `{f:AccessPolicy}` default: the
+/// operator must name which classes govern.
+///
+/// `f:AccessPolicy` is the canonical / baseline policy class — declaring
+/// `f:policySource` cross-ledger pulls those rules in automatically for
+/// anonymous requests; custom-typed rules require an explicit
+/// `f:policyClass` in D's config to be enforced. This is the safer default
+/// than "load every structurally-policy-looking subject from M," which
+/// would silently include rules the operator never opted into.
 pub(crate) async fn resolve_cross_ledger_policy_restrictions(
     snapshot: &LedgerSnapshot,
     effective_opts: &GovernanceOptions,
+    config_policy_class: Option<&[String]>,
     source: &fluree_db_core::ledger_config::GraphSourceRef,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> Result<Vec<fluree_db_policy::PolicyRestriction>> {
-    // Phase 1a: cross-ledger + identity-mode is not supported. The model
-    // ledger contributes policy rules; the data ledger contributes identity
-    // binding. Mixing them ambiguously is a fail-closed config error.
-    if effective_opts.identity.is_some() {
+    const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
+    let filter: std::collections::HashSet<String> = if let Some(classes) = effective_opts
+        .policy_class
+        .as_ref()
+        .filter(|v| !v.is_empty())
+    {
+        classes.iter().cloned().collect()
+    } else if let Some(classes) = config_policy_class.filter(|v| !v.is_empty()) {
+        classes.iter().cloned().collect()
+    } else if effective_opts.identity.is_none() {
+        [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect()
+    } else {
         return Err(crate::error::ApiError::config(
-            "cross-ledger f:policySource cannot be combined with opts.identity \
-             in Phase 1a; use opts.policy_class with the cross-ledger config",
+            "cross-ledger f:policySource with an identity requires an explicit \
+             f:policyClass (on the request or in the ledger config) to select \
+             which of the model ledger's rules apply; the identity only binds \
+             ?$identity and never selects rules",
         ));
-    }
+    };
 
     let resolved = crate::cross_ledger::resolve_graph_ref(
         source,
@@ -291,14 +319,6 @@ pub(crate) async fn resolve_cross_ledger_policy_restrictions(
             },
         ));
     };
-
-    const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
-    let filter: std::collections::HashSet<String> = effective_opts
-        .policy_class
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        .map(|v| v.iter().cloned().collect())
-        .unwrap_or_else(|| [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect());
 
     fluree_db_policy::wire_to_restrictions(wire, |iri| snapshot.encode_iri(iri), Some(&filter))
         .map_err(crate::error::ApiError::from)
@@ -357,9 +377,18 @@ pub async fn build_transact_policy_context(
     if let Some(source) = source.filter(|s| s.ledger.is_some()) {
         let ledger_id: String = snapshot.ledger_id.to_string();
         let mut ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
-        let restrictions =
-            resolve_cross_ledger_policy_restrictions(snapshot, &effective_opts, source, &mut ctx)
-                .await?;
+        let config_policy_class = resolved
+            .as_ref()
+            .and_then(|r| r.policy.as_ref())
+            .and_then(|p| p.policy_class.as_deref());
+        let restrictions = resolve_cross_ledger_policy_restrictions(
+            snapshot,
+            &effective_opts,
+            config_policy_class,
+            source,
+            &mut ctx,
+        )
+        .await?;
         let policy_ctx = policy_builder::build_policy_context_from_opts_with_cross_ledger(
             snapshot,
             overlay,
