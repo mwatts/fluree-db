@@ -1301,15 +1301,6 @@ fn materialize_batch(
         }
         let subject_binding = encoder.encode(&subject_term);
 
-        // Seed a fresh output row with the subject binding, or an empty row when
-        // the subject is a constant (which binds no variable).
-        let seed_row = || -> Vec<(VarId, Binding)> {
-            match pattern.subject_var {
-                Some(sv) => vec![(sv, subject_binding.clone())],
-                None => Vec::new(),
-            }
-        };
-
         if !pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty() {
             let mut members: Vec<(VarId, &str)> = Vec::new();
             if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
@@ -1375,7 +1366,14 @@ fn materialize_batch(
                 continue;
             }
 
-            let mut rows: Vec<Vec<(VarId, Binding)>> = vec![seed_row()];
+            // Seed row: the subject binding, or empty for a constant subject.
+            // The cross-product below clones this row per extra object, so a clone
+            // (not a move) of the subject binding is required here.
+            let seed = match pattern.subject_var {
+                Some(sv) => vec![(sv, subject_binding.clone())],
+                None => Vec::new(),
+            };
+            let mut rows: Vec<Vec<(VarId, Binding)>> = vec![seed];
             for (var, vals) in &binding_lists {
                 if vals.len() == 1 {
                     for r in &mut rows {
@@ -1403,6 +1401,8 @@ fn materialize_batch(
             // equality is the pattern's semantics, so it is enforced here
             // regardless of scan pushdown; the pushed ScanFilter is only an
             // optimization on top.
+            // Subject-only: exactly one row per surviving subject, so move the
+            // subject binding into it (no per-row clone).
             if let Some(required) = &pattern.object_constant {
                 let mut matched = false;
                 for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
@@ -1421,11 +1421,17 @@ fn materialize_batch(
                     }
                 }
                 if matched {
-                    produced.push(seed_row());
+                    produced.push(match pattern.subject_var {
+                        Some(sv) => vec![(sv, subject_binding)],
+                        None => Vec::new(),
+                    });
                 }
                 continue;
             }
-            produced.push(seed_row());
+            produced.push(match pattern.subject_var {
+                Some(sv) => vec![(sv, subject_binding)],
+                None => Vec::new(),
+            });
             continue;
         };
 
@@ -1439,7 +1445,12 @@ fn materialize_batch(
                 materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
             {
                 let object_binding = encoder.encode(&t);
-                let mut row = seed_row();
+                // Allocate at the final capacity (subject? + object) so the push
+                // below never reallocates — this is the hottest scan path.
+                let mut row = Vec::with_capacity(2);
+                if let Some(sv) = pattern.subject_var {
+                    row.push((sv, subject_binding.clone()));
+                }
                 row.push((obj_var, object_binding));
                 produced.push(row);
             }

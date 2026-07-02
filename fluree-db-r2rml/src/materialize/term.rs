@@ -292,8 +292,17 @@ pub fn reverse_subject_template(template: &str, iri: &str) -> Option<Vec<(String
             v
         } else {
             // The separator must begin with a hard (always-escaped) char so the
-            // value's right boundary is unambiguous.
-            if !sep.chars().next().is_some_and(is_always_escaped) {
+            // value's right boundary is unambiguous — EXCEPT `%`, which is
+            // always-escaped yet also introduces every `%XX` byte *inside* an
+            // encoded value, so a `%`-led separator (e.g. `%20`) can match a
+            // false boundary within a value. `%` is the only always-escaped char
+            // in `iri_escape`'s output, so excluding it fully closes the hole
+            // (such templates fall back to a full scan — correct, just unpruned).
+            if !sep
+                .chars()
+                .next()
+                .is_some_and(|c| is_always_escaped(c) && c != '%')
+            {
                 return None;
             }
             let idx = rest.find(sep)?;
@@ -1205,6 +1214,15 @@ mod tests {
         assert!(reverse_subject_template("http://ex/{a}{b}", "http://ex/xy").is_none());
         // No placeholder (constant subject) → None.
         assert!(reverse_subject_template("http://ex/store", "http://ex/store").is_none());
+        // A '%'-led separator ('%20') is always-escaped yet also begins every
+        // '%XX' byte inside an encoded value, so `find` could match a false
+        // boundary inside a value (`first="Mary Ann"` → `%20` at index 4) and
+        // recover wrong keys. Must bail. Regression for the composite-key hole.
+        assert!(reverse_subject_template(
+            "http://ex/person/{first}%20{last}",
+            "http://ex/person/Mary%20Ann%20Smith"
+        )
+        .is_none());
     }
 
     #[test]
