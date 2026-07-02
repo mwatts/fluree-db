@@ -8,6 +8,7 @@ mod events;
 mod export;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+mod iceberg_ssrf;
 mod import;
 mod ledger;
 mod log;

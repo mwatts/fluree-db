@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::Instrument;
 
+use super::iceberg_ssrf::guard_connection_urls;
 use super::ledger::forward_write_request;
 
 /// Request body for `POST /v1/fluree/iceberg/map`
@@ -121,6 +122,15 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
     );
     async move {
         tracing::info!(status = "start", name = %req.name, "iceberg map requested");
+
+        // SSRF guard: reject request-supplied URLs that target internal hosts,
+        // before any outbound HTTP client sees them (unauthenticated by default).
+        guard_connection_urls(
+            req.catalog_uri.as_deref(),
+            req.oauth2_token_url.as_deref(),
+            req.s3_endpoint.as_deref(),
+        )
+        .await?;
 
         let fluree = &state.fluree;
         let iceberg_config = build_iceberg_config(&req)?;
@@ -406,6 +416,12 @@ async fn iceberg_catalog_browse_local(
         None,
     );
     async move {
+        guard_connection_urls(
+            req.connection.catalog_uri.as_deref(),
+            req.connection.oauth2_token_url.as_deref(),
+            req.connection.s3_endpoint.as_deref(),
+        )
+        .await?;
         let conn = build_iceberg_connection(&req.connection)?;
         let depth = match req.depth.as_deref().map(str::to_lowercase).as_deref() {
             Some("namespaces") => BrowseDepth::Namespaces,
@@ -480,6 +496,12 @@ async fn iceberg_catalog_preview_local(
         None,
     );
     async move {
+        guard_connection_urls(
+            req.connection.catalog_uri.as_deref(),
+            req.connection.oauth2_token_url.as_deref(),
+            req.connection.s3_endpoint.as_deref(),
+        )
+        .await?;
         let conn = build_iceberg_connection(&req.connection)?;
         let tier = match req.tier.as_deref().map(str::to_lowercase).as_deref() {
             None | Some("schema") => StatsTier::Schema,
@@ -590,6 +612,12 @@ async fn iceberg_r2rml_generate_local(
                 "at least one table is required for generate",
             ));
         }
+        guard_connection_urls(
+            req.connection.catalog_uri.as_deref(),
+            req.connection.oauth2_token_url.as_deref(),
+            req.connection.s3_endpoint.as_deref(),
+        )
+        .await?;
         let connection = build_iceberg_connection(&req.connection)?;
         let per_table_overrides = req
             .per_table_overrides
@@ -675,6 +703,12 @@ async fn iceberg_r2rml_validate_local(
         None,
     );
     async move {
+        guard_connection_urls(
+            req.connection.catalog_uri.as_deref(),
+            req.connection.oauth2_token_url.as_deref(),
+            req.connection.s3_endpoint.as_deref(),
+        )
+        .await?;
         let conn = build_iceberg_connection(&req.connection)?;
 
         let response = state
