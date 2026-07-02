@@ -644,29 +644,6 @@ impl FlureeServerBuilder {
             None => None,
         };
 
-        // Subscribe Fluree's `LedgerManager` to the (now-unified)
-        // event bus so commit / index applies reconcile cached state
-        // on every node, not just the one that staged the commit.
-        //
-        // This is not a duplicate of Fluree's own internal listener
-        // (spawned inside `finalize_with_backend` when indexing is
-        // enabled): `build_client_with_nameservice` — the raft path —
-        // passes a caller-supplied nameservice, which flips
-        // `indexing_mode` to `Disabled`, which skips the internal
-        // listener. So this is the *only* subscription forwarding
-        // ledger commits to the manager in raft mode. Post-fix, it
-        // fires on the same bus the events endpoint reads, so both
-        // consumers see the same event stream.
-        #[cfg(feature = "raft")]
-        if let Some(((integration, _), mgr)) =
-            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
-        {
-            fluree_db_api::spawn_local_cache_event_listener(
-                Arc::clone(&integration.event_bus),
-                Arc::clone(mgr),
-            );
-        }
-
         // Per-node worker supervisor. Runs on every node (leader and
         // followers alike) because distributed workers can land
         // anywhere under rendezvous assignment. Spawned here so its
