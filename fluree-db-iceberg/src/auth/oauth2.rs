@@ -87,8 +87,12 @@ impl std::fmt::Debug for OAuth2ClientCredentials {
 
 impl OAuth2ClientCredentials {
     /// Create a new OAuth2 auth provider.
+    ///
+    /// The HTTP client is SSRF-hardened (see [`crate::net::hardened_client_builder`]):
+    /// it follows no redirects and resolves the token endpoint through the guard
+    /// resolver, so the token request cannot be bounced to an internal address.
     pub fn new(config: OAuth2Config) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::net::hardened_client_builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(60))
             .build()

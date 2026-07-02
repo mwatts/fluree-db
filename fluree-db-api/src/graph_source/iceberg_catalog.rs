@@ -33,6 +33,38 @@ use fluree_db_iceberg::FieldType;
 use fluree_db_r2rml::emit::naming::xsd_datatype;
 
 // =============================================================================
+// SSRF boundary guard
+// =============================================================================
+
+/// Up-front SSRF reject for the request-supplied outbound URLs on an Iceberg
+/// connection, for use at the (unauthenticated-by-default) route boundary.
+///
+/// This is a cheap literal-IP + scheme check; the AUTHORITATIVE enforcement is
+/// at the client layer, where the catalog / OAuth2 clients are built with a
+/// redirect-refusing, IP-denylisting resolver (see [`fluree_db_iceberg::net`]) —
+/// which is what closes the redirect / DNS-rebinding bypasses a boundary string
+/// check alone cannot. `catalog_uri` / `oauth2_token_url` get the full internal
+/// denylist; `s3_endpoint` gets the narrower metadata-only block (MinIO /
+/// LocalStack legitimately use loopback/private hosts).
+pub fn guard_iceberg_connection_urls(
+    catalog_uri: Option<&str>,
+    oauth2_token_url: Option<&str>,
+    s3_endpoint: Option<&str>,
+) -> Result<()> {
+    let to_err = |e: fluree_db_iceberg::IcebergError| crate::ApiError::config(e.to_string());
+    if let Some(u) = catalog_uri {
+        fluree_db_iceberg::net::validate_public_url(u).map_err(to_err)?;
+    }
+    if let Some(u) = oauth2_token_url {
+        fluree_db_iceberg::net::validate_public_url(u).map_err(to_err)?;
+    }
+    if let Some(u) = s3_endpoint {
+        fluree_db_iceberg::net::validate_s3_endpoint(u).map_err(to_err)?;
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Shared identifiers
 // =============================================================================
 

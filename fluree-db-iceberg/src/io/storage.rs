@@ -172,6 +172,9 @@ impl S3IcebergStorage {
         let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
 
         if let Some(endpoint) = &endpoint {
+            // SSRF: reject a metadata/link-local endpoint (loopback/private are
+            // allowed here for MinIO / LocalStack).
+            crate::net::validate_s3_endpoint(endpoint)?;
             s3_config = s3_config.endpoint_url(endpoint);
         }
 
@@ -214,6 +217,9 @@ impl S3IcebergStorage {
         let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
 
         if let Some(ep) = endpoint {
+            // SSRF: reject a metadata/link-local endpoint (loopback/private are
+            // allowed here for MinIO / LocalStack).
+            crate::net::validate_s3_endpoint(ep)?;
             s3_config = s3_config.endpoint_url(ep);
         }
 

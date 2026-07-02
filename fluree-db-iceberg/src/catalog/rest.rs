@@ -56,8 +56,12 @@ impl std::fmt::Debug for RestCatalogClient {
 
 impl RestCatalogClient {
     /// Create a new REST catalog client.
+    ///
+    /// The HTTP client is SSRF-hardened (see [`crate::net::hardened_client_builder`]):
+    /// it follows no redirects and resolves through the guard resolver, so a
+    /// catalog request cannot be redirected or rebound to an internal address.
     pub fn new(config: RestCatalogConfig, auth: Arc<dyn SendCatalogAuth>) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::net::hardened_client_builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()

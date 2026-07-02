@@ -60,6 +60,7 @@ pub mod error;
 pub mod io;
 pub mod manifest;
 pub mod metadata;
+pub mod net;
 pub mod scan;
 pub mod stats;
 

@@ -129,8 +129,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
             req.catalog_uri.as_deref(),
             req.oauth2_token_url.as_deref(),
             req.s3_endpoint.as_deref(),
-        )
-        .await?;
+        )?;
 
         let fluree = &state.fluree;
         let iceberg_config = build_iceberg_config(&req)?;
@@ -420,8 +419,7 @@ async fn iceberg_catalog_browse_local(
             req.connection.catalog_uri.as_deref(),
             req.connection.oauth2_token_url.as_deref(),
             req.connection.s3_endpoint.as_deref(),
-        )
-        .await?;
+        )?;
         let conn = build_iceberg_connection(&req.connection)?;
         let depth = match req.depth.as_deref().map(str::to_lowercase).as_deref() {
             Some("namespaces") => BrowseDepth::Namespaces,
@@ -500,8 +498,7 @@ async fn iceberg_catalog_preview_local(
             req.connection.catalog_uri.as_deref(),
             req.connection.oauth2_token_url.as_deref(),
             req.connection.s3_endpoint.as_deref(),
-        )
-        .await?;
+        )?;
         let conn = build_iceberg_connection(&req.connection)?;
         let tier = match req.tier.as_deref().map(str::to_lowercase).as_deref() {
             None | Some("schema") => StatsTier::Schema,
@@ -616,8 +613,7 @@ async fn iceberg_r2rml_generate_local(
             req.connection.catalog_uri.as_deref(),
             req.connection.oauth2_token_url.as_deref(),
             req.connection.s3_endpoint.as_deref(),
-        )
-        .await?;
+        )?;
         let connection = build_iceberg_connection(&req.connection)?;
         let per_table_overrides = req
             .per_table_overrides
@@ -707,8 +703,7 @@ async fn iceberg_r2rml_validate_local(
             req.connection.catalog_uri.as_deref(),
             req.connection.oauth2_token_url.as_deref(),
             req.connection.s3_endpoint.as_deref(),
-        )
-        .await?;
+        )?;
         let conn = build_iceberg_connection(&req.connection)?;
 
         let response = state
