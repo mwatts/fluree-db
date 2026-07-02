@@ -578,9 +578,15 @@ pub async fn format_async(
 /// Per-ledger policy is preserved: a foreign subject is read under *its own*
 /// view's policy enforcer, never the primary's.
 ///
-/// NOTE (staged): this slice routes the **root** subject. Nested cross-ledger
-/// refs still expand within the root's view (correct only when the two ledgers
-/// allocated matching namespace codes) until the union-resolution slice lands.
+/// Explicit-projection predicate `Sid`s are re-encoded into the ledger that
+/// stores each subject — both for nested refs (`expand_ref`) and for a root
+/// routed to a non-primary ledger (issue #1295) — so a cross-ledger projection
+/// returns the same predicates a single-ledger one would, regardless of how the
+/// ledgers allocated namespace codes.
+///
+/// Known gap: a root with no home-ledger provenance — bound as the *object* of a
+/// primary-ledger triple — routes to the primary view and can come back
+/// `@id`-only (a separate root-routing follow-up).
 pub async fn format_async_dataset(
     result: &QueryResult,
     dataset: &crate::view::DataSetDb,
