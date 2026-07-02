@@ -205,6 +205,11 @@ pub async fn wrap_policy_view_historical<'a>(
 /// don't go through `wrap_policy` / `GraphDb` (e.g., server transact handlers,
 /// CLI insert) use this function and still get config-driven policy graphs.
 ///
+/// Same-ledger only: a cross-ledger `f:policySource` (with `f:ledger`) fails
+/// closed here. Callers with a `Fluree` handle should use
+/// [`build_transact_policy_context`], which also merges config policy
+/// defaults and resolves cross-ledger sources.
+///
 /// # Arguments
 ///
 /// * `snapshot` - The database snapshot to query against
@@ -230,6 +235,159 @@ pub async fn build_policy_context(
         &policy_graphs,
     )
     .await
+}
+
+/// Resolve a cross-ledger `f:policySource` into policy restrictions
+/// interned against the data ledger's term space.
+///
+/// Shared between `wrap_policy` (read path) and
+/// [`build_transact_policy_context`] (write path) so both sides apply
+/// identical semantics: identity-mode rejection, `ArtifactKind::PolicyRules`
+/// dispatch, and the policy-class intersection filter.
+///
+/// The filter contract: the data ledger's configured `policy_class` set is
+/// applied as an exact-IRI intersection on the wire's restrictions, OR
+/// `{f:AccessPolicy}` when no policy_class is set. `f:AccessPolicy` is the
+/// canonical / baseline policy class — declaring `f:policySource`
+/// cross-ledger pulls those rules in automatically; custom-typed rules
+/// require an explicit `f:policyClass` in D's config to be enforced. This is
+/// the safer default than "load every structurally-policy-looking subject
+/// from M," which would silently include rules the operator never opted into.
+pub(crate) async fn resolve_cross_ledger_policy_restrictions(
+    snapshot: &LedgerSnapshot,
+    effective_opts: &GovernanceOptions,
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+) -> Result<Vec<fluree_db_policy::PolicyRestriction>> {
+    // Phase 1a: cross-ledger + identity-mode is not supported. The model
+    // ledger contributes policy rules; the data ledger contributes identity
+    // binding. Mixing them ambiguously is a fail-closed config error.
+    if effective_opts.identity.is_some() {
+        return Err(crate::error::ApiError::config(
+            "cross-ledger f:policySource cannot be combined with opts.identity \
+             in Phase 1a; use opts.policy_class with the cross-ledger config",
+        ));
+    }
+
+    let resolved = crate::cross_ledger::resolve_graph_ref(
+        source,
+        crate::cross_ledger::ArtifactKind::PolicyRules,
+        ctx,
+    )
+    .await?;
+    let crate::cross_ledger::GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
+        // resolve_graph_ref dispatches on ArtifactKind, so requesting
+        // PolicyRules must yield PolicyRules. Surfacing this as
+        // TranslationFailed rather than panicking keeps the failure path
+        // uniform for operators reading the response body.
+        return Err(crate::error::ApiError::CrossLedger(
+            crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                ledger_id: resolved.model_ledger_id.clone(),
+                graph_iri: resolved.graph_iri.clone(),
+                detail: "resolver returned a non-PolicyRules artifact for an \
+                        ArtifactKind::PolicyRules request; this is a bug in \
+                        the resolver dispatch"
+                    .into(),
+            },
+        ));
+    };
+
+    const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
+    let filter: std::collections::HashSet<String> = effective_opts
+        .policy_class
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_else(|| [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect());
+
+    fluree_db_policy::wire_to_restrictions(wire, |iri| snapshot.encode_iri(iri), Some(&filter))
+        .map_err(crate::error::ApiError::from)
+}
+
+/// Build the policy context for a write (or other non-view enforcement
+/// point), honoring the ledger's `#config` graph the same way `wrap_policy`
+/// does on the read path.
+///
+/// This is the write-side counterpart of `Fluree::wrap_policy`:
+///
+/// 1. Resolves the ledger config at `to_t` and merges config policy defaults
+///    (`f:policyClass`, `f:defaultAllow`, override control) into `opts` via
+///    `merge_policy_opts` — so config-declared policy governs writes even
+///    when the request itself carries no policy inputs.
+/// 2. A cross-ledger `f:policySource` (with `f:ledger`) is resolved live
+///    against the model ledger (`ArtifactKind::PolicyRules`, latest committed
+///    M) and its restrictions are interned into this ledger's term space.
+/// 3. A same-ledger `f:policySource` resolves to concrete graph IDs via
+///    `resolve_policy_source_g_ids` (fail-closed on unknown selectors).
+///
+/// Returns `Ok(None)` when neither the request nor the config supplies any
+/// policy input — the transaction runs under root, matching the previous
+/// behavior for unconfigured ledgers. A cross-ledger source always builds a
+/// context (mirroring the read path, where the model ledger's rules apply
+/// regardless of request inputs).
+pub async fn build_transact_policy_context(
+    fluree: &crate::Fluree,
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &GovernanceOptions,
+) -> Result<Option<PolicyContext>> {
+    let resolved =
+        match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
+            Ok(Some(c)) => Some(crate::config_resolver::resolve_effective_config(&c, None)),
+            Ok(None) => None,
+            Err(e) => {
+                return Err(crate::error::ApiError::config(format!(
+                    "Failed to load ledger config while resolving transaction policy: {e}"
+                )));
+            }
+        };
+
+    let effective_opts = match &resolved {
+        Some(r) => crate::config_resolver::merge_policy_opts(r, opts, None),
+        None => opts.clone(),
+    };
+
+    let source = resolved
+        .as_ref()
+        .and_then(|r| r.policy.as_ref())
+        .and_then(|p| p.policy_source.as_ref());
+
+    if let Some(source) = source.filter(|s| s.ledger.is_some()) {
+        let ledger_id: String = snapshot.ledger_id.to_string();
+        let mut ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
+        let restrictions =
+            resolve_cross_ledger_policy_restrictions(snapshot, &effective_opts, source, &mut ctx)
+                .await?;
+        let policy_ctx = policy_builder::build_policy_context_from_opts_with_cross_ledger(
+            snapshot,
+            overlay,
+            novelty_for_stats,
+            to_t,
+            &effective_opts,
+            &[0], // identity-mode uses [0]; unused under cross-ledger
+            restrictions,
+        )
+        .await?;
+        return Ok(Some(policy_ctx));
+    }
+
+    if !effective_opts.has_any_policy_inputs() {
+        return Ok(None);
+    }
+
+    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot)?;
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        &effective_opts,
+        &policy_graphs,
+    )
+    .await?;
+    Ok(Some(policy_ctx))
 }
 
 /// Wrap a ledger with identity-based policy via `f:policyClass` lookup.
@@ -271,7 +429,7 @@ pub async fn wrap_identity_policy_view<'a>(
 /// Returns `[0]` (default graph) only when no config has been written to the
 /// ledger yet (`Ok(None)`) or no `f:policySource` is configured — in both
 /// cases the caller's policy rules, if any, live in the default graph.
-async fn resolve_policy_graphs_from_config(
+pub(crate) async fn resolve_policy_graphs_from_config(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,

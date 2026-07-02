@@ -38,6 +38,8 @@ Controls default policy enforcement behavior.
 
 When `f:policySource` is set, the policy loader scans the specified graph for policy rules instead of the default graph. This keeps policy rules separate from end-user data. If `f:policySource` is not set, policies are loaded from the default graph (backward compatible).
 
+`f:policySource` and the policy defaults are honored on **both reads and writes**: queries load view rules from the configured graph, and transactions load `f:modify` rules from the same graph before staging. Config-declared `f:policyClass` / `f:defaultAllow` defaults apply to transactions even when the request itself carries no policy inputs — an operator who relocates policy into a named graph (or a model ledger) gets the same enforcement on writes as on reads.
+
 **Cross-ledger references are supported on `f:policySource`.** The graph source can name another ledger via `f:ledger`, so a single model ledger can hold policy rules that govern many data ledgers. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the configuration pattern and the contract on `f:policyClass` filtering, baseline `f:AccessPolicy` semantics, and the failure modes.
 
 **Not yet honored on `f:policySource`** (parsed by the config layer but rejected at request time with a clear error): `f:atT` temporal pinning, `f:trustPolicy` verification, `f:rollbackGuard` freshness constraints. Cross-ledger references are also supported on `f:constraintsSource`, `f:schemaSource` (single graph only — transitive `owl:imports` recursion across ledgers is not yet supported), `f:shapesSource`, and `f:rulesSource`. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the end-to-end configuration patterns and failure modes shared by all five subsystems.

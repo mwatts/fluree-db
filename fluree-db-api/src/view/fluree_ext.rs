@@ -681,17 +681,6 @@ impl Fluree {
         let is_cross_ledger = source.is_some_and(|s| s.ledger.is_some());
 
         if is_cross_ledger {
-            // Phase 1a: cross-ledger + identity-mode is not supported.
-            // The model ledger contributes policy rules; the data
-            // ledger contributes identity binding. Mixing them
-            // ambiguously is a fail-closed config error.
-            if effective_opts.identity.is_some() {
-                return Err(crate::error::ApiError::config(
-                    "cross-ledger f:policySource cannot be combined with opts.identity \
-                     in Phase 1a; use opts.policy_class with the cross-ledger config",
-                ));
-            }
-
             let source = source.expect("checked above");
             // Seed from any prior governance-context capture stored
             // on the view (e.g., an earlier `wrap_policy` in the
@@ -707,60 +696,16 @@ impl Fluree {
                 self,
                 (**view.cross_ledger_resolved_ts()).clone(),
             );
-            let resolved = crate::cross_ledger::resolve_graph_ref(
+            // Identity-mode rejection (Phase 1a), PolicyRules dispatch, and
+            // the policy-class intersection filter all live in the shared
+            // helper so read and write paths can't drift.
+            let restrictions = crate::policy_view::resolve_cross_ledger_policy_restrictions(
+                &view.snapshot,
+                &effective_opts,
                 source,
-                crate::cross_ledger::ArtifactKind::PolicyRules,
                 &mut ctx,
             )
             .await?;
-            let crate::cross_ledger::GovernanceArtifact::PolicyRules(wire) = &resolved.artifact
-            else {
-                // resolve_graph_ref dispatches on ArtifactKind, so
-                // requesting PolicyRules must yield PolicyRules.
-                // Surfacing this as TranslationFailed rather than
-                // panicking keeps the failure path uniform for
-                // operators reading the response body.
-                return Err(crate::error::ApiError::CrossLedger(
-                    crate::cross_ledger::CrossLedgerError::TranslationFailed {
-                        ledger_id: resolved.model_ledger_id.clone(),
-                        graph_iri: resolved.graph_iri.clone(),
-                        detail: "resolver returned a non-PolicyRules artifact for an \
-                                ArtifactKind::PolicyRules request; this is a bug in \
-                                the resolver dispatch"
-                            .into(),
-                    },
-                ));
-            };
-
-            // Apply the data ledger's configured policy_class set as
-            // an exact-IRI intersection filter on the wire's
-            // restrictions. The contract is:
-            //
-            //   filter = effective_opts.policy_class, OR
-            //            {f:AccessPolicy} when no policy_class is set.
-            //
-            // f:AccessPolicy is the canonical / baseline policy class
-            // — declaring `f:policySource` cross-ledger pulls those
-            // rules in automatically. Custom-typed rules require
-            // an explicit `f:policyClass` in D's config to be
-            // enforced. This is the safer default than "load every
-            // structurally-policy-looking subject from M," which
-            // would silently include rules the operator never opted
-            // into.
-            const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
-            let filter: std::collections::HashSet<String> = effective_opts
-                .policy_class
-                .as_ref()
-                .filter(|v| !v.is_empty())
-                .map(|v| v.iter().cloned().collect())
-                .unwrap_or_else(|| [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect());
-            let snapshot_ref = &view.snapshot;
-            let restrictions = fluree_db_policy::wire_to_restrictions(
-                wire,
-                |iri| snapshot_ref.encode_iri(iri),
-                Some(&filter),
-            )
-            .map_err(crate::error::ApiError::from)?;
 
             let policy_ctx =
                 crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(

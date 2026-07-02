@@ -23,7 +23,7 @@ use crate::dataset::GovernanceOptions;
 use crate::format::iri::IriCompactor;
 use crate::graph::Graph;
 use crate::ledger_view::CommitRef;
-use crate::{policy_builder, ApiError, Result};
+use crate::{ApiError, Result};
 use fluree_db_core::commit::codec::read_commit;
 use fluree_db_core::{ContentId, ContentStore, FlakeValue, OverlayProvider, Tracker};
 use fluree_db_novelty::Commit;
@@ -282,19 +282,24 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
                 ..Default::default()
             };
             // Use the novelty overlay so policy rules in uncommitted
-            // transactions are visible to the policy builder.
+            // transactions are visible to the policy builder. Config-aware:
+            // a configured `f:policySource` (same-ledger named graph or
+            // cross-ledger model reference) redirects the policy-rule
+            // lookup instead of assuming the default graph. The
+            // identity/policy_class gate above is unchanged — commit-detail
+            // filtering stays opt-in per request.
             let overlay: &dyn OverlayProvider = snapshot.novelty.as_ref();
-            let policy_ctx = policy_builder::build_policy_context_from_opts(
+            let policy_ctx = crate::policy_view::build_transact_policy_context(
+                self.graph.fluree,
                 &snapshot.snapshot,
                 overlay,
                 Some(snapshot.novelty.as_ref()),
                 commit.t,
                 &opts,
-                &[0],
             )
             .await?;
 
-            if !policy_ctx.wrapper().is_root() {
+            if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
                 let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx));
                 let tracker = Tracker::disabled();
 

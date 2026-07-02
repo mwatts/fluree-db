@@ -164,8 +164,8 @@ pub use pack::{
 };
 pub use policy_builder::identity_has_no_policies;
 pub use policy_view::{
-    build_policy_context, wrap_identity_policy_view, wrap_policy_view, wrap_policy_view_historical,
-    PolicyWrappedView,
+    build_policy_context, build_transact_policy_context, wrap_identity_policy_view,
+    wrap_policy_view, wrap_policy_view_historical, PolicyWrappedView,
 };
 pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,

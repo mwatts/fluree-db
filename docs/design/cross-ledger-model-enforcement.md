@@ -454,7 +454,14 @@ mode can be added without rewriting the failure taxonomy.
 - `f:policySource` cross-ledger via `resolve_graph_ref`. The
   policy IR carries definitional/contextual term references
   separately so the model ledger contributes rules while the
-  data ledger contributes identity binding.
+  data ledger contributes identity binding. Enforced on both
+  the read path (`wrap_policy`) and the write path
+  (`build_transact_policy_context`, used by the consensus
+  transact pipeline, push replication, credentialed
+  transactions, and the CLI); the two share one restriction
+  resolver (`resolve_cross_ledger_policy_restrictions`) so the
+  identity-mode rejection and `f:policyClass` filter cannot
+  drift.
 - `f:constraintsSource` cross-ledger via the same shared
   resolver. M's `f:enforceUnique true` annotations on
   properties apply to D's transactions; a tx that would

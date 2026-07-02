@@ -11,7 +11,8 @@ All five `f:GraphRef`-shaped governance predicates support
 cross-ledger references today:
 
 - **Cross-ledger policy** (`f:policySource` with `f:ledger`) —
-  M's policy rule set is applied to queries against D.
+  M's policy rule set is applied to queries (`f:view`) and
+  transactions (`f:modify`) against D.
 - **Cross-ledger constraints** (`f:constraintsSource` with
   `f:ledger`) — M's `f:enforceUnique` annotations are applied
   to transactions against D.
@@ -154,16 +155,26 @@ rules are opt-in — operators name the class to enroll them.
 
 ## Engaging policy enforcement
 
-There's a subtlety in how the server's JSON-LD query route
-chooses whether to invoke policy enforcement at all. Requests
-without an `fluree-policy-class`, `fluree-identity`, or inline
-`opts.policy` go through a no-policy fast path that bypasses the
-cross-ledger dispatch. A configured `f:policySource` in `#config`
-is **not** enough on its own to force enforcement at the HTTP
-layer today.
+**Transactions engage cross-ledger policy automatically.** The
+transact path (JSON-LD / SPARQL UPDATE / Turtle / TriG through
+the server, push replication, credentialed transactions, and the
+CLI's local mode with policy flags) resolves D's config before
+staging: a cross-ledger `f:policySource` always builds a policy
+context, and M's `f:modify` rules are enforced on the staged
+flakes even when the request carries no policy inputs at all.
+Config `f:defaultAllow` / `f:policyClass` defaults merge in the
+same way they do for reads.
 
-To engage cross-ledger policy via HTTP, send a request with at
-least one of:
+For **queries**, there's a subtlety in how the server's JSON-LD
+query route chooses whether to invoke policy enforcement at all.
+Requests without an `fluree-policy-class`, `fluree-identity`, or
+inline `opts.policy` go through a no-policy fast path that
+bypasses the cross-ledger dispatch. A configured `f:policySource`
+in `#config` is **not** enough on its own to force enforcement at
+the HTTP query layer today.
+
+To engage cross-ledger policy on an HTTP query, send a request
+with at least one of:
 
 - `fluree-policy-class: <iri>` — the policy class header (the
   cleanest way to declare "use the configured policy"). Matching
@@ -177,7 +188,9 @@ least one of:
 When using the in-process Rust API, calling
 `fluree.db_with_policy(ledger_id, &opts)` always engages the
 policy path, even with empty opts. Programmatic users don't see
-this gating.
+this gating. The write-side equivalent is
+`build_transact_policy_context` — see
+[Programmatic policy API (Rust)](programmatic-policy.md).
 
 ## Cross-ledger uniqueness constraints
 
