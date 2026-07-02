@@ -1355,8 +1355,10 @@ fn materialize_batch(
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
     // Precompute each decimal constant's canonical string once (not per row), so
     // the per-row match can skip the `BigDecimal` parse on an exact lexical hit.
-    let object_constant_canon: Option<String> =
-        pattern.object_constant.as_ref().and_then(decimal_canonical_of);
+    let object_constant_canon: Option<String> = pattern
+        .object_constant
+        .as_ref()
+        .and_then(decimal_canonical_of);
     let star_constraint_canon: Vec<Option<String>> = pattern
         .star_constraints
         .iter()
@@ -1951,11 +1953,27 @@ mod tests {
         // Decimal: scale-insensitive numeric match (`9.99` == `9.990`).
         // (numeric_column is irrelevant to the Decimal arm; pass false.)
         let d = ObjectConstant::Decimal(BigDecimal::from_str("9.99").unwrap());
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("9.99"), &d, false));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("9.990"), &d, false));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("9.98"), &d, false));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("9.99"),
+            &d,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("9.990"),
+            &d,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("9.98"),
+            &d,
+            false
+        ));
         // An IRI term never matches a literal constant.
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("9.99"), &d, false));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::iri("9.99"),
+            &d,
+            false
+        ));
 
         // Cached fast-path (fed the constant's own canonical string, as the hot
         // loop does): identical results to the uncached path — an exact lexical
@@ -1963,17 +1981,49 @@ mod tests {
         let canon = decimal_canonical_of(&d);
         assert_eq!(canon.as_deref(), Some("9.99"));
         let c = canon.as_deref();
-        assert!(rdf_term_eq_object_constant_cached(&RdfTerm::string("9.99"), &d, false, c)); // fast hit
-        assert!(rdf_term_eq_object_constant_cached(&RdfTerm::string("9.990"), &d, false, c)); // fallback
-        assert!(!rdf_term_eq_object_constant_cached(&RdfTerm::string("9.98"), &d, false, c));
+        assert!(rdf_term_eq_object_constant_cached(
+            &RdfTerm::string("9.99"),
+            &d,
+            false,
+            c
+        )); // fast hit
+        assert!(rdf_term_eq_object_constant_cached(
+            &RdfTerm::string("9.990"),
+            &d,
+            false,
+            c
+        )); // fallback
+        assert!(!rdf_term_eq_object_constant_cached(
+            &RdfTerm::string("9.98"),
+            &d,
+            false,
+            c
+        ));
         // With no cached string, still correct via the numeric compare.
-        assert!(rdf_term_eq_object_constant_cached(&RdfTerm::string("9.990"), &d, false, None));
+        assert!(rdf_term_eq_object_constant_cached(
+            &RdfTerm::string("9.990"),
+            &d,
+            false,
+            None
+        ));
 
         // Double: exact f64 value match, insensitive to trailing zeros.
         let f = ObjectConstant::Double(1.5);
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1.5"), &f, false));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1.50"), &f, false));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("1.6"), &f, false));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("1.5"),
+            &f,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("1.50"),
+            &f,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("1.6"),
+            &f,
+            false
+        ));
 
         // Date: ISO 8601 materialized lexical parsed back to days-since-epoch.
         let days = fluree_db_core::Date::parse("2024-01-15")
