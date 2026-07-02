@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// OAuth2 client credentials configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuth2Config {
     pub token_url: String,
     pub client_id: String,
@@ -18,12 +18,36 @@ pub struct OAuth2Config {
     pub audience: Option<String>,
 }
 
+/// Redacting `Debug`: never leak `client_secret` via a `{:?}` in a log or error.
+impl std::fmt::Debug for OAuth2Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth2Config")
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("scope", &self.scope)
+            .field("audience", &self.audience)
+            .finish()
+    }
+}
+
 /// Cached token with expiration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CachedToken {
     access_token: String,
     token_type: String,
     expires_at: DateTime<Utc>,
+}
+
+/// Redacting `Debug`: the `access_token` is a live bearer credential.
+impl std::fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("access_token", &"***")
+            .field("token_type", &self.token_type)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl CachedToken {

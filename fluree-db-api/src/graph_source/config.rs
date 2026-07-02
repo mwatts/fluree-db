@@ -1208,6 +1208,41 @@ mod tests {
 
     #[cfg(feature = "iceberg")]
     #[test]
+    fn debug_of_connection_config_redacts_secrets() {
+        // A future `{:?}` on the connection (in a log or error) must not leak the
+        // bearer token or the OAuth2 client secret it transitively holds via the
+        // `AuthConfig` -> `ConfigValue` chain.
+        let bearer = IcebergConnectionConfig::rest("https://catalog.example.com")
+            .with_auth_bearer("super-secret-bearer-token");
+        let dbg = format!("{bearer:?}");
+        assert!(
+            !dbg.contains("super-secret-bearer-token"),
+            "bearer token leaked in Debug: {dbg}"
+        );
+
+        let oauth = IcebergConnectionConfig::rest("https://catalog.example.com").with_auth_oauth2(
+            "https://catalog.example.com/v1/oauth/tokens",
+            "client-id-ok-to-show",
+            "super-secret-oauth-secret",
+        );
+        let dbg = format!("{oauth:?}");
+        assert!(
+            !dbg.contains("super-secret-oauth-secret"),
+            "oauth client_secret leaked in Debug: {dbg}"
+        );
+
+        // The same guarantee must hold one level up, on IcebergCreateConfig,
+        // whose derived Debug prints the connection.
+        let create = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_bearer("super-secret-bearer-token");
+        assert!(
+            !format!("{create:?}").contains("super-secret-bearer-token"),
+            "bearer token leaked in IcebergCreateConfig Debug"
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
     fn test_oauth2_scope_setter_warns_without_oauth2() {
         // Bearer auth set, scope setter should be a no-op (and not panic).
         let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
