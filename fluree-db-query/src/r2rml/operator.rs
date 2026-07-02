@@ -1218,7 +1218,33 @@ fn materialize_pom_object(
 /// both admit false positives across adjacent large integers and let the
 /// operator keep a lexical form (`"2024.0"`) that the Arrow scan filter would
 /// drop, breaking the invariant that pushdown never removes an operator-kept row.
+/// Uncached convenience wrapper — used only by tests; the hot per-row paths call
+/// [`rdf_term_eq_object_constant_cached`] with a precomputed canonical string.
+#[cfg(test)]
 fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectConstant) -> bool {
+    rdf_term_eq_object_constant_cached(term, constant, None)
+}
+
+/// The constant's precomputed `BigDecimal::to_string()`, for an
+/// `ObjectConstant::Decimal` — computed once per scan so the hot per-row match
+/// can skip re-parsing. `None` for any other constant.
+fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
+    match constant {
+        crate::r2rml::ObjectConstant::Decimal(d) => Some(d.to_string()),
+        _ => None,
+    }
+}
+
+/// Like [`rdf_term_eq_object_constant`], but `decimal_canonical` may carry the
+/// constant's precomputed canonical string (see [`decimal_canonical_of`]). When
+/// the materialized value matches it exactly — the common same-scale case — the
+/// per-row `BigDecimal` parse (a heap allocation) is skipped. A scale variant
+/// (`"9.990"` vs `"9.99"`) still falls back to the exact numeric compare.
+fn rdf_term_eq_object_constant_cached(
+    term: &RdfTerm,
+    constant: &crate::r2rml::ObjectConstant,
+    decimal_canonical: Option<&str>,
+) -> bool {
     use crate::r2rml::{ObjectConstant, ScanValue};
     match constant {
         // Bound IRI / ref object: exact IRI match.
@@ -1229,6 +1255,9 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
             let RdfTerm::Literal { value: v, .. } = term else {
                 return false;
             };
+            if decimal_canonical == Some(v.as_str()) {
+                return true;
+            }
             v.parse::<bigdecimal::BigDecimal>().is_ok_and(|x| &x == d)
         }
         // Double object: exact f64 value match.
@@ -1280,6 +1309,16 @@ fn materialize_batch(
     parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
     encoder: &LiteralEncoder,
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
+    // Precompute each decimal constant's canonical string once (not per row), so
+    // the per-row match can skip the `BigDecimal` parse on an exact lexical hit.
+    let object_constant_canon: Option<String> =
+        pattern.object_constant.as_ref().and_then(decimal_canonical_of);
+    let star_constraint_canon: Vec<Option<String>> = pattern
+        .star_constraints
+        .iter()
+        .map(|(_, c)| decimal_canonical_of(c))
+        .collect();
+
     let mut produced: Vec<Vec<(VarId, Binding)>> = Vec::new();
     for table_row_idx in 0..iceberg_batch.num_rows {
         let subject_term = match materialize_subject_from_batch(
@@ -1337,7 +1376,9 @@ fn materialize_batch(
             // predicate produces at least one object equal to its constant. This
             // is an existence filter (produces no var), enforced by the operator.
             if row_ok {
-                for (pred, required) in &pattern.star_constraints {
+                for ((pred, required), canon) in
+                    pattern.star_constraints.iter().zip(&star_constraint_canon)
+                {
                     let mut matched = false;
                     for pom in triples_map
                         .predicate_object_maps
@@ -1350,7 +1391,7 @@ fn materialize_batch(
                             table_row_idx,
                             parent_lookups,
                         )? {
-                            if rdf_term_eq_object_constant(&t, required) {
+                            if rdf_term_eq_object_constant_cached(&t, required, canon.as_deref()) {
                                 matched = true;
                                 break;
                             }
@@ -1414,7 +1455,11 @@ fn materialize_batch(
                     if let Some(t) =
                         materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
                     {
-                        if rdf_term_eq_object_constant(&t, required) {
+                        if rdf_term_eq_object_constant_cached(
+                            &t,
+                            required,
+                            object_constant_canon.as_deref(),
+                        ) {
                             matched = true;
                             break;
                         }
@@ -1751,6 +1796,18 @@ mod tests {
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("9.98"), &d));
         // An IRI term never matches a literal constant.
         assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("9.99"), &d));
+
+        // Cached fast-path (fed the constant's own canonical string, as the hot
+        // loop does): identical results to the uncached path — an exact lexical
+        // hit short-circuits, a scale variant falls back to the numeric compare.
+        let canon = decimal_canonical_of(&d);
+        assert_eq!(canon.as_deref(), Some("9.99"));
+        let c = canon.as_deref();
+        assert!(rdf_term_eq_object_constant_cached(&RdfTerm::string("9.99"), &d, c)); // fast hit
+        assert!(rdf_term_eq_object_constant_cached(&RdfTerm::string("9.990"), &d, c)); // fallback
+        assert!(!rdf_term_eq_object_constant_cached(&RdfTerm::string("9.98"), &d, c));
+        // With no cached string, still correct via the numeric compare.
+        assert!(rdf_term_eq_object_constant_cached(&RdfTerm::string("9.990"), &d, None));
 
         // Double: exact f64 value match, insensitive to trailing zeros.
         let f = ObjectConstant::Double(1.5);
