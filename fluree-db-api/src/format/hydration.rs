@@ -87,13 +87,11 @@ type CacheKey = (usize, Sid, u64, usize, Option<Arc<str>>);
 /// - `results`: memoizes a subject's finished JSON so a subject reached many
 ///   times in one response (shared ancestors/units, multiply-referenced
 ///   entities) is hydrated once.
-/// - `reencoded_levels`: memoizes a projection level re-encoded into a target
-///   ledger's namespace dict (issue #1295), keyed by `(target view index, level
-///   address)`, so each `(level, target)` is re-encoded at most once per response
-///   and reused via a shared `Arc` instead of re-cloning the sub-tree on every
-///   cross-ledger crossing. The address key is stable for the response
-///   (originals live in the `HydrationSpec`, re-encoded copies are held here) and
-///   is only ever compared, never dereferenced.
+/// - `reencoded_levels`: memoizes a level re-encoded into a target ledger's dict
+///   (issue #1295), keyed by `(target view index, level address)` — re-encoded
+///   once per `(level, target)`, then shared via `Arc` instead of re-cloning the
+///   sub-tree per crossing. The address key is stable for the response (originals
+///   live in the `HydrationSpec`), only ever compared, never dereferenced.
 #[derive(Default)]
 struct HydrationCaches {
     results: HashMap<CacheKey, JsonValue>,
@@ -182,34 +180,20 @@ fn predicate_filter_for_level(level: &NestedSelectSpec) -> Option<Arc<[Sid]>> {
     }
 }
 
-/// Re-encode one hydration level's IMMEDIATE predicate `Sid`s from the lowering
-/// (primary) namespace dict into `target`'s dict, for cross-ledger hydration.
+/// Re-encode a hydration level's IMMEDIATE predicate `Sid`s from the lowering
+/// (primary) dict into `target`'s dict (issue #1295). The spec is lowered once
+/// against the primary dict, so its `Sid`s miss any target ledger whose codes
+/// diverge, dropping predicates in non-reserved namespaces.
 ///
-/// A dataset query is lowered once against the primary ledger's dict, so every
-/// predicate `Sid` in a [`NestedSelectSpec`] carries the *primary* ledger's
-/// namespace code. When [`HydrationFormatter::expand_ref`] crosses into another
-/// ledger, those codes no longer match the target ledger's `Sid`s, so the
-/// predicate filter (`predicate_filter_for_level`) misses the target's SPOT
-/// index and `select_predicate` fails its `Sid`-equality match — predicates in
-/// divergent namespaces are silently dropped (issue #1295). Reserved namespaces
-/// (rdf, rdfs, …) survive because their codes are stable across ledgers.
+/// **Shallow**: `sub_spec`s and reverse/refinement values stay in lowering-dict
+/// form and are re-encoded at their own crossing, so the decode source is ALWAYS
+/// the lowering view — never `self`, which may be non-primary in a depth-N chain.
+/// A predicate `target` can't encode is dropped (it can hold no such flake),
+/// mirroring the subject-side `encode_iri_strict` in `expand_ref`.
 ///
-/// This re-encodes the immediate forward/reverse (and wildcard-refinement) keys
-/// by `lowering.decode_sid` → IRI → `target.encode_iri_strict`. It is **shallow**:
-/// `sub_spec`s (and refinement/reverse values) are left in lowering-dict form —
-/// each is re-encoded at *its own* crossing, so the decode source is ALWAYS the
-/// lowering (primary) view, never `self`, even in depth-N chains where `self`
-/// is a non-primary view. A predicate the target can't encode is dropped: the
-/// target ledger has no code for that namespace, so it can hold no such flake —
-/// mirroring the subject-side `encode_iri_strict … else continue` in `expand_ref`.
-///
-/// This is the hydration-side analogue of the WHERE-scan's per-graph re-encode
-/// (`fluree_db_query::binary_scan::build_match_val_for_snapshot`'s `reencode_sid`):
-/// both decode a primary-lowered `Sid` and re-encode it into the ledger they're
-/// about to touch. They differ, deliberately, in the miss policy — the scan
-/// *preserves* the raw `Sid` (still matchable by raw bytes), hydration *drops* the
-/// predicate (an absent projection key, not a mis-scan). Keep the vocabulary in
-/// sync with that function.
+/// Mirror of the WHERE-scan's per-graph re-encode (`fluree_db_query::binary_scan`'s
+/// `reencode_sid`); that one preserves an unencodable `Sid`, this one drops it —
+/// keep the vocabulary in sync.
 fn reencode_level_for_view(
     level: &NestedSelectSpec,
     lowering: &IriCompactor,
@@ -501,17 +485,11 @@ async fn format_hydration_column(
 
     let formatter = set.pick(root.ledger_alias.as_ref());
 
-    // Re-encode the projection level's predicate Sids into the routed view's
-    // namespace dict when the root subject lives in a non-primary ledger
-    // (issue #1295, root path). The level is lowered once against the primary
-    // dict, so predicate Sids carry the primary ledger's namespace codes; a
-    // root routed to a non-primary view would otherwise miss that ledger's
-    // index for any divergent-code predicate (reserved-namespace predicates
-    // survive only because their codes are stable). A root that stays on the
-    // primary view needs no re-encode — keep the original level (no allocation,
-    // byte-identical output). This mirrors the nested `expand_ref` re-encode and
-    // shares its memo (per target view + level address). The lowering/decode
-    // source is the primary view's compactor, never the routed view's.
+    // Root path for #1295: when `pick` routes a root to a non-primary ledger,
+    // re-encode the level into that view's dict (as the nested `expand_ref` path
+    // does, sharing the memo). A primary-view root needs none — keep the original
+    // level (no allocation, byte-identical). Decode source is the primary
+    // compactor, never the routed view's.
     let reencoded_arc;
     let level = if formatter.active_idx == set.primary {
         &spec.level
@@ -1259,22 +1237,17 @@ impl<'a> HydrationFormatter<'a> {
                     continue;
                 };
                 let tfmt = ctx.formatter_for(tidx);
-                // Re-encode the projection's predicate Sids into this target
-                // ledger's namespace dict (issue #1295). The level is lowered
-                // once against the primary dict, so a same-ledger ref
-                // (`tidx == primary`) needs no re-encode — keep the original level
-                // (no allocation, byte-identical output). The decode source is
-                // the primary/lowering view, never `self` (which may be a
-                // non-primary view in a depth-N chain).
+                // Re-encode the level into this target ledger's dict (#1295). A
+                // same-ledger ref (`tidx == primary`) needs none — keep the
+                // original (no allocation, byte-identical). Decode source is the
+                // primary/lowering view, never `self` (may be non-primary in a
+                // depth-N chain).
                 let reencoded_arc;
                 let level_for_target = if tidx == ctx.primary {
                     level
                 } else {
-                    // Memoize per (target view, level address): re-encode a level
-                    // into this ledger's dict at most once per response, then reuse
-                    // the shared Arc (a refcount bump) rather than re-cloning the
-                    // sub-tree on every crossing. The key uses the level's address
-                    // — stable for the response, only ever compared.
+                    // Memoized per (target view, level address); see
+                    // `HydrationCaches::reencoded_levels`.
                     let key = (tidx, level as *const NestedSelectSpec as usize);
                     reencoded_arc = cache
                         .reencoded_levels
