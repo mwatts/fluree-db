@@ -1264,6 +1264,49 @@ fn adversarial_names_escape_and_do_not_inject_predicate_object_maps() {
     assert!(tm.columns.iter().any(|c| c.column_name == evil));
 }
 
+#[cfg(feature = "turtle")]
+#[test]
+fn hostile_base_namespace_is_escaped_in_header_and_cannot_inject() {
+    // `base_namespace` reaches the `@prefix v: <…>` header, which bypasses
+    // curie(). A crafted newline + `@prefix`/triple must not inject real Turtle.
+    let hostile =
+        "http://ns.example/x\n@prefix evil: <http://evil/> .\n<#Inj> a <http://evil/T> .\n#";
+    let opts = EmitOptions {
+        base_namespace: hostile.to_string(),
+        ..EmitOptions::default()
+    };
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![ik(1, "WIDGET_KEY", 1, 100, true)],
+    );
+    let out = emit_r2rml(&[t], &opts);
+
+    // Still compiles and round-trips to exactly ONE TriplesMap — the injected
+    // statements did not parse as real triples.
+    crate::emit::roundtrip_check(&out).expect("hostile base_namespace must still round-trip");
+    let compiled = crate::loader::R2rmlLoader::from_turtle(&out.turtle)
+        .unwrap()
+        .compile()
+        .unwrap();
+    assert_eq!(compiled.len(), 1, "no injected TriplesMap");
+
+    // The injection vector is a RAW newline that ends the @prefix line and starts
+    // a new directive/triple. Escaping turns every base newline into a \uXXXX
+    // (header IRI) or \n (rr:template) escape — neither a real 0x0A — so the
+    // crafted payload can never reach statement position.
+    assert!(
+        !out.turtle.contains("\n@prefix evil"),
+        "raw-newline prefix injection: {}",
+        out.turtle
+    );
+    assert!(
+        !out.turtle.contains("\n<#Inj>"),
+        "raw-newline triple injection: {}",
+        out.turtle
+    );
+}
+
 // =============================================================================
 // hex-not-base64 regression guard (rule 2)
 // =============================================================================

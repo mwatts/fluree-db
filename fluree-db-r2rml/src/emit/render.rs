@@ -20,9 +20,16 @@ pub fn render_turtle(mapping: &StructuredR2rmlMapping, opts: &EmitOptions) -> St
     let vocab_prefix = mapping.vocab_prefix();
 
     // -- Header: @base then @prefix declarations, in IR order. --
-    let mut header = format!("@base <{}> .\n", opts.map_document_base);
+    // The `@base` / `@prefix` IRIs bypass `curie()`, so escape them here too: the
+    // vocab prefix's namespace IS the request-controlled `base_namespace`, and an
+    // unescaped newline/`>` would otherwise inject arbitrary Turtle statements.
+    let mut header = format!("@base <{}> .\n", escape_iri(&opts.map_document_base));
     for p in &mapping.prefixes {
-        header.push_str(&format!("@prefix {}: <{}> .\n", p.prefix, p.namespace));
+        header.push_str(&format!(
+            "@prefix {}: <{}> .\n",
+            p.prefix,
+            escape_iri(&p.namespace)
+        ));
     }
 
     // -- One block per table. --

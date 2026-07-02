@@ -231,10 +231,41 @@ fn emit_from_previews(
 /// catalog-wide snapshot), so the returned `snapshot_id` is the first requested
 /// table's current snapshot — captured once and threaded through as the coherent
 /// pin for the whole generate (solo persists a single `snapshotId` per Dataset).
+/// Validate the request's `base_namespace` is an absolute IRI with no control
+/// characters. The emitter escapes it into the Turtle `@prefix` header, but a
+/// value carrying a newline / control char is rejected here for a clean `400`
+/// (defense in depth against Turtle header injection).
+fn validate_base_namespace(base: &str) -> Result<()> {
+    if base.is_empty() {
+        return Err(crate::ApiError::config("base_namespace must not be empty"));
+    }
+    if base.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(crate::ApiError::config(
+            "base_namespace must not contain control characters or spaces",
+        ));
+    }
+    let has_scheme = base.split_once(':').is_some_and(|(scheme, _)| {
+        scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    if !has_scheme {
+        return Err(crate::ApiError::config(
+            "base_namespace must be an absolute IRI (with a scheme, e.g. https://…)",
+        ));
+    }
+    Ok(())
+}
+
 fn assemble_generate_response(
     previews: &[(TableIdentifier, TablePreview)],
     req: &GenerateR2rmlRequest,
 ) -> Result<GenerateR2rmlResponse> {
+    validate_base_namespace(&req.base_namespace)?;
     let snapshot_id = previews
         .first()
         .map(|(_, preview)| preview.schema.snapshot.clone())
@@ -558,6 +589,47 @@ mod tests {
         assert_eq!(unverified.len(), 1);
         assert_eq!(unverified[0].column.as_deref(), Some("ALT_KEY"));
         assert_eq!(unverified[0].table.as_deref(), Some("DW.DIM_WIDGET"));
+    }
+
+    // ---- base_namespace validation (Turtle header-injection defense) ----
+
+    #[test]
+    fn base_namespace_with_control_char_is_rejected() {
+        let (id, pv) = preview(
+            "DW",
+            "DIM_A",
+            vec![1],
+            vec![int_col(1, "A_KEY", true, 1, 100)],
+        );
+        let mut req = base_req(vec![id.clone()], HashMap::new());
+        req.base_namespace = "http://ns.example/x\n@prefix evil: <http://evil/> .".to_string();
+        let err = assemble_generate_response(&[(id, pv)], &req).unwrap_err();
+        assert!(err.to_string().contains("base_namespace"), "got: {err}");
+    }
+
+    #[test]
+    fn base_namespace_without_scheme_is_rejected() {
+        let (id, pv) = preview(
+            "DW",
+            "DIM_A",
+            vec![1],
+            vec![int_col(1, "A_KEY", true, 1, 100)],
+        );
+        let mut req = base_req(vec![id.clone()], HashMap::new());
+        req.base_namespace = "not-an-absolute-iri".to_string();
+        assert!(assemble_generate_response(&[(id, pv)], &req).is_err());
+    }
+
+    #[test]
+    fn base_namespace_valid_https_is_accepted() {
+        let (id, pv) = preview(
+            "DW",
+            "DIM_A",
+            vec![1],
+            vec![int_col(1, "A_KEY", true, 1, 100)],
+        );
+        let req = base_req(vec![id.clone()], HashMap::new()); // default http://ns.fluree.dev/edw#
+        assert!(assemble_generate_response(&[(id, pv)], &req).is_ok());
     }
 
     // ---- generated turtle round-trips + FK resolves ----
