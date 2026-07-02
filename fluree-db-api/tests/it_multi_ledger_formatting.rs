@@ -969,6 +969,13 @@ async fn cross_graph_root_unions_split_subject_altlabels() {
         .as_array()
         .and_then(|a| a.first())
         .expect("one subject");
+    // @id must stay a single scalar: both default ledgers encode the subject, so
+    // the merge sees `@id` twice — `merge_values` must dedup it, not array it.
+    assert_eq!(
+        widget.get("@id").and_then(|v| v.as_str()),
+        Some("ex:widget"),
+        "merged root @id should be a single scalar, not duplicated/arrayed: {value:#}"
+    );
     let labels = collect_strs(widget.get("skos:altLabel"));
     assert_eq!(
         labels,
