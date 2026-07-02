@@ -171,6 +171,15 @@ pub fn validate_public_url(raw: &str) -> Result<()> {
 /// Validation for the S3 `endpoint` override. Narrower than [`validate_public_url`]
 /// because MinIO / LocalStack legitimately run on loopback/private hosts — but the
 /// cloud-metadata / link-local range (the credential-exfil target) is still refused.
+///
+/// RESIDUAL (tracked follow-up): the S3 sink uses the AWS SDK, not `reqwest`, so —
+/// unlike the catalog / OAuth2 clients — there is no denylisting DNS resolver on
+/// its connector. A DNS-name `s3_endpoint` that RESOLVES to a private address is
+/// therefore only caught here when it is a literal metadata/link-local IP, not
+/// when it is a hostname. This is lower-risk (s3_endpoint is data-plane and the
+/// metadata IP is blocked). The full fix is to pin the AWS SDK's HTTP connector
+/// to a checked IP — the equivalent of [`hardened_client_builder`]'s resolver —
+/// which is deferred rather than done here.
 pub fn validate_s3_endpoint(raw: &str) -> Result<()> {
     let (scheme, host) = parse_scheme_host(raw)?;
     if scheme != "http" && scheme != "https" {
