@@ -484,45 +484,44 @@ async fn format_hydration_column(
     };
 
     let formatter = set.pick(root.ledger_alias.as_ref());
-
-    // Root path for #1295: when `pick` routes a root to a non-primary ledger,
-    // re-encode the level into that view's dict (as the nested `expand_ref` path
-    // does, sharing the memo). A primary-view root needs none — keep the original
-    // level (no allocation, byte-identical). Decode source is the primary
-    // compactor, never the routed view's.
-    let reencoded_arc;
-    let level = if formatter.active_idx == set.primary {
-        &spec.level
-    } else {
-        let key = (
-            formatter.active_idx,
-            &spec.level as *const NestedSelectSpec as usize,
-        );
-        reencoded_arc = cache
-            .reencoded_levels
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(reencode_level_for_view(
-                    &spec.level,
-                    set.primary().compactor,
-                    formatter.db.snapshot,
-                ))
-            })
-            .clone();
-        &*reencoded_arc
-    };
-
     let mut visited = HashSet::new();
-    formatter
-        .format_subject(
-            &root.sid,
-            root.iri,
-            level,
-            DepthBudget::root(spec.depth),
-            &mut visited,
-            cache,
-        )
-        .await
+
+    // Multi-ledger: resolve the root across the default-graph union (same
+    // machinery as nested `expand_ref`), so a subject described in several
+    // default ledgers merges (RDF merge) and a root with no home-ledger
+    // provenance — e.g. one bound as the object of a primary-ledger triple —
+    // is still found in its home ledger rather than coming back `@id`-only.
+    // The level is re-encoded per contributing view inside the resolver (#1295).
+    // Single-ledger: format directly in the one view (byte-identical).
+    if formatter.dataset.is_some() {
+        // Canonical IRI: an `IriMatch` root carries it; a bare-`Sid` root's SID
+        // is primary-dict-encoded, so decode it against the picked (primary)
+        // view to recover it.
+        let iri: Arc<str> = match &root.iri {
+            Some(iri) => Arc::clone(iri),
+            None => Arc::from(formatter.compactor.decode_sid(&root.sid)?.as_str()),
+        };
+        formatter
+            .resolve_iri_across_union(
+                iri,
+                &spec.level,
+                DepthBudget::root(spec.depth),
+                &mut visited,
+                cache,
+            )
+            .await
+    } else {
+        formatter
+            .format_subject(
+                &root.sid,
+                root.iri,
+                &spec.level,
+                DepthBudget::root(spec.depth),
+                &mut visited,
+                cache,
+            )
+            .await
+    }
 }
 
 /// Async hydration formatter entry point.
@@ -1213,82 +1212,109 @@ impl<'a> HydrationFormatter<'a> {
         cache: &'b mut HydrationCaches,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
-            let Some(ctx) = self.dataset else {
+            if self.dataset.is_none() {
                 // Single-ledger: stay in the current view.
                 return self
                     .format_subject(ref_sid, None, level, depth, visited, cache)
                     .await;
-            };
+            }
 
             // Decode against the CURRENT view (where the flake lives) to recover
-            // the canonical IRI, then resolve it in the target ledger(s).
+            // the canonical IRI, then resolve it across the scope.
             let iri: Arc<str> = Arc::from(self.compactor.decode_sid(ref_sid)?.as_str());
-
-            // Scope: default-graph refs resolve across the default-graph union;
-            // a named-graph ref stays within its graph.
-            let targets: Vec<usize> = if ctx.default_indices.contains(&self.active_idx) {
-                ctx.default_indices.clone()
-            } else {
-                vec![self.active_idx]
-            };
-
-            let mut merged: Option<JsonValue> = None;
-            for tidx in targets {
-                let tview = &ctx.views[tidx];
-                // Only a view whose namespace dict can encode the IRI can hold
-                // the subject — skip the rest (no scan, no error).
-                let Some(tsid) = tview.db.snapshot.encode_iri_strict(&iri) else {
-                    continue;
-                };
-                let tfmt = ctx.formatter_for(tidx);
-                // Re-encode the level into this target ledger's dict (#1295). A
-                // same-ledger ref (`tidx == primary`) needs none — keep the
-                // original (no allocation, byte-identical). Decode source is the
-                // primary/lowering view, never `self` (may be non-primary in a
-                // depth-N chain).
-                let reencoded_arc;
-                let level_for_target = if tidx == ctx.primary {
-                    level
-                } else {
-                    // Memoized per (target view, level address); see
-                    // `HydrationCaches::reencoded_levels`.
-                    let key = (tidx, level as *const NestedSelectSpec as usize);
-                    reencoded_arc = cache
-                        .reencoded_levels
-                        .entry(key)
-                        .or_insert_with(|| {
-                            Arc::new(reencode_level_for_view(
-                                level,
-                                &ctx.views[ctx.primary].compactor,
-                                tview.db.snapshot,
-                            ))
-                        })
-                        .clone();
-                    &*reencoded_arc
-                };
-                let obj = tfmt
-                    .format_subject(
-                        &tsid,
-                        Some(Arc::clone(&iri)),
-                        level_for_target,
-                        depth,
-                        visited,
-                        cache,
-                    )
-                    .await?;
-                merged = Some(match merged {
-                    None => obj,
-                    Some(acc) => merge_subject_objects(acc, obj),
-                });
-            }
-
-            // No view could resolve the subject → bare canonical @id.
-            match merged {
-                Some(v) => Ok(v),
-                None => Ok(json!({ "@id": self.compactor.compact_id_iri(&iri) })),
-            }
+            self.resolve_iri_across_union(iri, level, depth, visited, cache)
+                .await
         }
         .boxed()
+    }
+
+    /// Hydrate a canonical IRI across the current scope, RDF-merging each
+    /// contributing ledger's view of the subject.
+    ///
+    /// A subject reached from a default-graph view resolves across the **whole
+    /// default-graph union** (so a subject described in several default ledgers
+    /// merges — same predicate included); a subject in a named graph stays in
+    /// that graph. Each contributing view re-encodes the projection level into
+    /// its own dict (#1295) and reads under its own policy. Returns a bare
+    /// `{"@id": …}` when no view can resolve the subject.
+    ///
+    /// Shared by nested-ref expansion (`expand_ref`) and root hydration
+    /// (`format_hydration_column`) so both honor the same default-graph merge.
+    /// Requires a dataset context; single-ledger callers format directly.
+    async fn resolve_iri_across_union(
+        &self,
+        iri: Arc<str>,
+        level: &NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &mut HashSet<Sid>,
+        cache: &mut HydrationCaches,
+    ) -> Result<JsonValue> {
+        let ctx = self
+            .dataset
+            .expect("resolve_iri_across_union requires a dataset context");
+
+        // Scope: default-graph subjects resolve across the default-graph union;
+        // a named-graph subject stays within its graph.
+        let targets: Vec<usize> = if ctx.default_indices.contains(&self.active_idx) {
+            ctx.default_indices.clone()
+        } else {
+            vec![self.active_idx]
+        };
+
+        let mut merged: Option<JsonValue> = None;
+        for tidx in targets {
+            let tview = &ctx.views[tidx];
+            // Only a view whose namespace dict can encode the IRI can hold the
+            // subject — skip the rest (no scan, no error).
+            let Some(tsid) = tview.db.snapshot.encode_iri_strict(&iri) else {
+                continue;
+            };
+            let tfmt = ctx.formatter_for(tidx);
+            // Re-encode the level into this target ledger's dict (#1295). The
+            // primary view (`tidx == primary`) needs none — keep the original
+            // (no allocation, byte-identical). Decode source is the
+            // primary/lowering view, never `self` (may be non-primary here).
+            let reencoded_arc;
+            let level_for_target = if tidx == ctx.primary {
+                level
+            } else {
+                // Memoized per (target view, level address); see
+                // `HydrationCaches::reencoded_levels`.
+                let key = (tidx, level as *const NestedSelectSpec as usize);
+                reencoded_arc = cache
+                    .reencoded_levels
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(reencode_level_for_view(
+                            level,
+                            &ctx.views[ctx.primary].compactor,
+                            tview.db.snapshot,
+                        ))
+                    })
+                    .clone();
+                &*reencoded_arc
+            };
+            let obj = tfmt
+                .format_subject(
+                    &tsid,
+                    Some(Arc::clone(&iri)),
+                    level_for_target,
+                    depth,
+                    visited,
+                    cache,
+                )
+                .await?;
+            merged = Some(match merged {
+                None => obj,
+                Some(acc) => merge_subject_objects(acc, obj),
+            });
+        }
+
+        // No view could resolve the subject → bare canonical @id.
+        match merged {
+            Some(v) => Ok(v),
+            None => Ok(json!({ "@id": self.compactor.compact_id_iri(&iri) })),
+        }
     }
 
     /// Hydrate a referenced subject, dispatching cross-ledger only when needed.

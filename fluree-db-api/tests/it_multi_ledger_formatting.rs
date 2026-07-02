@@ -647,10 +647,11 @@ async fn cross_graph_root_bound_in_home_graph_hydrates() {
 /// returns it `@id`-only. `schema:name` (aligned namespace) is dropped, proving
 /// this is the root-view-routing mechanism, not the per-predicate-Sid mismatch.
 ///
-/// Out of scope for the #1295 core fix (the rebind lives in `expand_ref`; this
-/// root path goes through `format_hydration_column`/`FormatterSet::pick`).
-/// Kept as a documented, ignored repro pending the root-routing follow-up.
-#[ignore = "pending #1295 non-primary-root routing follow-up"]
+/// FIXED by the root-path union resolution: `format_hydration_column` now
+/// resolves a multi-ledger root across the default-graph union (like nested
+/// `expand_ref`), decoding the bare object SID against the primary view to
+/// recover its IRI and finding the subject in its home ledger — no home-ledger
+/// provenance required.
 #[tokio::test]
 async fn cross_graph_root_bound_as_object_hydrates_in_home_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -937,15 +938,10 @@ async fn cross_graph_nested_ref_unions_split_subject_altlabels() {
     );
 }
 
-/// BUG (root-path union gap) — the SAME split subject, bound at the ROOT, is
-/// hydrated against only its provenance ledger (A), so B's `skos:altLabel "WB"`
-/// is dropped. Under default-graph merge the root should union both, exactly as
-/// the nested control above does.
-///
-/// Companion to Finding B: both are root-path limitations
-/// (`format_hydration_column` / `FormatterSet::pick`) where the root does not
-/// behave like `expand_ref`. Ignored pending the root-path union follow-up.
-#[ignore = "pending root-path default-graph union follow-up (companion to Finding B)"]
+/// FIXED — the SAME split subject, bound at the ROOT, now unions both ledgers'
+/// `skos:altLabel` values under default-graph merge, exactly as the nested
+/// control above does. `format_hydration_column` routes the root through the
+/// same union resolver as `expand_ref` instead of picking a single ledger.
 #[tokio::test]
 async fn cross_graph_root_unions_split_subject_altlabels() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -973,6 +969,13 @@ async fn cross_graph_root_unions_split_subject_altlabels() {
         .as_array()
         .and_then(|a| a.first())
         .expect("one subject");
+    // @id must stay a single scalar: both default ledgers encode the subject, so
+    // the merge sees `@id` twice — `merge_values` must dedup it, not array it.
+    assert_eq!(
+        widget.get("@id").and_then(|v| v.as_str()),
+        Some("ex:widget"),
+        "merged root @id should be a single scalar, not duplicated/arrayed: {value:#}"
+    );
     let labels = collect_strs(widget.get("skos:altLabel"));
     assert_eq!(
         labels,
