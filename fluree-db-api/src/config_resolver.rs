@@ -847,6 +847,121 @@ async fn read_iri_list_field(
     }
 }
 
+/// Read `f:reasoningModes`, accepting every shape users naturally write:
+///
+/// - repeated IRI objects — `f:reasoningModes f:rdfs, f:datalog`
+/// - repeated string literals — `f:reasoningModes "rdfs"`
+/// - an RDF collection of either — `f:reasoningModes ( "rdfs" "datalog" )`
+///
+/// `ReasoningModes::from_mode_strings` downstream handles both full IRIs
+/// and bare mode names, so all shapes normalize to the same modes.
+///
+/// This is deliberately more permissive than [`read_iri_list_field`]
+/// (which stays IRI-only for `f:policyClass` / `f:allowedIdentities`,
+/// where a stray string must not widen policy). Before this reader,
+/// string-literal and collection shapes silently produced no modes —
+/// config-declared reasoning never engaged and queries returned
+/// non-entailed results with no error.
+async fn read_reasoning_modes_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+) -> Result<Option<Vec<String>>> {
+    let pred_sid = match try_encode(snapshot, config_iris::REASONING_MODES) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    let mut values = Vec::new();
+    for binding in bindings {
+        if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
+            values.push(s.to_string());
+            continue;
+        }
+        let Some(sid) = binding.as_sid() else {
+            continue;
+        };
+        // An object ref is either a mode IRI or the head of an RDF
+        // collection. Distinguish by probing `rdf:first`.
+        match read_rdf_list_values(snapshot, overlay, to_t, sid).await? {
+            Some(items) => values.extend(items),
+            None => {
+                if let Some(iri) = snapshot.decode_sid(sid) {
+                    values.push(iri);
+                }
+            }
+        }
+    }
+
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values))
+    }
+}
+
+/// Walk an RDF collection (`rdf:first`/`rdf:rest`.. `rdf:nil`) starting at
+/// `head`, returning each element as a string (string literals verbatim,
+/// IRI refs decoded). Returns `Ok(None)` when `head` is not a list node
+/// (no `rdf:first`), so callers can fall back to treating it as a plain
+/// IRI value.
+async fn read_rdf_list_values(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    head: &Sid,
+) -> Result<Option<Vec<String>>> {
+    use fluree_vocab::rdf;
+
+    let (Some(first_sid), Some(rest_sid)) = (
+        try_encode(snapshot, rdf::FIRST),
+        try_encode(snapshot, rdf::REST),
+    ) else {
+        return Ok(None);
+    };
+
+    let mut node = head.clone();
+    let mut values = Vec::new();
+    let mut is_list = false;
+    // Bounded walk: a malformed cyclic list must not spin forever.
+    for _ in 0..MAX_RDF_LIST_LEN {
+        let firsts = query_config_predicate(snapshot, overlay, to_t, &node, &first_sid).await?;
+        if firsts.is_empty() {
+            return if is_list { Ok(Some(values)) } else { Ok(None) };
+        }
+        is_list = true;
+        for binding in &firsts {
+            if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
+                values.push(s.to_string());
+            } else if let Some(sid) = binding.as_sid() {
+                if let Some(iri) = snapshot.decode_sid(sid) {
+                    values.push(iri);
+                }
+            }
+        }
+        let rests = query_config_predicate(snapshot, overlay, to_t, &node, &rest_sid).await?;
+        let Some(next) = rests.iter().find_map(|b| b.as_sid().cloned()) else {
+            return Ok(Some(values));
+        };
+        if snapshot.decode_sid(&next).as_deref() == Some(rdf::NIL) {
+            return Ok(Some(values));
+        }
+        node = next;
+    }
+    tracing::warn!(
+        "f:reasoningModes RDF collection exceeded {MAX_RDF_LIST_LEN} entries \
+         (malformed or cyclic list?); truncating"
+    );
+    Ok(Some(values))
+}
+
+/// Upper bound on RDF-collection length when walking `f:reasoningModes`
+/// lists; there are only a handful of reasoning modes, so anything near
+/// this is a malformed (likely cyclic) list.
+const MAX_RDF_LIST_LEN: usize = 64;
+
 /// Read an integer field from a subject at the config graph.
 async fn read_i64_field(
     snapshot: &LedgerSnapshot,
@@ -995,14 +1110,7 @@ async fn read_reasoning_defaults(
         None => return Ok(None),
     };
 
-    let modes = read_iri_list_field(
-        snapshot,
-        overlay,
-        to_t,
-        &group_sid,
-        config_iris::REASONING_MODES,
-    )
-    .await?;
+    let modes = read_reasoning_modes_field(snapshot, overlay, to_t, &group_sid).await?;
     let schema_source = read_graph_source_ref(
         snapshot,
         overlay,

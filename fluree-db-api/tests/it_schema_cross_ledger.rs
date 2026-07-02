@@ -200,3 +200,107 @@ async fn cross_ledger_schema_with_follow_owl_imports_fails_closed() {
         other => panic!("expected OntologyImport, got {other:?}"),
     }
 }
+
+/// Dataset-path parity: the same cross-ledger entailment must work when
+/// the query takes the multi-ledger dataset path (`from` with two
+/// sources → `DataSetDb` → `build_executable_for_dataset`), which
+/// previously resolved `f:schemaSource` same-ledger-only and errored on
+/// a cross-ledger ref. The second source is an unrelated ledger — NOT M
+/// — so the hierarchy is reachable only through the cross-ledger schema
+/// bundle, not via the dataset union.
+#[tokio::test]
+async fn dataset_query_pulls_schema_from_model_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-schema/model-ds:main";
+    let data_id = "test/cross-ledger-schema/data-ds:main";
+    let other_id = "test/cross-ledger-schema/other-ds:main";
+    let ontology_iri = "http://example.org/ontology/core";
+
+    seed_model(&fluree, model_id, Some(ontology_iri)).await;
+    seed_data(&fluree, data_id, model_id, &format!("<{ontology_iri}>"), "").await;
+
+    let other = genesis_ledger(&fluree, other_id);
+    fluree
+        .insert(
+            other,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:unrelated",
+                "ex:note": "no ontology here"
+            }),
+        )
+        .await
+        .expect("seed unrelated ledger");
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": [data_id, other_id],
+        "select": "?x",
+        "where": {"@id": "?x", "@type": "ex:Employee"},
+        "reasoning": "rdfs"
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("dataset query with cross-ledger schema");
+    let data = fluree.ledger(data_id).await.expect("reload D ledger");
+    let rows = result.to_jsonld(&data.snapshot).expect("to_jsonld");
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:anita")),
+        "M's subclass axiom must entail anita on the dataset path; \
+         got: {results:?}"
+    );
+}
+
+/// Dataset-path parity for the fail-closed guard: `f:followOwlImports`
+/// + cross-ledger `f:schemaSource` must reject on the dataset path
+/// exactly as it does on the single-ledger path (shared choke point).
+#[tokio::test]
+async fn dataset_follow_owl_imports_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-schema/model-ds-follow:main";
+    let data_id = "test/cross-ledger-schema/data-ds-follow:main";
+    let other_id = "test/cross-ledger-schema/other-ds-follow:main";
+    let ontology_iri = "http://example.org/ontology/core";
+
+    seed_model(&fluree, model_id, Some(ontology_iri)).await;
+    seed_data(
+        &fluree,
+        data_id,
+        model_id,
+        &format!("<{ontology_iri}>"),
+        ";\n                                 f:followOwlImports  true ",
+    )
+    .await;
+    let other = genesis_ledger(&fluree, other_id);
+    fluree
+        .insert(
+            other,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:unrelated",
+                "ex:note": "no ontology here"
+            }),
+        )
+        .await
+        .expect("seed unrelated ledger");
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": [data_id, other_id],
+        "select": "?x",
+        "where": {"@id": "?x", "@type": "ex:Employee"},
+        "reasoning": "rdfs"
+    });
+    let err = fluree
+        .query_connection(&q)
+        .await
+        .expect_err("followOwlImports + cross-ledger schemaSource must reject on dataset path");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("followOwlImports"),
+        "error should name the unsupported flag: {msg}"
+    );
+}

@@ -84,10 +84,12 @@ cross-ledger resolver (`ArtifactKind::SchemaClosure`), which projects
 the model ledger's whitelisted axioms onto the data ledger's snapshot
 at the model ledger's **current head** (as-of-now, matching
 `f:policySource` / `f:shapesSource` semantics — not the query's `to_t`).
-The cross-ledger materializer is single-graph: combining it with
-`f:followOwlImports true` fails closed with `ApiError::OntologyImport`
-rather than silently dropping the import closure. See
-`cross-ledger-model-enforcement.md`.
+Both the single-ledger view path and the multi-ledger dataset path
+(where reasoning is governed by the dataset's primary view) share this
+dispatch via `apply_reasoning_to_executable`. The cross-ledger
+materializer is single-graph: combining it with `f:followOwlImports
+true` fails closed with `ApiError::OntologyImport` rather than silently
+dropping the import closure. See `cross-ledger-model-enforcement.md`.
 
 ## Resolution algorithm
 
@@ -214,16 +216,19 @@ so broken ontology references surface early. Sources of this error:
   `f:rollbackGuard`. The local bundle is resolved at the query's single
   `to_t`, and accepting these fields silently would create a gap between
   declared intent and actual behavior. (A cross-ledger `f:schemaSource`
-  is legal but never reaches this module — see above.)
+  is legal on both the single-ledger and dataset query paths but never
+  reaches this module — see above.)
 - `f:followOwlImports true` combined with a cross-ledger
   `f:schemaSource` (raised by `view/query.rs` before dispatch — the
   cross-ledger materializer does not walk `owl:imports`).
 
 ## Wiring at query time
 
-`Fluree::query(&db, ...)` (and the dataset-query counterpart) call
-`build_executable_for_view` → `attach_schema_bundle` on every query. The
-attach step:
+`Fluree::query(&db, ...)` calls `build_executable_for_view`, and the
+dataset counterpart calls `build_executable_for_dataset` with the
+dataset's primary view; both route through the shared
+`apply_reasoning_to_executable` → `attach_schema_bundle` on every query.
+The attach step:
 
 1. Reads `db.resolved_config().reasoning`. If there is no `f:schemaSource`,
    returns immediately — the legacy default-graph path applies unchanged.

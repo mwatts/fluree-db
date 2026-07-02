@@ -164,9 +164,8 @@ fn resolve_local_graph_source(
                 "this schema/import source must resolve within the current \
                  ledger (ref targets ledger '{ledger}', current ledger is \
                  '{}'). Cross-ledger refs are supported only for the \
-                 top-level `f:schemaSource` of a single-ledger query — not \
-                 for `f:ontologyImportMap` entries or multi-ledger dataset \
-                 queries.",
+                 top-level `f:schemaSource`, not for `f:ontologyImportMap` \
+                 entries.",
                 snapshot.ledger_id
             )));
         }

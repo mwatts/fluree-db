@@ -319,7 +319,7 @@ impl ReasoningModes {
                 rdfs: true,
                 ..Default::default()
             }),
-            "owl2ql" | "owl-ql" | "owlql" => Ok(Self {
+            "owl2ql" | "owl-ql" | "owlql" | "owl2-ql" => Ok(Self {
                 rdfs: true, // OWL2-QL implies RDFS for subclass expansion
                 owl2ql: true,
                 ..Default::default()
@@ -328,7 +328,7 @@ impl ReasoningModes {
                 datalog: true,
                 ..Default::default()
             }),
-            "owl2rl" | "owl-rl" | "owlrl" => Ok(Self {
+            "owl2rl" | "owl-rl" | "owlrl" | "owl2-rl" => Ok(Self {
                 owl2rl: true,
                 ..Default::default()
             }),
