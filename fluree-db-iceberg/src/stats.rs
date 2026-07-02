@@ -16,7 +16,7 @@ use serde_json::Value as JsonValue;
 use crate::error::Result;
 use crate::io::IcebergStorage;
 use crate::manifest::value_codec::decode_bound;
-use crate::manifest::{parse_manifest, parse_manifest_list, DataFile, TypedValue};
+use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes, DataFile, TypedValue};
 use crate::metadata::{Schema, SchemaField, Snapshot};
 
 /// Aggregated statistics for a single column across a snapshot's data files.
@@ -40,6 +40,12 @@ pub struct AggregatedColumnStats {
     pub on_disk_bytes: Option<i64>,
     /// Distinct value count — ALWAYS `None` (NDV deferred to PR-5).
     pub distinct_count: Option<i64>,
+    /// Whether `min`/`max` are **truncated prefixes** rather than exact observed
+    /// values. Iceberg truncates variable-length (string/binary/fixed) bounds:
+    /// the decoded value is a valid bound (`min <= all values <= max`) but not
+    /// necessarily an observed value. Always `false` for fixed-width types
+    /// (numeric/temporal/uuid/boolean), whose bounds are exact.
+    pub bounds_truncated: bool,
 }
 
 /// Aggregated table-level statistics computed from a snapshot's data files.
@@ -66,6 +72,11 @@ struct Acc {
     on_disk_bytes: Option<i64>,
     min: Option<TypedValue>,
     max: Option<TypedValue>,
+    /// Number of data files that reported a null count for this column (for the
+    /// all-files-reported coverage gate).
+    null_reports: usize,
+    /// Number of data files that reported a value count for this column.
+    value_reports: usize,
 }
 
 fn add_opt(slot: &mut Option<i64>, add: i64) {
@@ -130,9 +141,11 @@ pub fn aggregate_column_stats(data_files: &[DataFile], schema: &Schema) -> Table
 
             if let Some(n) = lookup(df.null_value_counts.as_ref(), fid) {
                 add_opt(&mut acc.null_count, n);
+                acc.null_reports += 1;
             }
             if let Some(n) = lookup(df.value_counts.as_ref(), fid) {
                 add_opt(&mut acc.value_count, n);
+                acc.value_reports += 1;
             }
             if let Some(n) = lookup(df.nan_value_counts.as_ref(), fid) {
                 add_opt(&mut acc.nan_count, n);
@@ -156,23 +169,47 @@ pub fn aggregate_column_stats(data_files: &[DataFile], schema: &Schema) -> Table
         }
     }
 
+    let total_files = data_files.len();
     let columns = accs
         .into_iter()
         .map(|(fid, acc)| {
-            let null_fraction = match (acc.null_count, acc.value_count) {
+            // Coverage gate: a summed count is authoritative only when EVERY
+            // data file reported it. Under partial coverage the sum is unknown
+            // (`None`), never a partial total — a partial `null_count` of 0
+            // would otherwise read as a confident "no nulls" and let a nullable
+            // column masquerade as a safe non-null subject key.
+            let full = |reports: usize| total_files > 0 && reports == total_files;
+            let null_count = if full(acc.null_reports) {
+                acc.null_count
+            } else {
+                None
+            };
+            let value_count = if full(acc.value_reports) {
+                acc.value_count
+            } else {
+                None
+            };
+            let null_fraction = match (null_count, value_count) {
                 (Some(n), Some(v)) if v > 0 => Some(n as f64 / v as f64),
                 _ => None,
             };
+            // Iceberg truncates variable-length (string/binary/fixed) min/max
+            // bounds; the decoded value is a valid bound but not necessarily an
+            // observed value, so flag it rather than present it as exact.
+            let bounds_truncated =
+                matches!(&acc.min, Some(TypedValue::String(_) | TypedValue::Bytes(_)))
+                    || matches!(&acc.max, Some(TypedValue::String(_) | TypedValue::Bytes(_)));
             let stats = AggregatedColumnStats {
                 field_id: fid,
-                null_count: acc.null_count,
-                value_count: acc.value_count,
+                null_count,
+                value_count,
                 null_fraction,
                 nan_count: acc.nan_count,
                 min: acc.min.as_ref().map(typed_value_to_json),
                 max: acc.max.as_ref().map(typed_value_to_json),
                 on_disk_bytes: acc.on_disk_bytes,
                 distinct_count: None,
+                bounds_truncated,
             };
             (fid, stats)
         })
@@ -265,15 +302,20 @@ fn format_decimal(unscaled: i128, scale: i8) -> String {
 }
 
 /// Read the data files listed by a snapshot's manifests — **manifest-list +
-/// manifest Avro only**, never a data file. Returns the collected data files and
-/// the number of manifest files read.
+/// manifest Avro only**, never a data file. Returns the collected data files,
+/// the number of data-manifest files read, and whether the snapshot carries any
+/// **delete manifests** (merge-on-read position/equality deletes).
+///
+/// The delete flag matters because the aggregated `row_count`/value/null counts
+/// sum live data-file records and do **not** subtract deletes; when it is
+/// `true`, those totals are upper bounds, not exact.
 ///
 /// Runtime-agnostic variant (`?Send`); server code should use
 /// [`send_read_snapshot_data_files`].
 pub async fn read_snapshot_data_files<S: IcebergStorage + ?Sized>(
     storage: &S,
     snapshot: &Snapshot,
-) -> Result<(Vec<DataFile>, usize)> {
+) -> Result<(Vec<DataFile>, usize, bool)> {
     let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
         crate::error::IcebergError::Manifest(
             "Snapshot has no manifest list (v1 format not supported)".to_string(),
@@ -281,12 +323,17 @@ pub async fn read_snapshot_data_files<S: IcebergStorage + ?Sized>(
     })?;
 
     let manifest_list_data = storage.read(manifest_list_path).await?;
-    let manifest_entries = parse_manifest_list(&manifest_list_data)?;
+    // Parse WITH delete manifests so we can DETECT (never read) them: a present
+    // delete manifest means the snapshot has merge-on-read deletes the
+    // record-count sum does not subtract.
+    let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
 
     let mut data_files = Vec::new();
     let mut manifests_read = 0usize;
+    let mut has_delete_manifests = false;
     for me in &manifest_entries {
         if me.is_deletes() {
+            has_delete_manifests = true;
             continue;
         }
         let manifest_data = storage.read(&me.manifest_path).await?;
@@ -296,7 +343,7 @@ pub async fn read_snapshot_data_files<S: IcebergStorage + ?Sized>(
         }
     }
 
-    Ok((data_files, manifests_read))
+    Ok((data_files, manifests_read, has_delete_manifests))
 }
 
 /// Send-safe variant of [`read_snapshot_data_files`] for server-side use.
@@ -304,7 +351,7 @@ pub async fn read_snapshot_data_files<S: IcebergStorage + ?Sized>(
 pub async fn send_read_snapshot_data_files<S: crate::io::SendIcebergStorage + ?Sized>(
     storage: &S,
     snapshot: &Snapshot,
-) -> Result<(Vec<DataFile>, usize)> {
+) -> Result<(Vec<DataFile>, usize, bool)> {
     let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
         crate::error::IcebergError::Manifest(
             "Snapshot has no manifest list (v1 format not supported)".to_string(),
@@ -312,12 +359,16 @@ pub async fn send_read_snapshot_data_files<S: crate::io::SendIcebergStorage + ?S
     })?;
 
     let manifest_list_data = storage.read(manifest_list_path).await?;
-    let manifest_entries = parse_manifest_list(&manifest_list_data)?;
+    // See the runtime-agnostic variant: parse WITH deletes to detect merge-on-
+    // read delete manifests without reading them.
+    let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
 
     let mut data_files = Vec::new();
     let mut manifests_read = 0usize;
+    let mut has_delete_manifests = false;
     for me in &manifest_entries {
         if me.is_deletes() {
+            has_delete_manifests = true;
             continue;
         }
         let manifest_data = storage.read(&me.manifest_path).await?;
@@ -327,7 +378,7 @@ pub async fn send_read_snapshot_data_files<S: crate::io::SendIcebergStorage + ?S
         }
     }
 
-    Ok((data_files, manifests_read))
+    Ok((data_files, manifests_read, has_delete_manifests))
 }
 
 #[cfg(test)]
@@ -448,6 +499,102 @@ mod tests {
         assert_eq!(agg.columns[&1].max, None);
         // Row count is still authoritative from record_count.
         assert_eq!(agg.row_count, 100);
+    }
+
+    #[test]
+    fn null_count_unknown_under_partial_coverage() {
+        // Two files, but only one reports null/value counts for the column. A
+        // partial sum must NOT read as a confident count — the non-reporting
+        // file could hold nulls — so the counts (and null_fraction) are unknown.
+        let schema = schema_id_amount();
+        let a = data_file("a.parquet", 100, 2000, (10, 50), 0, 0);
+        let mut b = data_file("b.parquet", 200, 4000, (5, 80), 0, 0);
+        b.null_value_counts = None;
+        b.value_counts = None;
+
+        let agg = aggregate_column_stats(&[a, b], &schema);
+        let id = &agg.columns[&1];
+        assert_eq!(id.null_count, None, "partial null coverage → unknown");
+        assert_eq!(id.value_count, None, "partial value coverage → unknown");
+        assert_eq!(
+            id.null_fraction, None,
+            "null_fraction is uncomputable under partial coverage — a nullable \
+             column must not look like a safe non-null key"
+        );
+        // Authoritative totals (record_count/bytes) still sum across all files.
+        assert_eq!(agg.row_count, 300);
+        assert_eq!(agg.total_bytes, 6000);
+    }
+
+    #[test]
+    fn null_count_zero_when_all_files_report() {
+        // Full coverage with genuine zeros must stay Some(0) — the coverage gate
+        // must not turn a real, complete "no nulls" into unknown.
+        let schema = schema_id_amount();
+        let files = vec![
+            data_file("a.parquet", 100, 2000, (10, 50), 0, 0),
+            data_file("b.parquet", 200, 4000, (5, 80), 0, 0),
+        ];
+        let agg = aggregate_column_stats(&files, &schema);
+        let id = &agg.columns[&1];
+        assert_eq!(id.null_count, Some(0));
+        assert_eq!(id.value_count, Some(300));
+        assert_eq!(id.null_fraction, Some(0.0));
+    }
+
+    #[test]
+    fn bounds_truncated_flag_set_for_string_not_numeric() {
+        // Iceberg truncates string/binary min/max; numeric bounds are exact.
+        let schema = Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![1],
+            fields: vec![
+                SchemaField {
+                    id: 1,
+                    name: "ID".to_string(),
+                    required: true,
+                    field_type: serde_json::json!("long"),
+                    doc: None,
+                },
+                SchemaField {
+                    id: 2,
+                    name: "NAME".to_string(),
+                    required: false,
+                    field_type: serde_json::json!("string"),
+                    doc: None,
+                },
+            ],
+        };
+        let mut lower = HashMap::new();
+        lower.insert(1, encode_value(&TypedValue::Int64(1)));
+        lower.insert(2, encode_value(&TypedValue::String("aaa".to_string())));
+        let mut upper = HashMap::new();
+        upper.insert(1, encode_value(&TypedValue::Int64(100)));
+        upper.insert(2, encode_value(&TypedValue::String("zzz".to_string())));
+        let df = DataFile {
+            file_path: "a.parquet".to_string(),
+            file_format: FileFormat::Parquet,
+            record_count: 10,
+            file_size_in_bytes: 100,
+            partition: PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: Some(lower),
+            upper_bounds: Some(upper),
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        let agg = aggregate_column_stats(&[df], &schema);
+        assert!(
+            !agg.columns[&1].bounds_truncated,
+            "numeric bounds are exact"
+        );
+        assert!(
+            agg.columns[&2].bounds_truncated,
+            "string bounds are truncated prefixes"
+        );
     }
 
     #[test]
@@ -715,10 +862,11 @@ mod tests {
         let storage = RecordingStorage::new(mem);
 
         let snapshot = snapshot_with_list(list_path);
-        let (data_files, manifests_read) =
+        let (data_files, manifests_read, has_deletes) =
             read_snapshot_data_files(&storage, &snapshot).await.unwrap();
 
         assert_eq!(manifests_read, 1);
+        assert!(!has_deletes, "this snapshot has no delete manifests");
         assert_eq!(data_files.len(), 1);
         assert_eq!(data_files[0].file_path, data_path);
 
@@ -745,5 +893,62 @@ mod tests {
         assert_eq!(agg.columns[&1].min, Some(serde_json::json!(1)));
         assert_eq!(agg.columns[&1].max, Some(serde_json::json!(999)));
         assert_eq!(agg.columns[&2].null_count, Some(5));
+    }
+
+    /// A manifest list carrying one data manifest (`content=0`) and one delete
+    /// manifest (`content=1`).
+    fn build_manifest_list_with_delete(data_manifest: &str, delete_manifest: &str) -> Bytes {
+        let schema = AvroSchema::parse_str(MANIFEST_LIST_SCHEMA).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        for (path, content) in [(data_manifest, 0i32), (delete_manifest, 1i32)] {
+            let mut record = Record::new(writer.schema()).unwrap();
+            record.put("manifest_path", path);
+            record.put("manifest_length", 100i64);
+            record.put("partition_spec_id", 0i32);
+            record.put("content", content);
+            record.put("sequence_number", 1i64);
+            record.put("min_sequence_number", 1i64);
+            record.put("added_snapshot_id", 100i64);
+            record.put("added_data_files_count", 1i32);
+            record.put("existing_data_files_count", 0i32);
+            record.put("deleted_data_files_count", 0i32);
+            record.put("added_rows_count", 1000i64);
+            record.put("existing_rows_count", 0i64);
+            record.put("deleted_rows_count", 0i64);
+            record.put("partitions", AvroValue::Union(0, Box::new(AvroValue::Null)));
+            writer.append(record).unwrap();
+        }
+        Bytes::from(writer.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn detects_delete_manifests_without_reading_them() {
+        let list_path = "s3://b/t/metadata/snap.avro";
+        let data_manifest = "s3://b/t/metadata/m-data.avro";
+        let delete_manifest = "s3://b/t/metadata/m-del.avro";
+        let data_path = "s3://b/t/data/f1.parquet";
+
+        let mut mem = crate::io::MemoryStorage::new();
+        mem.add_file(
+            list_path,
+            build_manifest_list_with_delete(data_manifest, delete_manifest),
+        );
+        mem.add_file(data_manifest, build_manifest(data_path));
+        // The delete manifest is deliberately absent: the reader must DETECT it
+        // from the manifest list and skip it, never fetch it.
+        let storage = RecordingStorage::new(mem);
+        let snapshot = snapshot_with_list(list_path);
+
+        let (data_files, manifests_read, has_deletes) =
+            read_snapshot_data_files(&storage, &snapshot).await.unwrap();
+
+        assert!(has_deletes, "a content=1 delete manifest must be detected");
+        assert_eq!(manifests_read, 1, "only the data manifest is read");
+        assert_eq!(data_files.len(), 1);
+        let reads = storage.reads();
+        assert!(
+            !reads.iter().any(|p| p == delete_manifest),
+            "the delete manifest must never be fetched: {reads:?}"
+        );
     }
 }

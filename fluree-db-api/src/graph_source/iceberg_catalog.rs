@@ -275,6 +275,11 @@ pub struct ColumnStats {
     pub on_disk_bytes: Option<i64>,
     /// Distinct value count — ALWAYS `None` in Phase-1 (NDV deferred to PR-5).
     pub distinct_count: Option<i64>,
+    /// Whether `min`/`max` are **truncated prefixes** rather than exact observed
+    /// values. Iceberg truncates variable-length (string/binary) bounds, so the
+    /// decoded value is a valid bound but not necessarily present in the column.
+    #[serde(default)]
+    pub bounds_truncated: bool,
 }
 
 /// A single column of a table, with type mapping and optional statistics.
@@ -348,6 +353,12 @@ pub struct StatsCompleteness {
     pub manifests_read: usize,
     /// Whether any column carried lower/upper bounds in the manifests read.
     pub had_column_bounds: bool,
+    /// Whether the snapshot carries **merge-on-read delete files**. When `true`,
+    /// the aggregated `row_count` / value / null counts are **upper bounds**:
+    /// they sum live data-file records without subtracting position/equality
+    /// deletes, so they are not exact.
+    #[serde(default)]
+    pub has_delete_files: bool,
 }
 
 /// The full preview of a table: schema, statistics completeness, warnings.
@@ -576,13 +587,16 @@ pub async fn preview_iceberg_table(
                 tier: "schema".to_string(),
                 manifests_read: 0,
                 had_column_bounds: false,
+                has_delete_files: false,
             },
             warnings: Vec::new(),
         }),
         StatsTier::Stats => {
             let mut warnings = vec![DISTINCT_COUNT_WARNING.to_string()];
 
-            let (manifests_read, had_column_bounds) = match metadata.current_snapshot() {
+            let (manifests_read, had_column_bounds, has_delete_files) = match metadata
+                .current_snapshot()
+            {
                 Some(snapshot) => {
                     let iceberg_schema = metadata.current_schema().ok_or_else(|| {
                         crate::ApiError::config("Table metadata has no current schema")
@@ -593,9 +607,9 @@ pub async fn preview_iceberg_table(
                     // the scan path.
                     let storage = build_preview_storage(&conn, load.credentials.as_ref()).await?;
 
-                    // Metadata-only: reads the manifest-list + manifests, never a
-                    // Parquet/data file (see fluree_db_iceberg::stats).
-                    let (data_files, manifests_read) =
+                    // Metadata-only: reads the manifest-list + manifests, never
+                    // a Parquet/data file (see fluree_db_iceberg::stats).
+                    let (data_files, manifests_read, has_delete_files) =
                         send_read_snapshot_data_files(&storage, snapshot)
                             .await
                             .map_err(|e| {
@@ -617,19 +631,30 @@ pub async fn preview_iceberg_table(
                     }
 
                     // Fill authoritative counts from the aggregation if the
-                    // snapshot summary omitted them.
+                    // snapshot summary omitted them. When the snapshot carries
+                    // merge-on-read deletes, the aggregated counts are upper
+                    // bounds (deletes are not subtracted), so warn.
                     schema.row_count = schema.row_count.or(Some(agg.row_count));
                     schema.data_file_count = schema.data_file_count.or(Some(agg.data_file_count));
                     schema.total_bytes = schema.total_bytes.or(Some(agg.total_bytes));
 
-                    (manifests_read, agg.had_column_bounds)
+                    if has_delete_files {
+                        warnings.push(
+                            "Table has merge-on-read delete files; aggregated row/value/null \
+                                 counts are upper bounds (position/equality deletes are not \
+                                 subtracted)."
+                                .to_string(),
+                        );
+                    }
+
+                    (manifests_read, agg.had_column_bounds, has_delete_files)
                 }
                 None => {
                     warnings.push(
                         "Table has no current snapshot; no column statistics available."
                             .to_string(),
                     );
-                    (0, false)
+                    (0, false, false)
                 }
             };
 
@@ -639,6 +664,7 @@ pub async fn preview_iceberg_table(
                     tier: "stats".to_string(),
                     manifests_read,
                     had_column_bounds,
+                    has_delete_files,
                 },
                 warnings,
             })
@@ -684,6 +710,7 @@ fn to_api_column_stats(a: &AggregatedColumnStats) -> ColumnStats {
         max: a.max.clone(),
         on_disk_bytes: a.on_disk_bytes,
         distinct_count: a.distinct_count,
+        bounds_truncated: a.bounds_truncated,
     }
 }
 

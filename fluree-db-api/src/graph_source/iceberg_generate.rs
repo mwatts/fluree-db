@@ -325,6 +325,7 @@ mod tests {
                 max: Some(serde_json::json!(max)),
                 on_disk_bytes: None,
                 distinct_count: None,
+                bounds_truncated: false,
             }),
         }
     }
@@ -389,6 +390,7 @@ mod tests {
                     tier: "stats".to_string(),
                     manifests_read: 1,
                     had_column_bounds: true,
+                    has_delete_files: false,
                 },
                 warnings: Vec::new(),
             },
