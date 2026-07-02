@@ -41,6 +41,13 @@ pub fn ip_is_blocked(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => ipv4_is_blocked(v4),
         IpAddr::V6(v6) => {
+            // `::/96` IPv4-compatible (deprecated) embeds an IPv4 in the low 32
+            // bits — treat it as that IPv4 so `::10.0.0.1` is blocked like
+            // `10.0.0.1`. `::ffff:x` (mapped) is handled separately below.
+            if is_ipv6_v4_compatible(v6) {
+                let o = v6.octets();
+                return ipv4_is_blocked(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+            }
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ipv4_is_blocked(v4);
             }
@@ -59,6 +66,13 @@ fn ipv4_is_blocked(v4: Ipv4Addr) -> bool {
         || v4.is_unspecified()
         || v4.is_broadcast()
         || is_ipv4_shared(v4)
+        || v4.octets()[0] == 0 // 0.0.0.0/8 "this network" (RFC 1122)
+}
+
+/// `::/96` IPv4-compatible IPv6 (deprecated) — the first 96 bits are zero and the
+/// low 32 bits carry an IPv4 address (includes `::` and `::1`).
+fn is_ipv6_v4_compatible(v6: Ipv6Addr) -> bool {
+    v6.octets()[..12].iter().all(|&b| b == 0)
 }
 
 /// RFC 6598 shared address space (100.64.0.0/10, carrier-grade NAT).
@@ -221,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_internal_ipv6_including_mapped() {
+    fn blocks_internal_ipv6_including_mapped_and_v4_compatible() {
         for ip in [
             "::1",
             "::",
@@ -230,10 +244,55 @@ mod tests {
             "fe80::1",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
+            // ::/96 IPv4-compatible embeds an IPv4 in the low 32 bits.
+            "::0.0.0.1",
+            "::10.0.0.1",
+            "::169.254.169.254",
         ] {
             assert!(ip_is_blocked(ip.parse().unwrap()), "{ip} must be blocked");
         }
         assert!(!ip_is_blocked("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn blocks_zero_network_ipv4() {
+        // 0.0.0.0/8 "this network" — not just the unspecified 0.0.0.0.
+        assert!(ip_is_blocked("0.0.0.0".parse().unwrap()));
+        assert!(ip_is_blocked("0.1.2.3".parse().unwrap()));
+        assert!(ip_is_blocked("0.255.255.255".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn hardened_client_does_not_follow_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/landed"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/landed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("LANDED"))
+            .mount(&server)
+            .await;
+
+        let client = hardened_client_builder().build().unwrap();
+        let resp = client
+            .get(format!("{}/redirect", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        // Policy::none() → the 302 is returned as-is, never followed to /landed
+        // (which is how a public catalog could bounce to an internal address).
+        assert_eq!(resp.status().as_u16(), 302, "redirect must not be followed");
+        assert_ne!(
+            resp.text().await.unwrap(),
+            "LANDED",
+            "redirect target must not be reached"
+        );
     }
 
     #[test]
