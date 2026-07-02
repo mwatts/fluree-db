@@ -889,9 +889,10 @@ async fn seed_split_subject_ledgers(fluree: &MemoryFluree) {
 /// an array (single-valued predicates may compact to a bare string).
 fn collect_strs(v: Option<&serde_json::Value>) -> std::collections::BTreeSet<String> {
     match v {
-        Some(serde_json::Value::Array(a)) => {
-            a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
-        }
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
         Some(serde_json::Value::String(s)) => [s.clone()].into_iter().collect(),
         _ => std::collections::BTreeSet::new(),
     }
@@ -923,7 +924,10 @@ async fn cross_graph_nested_ref_unions_split_subject_altlabels() {
         .await
         .expect("execute_formatted should not error");
 
-    let parent = value.as_array().and_then(|a| a.first()).expect("one parent");
+    let parent = value
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("one parent");
     let widget = parent.get("ex:related").expect("ex:related present");
     let labels = collect_strs(widget.get("skos:altLabel"));
     assert_eq!(
@@ -965,7 +969,10 @@ async fn cross_graph_root_unions_split_subject_altlabels() {
         .await
         .expect("execute_formatted should not error");
 
-    let widget = value.as_array().and_then(|a| a.first()).expect("one subject");
+    let widget = value
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("one subject");
     let labels = collect_strs(widget.get("skos:altLabel"));
     assert_eq!(
         labels,
