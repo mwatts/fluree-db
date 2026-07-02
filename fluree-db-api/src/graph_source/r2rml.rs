@@ -107,12 +107,14 @@ fn build_iceberg_filter(
             },
             ScanValue::Str(s) => LiteralValue::String(s.clone()),
             // A reversed subject-template key: coerce the raw string to the
-            // column's physical type. Integer keys on `int`/`long`/`decimal`
-            // columns push as an integer literal (the Arrow reader casts it to a
-            // Decimal column, and row-group stats conservatively skip decimals),
-            // string keys push as a string. Non-integer or unsupported physical
-            // types (float/date/timestamp/boolean, non-integer decimals) skip the
-            // pushdown — the operator still enforces the subject equality.
+            // column's physical type. A key that parses as an integer pushes as an
+            // integer literal against an `int`/`long`/`decimal` column — including
+            // a `decimal` of any scale (the Arrow reader casts the integer to the
+            // column's decimal type; row-group stats conservatively skip
+            // decimals). A `string` column pushes the raw string. A key that is
+            // not integer-valued, or any other physical type
+            // (float/date/timestamp/boolean), skips the pushdown — the operator
+            // still enforces the subject equality either way.
             ScanValue::TemplateKey(s) => match field.type_string() {
                 Some("int") => match s.parse::<i32>() {
                     Ok(v) => LiteralValue::Int32(v),

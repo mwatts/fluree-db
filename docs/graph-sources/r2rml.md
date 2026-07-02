@@ -319,7 +319,7 @@ If a query IRI is encoded differently, it simply matches no generated subject â€
 **What is pushed.** Pushdown engages only for templates that reverse unambiguously and key columns whose physical type is supported:
 
 - **Template shape:** a single trailing placeholder (`.../{key}`) always qualifies; multi-placeholder templates (`.../{a}/{b}`) qualify only when the separators between placeholders are characters that are always percent-encoded (like `/`). Ambiguous shapes such as `.../{a};{b}` (`;` is left literal) are skipped and fall back to a full scan.
-- **Key column type:** integer keys on `int`, `long`, or integer-valued `decimal` columns, and `string` keys. Other physical types (dates, floats, non-integer decimals) are not pushed yet and fall back to a full scan.
+- **Key column type:** `string` keys, and integer-valued keys on `int`, `long`, or `decimal` columns. A `decimal` column of *any* scale qualifies â€” the recovered key is pushed as an integer literal (the Arrow reader casts it to the column's decimal type), and a key that is not integer-valued fails the parse and falls back to a full scan. Other physical types (dates, floats) are not pushed yet. The pushdown never affects correctness regardless: the operator always re-enforces the subject equality.
 
 ## Use Cases
 
