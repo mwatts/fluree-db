@@ -1618,10 +1618,6 @@ fn build_match_val_for_snapshot(
         // Decode to canonical IRI and re-encode into the target snapshot.
         // Use `original_snapshot` (the primary) rather than `snapshot`
         // (which may be a per-graph snapshot with different namespace codes).
-        //
-        // Same primary→target re-encode as hydration's `reencode_level_for_view`
-        // (fluree-db-api); that one drops an unencodable Sid, this one preserves
-        // it (raw-byte match, below). Keep the vocabulary in sync.
         if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
             if let Some(store) = ctx.binary_store.as_deref() {
                 if let Ok(Some(persisted_sid)) = store.find_subject_sid(&iri) {
