@@ -109,9 +109,13 @@ fn subject_key_from_identifier_field_ids() {
         "{}",
         tm.subject_template
     );
-    // No NoSafeSubjectKey / SubjectKeyUnverified for a clean identifier hint.
+    // A clean identifier hint has no NoSafeSubjectKey, but — since uniqueness is
+    // unverifiable metadata-only — it earns a SubjectKeyUnverified on the key.
     assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
-    assert!(diag_cols(&out, DiagCode::SubjectKeyUnverified).is_empty());
+    assert_eq!(
+        diag_cols(&out, DiagCode::SubjectKeyUnverified),
+        BTreeSet::from([("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())])
+    );
     // The subject-key column is retained as a literal marked isSubjectId.
     let pk = tm
         .columns
@@ -199,6 +203,54 @@ fn identifier_field_ids_nullable_column_yields_no_safe_subject_key() {
             .any(|(ct, cc, _, _)| ct == "DW.FACT_USE" && cc == "WIDGET_KEY"),
         "a nullable identifier must not be a valid FK parent"
     );
+}
+
+#[test]
+fn identifier_with_unknown_null_fraction_from_partial_stats_is_not_safe() {
+    // Partial-coverage Tier-B stats leave null_fraction == None (unknown). An
+    // identifier column that is neither `required` nor proven null-free
+    // (null_fraction == 0) must NOT be treated as a safe subject key — is_non_null
+    // is false — so the partial-coverage fix (#5) and the non-null gate (#4)
+    // compose correctly at the emitter level. The shared fixtures only ever set
+    // null_fraction from `required`, so this builds the column explicitly.
+    let key = |null_fraction: Option<f64>| EmitColumn {
+        field_id: 1,
+        name: "WIDGET_KEY".to_string(),
+        iceberg_type: "long".to_string(),
+        field_type: FieldType::Int64,
+        required: false, // not declared NOT NULL; safety must come from stats
+        nested: false,
+        doc: None,
+        stats: EmitColumnStats {
+            null_fraction,
+            min: Some(TypedBound::Int(1)),
+            max: Some(TypedBound::Int(100)),
+        },
+    };
+
+    // Unknown coverage → no subject.
+    let out = emit_r2rml(
+        &[tbl("DIM_WIDGET", vec![1], vec![key(None)])],
+        &EmitOptions::default(),
+    );
+    assert!(out.structured.table_mappings[0].subject_template.is_empty());
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+        .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
+
+    // Full coverage proving null_fraction == 0 → the SAME column is safe (only
+    // unverified for uniqueness).
+    let out2 = emit_r2rml(
+        &[tbl("DIM_WIDGET", vec![1], vec![key(Some(0.0))])],
+        &EmitOptions::default(),
+    );
+    assert!(out2.structured.table_mappings[0]
+        .subject_template
+        .ends_with("/{WIDGET_KEY}"));
+    assert_eq!(
+        diag_cols(&out2, DiagCode::SubjectKeyUnverified),
+        BTreeSet::from([("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())])
+    );
+    assert!(diag_cols(&out2, DiagCode::NoSafeSubjectKey).is_empty());
 }
 
 #[test]
@@ -1090,9 +1142,14 @@ fn override_class_name_changes_class_and_slug_only() {
         tm.subject_template
     );
     // Predicate-object mappings (predicates derive from column names, not the
-    // class) are byte-identical, and no subject-key diagnostics fire.
+    // class) are byte-identical, and the class-name override changes no
+    // diagnostics (both runs carry the identifier_field_ids SubjectKeyUnverified).
     assert_eq!(default_tm.columns, tm.columns);
-    assert!(out.diagnostics.is_empty());
+    assert_eq!(out.diagnostics, default_out.diagnostics);
+    assert_eq!(
+        diag_cols(&out, DiagCode::SubjectKeyUnverified),
+        BTreeSet::from([("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())])
+    );
 }
 
 #[test]

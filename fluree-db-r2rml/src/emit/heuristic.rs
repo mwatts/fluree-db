@@ -237,7 +237,9 @@ fn build_table_draft(
 /// uniqueness is unprovable metadata-only — it ALWAYS earns a `SubjectKeyUnverified`
 /// diagnostic. Never fabricate a surrogate.
 ///
-/// Otherwise: prefer `identifier_field_ids`; else a `required` / null-free
+/// Otherwise: prefer `identifier_field_ids` (each member gated on the same
+/// `required` / null-free check and, since uniqueness is unverifiable
+/// metadata-only, flagged `SubjectKeyUnverified`); else a `required` / null-free
 /// `<STEM>_KEY` / `<STEM>_ID` fallback (`SubjectKeyUnverified`); else
 /// `NoSafeSubjectKey` (no subject; never invent a surrogate row id).
 fn select_subject_key(
@@ -339,6 +341,20 @@ fn select_subject_key(
                     columns: Vec::new(),
                 };
             }
+            // Parity with the override / <STEM>_KEY-_ID branches: even a declared
+            // identifier's uniqueness is unverifiable metadata-only (NDV deferred),
+            // so flag it. One diagnostic per key column (composite keys included).
+            diagnostics.push(Diagnostic::new(
+                Severity::Warning,
+                DiagCode::SubjectKeyUnverified,
+                table.qualified_name(),
+                Some(col.name.clone()),
+                format!(
+                    "subject key '{}' from Iceberg identifier_field_ids; uniqueness is \
+                     unverifiable metadata-only (NDV deferred)",
+                    col.name
+                ),
+            ));
             columns.push(col.name.clone());
         }
         return SubjectKey { columns };
