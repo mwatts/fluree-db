@@ -13,3 +13,5 @@ mod it_reasoning_join_repro;
 mod it_rules_cross_ledger;
 #[path = "it_rules_source.rs"]
 mod it_rules_source;
+#[path = "it_schema_cross_ledger.rs"]
+mod it_schema_cross_ledger;

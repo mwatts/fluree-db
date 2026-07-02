@@ -757,7 +757,9 @@ impl Fluree {
     ///   import; the bundle is a reasoning-only concern.
     ///
     /// Errors with [`ApiError::OntologyImport`] only when reasoning is
-    /// actually engaged and an import can't be resolved locally.
+    /// actually engaged and an import can't be resolved locally, or when
+    /// `f:followOwlImports` is combined with a cross-ledger
+    /// `f:schemaSource` (the cross-ledger materializer is single-graph).
     async fn attach_schema_bundle(
         &self,
         db: &GraphDb,
@@ -830,6 +832,21 @@ impl Fluree {
         // the resulting `SchemaArtifactWire` into a SchemaBundleFlakes
         // against D's snapshot.
         if schema_source.ledger.is_some() {
+            // The cross-ledger schema materializer resolves a single
+            // graph and does not walk `owl:imports`. Fail closed —
+            // silently ignoring `f:followOwlImports` would let the user
+            // believe the import closure is part of the reasoning view
+            // when only the starting graph is.
+            if reasoning.follow_owl_imports.unwrap_or(false) {
+                return Err(crate::error::ApiError::OntologyImport(
+                    "`f:followOwlImports` is not supported with a cross-ledger \
+                     `f:schemaSource` — the cross-ledger resolver materializes \
+                     the referenced graph only and does not walk `owl:imports`. \
+                     Consolidate the schema closure into the referenced graph, \
+                     or remove `f:followOwlImports`."
+                        .to_string(),
+                ));
+            }
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 schema_source,
                 crate::cross_ledger::ArtifactKind::SchemaClosure,

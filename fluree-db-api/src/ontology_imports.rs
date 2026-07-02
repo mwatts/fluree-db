@@ -161,9 +161,12 @@ fn resolve_local_graph_source(
     if let Some(ledger) = source.ledger.as_deref() {
         if ledger != snapshot.ledger_id {
             return Err(ApiError::OntologyImport(format!(
-                "schema/import sources must resolve within the current \
+                "this schema/import source must resolve within the current \
                  ledger (ref targets ledger '{ledger}', current ledger is \
-                 '{}'). Move the schema into the current ledger.",
+                 '{}'). Cross-ledger refs are supported only for the \
+                 top-level `f:schemaSource` of a single-ledger query — not \
+                 for `f:ontologyImportMap` entries or multi-ledger dataset \
+                 queries.",
                 snapshot.ledger_id
             )));
         }
