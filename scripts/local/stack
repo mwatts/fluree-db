@@ -32,14 +32,21 @@ NETWORK_NAME="fluree-net"
 
 # Port base. Node N publishes its public listener on PUBLIC_PORT_BASE+N.
 # Raft nodes additionally publish their raft listener on RAFT_PORT_BASE+N.
-# Override via env if 8091 / 9091 are taken. Monolithic deployments
-# still use BASE+1 for consistency with `kill 1` / `restart 1`.
+# Query peers publish on PEER_PORT_BASE+P. Override via env if the
+# defaults collide with something local. Monolithic deployments still
+# use PUBLIC_PORT_BASE+1 for consistency with `kill 1` / `restart 1`.
 : "${PUBLIC_PORT_BASE:=8090}"
 : "${RAFT_PORT_BASE:=9090}"
+: "${PEER_PORT_BASE:=7090}"
 
 # Default raft node count when `up --mode raft` is called without
 # --nodes. Ignored for monolithic mode (which is always 1 node).
 : "${DEFAULT_RAFT_NODES:=3}"
+
+# Default peer count when `up --mode raft` is called without --peers.
+# 0 means no peers. Peers only make sense in raft mode; the up-time
+# validator rejects `--peers M` in monolithic mode.
+: "${DEFAULT_PEERS:=0}"
 
 # Storage mode default. `--storage` flag on `up` overrides this.
 # "ephemeral" uses docker named volumes (wiped on `down`).
@@ -110,6 +117,40 @@ node_host_raft_url()   { printf "http://127.0.0.1:%d" "$(node_host_raft   "$1")"
 node_peer_raft_url()   { printf "http://%s:%d/raft" "$(node_host "$1")" "$(node_internal_raft   "$1")"; }
 node_peer_client_url() { printf "http://%s:%d"      "$(node_host "$1")" "$(node_internal_public "$1")"; }
 
+# Query peer helpers. A peer subscribes to one raft node via its
+# tx-server URL; kill/repoint sequences model the "SSE target dies,
+# peer opens a new subscription" scenario.
+peer_host()          { printf "peer-%d" "$1"; }
+peer_host_public()   { echo $((PEER_PORT_BASE + $1)); }
+peer_host_public_url() { printf "http://127.0.0.1:%d" "$(peer_host_public "$1")"; }
+
+# Default subscription target for a peer at up time.
+#
+# Single-node deployments (monolithic, or `--mode raft --nodes 1`)
+# have only one tx-server to subscribe to — fluree-1. The
+# monolithic case is the only currently-working peer topology
+# end-to-end, because the raft path has a known event-bus wiring
+# gap where runtime SSE events don't reach the events endpoint's
+# subscription (tracked separately).
+#
+# Multi-node raft: peer P wraps through the followers so peer 1 →
+# fluree-2, peer 2 → fluree-3, peer 3 → fluree-2 (with 3 raft
+# nodes), etc. Node 1 is skipped because it's typically the leader
+# immediately after bootstrap — the interesting case for a peer in
+# raft mode is subscribing to a follower and exercising the
+# follower-emit path.
+default_peer_target() {
+    local peer_id="$1"
+    local node_count="$2"
+    if [ "$node_count" -le 1 ]; then
+        echo 1
+        return
+    fi
+    local follower_count=$((node_count - 1))
+    local follower_slot=$(( (peer_id - 1) % follower_count ))
+    echo $((follower_slot + 2))
+}
+
 # Read deployment mode (`monolithic` | `raft`) from a header comment
 # in compose.generated.yml. `up` writes this so subsequent commands
 # don't need it re-specified.
@@ -121,10 +162,28 @@ read_mode() {
     echo "$mode"
 }
 
-# Read the number of nodes from the generated compose file.
+# Read the number of raft nodes from the generated compose file.
 read_node_count() {
     [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
     grep -c '^  fluree-[0-9]\+:' "$COMPOSE_FILE" || die "Could not parse node count from $COMPOSE_FILE"
+}
+
+# Read the number of query peers from the generated compose file.
+# Peers are optional (default 0); returns 0 if none are present.
+read_peer_count() {
+    [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
+    grep -c '^  peer-[0-9]\+:' "$COMPOSE_FILE" 2>/dev/null || echo 0
+}
+
+# Read the current tx-server target for peer N from the compose file.
+# `up` writes this as a `# Peer-N-target: fluree-M` comment so
+# `repoint` can update it and `status` can display it.
+read_peer_target() {
+    local peer_id="$1"
+    [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
+    grep -m1 "^# Peer-$peer_id-target: " "$COMPOSE_FILE" \
+        | sed "s/^# Peer-$peer_id-target: //" \
+        || die "Could not find peer-$peer_id target in $COMPOSE_FILE"
 }
 
 require_node_in_range() {
@@ -133,6 +192,32 @@ require_node_in_range() {
     count="$(read_node_count)"
     [ "$id" -ge 1 ] && [ "$id" -le "$count" ] \
         || die "node id $id out of range [1, $count]"
+}
+
+require_peer_in_range() {
+    local id="$1"
+    local count
+    count="$(read_peer_count)"
+    [ "$count" -ge 1 ] || die "no query peers in this deployment"
+    [ "$id" -ge 1 ] && [ "$id" -le "$count" ] \
+        || die "peer id $id out of range [1, $count]"
+}
+
+# Resolve a user-supplied target (bare number for raft node or
+# `peer-N` for a query peer) to a docker container name. Prints the
+# container name on success; dies on invalid targets.
+resolve_target_host() {
+    local target="$1"
+    if [[ "$target" =~ ^peer-([1-9][0-9]*)$ ]]; then
+        local peer_id="${BASH_REMATCH[1]}"
+        require_peer_in_range "$peer_id"
+        peer_host "$peer_id"
+    elif [[ "$target" =~ ^[1-9][0-9]*$ ]]; then
+        require_node_in_range "$target"
+        node_host "$target"
+    else
+        die "invalid target: $target (expected a raft node number like \`2\` or a peer like \`peer-1\`)"
+    fi
 }
 
 # Hard-fail when a raft-only command is invoked against a monolithic
@@ -155,23 +240,26 @@ ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") <command> [args]
 
 ${C_BOLD}COMMANDS${C_RESET}
-  up [flags]           Build, start, and (if raft) bootstrap a deployment
-  down [flags]         Tear down the deployment
-  status               Show per-node container state (+ /cluster/status in raft mode)
-  kill <N>             SIGKILL node N (simulate a crash)
-  restart <N>          Start a killed/stopped node
-  pause <N>            SIGSTOP node N (simulate unresponsive but alive)
-  unpause <N>          SIGCONT a paused node
-  partition <N>        Disconnect node N from the network (raft only)
-  heal <N>             Reconnect a partitioned node (raft only)
-  logs [N] [flags]     Tail logs from one node, or all nodes if N omitted
-  load [args...]       Run the HTTP load harness against this deployment
-  help [command]       Show top-level help or per-command help
+  up [flags]                 Build, start, and (if raft) bootstrap a deployment
+  down [flags]               Tear down the deployment
+  status                     Show per-node + per-peer container state
+  kill <target>              SIGKILL a raft node (N) or a peer (peer-N)
+  restart <target>           Start a killed/stopped raft node or peer
+  pause <target>             SIGSTOP a raft node or peer (unresponsive but alive)
+  unpause <target>           SIGCONT a paused target
+  partition <target>         Disconnect from the network (raft only)
+  heal <target>              Reconnect a partitioned target (raft only)
+  repoint <peer-N> <fluree-M>  Point a peer at a new raft node (opens new SSE)
+  logs [target] [flags]      Tail logs from one target, or all if omitted
+  load [args...]             Run the HTTP load harness against this deployment
+  help [command]             Show top-level help or per-command help
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
   DEFAULT_RAFT_NODES     default node count for \`up --mode raft\` (currently $DEFAULT_RAFT_NODES)
+  DEFAULT_PEERS          default peer count for \`up --mode raft\` (currently $DEFAULT_PEERS)
   PUBLIC_PORT_BASE       host port base for public listeners (currently $PUBLIC_PORT_BASE)
   RAFT_PORT_BASE         host port base for raft listeners (currently $RAFT_PORT_BASE)
+  PEER_PORT_BASE         host port base for peer listeners (currently $PEER_PORT_BASE)
   FLUREE_LOCAL_STORAGE   ephemeral|persistent (currently $FLUREE_LOCAL_STORAGE)
 
 Run \`$(basename "$0") help <command>\` for per-command details.
@@ -181,7 +269,7 @@ EOF
 usage_up() {
     cat <<EOF
 ${C_BOLD}USAGE${C_RESET}
-  $(basename "$0") up [--mode MODE] [--nodes N] [--no-build] [--storage MODE]
+  $(basename "$0") up [--mode MODE] [--nodes N] [--peers M] [--no-build] [--storage MODE]
 
 Build the fluree-server binary and docker image, generate
 compose.generated.yml for the requested mode, start containers, wait
@@ -192,6 +280,23 @@ ${C_BOLD}FLAGS${C_RESET}
   --nodes N         raft only: cluster size, integer >= 1
                     [default: $DEFAULT_RAFT_NODES]
                     rejected when --mode monolithic
+  --peers M         Number of query peers (M >= 0). Each peer is a
+                    read-only Fluree node with server_role peer,
+                    subscribed to a tx-server via SSE and forwarding
+                    writes to the same node's URL.
+
+                    In monolithic mode: all peers subscribe to
+                    fluree-1 (the only node).
+
+                    In raft mode with >= 2 nodes: peer P subscribes
+                    to fluree-((P-1)%(N-1)+2), cycling through
+                    followers. (Raft mode with 1 node subscribes
+                    every peer to fluree-1.)
+
+                    Peers use shared storage — they mount the same
+                    data volume the tx-server uses. Proxy-storage
+                    mode is a planned follow-up.
+                    [default: $DEFAULT_PEERS]
   --no-build        skip cargo build; reuse .build/fluree-server
   --storage MODE    ephemeral (named volumes, wiped on down)
                     or persistent (bind-mount ./data/, survives down)
@@ -199,10 +304,12 @@ ${C_BOLD}FLAGS${C_RESET}
   -h, --help        show this help
 
 ${C_BOLD}EXAMPLES${C_RESET}
-  $(basename "$0") up                                    # one-node monolithic
-  $(basename "$0") up --mode raft                        # 3-node raft cluster
-  $(basename "$0") up --mode raft --nodes 5              # 5-node raft cluster
-  $(basename "$0") up --storage persistent               # data survives down --keep-data
+  $(basename "$0") up                                     # one-node monolithic
+  $(basename "$0") up --peers 1                           # monolithic + 1 query peer
+  $(basename "$0") up --mode raft                         # 3-node raft cluster
+  $(basename "$0") up --mode raft --nodes 5               # 5-node raft cluster
+  $(basename "$0") up --mode raft --nodes 3 --peers 2     # cluster + 2 query peers
+  $(basename "$0") up --storage persistent                # data survives down --keep-data
 EOF
 }
 
@@ -319,6 +426,27 @@ on the first attempt.
 EOF
 }
 
+usage_repoint() {
+    cat <<EOF
+${C_BOLD}USAGE${C_RESET}
+  $(basename "$0") repoint <peer-N> <fluree-M>
+
+Reconfigure query peer N to subscribe to raft node M, then recreate
+the peer container so it picks up the new tx-server URL and opens a
+fresh SSE subscription against the new target. Models the "peer's
+subscription target dies, peer reconnects to a new cluster member"
+scenario.
+
+The peer's local storage view is unaffected (it still reads from
+the shared-data volume). Only the tx-server URL for writes and the
+event-subscription URL change.
+
+${C_BOLD}EXAMPLES${C_RESET}
+  $(basename "$0") repoint peer-1 fluree-3
+  $(basename "$0") kill 2 && $(basename "$0") repoint peer-1 fluree-3   # simulate failover
+EOF
+}
+
 usage_logs() {
     cat <<EOF
 ${C_BOLD}USAGE${C_RESET}
@@ -376,6 +504,7 @@ cmd_help() {
         unpause)   usage_unpause   ;;
         partition) usage_partition ;;
         heal)      usage_heal      ;;
+        repoint)   usage_repoint   ;;
         logs)      usage_logs      ;;
         load)      usage_load      ;;
         help)      usage_top       ;;
@@ -391,6 +520,7 @@ cmd_up() {
     local skip_build=0
     local mode="monolithic"
     local nodes_arg=""
+    local peers_arg=""
     local storage="$FLUREE_LOCAL_STORAGE"
 
     while [ $# -gt 0 ]; do
@@ -402,6 +532,9 @@ cmd_up() {
             --nodes)
                 [ $# -ge 2 ] || die "--nodes requires an argument"
                 nodes_arg="$2"; shift 2 ;;
+            --peers)
+                [ $# -ge 2 ] || die "--peers requires an argument"
+                peers_arg="$2"; shift 2 ;;
             --no-build) skip_build=1; shift ;;
             --storage)
                 [ $# -ge 2 ] || die "--storage requires an argument"
@@ -427,6 +560,9 @@ cmd_up() {
             [ "$node_count" -ge 1 ] || die "--nodes must be >= 1"
             ;;
     esac
+
+    local peer_count="${peers_arg:-$DEFAULT_PEERS}"
+    [[ "$peer_count" =~ ^[0-9]+$ ]] || die "--peers must be a non-negative integer (got: $peer_count)"
 
     case "$storage" in
         ephemeral|persistent) : ;;
@@ -459,14 +595,14 @@ cmd_up() {
     docker build -q -t "$IMAGE_TAG" "$LOCAL_DIR" >/dev/null
     ok "Image $IMAGE_TAG ready"
 
-    info "Generating compose file: mode=$mode nodes=$node_count..."
-    generate_compose "$mode" "$node_count" "$storage" > "$COMPOSE_FILE"
+    info "Generating compose file: mode=$mode nodes=$node_count peers=$peer_count..."
+    generate_compose "$mode" "$node_count" "$peer_count" "$storage" > "$COMPOSE_FILE"
     ok "Wrote $COMPOSE_FILE"
 
     info "Starting containers..."
     "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d >/dev/null
 
-    info "Waiting for nodes to come up..."
+    info "Waiting for raft nodes to come up..."
     local deadline
     deadline=$(( $(date +%s) + 60 ))
     local i
@@ -490,9 +626,30 @@ cmd_up() {
         bootstrap_raft "$node_count"
     fi
 
+    if [ "$peer_count" -ge 1 ]; then
+        info "Waiting for peers to come up..."
+        for i in $(seq 1 "$peer_count"); do
+            local url
+            url="$(peer_host_public_url "$i")/health"
+            while ! curl -fsS -m 2 "$url" >/dev/null 2>&1; do
+                if [ "$(date +%s)" -gt "$deadline" ]; then
+                    err "Timed out waiting for peer $i ($url)"
+                    warn "Recent logs:"
+                    "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+                        logs --tail 30 "$(peer_host "$i")"
+                    exit 1
+                fi
+                sleep 0.5
+            done
+            local target
+            target="$(default_peer_target "$i" "$node_count")"
+            ok "Peer $i healthy at $(peer_host_public_url "$i") (subscribed to fluree-$target)"
+        done
+    fi
+
     echo
-    printf "%sDeployment up%s — mode=%s, %d node(s)\n\n" \
-        "$C_BOLD" "$C_RESET" "$mode" "$node_count"
+    printf "%sDeployment up%s — mode=%s, %d node(s), %d peer(s)\n\n" \
+        "$C_BOLD" "$C_RESET" "$mode" "$node_count" "$peer_count"
     for i in $(seq 1 "$node_count"); do
         if [ "$mode" = "raft" ]; then
             printf "  node %d  public %s   raft %s\n" \
@@ -501,12 +658,25 @@ cmd_up() {
             printf "  node %d  public %s\n" "$i" "$(node_host_public_url "$i")"
         fi
     done
+    if [ "$peer_count" -ge 1 ]; then
+        for i in $(seq 1 "$peer_count"); do
+            local target
+            target="$(default_peer_target "$i" "$node_count")"
+            printf "  peer %d  public %s   → fluree-%s\n" \
+                "$i" "$(peer_host_public_url "$i")" "$target"
+        done
+    fi
     echo
     echo "Try:"
     echo "  curl $(node_host_public_url 1)/health"
     echo "  $(basename "$0") status"
     if [ "$mode" = "raft" ] && [ "$node_count" -ge 2 ]; then
         echo "  $(basename "$0") kill 2"
+    fi
+    if [ "$peer_count" -ge 1 ]; then
+        echo "  curl $(peer_host_public_url 1)/health"
+        echo "  $(basename "$0") kill peer-1"
+        echo "  $(basename "$0") repoint peer-1 fluree-3"
     fi
     echo "  $(basename "$0") down"
 }
@@ -515,11 +685,20 @@ cmd_up() {
 generate_compose() {
     local mode="$1"
     local node_count="$2"
-    local storage="$3"
+    local peer_count="$3"
+    local storage="$4"
 
     echo "# Generated by \`$(basename "$0") up\` — do not edit. Re-run to regenerate."
     echo "# Mode: $mode"
     echo "# Nodes: $node_count"
+    echo "# Peers: $peer_count"
+    # Per-peer initial subscription target. Later commands read these
+    # (`status` for the display; `repoint` overwrites the line for
+    # the peer it's reconfiguring).
+    local pi
+    for pi in $(seq 1 "$peer_count"); do
+        echo "# Peer-$pi-target: fluree-$(default_peer_target "$pi" "$node_count")"
+    done
     echo
     echo "networks:"
     echo "  $NETWORK_NAME:"
@@ -529,6 +708,9 @@ generate_compose() {
     local i
     for i in $(seq 1 "$node_count"); do
         emit_service "$mode" "$i" "$storage"
+    done
+    for i in $(seq 1 "$peer_count"); do
+        emit_peer_service "$mode" "$i" "$node_count" "$storage"
     done
     echo
     # Volume layout depends on mode:
@@ -540,6 +722,9 @@ generate_compose() {
     #   what makes each node a distinct openraft participant).
     #   Mimics production topologies where a raft cluster sits over
     #   shared storage (S3, shared FS, etc.).
+    # - peers reuse the same shared-data volume in shared-storage
+    #   mode so they can serve local reads without proxying every
+    #   block through the raft cluster.
     if [ "$storage" = "ephemeral" ]; then
         echo "volumes:"
         if [ "$mode" = "raft" ]; then
@@ -599,13 +784,17 @@ EOF
     fi
     echo "    volumes:"
     # See the comment in generate_compose for why raft mode uses a
-    # shared data volume + per-node raft-log volume.
+    # shared data volume + per-node raft-log volume. Monolithic
+    # mounts at the same `/data` subpath (not the whole `/var/lib/fluree`)
+    # so query peers can share the exact same named volume at the
+    # exact same mount point — no per-mode conditional on the peer
+    # side.
     if [ "$storage" = "ephemeral" ]; then
         if [ "$mode" = "raft" ]; then
             echo "      - shared-data:/var/lib/fluree/data"
             echo "      - $host-raft:/var/lib/fluree/raft"
         else
-            echo "      - $host-data:/var/lib/fluree"
+            echo "      - $host-data:/var/lib/fluree/data"
         fi
     else
         if [ "$mode" = "raft" ]; then
@@ -615,8 +804,80 @@ EOF
             echo "      - ./data/$host-raft:/var/lib/fluree/raft"
         else
             mkdir -p "$LOCAL_DIR/data/$host"
-            echo "      - ./data/$host:/var/lib/fluree"
+            echo "      - ./data/$host:/var/lib/fluree/data"
         fi
+    fi
+}
+
+# Emit one query-peer service. Peers are read-only: they subscribe
+# to a specific tx-server's `/v1/fluree/events` for watermarks and
+# forward writes to that same node's tx-server URL. In raft mode the
+# tx-server is a raft node (leader-forward handles the redirect
+# internally); in monolithic mode it's the single fluree-1 node.
+#
+# Shared-storage mode: peer reuses the tx-server's data volume so
+# reads don't proxy every commit-envelope fetch through HTTP. A
+# proxy-storage variant is a planned follow-up.
+emit_peer_service() {
+    local mode="$1"
+    local i="$2"
+    local node_count="$3"
+    local storage="$4"
+    local host
+    host="$(peer_host "$i")"
+    local host_public
+    host_public="$(peer_host_public "$i")"
+    local target
+    target="$(default_peer_target "$i" "$node_count")"
+    local target_host
+    target_host="$(node_host "$target")"
+    local internal_public
+    internal_public="$(node_internal_public "$i")"
+
+    cat <<EOF
+  $host:
+    image: $IMAGE_TAG
+    container_name: $host
+    hostname: $host
+    networks:
+      $NETWORK_NAME:
+        aliases:
+          - $host
+    ports:
+      - "$host_public:$internal_public"
+    environment:
+      RUST_LOG: info
+      FLUREE_LISTEN_ADDR: "0.0.0.0:$internal_public"
+      FLUREE_STORAGE_PATH: "/var/lib/fluree/data"
+      FLUREE_SERVER_ROLE: "peer"
+      FLUREE_TX_SERVER_URL: "http://$target_host:$internal_public"
+      FLUREE_PEER_EVENTS_URL: "http://$target_host:$internal_public/v1/fluree/events"
+      FLUREE_STORAGE_ACCESS_MODE: "shared"
+    command:
+      - --peer-subscribe-all
+    volumes:
+EOF
+    # Peer reads the tx-server's data volume. In raft mode the whole
+    # cluster shares `shared-data`; in monolithic mode there's only
+    # one node (fluree-1) and the peer piggybacks on its data volume.
+    # Either way the container-side mount point is the same
+    # (`/var/lib/fluree/data`), matching FLUREE_STORAGE_PATH above.
+    local shared_volume
+    if [ "$mode" = "raft" ]; then
+        shared_volume="shared-data"
+    else
+        shared_volume="$(node_host 1)-data"
+    fi
+    if [ "$storage" = "ephemeral" ]; then
+        echo "      - $shared_volume:/var/lib/fluree/data"
+    else
+        local shared_path
+        if [ "$mode" = "raft" ]; then
+            shared_path="./data/shared"
+        else
+            shared_path="./data/$(node_host 1)"
+        fi
+        echo "      - $shared_path:/var/lib/fluree/data"
     fi
 }
 
@@ -711,12 +972,13 @@ cmd_status() {
     [ $# -eq 0 ] || die "status takes no arguments (try: $(basename "$0") help status)"
 
     detect_compose
-    local mode node_count
+    local mode node_count peer_count
     mode="$(read_mode)"
     node_count="$(read_node_count)"
+    peer_count="$(read_peer_count)"
 
-    printf "%sDeployment%s — mode=%s, %d node(s)\n\n" \
-        "$C_BOLD" "$C_RESET" "$mode" "$node_count"
+    printf "%sDeployment%s — mode=%s, %d node(s), %d peer(s)\n\n" \
+        "$C_BOLD" "$C_RESET" "$mode" "$node_count" "$peer_count"
 
     local i
     for i in $(seq 1 "$node_count"); do
@@ -752,34 +1014,63 @@ cmd_status() {
         fi
     done
 
-    if [ "$mode" != "raft" ]; then
-        return 0
+    if [ "$mode" = "raft" ]; then
+        echo
+        printf "%sLeader view (per node)%s\n\n" "$C_BOLD" "$C_RESET"
+
+        for i in $(seq 1 "$node_count"); do
+            local raft_url resp
+            raft_url="$(node_host_raft_url "$i")"
+            resp="$(curl -fsS -m 2 "$raft_url/cluster/status" 2>/dev/null || true)"
+            if [ -z "$resp" ]; then
+                printf "  node %d  %sno response%s\n" "$i" "$C_RED" "$C_RESET"
+                continue
+            fi
+            if command -v jq >/dev/null 2>&1; then
+                local leader term applied voters learners
+                leader=$(echo "$resp" | jq -r '.current_leader // "none"')
+                term=$(echo "$resp" | jq -r '.current_term // "?"')
+                applied=$(echo "$resp" | jq -r '.last_applied_index // "?"')
+                voters=$(echo "$resp" | jq -rc '.voters // []')
+                learners=$(echo "$resp" | jq -rc '.learners // []')
+                printf "  node %d  leader=%-4s term=%-3s applied=%-5s voters=%s learners=%s\n" \
+                    "$i" "$leader" "$term" "$applied" "$voters" "$learners"
+            else
+                printf "  node %d  %s\n" "$i" "$resp"
+            fi
+        done
     fi
 
-    echo
-    printf "%sLeader view (per node)%s\n\n" "$C_BOLD" "$C_RESET"
+    if [ "$peer_count" -ge 1 ]; then
+        echo
+        printf "%sQuery peers%s\n\n" "$C_BOLD" "$C_RESET"
+        for i in $(seq 1 "$peer_count"); do
+            local host raw_state container_state health_state public_url target
+            host="$(peer_host "$i")"
+            public_url="$(peer_host_public_url "$i")"
+            target="$(read_peer_target "$i")"
 
-    for i in $(seq 1 "$node_count"); do
-        local raft_url resp
-        raft_url="$(node_host_raft_url "$i")"
-        resp="$(curl -fsS -m 2 "$raft_url/cluster/status" 2>/dev/null || true)"
-        if [ -z "$resp" ]; then
-            printf "  node %d  %sno response%s\n" "$i" "$C_RED" "$C_RESET"
-            continue
-        fi
-        if command -v jq >/dev/null 2>&1; then
-            local leader term applied voters learners
-            leader=$(echo "$resp" | jq -r '.current_leader // "none"')
-            term=$(echo "$resp" | jq -r '.current_term // "?"')
-            applied=$(echo "$resp" | jq -r '.last_applied_index // "?"')
-            voters=$(echo "$resp" | jq -rc '.voters // []')
-            learners=$(echo "$resp" | jq -rc '.learners // []')
-            printf "  node %d  leader=%-4s term=%-3s applied=%-5s voters=%s learners=%s\n" \
-                "$i" "$leader" "$term" "$applied" "$voters" "$learners"
-        else
-            printf "  node %d  %s\n" "$i" "$resp"
-        fi
-    done
+            raw_state="$(docker inspect -f '{{.State.Status}}' "$host" 2>/dev/null || echo "missing")"
+            health_state="-"
+            case "$raw_state" in
+                running)
+                    container_state="${C_GREEN}running${C_RESET}"
+                    if curl -fsS -m 2 "$public_url/health" >/dev/null 2>&1; then
+                        health_state="${C_GREEN}healthy${C_RESET}"
+                    else
+                        health_state="${C_YELLOW}unreachable${C_RESET}"
+                    fi
+                    ;;
+                paused)  container_state="${C_YELLOW}paused${C_RESET}" ;;
+                exited)  container_state="${C_RED}exited${C_RESET}" ;;
+                missing) container_state="${C_RED}missing${C_RESET}" ;;
+                *)       container_state="$raw_state" ;;
+            esac
+
+            printf "  peer %d  container=%b  health=%b  public=%s  subscribed→%s\n" \
+                "$i" "$container_state" "$health_state" "$public_url" "$target"
+        done
+    fi
 
     echo
     echo "Tip: install jq for parsed output."
@@ -792,15 +1083,12 @@ cmd_status() {
 cmd_kill() {
     case "${1:-}" in
         -h|--help) usage_kill; return 0 ;;
-        "") die "usage: $(basename "$0") kill <node-id>" ;;
+        "") die "usage: $(basename "$0") kill <target>" ;;
     esac
-    [ $# -eq 1 ] || die "usage: $(basename "$0") kill <node-id>"
-
-    local node_id="$1"
-    require_node_in_range "$node_id"
+    [ $# -eq 1 ] || die "usage: $(basename "$0") kill <target>"
 
     local host
-    host="$(node_host "$node_id")"
+    host="$(resolve_target_host "$1")"
     info "Killing $host (SIGKILL)..."
     docker kill "$host" >/dev/null
     ok "$host killed. Inspect with: $(basename "$0") status"
@@ -813,16 +1101,19 @@ cmd_kill() {
 cmd_restart() {
     case "${1:-}" in
         -h|--help) usage_restart; return 0 ;;
-        "") die "usage: $(basename "$0") restart <node-id>" ;;
+        "") die "usage: $(basename "$0") restart <target>" ;;
     esac
-    [ $# -eq 1 ] || die "usage: $(basename "$0") restart <node-id>"
+    [ $# -eq 1 ] || die "usage: $(basename "$0") restart <target>"
 
-    local node_id="$1"
-    require_node_in_range "$node_id"
-
-    local host public_url
-    host="$(node_host "$node_id")"
-    public_url="$(node_host_public_url "$node_id")"
+    local target="$1"
+    local host
+    host="$(resolve_target_host "$target")"
+    local public_url
+    if [[ "$target" =~ ^peer-([1-9][0-9]*)$ ]]; then
+        public_url="$(peer_host_public_url "${BASH_REMATCH[1]}")"
+    else
+        public_url="$(node_host_public_url "$target")"
+    fi
 
     info "Starting $host..."
     docker start "$host" >/dev/null
@@ -847,18 +1138,16 @@ cmd_restart() {
 cmd_pause() {
     case "${1:-}" in
         -h|--help) usage_pause; return 0 ;;
-        "") die "usage: $(basename "$0") pause <node-id>" ;;
+        "") die "usage: $(basename "$0") pause <target>" ;;
     esac
-    [ $# -eq 1 ] || die "usage: $(basename "$0") pause <node-id>"
+    [ $# -eq 1 ] || die "usage: $(basename "$0") pause <target>"
 
-    local node_id="$1"
-    require_node_in_range "$node_id"
-
+    local target="$1"
     local host
-    host="$(node_host "$node_id")"
+    host="$(resolve_target_host "$target")"
     info "Pausing $host (SIGSTOP)..."
     docker pause "$host" >/dev/null
-    ok "$host paused. Resume with: $(basename "$0") unpause $node_id"
+    ok "$host paused. Resume with: $(basename "$0") unpause $target"
 }
 
 # ============================================================================
@@ -868,15 +1157,12 @@ cmd_pause() {
 cmd_unpause() {
     case "${1:-}" in
         -h|--help) usage_unpause; return 0 ;;
-        "") die "usage: $(basename "$0") unpause <node-id>" ;;
+        "") die "usage: $(basename "$0") unpause <target>" ;;
     esac
-    [ $# -eq 1 ] || die "usage: $(basename "$0") unpause <node-id>"
-
-    local node_id="$1"
-    require_node_in_range "$node_id"
+    [ $# -eq 1 ] || die "usage: $(basename "$0") unpause <target>"
 
     local host
-    host="$(node_host "$node_id")"
+    host="$(resolve_target_host "$1")"
     info "Unpausing $host (SIGCONT)..."
     docker unpause "$host" >/dev/null
     ok "$host resumed"
@@ -889,17 +1175,15 @@ cmd_unpause() {
 cmd_partition() {
     case "${1:-}" in
         -h|--help) usage_partition; return 0 ;;
-        "") die "usage: $(basename "$0") partition <node-id>" ;;
+        "") die "usage: $(basename "$0") partition <target>" ;;
     esac
-    [ $# -eq 1 ] || die "usage: $(basename "$0") partition <node-id>"
+    [ $# -eq 1 ] || die "usage: $(basename "$0") partition <target>"
 
     require_raft_mode partition
 
-    local node_id="$1"
-    require_node_in_range "$node_id"
-
+    local target="$1"
     local host
-    host="$(node_host "$node_id")"
+    host="$(resolve_target_host "$target")"
     local network="${COMPOSE_PROJECT}_$NETWORK_NAME"
 
     # Idempotency: if the container isn't on the network, treat as
@@ -914,7 +1198,7 @@ cmd_partition() {
 
     info "Disconnecting $host from $network..."
     docker network disconnect "$network" "$host" >/dev/null
-    ok "$host partitioned. Heal with: $(basename "$0") heal $node_id"
+    ok "$host partitioned. Heal with: $(basename "$0") heal $target"
 }
 
 # ============================================================================
@@ -924,17 +1208,14 @@ cmd_partition() {
 cmd_heal() {
     case "${1:-}" in
         -h|--help) usage_heal; return 0 ;;
-        "") die "usage: $(basename "$0") heal <node-id>" ;;
+        "") die "usage: $(basename "$0") heal <target>" ;;
     esac
-    [ $# -eq 1 ] || die "usage: $(basename "$0") heal <node-id>"
+    [ $# -eq 1 ] || die "usage: $(basename "$0") heal <target>"
 
     require_raft_mode heal
 
-    local node_id="$1"
-    require_node_in_range "$node_id"
-
     local host
-    host="$(node_host "$node_id")"
+    host="$(resolve_target_host "$1")"
     local network="${COMPOSE_PROJECT}_$NETWORK_NAME"
 
     if docker network inspect "$network" \
@@ -944,11 +1225,110 @@ cmd_heal() {
         return 0
     fi
 
-    # Re-attach with the same network alias so peers' hostname-based
-    # URLs (http://fluree-N:9090/raft) resolve to the new IP.
+    # Re-attach with the same network alias so peers / raft peers'
+    # hostname-based URLs resolve to the new IP.
     info "Reconnecting $host to $network..."
     docker network connect --alias "$host" "$network" "$host" >/dev/null
     ok "$host healed. Inspect with: $(basename "$0") status"
+}
+
+# ============================================================================
+# Subcommand: repoint (peer failover)
+# ============================================================================
+
+cmd_repoint() {
+    case "${1:-}" in
+        -h|--help) usage_repoint; return 0 ;;
+        "") die "usage: $(basename "$0") repoint <peer-N> <fluree-M>" ;;
+    esac
+    [ $# -eq 2 ] || die "usage: $(basename "$0") repoint <peer-N> <fluree-M>"
+
+    detect_compose
+
+    local peer_arg="$1"
+    local target_arg="$2"
+
+    # Parse the peer id: `peer-N` or bare `N`. Rejecting bare fluree
+    # ids explicitly makes the intent unambiguous.
+    local peer_id=""
+    if [[ "$peer_arg" =~ ^peer-([1-9][0-9]*)$ ]]; then
+        peer_id="${BASH_REMATCH[1]}"
+    elif [[ "$peer_arg" =~ ^[1-9][0-9]*$ ]]; then
+        peer_id="$peer_arg"
+    else
+        die "invalid peer: $peer_arg (expected \`peer-N\` or a bare peer number)"
+    fi
+    require_peer_in_range "$peer_id"
+
+    # Parse the target: `fluree-M` or bare `M`.
+    local target_id=""
+    if [[ "$target_arg" =~ ^fluree-([1-9][0-9]*)$ ]]; then
+        target_id="${BASH_REMATCH[1]}"
+    elif [[ "$target_arg" =~ ^[1-9][0-9]*$ ]]; then
+        target_id="$target_arg"
+    else
+        die "invalid target: $target_arg (expected \`fluree-M\` or a bare raft node number)"
+    fi
+    require_node_in_range "$target_id"
+
+    local peer
+    peer="$(peer_host "$peer_id")"
+    local target_host
+    target_host="$(node_host "$target_id")"
+    local internal_public
+    internal_public="$(node_internal_public 1)"
+    local new_tx_url="http://$target_host:$internal_public"
+    local new_events_url="http://$target_host:$internal_public/v1/fluree/events"
+
+    info "Rewriting compose entries for $peer to subscribe to $target_host..."
+    # 1. Update the header-comment record so `status` and later
+    #    `repoint` invocations reflect the new mapping.
+    # 2. Update the two env vars on the peer service.
+    # In-place edits with a portable sed (works on GNU + BSD via -i''):
+    sed -i.bak \
+        -e "s|^# Peer-$peer_id-target: .*|# Peer-$peer_id-target: $target_host|" \
+        "$COMPOSE_FILE"
+
+    # For the env-var rewrites we need to touch only the lines under
+    # the `$peer:` service block. awk is the safest way — sed can't
+    # cleanly scope a substitution to a YAML sub-block.
+    awk -v peer="$peer" \
+        -v new_tx="$new_tx_url" \
+        -v new_events="$new_events_url" \
+        '
+        BEGIN { in_peer = 0 }
+        # New service block begins at column 2 with `<name>:`.
+        /^  [A-Za-z][A-Za-z0-9-]*:/ {
+            in_peer = ($1 == peer ":") ? 1 : 0
+        }
+        in_peer && /FLUREE_TX_SERVER_URL:/ {
+            sub(/"http:[^"]*"/, "\"" new_tx "\"")
+        }
+        in_peer && /FLUREE_PEER_EVENTS_URL:/ {
+            sub(/"http:[^"]*"/, "\"" new_events "\"")
+        }
+        { print }
+        ' "$COMPOSE_FILE" > "$COMPOSE_FILE.new"
+    mv "$COMPOSE_FILE.new" "$COMPOSE_FILE"
+    rm -f "$COMPOSE_FILE.bak"
+
+    info "Recreating $peer with the new configuration..."
+    "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+        up -d --force-recreate --no-deps "$peer" >/dev/null
+
+    info "Waiting for $peer to come healthy..."
+    local public_url deadline
+    public_url="$(peer_host_public_url "$peer_id")"
+    deadline=$(( $(date +%s) + 30 ))
+    while ! curl -fsS -m 2 "$public_url/health" >/dev/null 2>&1; do
+        if [ "$(date +%s)" -gt "$deadline" ]; then
+            err "$peer restarted but /health didn't respond within 30s"
+            docker logs --tail 30 "$peer"
+            exit 1
+        fi
+        sleep 0.5
+    done
+    ok "$peer now subscribed to $target_host"
 }
 
 # ============================================================================
@@ -958,7 +1338,7 @@ cmd_heal() {
 cmd_logs() {
     local follow=0
     local tail_lines=""
-    local node_id=""
+    local target=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -967,8 +1347,8 @@ cmd_logs() {
             --tail)
                 [ $# -ge 2 ] || die "--tail requires an argument"
                 tail_lines="$2"; shift 2 ;;
-            [1-9]|[1-9][0-9])
-                node_id="$1"; shift ;;
+            [1-9]|[1-9][0-9]|peer-[1-9]|peer-[1-9][0-9])
+                target="$1"; shift ;;
             *) die "Unknown argument: $1 (try: $(basename "$0") help logs)" ;;
         esac
     done
@@ -977,9 +1357,10 @@ cmd_logs() {
     [ "$follow" -eq 1 ] && args+=(-f)
     [ -n "$tail_lines" ] && args+=(--tail "$tail_lines")
 
-    if [ -n "$node_id" ]; then
-        require_node_in_range "$node_id"
-        docker logs "${args[@]}" "$(node_host "$node_id")"
+    if [ -n "$target" ]; then
+        local host
+        host="$(resolve_target_host "$target")"
+        docker logs "${args[@]}" "$host"
     else
         detect_compose
         [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
@@ -1079,6 +1460,7 @@ case "$cmd" in
     unpause)        cmd_unpause "$@" ;;
     partition)      cmd_partition "$@" ;;
     heal)           cmd_heal "$@" ;;
+    repoint)        cmd_repoint "$@" ;;
     logs)           cmd_logs "$@" ;;
     load)           cmd_load "$@" ;;
     help|-h|--help) cmd_help "$@" ;;
