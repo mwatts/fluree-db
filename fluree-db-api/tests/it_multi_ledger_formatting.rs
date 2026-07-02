@@ -822,3 +822,154 @@ async fn cross_graph_root_projection_divergent_predicate() {
         "cross-ledger root projection dropped a non-primary-namespace predicate: {value:#}"
     );
 }
+
+// =============================================================================
+// Split subject across the default-graph union. A subject IRI is described in
+// BOTH default-graph ledgers, with the SAME multi-cardinality predicate
+// (`skos:altLabel`) carrying DIFFERENT values in each. Under default-graph RDF
+// merge semantics (`from: [A, B]`), the subject's rendering should be the union
+// of both ledgers' values. `expand_ref` does this (it loops `default_indices`
+// and `merge_subject_objects`); the root path (`format_hydration_column` /
+// `FormatterSet::pick`) routes to a single home ledger and does not — a third
+// root-path limitation alongside Finding B.
+//
+// Named-graph queries are intentionally excluded: a named graph is addressed
+// individually, so no cross-graph merge is expected (or wanted) there.
+// =============================================================================
+
+/// `ex:widget` carries a plain literal predicate (`ex:kind`) + `skos:altLabel
+/// "WA"` in ledger A; the SAME subject has only `skos:altLabel "WB"` in ledger B.
+/// `ex:parent` (in A) refs it for the nested-path test. `skos`/`ex` are
+/// non-reserved, so their codes may diverge — but the re-encode fix handles that;
+/// what's under test here is the UNION.
+///
+/// The root is bound via `ex:kind` rather than `@type` deliberately: it keeps the
+/// binding off the `@type`/`rdf:type` projection path so this exercises only the
+/// root-hydration routing, not any type-value handling.
+async fn seed_split_subject_ledgers(fluree: &MemoryFluree) {
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/split-a:main"),
+            &json!({
+                "@context": {
+                    "skos": "http://www.w3.org/2004/02/skos/core#",
+                    "ex": "http://example.org/",
+                    "id": "@id", "type": "@type",
+                },
+                "@graph": [
+                    {"@id": "ex:widget", "ex:kind": "gadget", "skos:altLabel": "WA"},
+                    {"@id": "ex:parent", "ex:kind": "container",
+                     "ex:related": {"@id": "ex:widget"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert split-a");
+
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/split-b:main"),
+            &json!({
+                "@context": {
+                    "skos": "http://www.w3.org/2004/02/skos/core#",
+                    "ex": "http://example.org/",
+                    "id": "@id", "type": "@type",
+                },
+                // Same subject IRI, additional altLabel, no other facts here.
+                "@graph": [
+                    {"@id": "ex:widget", "skos:altLabel": "WB"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert split-b");
+}
+
+/// Collect a JSON-LD value's string members whether it rendered as a scalar or
+/// an array (single-valued predicates may compact to a bare string).
+fn collect_strs(v: Option<&serde_json::Value>) -> std::collections::BTreeSet<String> {
+    match v {
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+        }
+        Some(serde_json::Value::String(s)) => [s.clone()].into_iter().collect(),
+        _ => std::collections::BTreeSet::new(),
+    }
+}
+
+/// CONTROL — the NESTED path unions the split subject across the default-graph
+/// union. `ex:parent`'s `ex:related` ref crosses into both ledgers; `expand_ref`
+/// merges A's and B's `skos:altLabel` values. Expected to pass.
+#[tokio::test]
+async fn cross_graph_nested_ref_unions_split_subject_altlabels() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_split_subject_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "skos": "http://www.w3.org/2004/02/skos/core#",
+            "ex": "http://example.org/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/split-a:main", "test/split-b:main"],
+        "select": {"?p": ["@id", {"ex:related": ["@id", "skos:altLabel"]}]},
+        "where": {"@id": "?p", "ex:kind": "container"}
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let parent = value.as_array().and_then(|a| a.first()).expect("one parent");
+    let widget = parent.get("ex:related").expect("ex:related present");
+    let labels = collect_strs(widget.get("skos:altLabel"));
+    assert_eq!(
+        labels,
+        ["WA".to_string(), "WB".to_string()].into_iter().collect(),
+        "nested ref should union skos:altLabel across the default-graph union: {value:#}"
+    );
+}
+
+/// BUG (root-path union gap) — the SAME split subject, bound at the ROOT, is
+/// hydrated against only its provenance ledger (A), so B's `skos:altLabel "WB"`
+/// is dropped. Under default-graph merge the root should union both, exactly as
+/// the nested control above does.
+///
+/// Companion to Finding B: both are root-path limitations
+/// (`format_hydration_column` / `FormatterSet::pick`) where the root does not
+/// behave like `expand_ref`. Ignored pending the root-path union follow-up.
+#[ignore = "pending root-path default-graph union follow-up (companion to Finding B)"]
+#[tokio::test]
+async fn cross_graph_root_unions_split_subject_altlabels() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_split_subject_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "skos": "http://www.w3.org/2004/02/skos/core#",
+            "ex": "http://example.org/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/split-a:main", "test/split-b:main"],
+        "select": {"?s": ["@id", "skos:altLabel"]},
+        "where": {"@id": "?s", "ex:kind": "gadget"}
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let widget = value.as_array().and_then(|a| a.first()).expect("one subject");
+    let labels = collect_strs(widget.get("skos:altLabel"));
+    assert_eq!(
+        labels,
+        ["WA".to_string(), "WB".to_string()].into_iter().collect(),
+        "root subject should union skos:altLabel across the default-graph union: {value:#}"
+    );
+}
