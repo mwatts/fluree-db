@@ -84,7 +84,16 @@ fn build_iceberg_filter(
         };
         let value = match &f.value {
             ScanValue::Bool(b) => LiteralValue::Boolean(*b),
-            ScanValue::Date(d) => LiteralValue::Date(*d),
+            // Push a Date literal only against a physically-`date` column. The
+            // Arrow reader applies it as an exact row filter (casting the column
+            // to text), but the operator enforces with a lenient `Date::parse`
+            // that also accepts `"2024-01-15Z"` / offset forms. On a physically
+            // string column the operator would keep such a row while the row
+            // filter drops it — so gate the pushdown to keep it a strict subset.
+            ScanValue::Date(d) => match field.type_string() {
+                Some("date") => LiteralValue::Date(*d),
+                _ => continue,
+            },
             // Iceberg `int` is 32-bit, `long` 64-bit. For an `int` column a
             // literal outside i32 range must NOT be truncated with `as` (it would
             // wrap and could prune files the residual filter keeps); skip the
@@ -1217,6 +1226,26 @@ mod tests {
             only_literal(&[key_filter("str_key", "west/5")], &s),
             Some(LiteralValue::String(v)) if v == "west/5"
         ));
+    }
+
+    #[test]
+    fn date_scalar_pushed_only_against_date_column() {
+        let s = key_schema();
+        let date_filter = |col: &str| ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Eq,
+            value: ScanValue::Date(19_737), // 2024-01-15, days since epoch
+        };
+        // Physically-`date` column: the scan filter compares like the operator.
+        assert!(matches!(
+            only_literal(&[date_filter("date_key")], &s),
+            Some(LiteralValue::Date(19_737))
+        ));
+        // Physically-`string` column: skip. The operator's lenient `Date::parse`
+        // keeps `"2024-01-15Z"`/offset forms that the exact row filter (Date32 →
+        // Utf8 `"2024-01-15"`) would drop — pushing here would remove an
+        // operator-kept row.
+        assert!(build_iceberg_filter(&[date_filter("str_key")], &s).is_none());
     }
 
     #[test]

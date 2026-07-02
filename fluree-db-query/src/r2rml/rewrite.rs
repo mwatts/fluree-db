@@ -661,6 +661,16 @@ pub fn convert_triple_to_r2rml(
         _ => return None,
     };
 
+    // A bound subject with a variable predicate (`<store/5> ?p ?o`) has no
+    // `predicate_filter` to resolve the POM and no predicate-var field to bind
+    // `?p`, so materialization would bind `?o` across every predicate with `?p`
+    // left unbound (`?p = NULL`). This PR newly routes bound subjects here, so
+    // leave that shape unconverted for normal evaluation. (The var-subject
+    // wildcard `?s ?p ?o` keeps its existing all-maps scan behavior.)
+    if subject_constant.is_some() && predicate_filter.is_none() && object_var.is_some() {
+        return None;
+    }
+
     let mut pattern = make_pattern(object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);

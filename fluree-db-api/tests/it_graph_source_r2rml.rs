@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanValue,
+    convert_triple_to_r2rml, ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
+    ScanValue,
 };
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
@@ -3226,6 +3227,20 @@ async fn guard_constant_object_fuses_into_star_single_scan() {
         Some(1),
         "constant-object storeId must fuse into the name star → one scan, got {counts:?}"
     );
+    // The fused scan MUST project the constraint's column (`store_id`), not just
+    // the base star's `store_name`. The mock returns the full batch regardless of
+    // projection, so `rows` alone can't catch a missing column — but the real
+    // (column-pruning) reader would omit `store_id`, making the constraint
+    // materialize as NULL and drop every row. Assert the projection directly.
+    assert_eq!(
+        provider.projection_of("dw.store"),
+        vec![
+            "store_id".to_string(),
+            "store_key".to_string(),
+            "store_name".to_string()
+        ],
+        "constant-object constraint column (store_id) must be projected into the fused scan"
+    );
     assert_eq!(
         rows, 1,
         "only STORE-2 satisfies the fused constant-object constraint"
@@ -3854,6 +3869,44 @@ async fn guard_bound_subject_binds_object_only() {
     assert_eq!(
         rows, 1,
         "only the <store/5> subject's storeId object is returned"
+    );
+}
+
+/// A bound subject with a VARIABLE predicate (`<store/5> ?p ?o`) must NOT convert
+/// to an R2RML pattern: with no `predicate_filter` to resolve the POM and no
+/// predicate-var binding, materialization would bind `?o` across every predicate
+/// with `?p` left NULL. It is left unconverted for normal evaluation. A bound
+/// subject with a CONSTANT predicate still converts.
+#[test]
+fn bound_subject_variable_predicate_not_converted() {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+
+    let wildcard = TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Var(p),
+        Term::Var(o),
+    );
+    assert!(
+        convert_triple_to_r2rml(&wildcard, "edw-gs:main", &ledger.snapshot).is_none(),
+        "bound subject + variable predicate must stay unconverted"
+    );
+
+    // Control: a constant predicate on the same bound subject still converts.
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let bound = TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(o),
+    );
+    assert!(
+        convert_triple_to_r2rml(&bound, "edw-gs:main", &ledger.snapshot).is_some(),
+        "bound subject + constant predicate must still convert"
     );
 }
 

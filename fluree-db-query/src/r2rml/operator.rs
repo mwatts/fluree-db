@@ -263,9 +263,12 @@ impl R2rmlScanOperator {
         }
     }
 
-    /// All predicate IRIs this pattern materializes: the base `predicate_filter`
-    /// plus any same-subject star members. Used for projection and parent-lookup
-    /// building so a star scan reads every needed column in one pass.
+    /// All predicate IRIs this pattern materializes: the base `predicate_filter`,
+    /// same-subject star members (`star_bindings`), and fused constant-object
+    /// constraints (`star_constraints`). Used for projection and parent-lookup
+    /// building so a star scan reads every needed column in one pass — omitting
+    /// the constraint predicates would leave the real (column-pruning) reader
+    /// without the constraint's column, dropping every row.
     fn pattern_predicates(&self) -> Vec<&str> {
         let mut preds: Vec<&str> = Vec::new();
         if let Some(p) = self.pattern.predicate_filter.as_deref() {
@@ -274,7 +277,18 @@ impl R2rmlScanOperator {
         for (pred, _) in &self.pattern.star_bindings {
             preds.push(pred.as_str());
         }
+        for (pred, _) in &self.pattern.star_constraints {
+            preds.push(pred.as_str());
+        }
         preds
+    }
+
+    /// Whether this pattern fuses multiple same-subject predicates into one scan
+    /// (extra var members or constant-object constraints beyond the base). Such a
+    /// scan must project/parent-lookup the union of all star predicates, not just
+    /// the base `predicate_filter`.
+    fn has_star_members(&self) -> bool {
+        !self.pattern.star_bindings.is_empty() || !self.pattern.star_constraints.is_empty()
     }
 
     /// True for a pure `rdf:type`/subject-only pattern: no object var, no
@@ -545,7 +559,7 @@ impl R2rmlScanOperator {
             // Determine projection columns. For a same-subject star, project the
             // union of columns needed for every star predicate so the whole star
             // is satisfied by one scan.
-            let projection: Vec<String> = if self.pattern.star_bindings.is_empty() {
+            let projection: Vec<String> = if !self.has_star_members() {
                 if self.is_subject_only_pattern() {
                     // rdf:type / subject-only pattern: only the subject columns are
                     // load-bearing. Projecting every POM column (the
@@ -651,7 +665,7 @@ impl R2rmlScanOperator {
                 .predicate_object_maps
                 .iter()
                 .filter(|pom| {
-                    if !self.pattern.star_bindings.is_empty() {
+                    if self.has_star_members() {
                         pom.predicate_map
                             .as_constant()
                             .is_some_and(|p| star_preds.contains(&p))
