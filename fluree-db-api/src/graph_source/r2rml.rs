@@ -84,7 +84,16 @@ fn build_iceberg_filter(
         };
         let value = match &f.value {
             ScanValue::Bool(b) => LiteralValue::Boolean(*b),
-            ScanValue::Date(d) => LiteralValue::Date(*d),
+            // Push a Date literal only against a physically-`date` column. The
+            // Arrow reader applies it as an exact row filter (casting the column
+            // to text), but the operator enforces with a lenient `Date::parse`
+            // that also accepts `"2024-01-15Z"` / offset forms. On a physically
+            // string column the operator would keep such a row while the row
+            // filter drops it — so gate the pushdown to keep it a strict subset.
+            ScanValue::Date(d) => match field.type_string() {
+                Some("date") => LiteralValue::Date(*d),
+                _ => continue,
+            },
             // Iceberg `int` is 32-bit, `long` 64-bit. For an `int` column a
             // literal outside i32 range must NOT be truncated with `as` (it would
             // wrap and could prune files the residual filter keeps); skip the
@@ -97,6 +106,27 @@ fn build_iceberg_filter(
                 _ => LiteralValue::Int64(*n),
             },
             ScanValue::Str(s) => LiteralValue::String(s.clone()),
+            // A reversed subject-template key: coerce the raw string to the
+            // column's physical type. A key that parses as an integer pushes as an
+            // integer literal against an `int`/`long`/`decimal` column — including
+            // a `decimal` of any scale (the Arrow reader casts the integer to the
+            // column's decimal type; row-group stats conservatively skip
+            // decimals). A `string` column pushes the raw string. A key that is
+            // not integer-valued, or any other physical type
+            // (float/date/timestamp/boolean), skips the pushdown — the operator
+            // still enforces the subject equality either way.
+            ScanValue::TemplateKey(s) => match field.type_string() {
+                Some("int") => match s.parse::<i32>() {
+                    Ok(v) => LiteralValue::Int32(v),
+                    Err(_) => continue,
+                },
+                Some(t) if t == "long" || t.starts_with("decimal") => match s.parse::<i64>() {
+                    Ok(v) => LiteralValue::Int64(v),
+                    Err(_) => continue,
+                },
+                Some("string") => LiteralValue::String(s.clone()),
+                _ => continue,
+            },
         };
         comparisons.push(Expression::Comparison {
             field_id: field.id,
@@ -1128,4 +1158,107 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
 fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_iceberg::metadata::{Schema, SchemaField};
+    use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
+    use serde_json::json;
+
+    fn field(id: i32, name: &str, ty: serde_json::Value) -> SchemaField {
+        SchemaField {
+            id,
+            name: name.to_string(),
+            required: false,
+            field_type: ty,
+            doc: None,
+        }
+    }
+
+    fn key_schema() -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: vec![
+                field(1, "int_key", json!("int")),
+                field(2, "long_key", json!("long")),
+                field(3, "dec_key", json!("decimal(38,0)")),
+                field(4, "str_key", json!("string")),
+                field(5, "date_key", json!("date")),
+            ],
+        }
+    }
+
+    fn key_filter(col: &str, raw: &str) -> ScanFilter {
+        ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Eq,
+            value: ScanValue::TemplateKey(raw.to_string()),
+        }
+    }
+
+    fn only_literal(filters: &[ScanFilter], schema: &Schema) -> Option<LiteralValue> {
+        match build_iceberg_filter(filters, schema)? {
+            Expression::Comparison { value, .. } => Some(value),
+            other => panic!("expected a single comparison, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_key_coerces_by_physical_type() {
+        let s = key_schema();
+        assert!(matches!(
+            only_literal(&[key_filter("int_key", "5")], &s),
+            Some(LiteralValue::Int32(5))
+        ));
+        assert!(matches!(
+            only_literal(&[key_filter("long_key", "5")], &s),
+            Some(LiteralValue::Int64(5))
+        ));
+        // Integer key on a Decimal column pushes as Int64 — the Arrow reader casts
+        // it to the Decimal column (the validated integer-vs-decimal path).
+        assert!(matches!(
+            only_literal(&[key_filter("dec_key", "5")], &s),
+            Some(LiteralValue::Int64(5))
+        ));
+        // The raw string is already percent-decoded upstream.
+        assert!(matches!(
+            only_literal(&[key_filter("str_key", "west/5")], &s),
+            Some(LiteralValue::String(v)) if v == "west/5"
+        ));
+    }
+
+    #[test]
+    fn date_scalar_pushed_only_against_date_column() {
+        let s = key_schema();
+        let date_filter = |col: &str| ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Eq,
+            value: ScanValue::Date(19_737), // 2024-01-15, days since epoch
+        };
+        // Physically-`date` column: the scan filter compares like the operator.
+        assert!(matches!(
+            only_literal(&[date_filter("date_key")], &s),
+            Some(LiteralValue::Date(19_737))
+        ));
+        // Physically-`string` column: skip. The operator's lenient `Date::parse`
+        // keeps `"2024-01-15Z"`/offset forms that the exact row filter (Date32 →
+        // Utf8 `"2024-01-15"`) would drop — pushing here would remove an
+        // operator-kept row.
+        assert!(build_iceberg_filter(&[date_filter("str_key")], &s).is_none());
+    }
+
+    #[test]
+    fn template_key_skips_unsupported_or_unparseable() {
+        let s = key_schema();
+        // Date physical type is not pushed yet (needs a live decimal/date check).
+        assert!(build_iceberg_filter(&[key_filter("date_key", "2024-01-15")], &s).is_none());
+        // Non-integer value against an integer column → skip (operator enforces).
+        assert!(build_iceberg_filter(&[key_filter("int_key", "abc")], &s).is_none());
+        assert!(build_iceberg_filter(&[key_filter("dec_key", "5.5")], &s).is_none());
+        // Unknown column → skip.
+        assert!(build_iceberg_filter(&[key_filter("nope", "5")], &s).is_none());
+    }
 }
