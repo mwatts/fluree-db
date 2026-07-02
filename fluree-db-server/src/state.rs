@@ -152,7 +152,12 @@ impl AppState {
         config.validate().map_err(|e| {
             fluree_db_api::ApiError::internal(format!("Invalid configuration: {e}"))
         })?;
-        let (fluree, cache_stats_handle) = build_default_fluree(&config).await?;
+        // No event bus to inject on the vanilla (non-raft) path — Fluree
+        // allocates its own. The raft assembly path builds Fluree
+        // separately via `build_fluree_with_nameservice`, threading
+        // `integration.event_bus` in so the state-machine adapter and
+        // the events endpoint share a single bus instance.
+        let (fluree, cache_stats_handle) = build_default_fluree(&config, None).await?;
         Self::with_fluree(config, telemetry_config, fluree, cache_stats_handle).await
     }
 
@@ -318,13 +323,21 @@ impl Drop for AppState {
 
 /// Build the default `Fluree` instance from server config — picks
 /// proxy or direct mode based on `config.is_proxy_storage_mode()`.
+///
+/// `event_bus` is threaded into `FlureeBuilder::with_event_bus` when
+/// provided; the raft assembly path uses this to hand Fluree the
+/// same `LedgerEventBus` the state-machine adapter emits into, so
+/// runtime raft events reach the events endpoint's subscription on
+/// `Fluree::event_bus()`. `None` yields the historical behaviour
+/// (Fluree allocates its own bus).
 pub async fn build_default_fluree(
     config: &ServerConfig,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     if config.is_proxy_storage_mode() {
         build_proxy_fluree(config)
     } else {
-        build_direct_fluree(config, None).await
+        build_direct_fluree(config, None, event_bus).await
     }
 }
 
@@ -335,10 +348,16 @@ pub async fn build_default_fluree(
 ///
 /// Raft mode requires direct storage; passing a proxy-mode config
 /// here errors at validation time below.
+///
+/// `event_bus` is the raft integration's `LedgerEventBus`; passing
+/// it here unifies the emitter (state-machine adapter) and the
+/// subscribers (events endpoint, Fluree's own cache reconciler)
+/// onto the same bus.
 #[cfg(feature = "raft")]
 pub async fn build_fluree_with_nameservice(
     config: &ServerConfig,
     nameservice: fluree_db_api::NameServiceMode,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     if config.is_proxy_storage_mode() {
         return Err(fluree_db_api::ApiError::config(
@@ -346,15 +365,17 @@ pub async fn build_fluree_with_nameservice(
              use direct storage (file or S3) instead",
         ));
     }
-    build_direct_fluree(config, Some(nameservice)).await
+    build_direct_fluree(config, Some(nameservice), event_bus).await
 }
 
 /// Build a direct-storage `Fluree` (file, S3, DynamoDB, etc.) from
 /// config. When `nameservice` is `Some`, it replaces the
-/// backend-implied nameservice.
+/// backend-implied nameservice. When `event_bus` is `Some`, it
+/// replaces Fluree's default per-instance bus.
 async fn build_direct_fluree(
     config: &ServerConfig,
     nameservice: Option<fluree_db_api::NameServiceMode>,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     let mut builder = if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
@@ -390,6 +411,9 @@ async fn build_direct_fluree(
     }
     if let Some(max_mb) = config.disk_cache_max_mb {
         builder = builder.disk_cache_max_mb(max_mb);
+    }
+    if let Some(bus) = event_bus {
+        builder = builder.with_event_bus(bus);
     }
     if config.indexing_enabled {
         let max_bytes = config
