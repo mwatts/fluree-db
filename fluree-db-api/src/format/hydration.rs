@@ -764,10 +764,8 @@ async fn run_hydration_rows(set: &FormatterSet<'_>, result: &QueryResult) -> Res
     let primary_compactor = primary.compactor;
     let typed = primary.typed;
 
-    // Shared cache across all rows and all hydration columns. The cache key
-    // includes the active ledger + a hash of the current `NestedSelectSpec`, so
-    // columns with structurally identical levels share entries while different
-    // levels (and different ledgers) stay separate.
+    // Shared per-response cache, reused across all rows and hydration columns.
+    // See `HydrationCaches` for the key shape and what each map memoizes.
     let mut cache = HydrationCaches::default();
     let mut rows: Vec<JsonValue> = Vec::new();
 
