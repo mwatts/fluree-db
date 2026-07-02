@@ -42,14 +42,18 @@ fn render_table(tm: &TableMapping, base: &str, vocab_prefix: &str) -> String {
     let mut stmts: Vec<String> = Vec::with_capacity(tm.columns.len() + 2);
     stmts.push(format!(
         "rr:logicalTable [ rr:tableName \"{}\" ]",
-        tm.table_name
+        escape_turtle_string(&tm.table_name)
     ));
     stmts.push(render_subject(tm, base, vocab_prefix));
     for col in &tm.columns {
         stmts.push(render_pom(col, base, vocab_prefix));
     }
 
-    format!("<#{node}> a rr:TriplesMap ;\n  {} .", stmts.join(" ;\n  "))
+    format!(
+        "<#{}> a rr:TriplesMap ;\n  {} .",
+        escape_iri(&node),
+        stmts.join(" ;\n  ")
+    )
 }
 
 /// Render the `rr:subjectMap`. Falls back to a class-only subject map when no
@@ -61,7 +65,7 @@ fn render_subject(tm: &TableMapping, base: &str, vocab_prefix: &str) -> String {
     } else {
         format!(
             "rr:subjectMap [ rr:template \"{}\" ; rr:class {class} ]",
-            tm.subject_template
+            escape_turtle_string(&tm.subject_template)
         )
     }
 }
@@ -75,9 +79,11 @@ fn render_pom(col: &ColumnMapping, base: &str, vocab_prefix: &str) -> String {
         let parent_node = tm_node_for_table(&fk.target_table);
         format!(
             "rr:predicateObjectMap [ rr:predicate {predicate} ;\n    rr:objectMap [ \
-             rr:parentTriplesMap <#{parent_node}> ; rr:joinCondition [ rr:child \"{}\" ; \
+             rr:parentTriplesMap <#{}> ; rr:joinCondition [ rr:child \"{}\" ; \
              rr:parent \"{}\" ] ] ]",
-            fk.child_column, fk.parent_column
+            escape_iri(&parent_node),
+            escape_turtle_string(&fk.child_column),
+            escape_turtle_string(&fk.parent_column)
         )
     } else {
         let datatype_clause = col
@@ -87,7 +93,7 @@ fn render_pom(col: &ColumnMapping, base: &str, vocab_prefix: &str) -> String {
             .unwrap_or_default();
         format!(
             "rr:predicateObjectMap [ rr:predicate {predicate} ; rr:objectMap [ rr:column \"{}\"{} ] ]",
-            col.column_name, datatype_clause
+            escape_turtle_string(&col.column_name), datatype_clause
         )
     }
 }
@@ -99,10 +105,143 @@ fn tm_node_for_table(table_name: &str) -> String {
 }
 
 /// Render a full IRI as a prefixed name against the vocab base, or as an
-/// absolute `<IRI>` if it does not sit under that base.
+/// absolute `<IRI>` otherwise.
+///
+/// A prefixed name is emitted ONLY when the local part is a safe `PN_LOCAL`
+/// (see [`is_safe_pn_local`]); anything else — an IRI outside the vocab base, or
+/// a base-relative local carrying characters that are illegal or injection-prone
+/// in a prefixed name (e.g. a class-name override with a quote) — falls back to
+/// the escaped absolute `<IRI>` form, which is always valid Turtle.
 fn curie(iri: &str, base: &str, vocab_prefix: &str) -> String {
-    match iri.strip_prefix(base) {
-        Some(local) => format!("{vocab_prefix}:{local}"),
-        None => format!("<{iri}>"),
+    if let Some(local) = iri.strip_prefix(base) {
+        if is_safe_pn_local(local) {
+            return format!("{vocab_prefix}:{local}");
+        }
+    }
+    format!("<{}>", escape_iri(iri))
+}
+
+/// Escape a string for use inside a Turtle `"..."` (`STRING_LITERAL_QUOTE`)
+/// literal: backslash, double-quote, and C0/DEL control characters. This is what
+/// keeps an adversarial catalog identifier from either breaking the parse or
+/// injecting extra predicate-object maps (a bare `"` would close `rr:column`).
+/// A string free of these characters is returned unchanged, so ordinary
+/// identifiers render byte-for-byte as before.
+fn escape_turtle_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a string for use inside a Turtle `<...>` `IRIREF`: every character the
+/// grammar forbids raw (`< > " { } | ^ \` `` ` ``, space, and control chars)
+/// becomes a `\uXXXX` escape. An IRI free of these is returned unchanged.
+fn escape_iri(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c if (c as u32) <= 0x20 || c as u32 == 0x7F => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether `local` is safe to emit verbatim as a prefixed-name local part.
+///
+/// A deliberately conservative subset of `PN_LOCAL` — ASCII letters, digits and
+/// `_`, with a letter/`_` first character — every member of which is a valid
+/// `PN_LOCAL`. Anything it rejects (punctuation, quotes, leading digits, empty)
+/// falls back to the always-valid escaped `<IRI>` form in [`curie`]. This admits
+/// every deterministic camelCase/PascalCase local the emitter produces, so the
+/// prefixed output is unchanged for normal input.
+fn is_safe_pn_local(local: &str) -> bool {
+    let mut chars = local.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    local.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_turtle_string_is_noop_for_ordinary_identifiers() {
+        assert_eq!(escape_turtle_string("DW.DIM_DATE"), "DW.DIM_DATE");
+        assert_eq!(escape_turtle_string("GEOGRAPHY_KEY"), "GEOGRAPHY_KEY");
+    }
+
+    #[test]
+    fn escape_turtle_string_escapes_quotes_backslash_and_controls() {
+        assert_eq!(escape_turtle_string("a\"b"), "a\\\"b");
+        assert_eq!(escape_turtle_string("a\\b"), "a\\\\b");
+        assert_eq!(escape_turtle_string("a\nb\tc\rd"), "a\\nb\\tc\\rd");
+        // A bare NUL becomes a \u escape, not a raw control byte.
+        assert_eq!(escape_turtle_string("a\u{0}b"), "a\\u0000b");
+    }
+
+    #[test]
+    fn escape_iri_is_noop_for_ordinary_iris() {
+        let iri = "http://ns.fluree.dev/edw#geographyKey";
+        assert_eq!(escape_iri(iri), iri);
+    }
+
+    #[test]
+    fn escape_iri_escapes_delimiters_and_spaces() {
+        assert_eq!(escape_iri("a>b"), "a\\u003Eb");
+        assert_eq!(escape_iri("a b"), "a\\u0020b");
+        assert_eq!(escape_iri("a\"b"), "a\\u0022b");
+        assert_eq!(escape_iri("a\\b"), "a\\u005Cb");
+    }
+
+    #[test]
+    fn safe_pn_local_accepts_camel_and_pascal_case() {
+        assert!(is_safe_pn_local("geographyKey"));
+        assert!(is_safe_pn_local("DimDate"));
+        assert!(is_safe_pn_local("Order"));
+        assert!(is_safe_pn_local("_private"));
+    }
+
+    #[test]
+    fn safe_pn_local_rejects_injection_and_leading_digit() {
+        assert!(!is_safe_pn_local(""));
+        assert!(!is_safe_pn_local("2023Revenue")); // leading digit → full-IRI form
+        assert!(!is_safe_pn_local("has space"));
+        assert!(!is_safe_pn_local("has\"quote"));
+        assert!(!is_safe_pn_local("a.b")); // dot → full-IRI form
+    }
+
+    #[test]
+    fn curie_falls_back_to_escaped_iri_for_unsafe_local() {
+        let base = "http://ns.fluree.dev/edw#";
+        // Safe local → prefixed name (byte-for-byte as before).
+        assert_eq!(curie(&format!("{base}Geography"), base, "v"), "v:Geography");
+        // Unsafe local (injected quote) → escaped absolute IRI, never `v:..."`.
+        let hostile = format!("{base}Ev\"il");
+        let rendered = curie(&hostile, base, "v");
+        assert_eq!(rendered, "<http://ns.fluree.dev/edw#Ev\\u0022il>");
+        assert!(!rendered.contains('"'));
     }
 }

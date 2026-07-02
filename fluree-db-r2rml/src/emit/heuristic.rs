@@ -300,8 +300,8 @@ fn select_subject_key(
     if !table.identifier_field_ids.is_empty() {
         let mut columns = Vec::new();
         for &fid in &table.identifier_field_ids {
-            match table.column_by_field_id(fid) {
-                Some(col) => columns.push(col.name.clone()),
+            let col = match table.column_by_field_id(fid) {
+                Some(col) => col,
                 None => {
                     diagnostics.push(Diagnostic::new(
                         Severity::Error,
@@ -314,7 +314,32 @@ fn select_subject_key(
                         columns: Vec::new(),
                     };
                 }
+            };
+            // Non-null gate. Iceberg requires identifier fields to be `required`,
+            // but a non-conforming writer (e.g. Snowflake-managed Iceberg) can
+            // populate `identifier_field_ids` without marking the column required.
+            // A nullable identifier yields an unsafe subject template (silent row
+            // loss at query time) and, in the single-column case, would be indexed
+            // as a valid FK parent — so gate it exactly like the override and
+            // `<STEM>_KEY`/`_ID` paths, emitting no subject when it cannot be
+            // confirmed non-null.
+            if !col.is_non_null() {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Error,
+                    DiagCode::NoSafeSubjectKey,
+                    table.qualified_name(),
+                    Some(col.name.clone()),
+                    format!(
+                        "identifier_field_ids column '{}' is nullable (fails required / \
+                         null_fraction==0); no safe subject key",
+                        col.name
+                    ),
+                ));
+                return SubjectKey {
+                    columns: Vec::new(),
+                };
             }
+            columns.push(col.name.clone());
         }
         return SubjectKey { columns };
     }
@@ -388,6 +413,9 @@ fn infer_foreign_keys(
 ) -> (Vec<ColumnMapping>, HashSet<String>) {
     let mut joins = Vec::new();
     let mut resolved = HashSet::new();
+    // Predicate locals already emitted by joins in THIS table, so a later join
+    // whose local collides with an earlier one is disambiguated (not merged).
+    let mut emitted_join_locals: HashSet<String> = HashSet::new();
 
     for col in &table.columns {
         // FK candidacy: non-nested, integer-typed, non-subject-key columns only.
@@ -404,7 +432,8 @@ fn infer_foreign_keys(
                     child_column: col.name.clone(),
                     parent_column: parent.pk_column.clone(),
                 };
-                let predicate_iri = join_predicate(&col.name, draft, opts);
+                let predicate_iri =
+                    join_predicate(&col.name, draft, &mut emitted_join_locals, opts);
                 joins.push(ColumnMapping::join(col.name.clone(), predicate_iri, fk));
                 resolved.insert(col.name.clone());
 
@@ -510,14 +539,31 @@ fn range_contained(
 /// Derive the join predicate IRI for a resolved FK on `child_column`.
 ///
 /// Uses `camelCase(strip_key_suffix(child))` (readable: `geography`,
-/// `destGeography`), appending `Ref` only when that local would collide with an
-/// existing literal predicate in the same table (e.g. `orderDate` literal vs.
-/// `ORDER_DATE_KEY` join → `orderDateRef`). Predicate IRIs are not compared by
-/// any structural test; this only keeps the emitted document unambiguous.
-fn join_predicate(child_column: &str, draft: &TableDraft, opts: &EmitOptions) -> String {
-    let mut local = naming::camel_case(naming::strip_key_suffix(child_column));
-    if draft.literal_locals.contains(&local) {
-        local.push_str("Ref");
+/// `destGeography`), disambiguating with a `Ref` suffix when that local would
+/// collide with EITHER an existing literal predicate (e.g. `orderDate` literal
+/// vs. `ORDER_DATE_KEY` join → `orderDateRef`) OR a local already emitted by an
+/// earlier join in the same table (e.g. `GEOGRAPHY_KEY` and `GEOGRAPHY_ID` both
+/// strip+camel to `geography` → the second becomes `geographyRef`). Without the
+/// second check, two FKs to different parents would emit the same predicate IRI
+/// and silently merge two distinct relationships. Further collisions append an
+/// increasing counter so the local always stays unique.
+fn join_predicate(
+    child_column: &str,
+    draft: &TableDraft,
+    emitted_join_locals: &mut HashSet<String>,
+    opts: &EmitOptions,
+) -> String {
+    let base_local = naming::camel_case(naming::strip_key_suffix(child_column));
+    let mut local = base_local.clone();
+    let mut suffix = 1u32;
+    while draft.literal_locals.contains(&local) || emitted_join_locals.contains(&local) {
+        local = if suffix == 1 {
+            format!("{base_local}Ref")
+        } else {
+            format!("{base_local}Ref{suffix}")
+        };
+        suffix += 1;
     }
+    emitted_join_locals.insert(local.clone());
     format!("{}{}", opts.base_namespace, local)
 }

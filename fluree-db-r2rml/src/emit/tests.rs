@@ -159,6 +159,49 @@ fn subject_key_fallback_rejects_nullable_key() {
 }
 
 #[test]
+fn identifier_field_ids_nullable_column_yields_no_safe_subject_key() {
+    // identifier_field_ids points at a NULLABLE column (not required, no proven
+    // null_fraction==0). Unlike a clean identifier hint, this must fail the
+    // non-null gate: no subject, a NoSafeSubjectKey diagnostic, and — crucially —
+    // it must NOT be indexed as an FK parent.
+    let parent = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, false), // nullable identifier
+            sc(2, "NAME", FieldType::String),
+        ],
+    );
+    // A child that WOULD join to WIDGET_KEY if the nullable identifier were
+    // (wrongly) indexed as a PK.
+    let child = tbl(
+        "FACT_USE",
+        vec![1],
+        vec![
+            ik(1, "USE_KEY", 1, 100, true),
+            ik(2, "WIDGET_KEY", 1, 100, false),
+        ],
+    );
+    let out = emit_r2rml(&[parent, child], &EmitOptions::default());
+
+    let widget = out.structured.table_mapping("DW.DIM_WIDGET").unwrap();
+    assert!(
+        widget.subject_template.is_empty(),
+        "a nullable identifier must emit no subject"
+    );
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+        .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
+
+    // Never indexed as a PK → the child's WIDGET_KEY resolves to no parent.
+    assert!(
+        !resolved_fks(&out)
+            .iter()
+            .any(|(ct, cc, _, _)| ct == "DW.FACT_USE" && cc == "WIDGET_KEY"),
+        "a nullable identifier must not be a valid FK parent"
+    );
+}
+
+#[test]
 fn no_safe_subject_key_emits_no_subject_and_never_invents_one() {
     let t = tbl(
         "WEIRD",
@@ -296,6 +339,63 @@ fn fk_self_join_resolves_when_name_aligned() {
         "DW.DIM_NODE".to_string(),
         "NODE_KEY".to_string(),
     )));
+}
+
+#[test]
+fn fk_join_locals_disambiguate_across_joins_not_just_literals() {
+    // Two parents whose PKs strip+camel to the SAME local: GEOGRAPHY_KEY and
+    // GEOGRAPHY_ID both → `geography`. A child referencing both must emit two
+    // DISTINCT predicate IRIs (the second `Ref`-suffixed), never one merged
+    // predicate that would collapse two relationships.
+    let geo_a = tbl(
+        "DIM_GEO_A",
+        vec![1],
+        vec![ik(1, "GEOGRAPHY_KEY", 1, 100, true)],
+    );
+    let geo_b = tbl(
+        "DIM_GEO_B",
+        vec![1],
+        vec![ik(1, "GEOGRAPHY_ID", 1, 100, true)],
+    );
+    let child = tbl(
+        "FACT_C",
+        vec![1],
+        vec![
+            ik(1, "C_KEY", 1, 100, true),
+            ik(2, "GEOGRAPHY_KEY", 1, 100, false),
+            ik(3, "GEOGRAPHY_ID", 1, 100, false),
+        ],
+    );
+    let out = emit_r2rml(&[geo_a, geo_b, child], &EmitOptions::default());
+
+    // Both FKs resolve to their distinct parents.
+    let fks = resolved_fks(&out);
+    assert!(fks.contains(&(
+        "DW.FACT_C".to_string(),
+        "GEOGRAPHY_KEY".to_string(),
+        "DW.DIM_GEO_A".to_string(),
+        "GEOGRAPHY_KEY".to_string(),
+    )));
+    assert!(fks.contains(&(
+        "DW.FACT_C".to_string(),
+        "GEOGRAPHY_ID".to_string(),
+        "DW.DIM_GEO_B".to_string(),
+        "GEOGRAPHY_ID".to_string(),
+    )));
+
+    // The two join predicate IRIs are DISTINCT.
+    let child_tm = out.structured.table_mapping("DW.FACT_C").unwrap();
+    let join_preds: Vec<&str> = child_tm
+        .columns
+        .iter()
+        .filter(|c| c.foreign_key.is_some())
+        .map(|c| c.predicate_iri.as_str())
+        .collect();
+    assert_eq!(join_preds.len(), 2);
+    assert_ne!(
+        join_preds[0], join_preds[1],
+        "colliding FK locals must not merge to one predicate IRI"
+    );
 }
 
 #[test]
@@ -1051,6 +1151,60 @@ fn single_table_round_trips() {
     crate::emit::roundtrip_check(&out).expect("DIM_DATE must round-trip");
     assert!(out.turtle.contains("rr:tableName \"DW.DIM_DATE\""));
     assert!(out.turtle.contains("{DATE_KEY}"));
+}
+
+#[cfg(feature = "turtle")]
+#[test]
+fn adversarial_names_escape_and_do_not_inject_predicate_object_maps() {
+    // A column name carrying Turtle-significant characters (`"`, `\`, newline)
+    // plus a crafted `] ; rr:predicate ... ; rr:column "` injection payload.
+    // Unescaped, the bare `"` closes `rr:column` and the tail becomes extra
+    // predicate-object maps; escaped, the document still parses and gains none.
+    let evil = "E\"VIL\\\n ] ; rr:predicate <http://x/inject> ; rr:column \"X";
+    let t = EmitTableSchema {
+        namespace: "DW".to_string(),
+        name: "DIM_WIDGET".to_string(),
+        identifier_field_ids: vec![1],
+        columns: vec![
+            ik(1, "WIDGET_KEY", 1, 100, true),
+            EmitColumn {
+                field_id: 2,
+                name: evil.to_string(),
+                iceberg_type: "string".to_string(),
+                field_type: FieldType::String,
+                required: false,
+                nested: false,
+                doc: None,
+                stats: EmitColumnStats::default(),
+            },
+        ],
+    };
+    let out = emit_r2rml(&[t], &EmitOptions::default());
+
+    // (a) The emitted Turtle compiles through the real loader and the IR
+    // reconstructs — proving the escaping is valid and lossless.
+    crate::emit::roundtrip_check(&out).expect("adversarial names must round-trip");
+
+    // (b) Exactly ONE TriplesMap, with exactly TWO predicate-object maps (the
+    // subject-key literal + the evil column's literal). The crafted name
+    // injected no extra map.
+    let compiled = crate::loader::R2rmlLoader::from_turtle(&out.turtle)
+        .unwrap()
+        .compile()
+        .unwrap();
+    assert_eq!(compiled.len(), 1, "no extra TriplesMap may be injected");
+    let maps = compiled.find_maps_for_table("DW.DIM_WIDGET");
+    assert_eq!(maps.len(), 1);
+    assert_eq!(
+        maps[0].predicate_object_maps.len(),
+        2,
+        "the crafted column name must not inject extra predicate-object maps"
+    );
+
+    // (c) The evil name survives verbatim in the IR (rendered escaped, parsed
+    // back intact) — no lossy mangling.
+    let tm = &out.structured.table_mappings[0];
+    assert!(tm.columns.iter().any(|c| c.column_name == evil));
 }
 
 // =============================================================================
