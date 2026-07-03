@@ -32,6 +32,16 @@ impl TargetHealth {
     }
 }
 
+/// Internal result of `dispatch_inner`: the final classified outcome
+/// plus a flag capturing whether we retried past a first-attempt
+/// `LeaderChange`. The retry-was-taken signal survives even when the
+/// retry succeeds, so callers (metrics) can count leader-change events
+/// separately from terminal outcomes.
+struct DispatchOutcome {
+    outcome: Outcome,
+    retried_from_leader_change: bool,
+}
+
 /// HTTP client + routing pool.
 ///
 /// Cheap to clone (everything inside is `Arc`'d), so every worker
@@ -122,6 +132,12 @@ impl ClusterClient {
             let now_ms = self.start.elapsed().as_millis() as u64;
             let until = now_ms.saturating_add(self.blacklist_window.as_millis() as u64);
             health.blacklist_until.store(until, Ordering::Relaxed);
+            // Clear the streak once the blacklist penalty has been
+            // applied. When the window expires and the target rejoins
+            // round-robin, it gets a fresh `blacklist_threshold`
+            // failures' worth of runway before being blacklisted
+            // again, matching the "consecutive failures" contract.
+            health.consecutive_failures.store(0, Ordering::Relaxed);
         }
     }
 
@@ -131,17 +147,18 @@ impl ClusterClient {
     /// actually experiences, which is what the operator cares about).
     pub async fn dispatch(&self, op: Op) -> OpResult {
         let started = Instant::now();
-        let outcome = self.dispatch_inner(&op).await;
+        let dispatched = self.dispatch_inner(&op).await;
         let latency_ns = started.elapsed().as_nanos() as u64;
         OpResult {
             kind: op.kind,
             ledger: op.ledger,
-            outcome,
+            outcome: dispatched.outcome,
             latency_ns,
+            retried_from_leader_change: dispatched.retried_from_leader_change,
         }
     }
 
-    async fn dispatch_inner(&self, op: &Op) -> Outcome {
+    async fn dispatch_inner(&self, op: &Op) -> DispatchOutcome {
         // First attempt — round-robin target.
         let idx = self.pick_target();
         let url = self.build_url(idx, op);
@@ -158,28 +175,26 @@ impl ClusterClient {
         // double-count latency. One leader-change retry against the
         // next target is conservative but useful: it stops a single
         // election from sinking every request in flight.
-        let outcome = if matches!(outcome, Outcome::LeaderChange) {
+        if matches!(outcome, Outcome::LeaderChange) {
             self.record_outcome(idx, outcome);
             let retry_idx = self.pick_target();
             let retry_url = self.build_url(retry_idx, op);
-            match self.build_request(retry_url, op).send().await {
-                Ok(resp) => {
-                    let o = self.classify_response(resp).await;
-                    self.record_outcome(retry_idx, o);
-                    o
-                }
-                Err(e) => {
-                    let o = classify_send_error(&e);
-                    self.record_outcome(retry_idx, o);
-                    o
-                }
+            let retry_outcome = match self.build_request(retry_url, op).send().await {
+                Ok(resp) => self.classify_response(resp).await,
+                Err(e) => classify_send_error(&e),
+            };
+            self.record_outcome(retry_idx, retry_outcome);
+            DispatchOutcome {
+                outcome: retry_outcome,
+                retried_from_leader_change: true,
             }
         } else {
             self.record_outcome(idx, outcome);
-            outcome
-        };
-
-        outcome
+            DispatchOutcome {
+                outcome,
+                retried_from_leader_change: false,
+            }
+        }
     }
 
     /// Assemble the request builder from an op. Consolidates the
@@ -226,13 +241,17 @@ impl ClusterClient {
         } else if status == StatusCode::SERVICE_UNAVAILABLE {
             // Distinguish leader-change from overloaded by body text.
             // The server returns 503 for both; the body hint is what
-            // separates them.
+            // separates them. Overload markers are checked first so
+            // a body mentioning both (e.g. "leader is overloaded")
+            // classifies as Overloaded — retrying an overload burns
+            // the target further, whereas leader-change retries are
+            // benign.
             let body = resp.text().await.unwrap_or_default();
             let lower = body.to_ascii_lowercase();
-            if lower.contains("not the leader") || lower.contains("leader") {
-                Outcome::LeaderChange
-            } else if lower.contains("overload") || lower.contains("admission") {
+            if lower.contains("overload") || lower.contains("admission") {
                 Outcome::Overloaded
+            } else if lower.contains("leader") {
+                Outcome::LeaderChange
             } else {
                 Outcome::ServerError
             }

@@ -602,16 +602,16 @@ cmd_up() {
     info "Starting containers..."
     "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d >/dev/null
 
-    info "Waiting for raft nodes to come up..."
+    info "Waiting for nodes to come up..."
     local deadline
     deadline=$(( $(date +%s) + 60 ))
     local i
     for i in $(seq 1 "$node_count"); do
-        local url
-        url="$(node_host_public_url "$i")/health"
-        while ! curl -fsS -m 2 "$url" >/dev/null 2>&1; do
+        local public_url
+        public_url="$(node_host_public_url "$i")/health"
+        while ! curl -fsS -m 2 "$public_url" >/dev/null 2>&1; do
             if [ "$(date +%s)" -gt "$deadline" ]; then
-                err "Timed out waiting for node $i ($url)"
+                err "Timed out waiting for node $i public listener ($public_url)"
                 warn "Recent logs:"
                 "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
                     logs --tail 20 "$(node_host "$i")"
@@ -619,6 +619,26 @@ cmd_up() {
             fi
             sleep 0.5
         done
+        # In raft mode, also verify the raft listener is bound before
+        # returning. Bootstrap's /cluster/* calls dial the raft port
+        # directly — a public listener that comes up before the raft
+        # one fails add-learner with connection-refused. Curl without
+        # -f accepts any HTTP response (including pre-init 4xx/5xx)
+        # since the goal is "listener is bound", not "endpoint says OK".
+        if [ "$mode" = "raft" ]; then
+            local raft_url
+            raft_url="$(node_host_raft_url "$i")/cluster/status"
+            while ! curl -sS -m 2 -o /dev/null "$raft_url" 2>/dev/null; do
+                if [ "$(date +%s)" -gt "$deadline" ]; then
+                    err "Timed out waiting for node $i raft listener ($raft_url)"
+                    warn "Recent logs:"
+                    "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+                        logs --tail 20 "$(node_host "$i")"
+                    exit 1
+                fi
+                sleep 0.5
+            done
+        fi
         ok "Node $i healthy at $(node_host_public_url "$i")"
     done
 
@@ -883,16 +903,44 @@ EOF
 
 # Raft only: /cluster/initialize + /cluster/add-learner * (N-1) +
 # /cluster/change-membership against node 1.
+# Per-call timeouts for bootstrap_raft's blocking POSTs. Without
+# `-m`, a hung or not-yet-ready raft peer makes `stack up` wait
+# forever with no diagnostic — the reviewer explicitly called this
+# out. `add-learner` sends `blocking: true`, which waits for the
+# learner to catch up before returning; give it more headroom than
+# the one-shot init / promote calls.
+BOOTSTRAP_INIT_TIMEOUT=15
+BOOTSTRAP_ADD_LEARNER_TIMEOUT=60
+BOOTSTRAP_PROMOTE_TIMEOUT=30
+
+# Emit a diagnostic and exit when a bootstrap curl call fails.
+# Prints the last few log lines from the involved container so an
+# operator has something to look at without hunting through the
+# whole compose log.
+bootstrap_curl_failed() {
+    local stage="$1"
+    local timeout="$2"
+    local node_container="$3"
+    err "Bootstrap failed at $stage (curl exit / ${timeout}s timeout)"
+    warn "Recent logs from $node_container:"
+    "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+        logs --tail 20 "$node_container" >&2 || true
+    exit 1
+}
+
 bootstrap_raft() {
     local node_count="$1"
     local leader_raft_url
     leader_raft_url="$(node_host_raft_url 1)"
+    local leader_container
+    leader_container="$(node_host 1)"
 
     info "Initializing raft cluster on node 1..."
     local init_body
     init_body="{\"members\":{$(build_member_json 1)}}"
-    curl -fsS -X POST -H 'Content-Type: application/json' \
-        -d "$init_body" "$leader_raft_url/cluster/initialize" >/dev/null
+    curl -fsS -m "$BOOTSTRAP_INIT_TIMEOUT" -X POST -H 'Content-Type: application/json' \
+        -d "$init_body" "$leader_raft_url/cluster/initialize" >/dev/null \
+        || bootstrap_curl_failed "initialize" "$BOOTSTRAP_INIT_TIMEOUT" "$leader_container"
     ok "Node 1 initialized as single-member cluster"
 
     [ "$node_count" -gt 1 ] || return 0
@@ -905,8 +953,9 @@ bootstrap_raft() {
         # alongside node_id and blocking, not nested under `addrs`.
         local add_body
         add_body="{\"node_id\":$i,\"raft_addr\":\"$(node_peer_raft_url "$i")\",\"client_addr\":\"$(node_peer_client_url "$i")\",\"blocking\":true}"
-        curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d "$add_body" "$leader_raft_url/cluster/add-learner" >/dev/null
+        curl -fsS -m "$BOOTSTRAP_ADD_LEARNER_TIMEOUT" -X POST -H 'Content-Type: application/json' \
+            -d "$add_body" "$leader_raft_url/cluster/add-learner" >/dev/null \
+            || bootstrap_curl_failed "add-learner node $i" "$BOOTSTRAP_ADD_LEARNER_TIMEOUT" "$(node_host "$i")"
         ok "Node $i caught up and joined as learner"
     done
 
@@ -915,8 +964,44 @@ bootstrap_raft() {
     members_json="$(seq 1 "$node_count" | paste -sd ',')"
     local promote_body
     promote_body="{\"members\":[$members_json],\"retain\":false}"
-    curl -fsS -X POST -H 'Content-Type: application/json' \
-        -d "$promote_body" "$leader_raft_url/cluster/change-membership" >/dev/null
+    curl -fsS -m "$BOOTSTRAP_PROMOTE_TIMEOUT" -X POST -H 'Content-Type: application/json' \
+        -d "$promote_body" "$leader_raft_url/cluster/change-membership" >/dev/null \
+        || bootstrap_curl_failed "change-membership" "$BOOTSTRAP_PROMOTE_TIMEOUT" "$leader_container"
+
+    # change-membership returning 2xx means the leader accepted the
+    # config change, not that it committed and every voter converged.
+    # Poll /cluster/status until the leader reports the expected
+    # voter set — surfaces a broken quorum here rather than at the
+    # first client request.
+    info "Verifying voter set converged..."
+    local expected_voters
+    expected_voters="[$members_json]"
+    local verify_deadline
+    verify_deadline=$(( $(date +%s) + 15 ))
+    local status_json actual_voters
+    while true; do
+        status_json="$(curl -fsS -m 3 "$leader_raft_url/cluster/status" 2>/dev/null || echo "")"
+        if [ -n "$status_json" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                actual_voters="$(echo "$status_json" | jq -rc '.voters | sort' 2>/dev/null || echo "")"
+            else
+                actual_voters="$(echo "$status_json" \
+                    | grep -oE '"voters":\[[0-9,]*\]' | sed 's/"voters"://' || echo "")"
+            fi
+            if [ "$actual_voters" = "$expected_voters" ]; then
+                break
+            fi
+        fi
+        if [ "$(date +%s)" -gt "$verify_deadline" ]; then
+            err "Voter set failed to converge to $expected_voters within 15s"
+            warn "Latest /cluster/status: ${status_json:-<no response>}"
+            warn "Recent logs from $leader_container:"
+            "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+                logs --tail 20 "$leader_container" >&2 || true
+            exit 1
+        fi
+        sleep 0.5
+    done
     ok "Voter set is now {$members_json}"
 }
 
@@ -1347,9 +1432,16 @@ cmd_logs() {
             --tail)
                 [ $# -ge 2 ] || die "--tail requires an argument"
                 tail_lines="$2"; shift 2 ;;
-            [1-9]|[1-9][0-9]|peer-[1-9]|peer-[1-9][0-9])
-                target="$1"; shift ;;
-            *) die "Unknown argument: $1 (try: $(basename "$0") help logs)" ;;
+            *)
+                # Accept any positive-integer node id or `peer-<n>`
+                # form — same regex `resolve_target_host` uses — so
+                # clusters with 100+ nodes aren't capped here.
+                if [[ "$1" =~ ^[1-9][0-9]*$ ]] || [[ "$1" =~ ^peer-[1-9][0-9]*$ ]]; then
+                    target="$1"; shift
+                else
+                    die "Unknown argument: $1 (try: $(basename "$0") help logs)"
+                fi
+                ;;
         esac
     done
 

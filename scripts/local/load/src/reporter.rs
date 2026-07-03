@@ -112,7 +112,32 @@ pub fn print_summary(snap: &MetricsSnapshot, run: &RunSummary) {
     }
     print_aggregate(&snap.aggregate);
     print_outcome_breakdown(snap);
+    print_leader_change_events(snap);
     print_ledger_distribution(snap);
+}
+
+fn print_leader_change_events(snap: &MetricsSnapshot) {
+    let mut rows: Vec<(OpKind, u64)> = OpKind::ALL
+        .iter()
+        .filter_map(|&kind| {
+            let n = snap
+                .per_kind_leader_change_retries
+                .get(&kind)
+                .copied()
+                .unwrap_or(0);
+            (n > 0).then_some((kind, n))
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    println!();
+    println!("─── Leader-change events ───");
+    println!("  (first-attempt LeaderChange; retry outcome landed separately in Outcomes)");
+    for (kind, count) in rows {
+        println!("    {:<16} {:>10}", kind.label(), count);
+    }
 }
 
 fn print_ledger_distribution(snap: &MetricsSnapshot) {
@@ -150,10 +175,11 @@ fn print_ledger_distribution(snap: &MetricsSnapshot) {
 }
 
 fn trim(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let head: String = s.chars().take(max - 1).collect();
+        format!("{head}…")
     }
 }
 

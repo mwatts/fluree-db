@@ -71,7 +71,7 @@ fluree iceberg map <NAME> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--s3-region <REGION>` | S3 region override |
-| `--s3-endpoint <URL>` | S3 endpoint override (for MinIO, LocalStack) |
+| `--s3-endpoint <URL>` | S3 endpoint override (e.g. MinIO, LocalStack, or `https://storage.googleapis.com` for Google Cloud Storage) |
 | `--s3-path-style` | Use path-style S3 URLs |
 
 **Other:**
@@ -90,7 +90,7 @@ An R2RML mapping (`--r2rml`) is required to define how Iceberg table rows are tr
 Two catalog modes are supported:
 
 - **REST mode** (default): Connects to an Iceberg REST catalog (e.g., Apache Polaris) to discover table metadata. Supports vended credentials and warehouse selection.
-- **Direct S3 mode**: Reads table metadata directly from S3 by resolving `version-hint.text` in the table's `metadata/` directory. No catalog server required.
+- **Direct S3 mode**: Reads table metadata directly from S3 by resolving `version-hint.text` in the table's `metadata/` directory. No catalog server required. Also reads **Google Cloud Storage** (`--s3-endpoint https://storage.googleapis.com`); GCS reads are signed with AWS SigV4 using GCS HMAC interop keys (the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) — see the [Iceberg guide](../graph-sources/iceberg.md#google-cloud-storage-gcs).
 
 ### Examples
 
@@ -115,6 +115,17 @@ fluree iceberg map execution-log \
   --table-location s3://my-bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl \
   --s3-region us-east-1
+
+# Direct mode on Google Cloud Storage.
+# Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY to your GCS HMAC interop keys
+# in the server environment (used to SigV4-sign GCS reads).
+fluree iceberg map orders \
+  --mode direct \
+  --table-location s3://my-bucket/warehouse/sales/orders \
+  --r2rml mappings/orders.ttl \
+  --s3-endpoint https://storage.googleapis.com \
+  --s3-region europe-west1 \
+  --s3-path-style
 
 # OAuth2 authentication
 fluree iceberg map orders \
@@ -154,10 +165,16 @@ Once mapped, the graph source appears in standard commands:
 fluree list
 
 # Inspect configuration
-fluree info warehouse-orders
+fluree iceberg info warehouse-orders
 
-# Query via SPARQL GRAPH pattern
-fluree query mydb 'SELECT ?id ?total FROM <mydb:main> WHERE { GRAPH <warehouse-orders:main> { ?o ex:id ?id ; ex:total ?total } }'
+# Query the graph source directly (single-target): name it as the target, with
+# no FROM. The CLI resolves it as a graph source and runs it through the
+# R2RML/Iceberg engine. Requires the `iceberg` feature.
+fluree query warehouse-orders 'SELECT ?id ?total WHERE { ?o ex:id ?id ; ex:total ?total }'
+
+# Federate into it: a query whose FROM names the source routes to the
+# connection-scoped path automatically (or force it with --connection).
+fluree query --connection 'SELECT ?id ?total FROM <warehouse-orders:main> WHERE { ?o ex:id ?id ; ex:total ?total }'
 
 # Remove the mapping
 fluree drop warehouse-orders --force

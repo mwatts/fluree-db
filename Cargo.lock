@@ -230,10 +230,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
- "arrow-csv",
  "arrow-data",
- "arrow-ipc",
- "arrow-json",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
@@ -303,22 +300,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow-csv"
-version = "54.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1644877d8bc9a0ef022d9153dc29375c2bda244c39aec05a91d0e87ccf77995f"
-dependencies = [
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
- "chrono",
- "csv",
- "csv-core",
- "lazy_static",
- "regex",
-]
-
-[[package]]
 name = "arrow-data"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,28 +322,6 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "flatbuffers",
-]
-
-[[package]]
-name = "arrow-json"
-version = "54.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ee5b4ca98a7fb2efb9ab3309a5d1c88b5116997ff93f3147efdc1062a6158e9"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
- "chrono",
- "half",
- "indexmap 2.13.0",
- "lexical-core",
- "memchr",
- "num",
- "serde",
- "serde_json",
- "simdutf8",
 ]
 
 [[package]]
@@ -878,7 +837,7 @@ dependencies = [
  "pin-project-lite",
  "rustls 0.21.12",
  "rustls 0.23.36",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.3",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -1210,8 +1169,8 @@ dependencies = [
  "log",
  "pin-project-lite",
  "rustls 0.23.36",
- "rustls-native-certs",
- "rustls-pemfile",
+ "rustls-native-certs 0.8.3",
+ "rustls-pemfile 2.2.0",
  "rustls-pki-types",
  "serde",
  "serde_derive",
@@ -1646,6 +1605,16 @@ name = "const-str"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f421161cb492475f1661ddc9815a745a1c894592070661180fdec3d4872e9c3"
+
+[[package]]
+name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "core-foundation"
@@ -2453,7 +2422,7 @@ checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fluree-bench-support"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "chrono",
  "rand 0.8.5",
@@ -2468,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-api"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2539,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-binary-index"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -2573,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-cli"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -2598,6 +2567,7 @@ dependencies = [
  "fluree-db-nameservice-sync",
  "fluree-db-novelty",
  "fluree-db-query",
+ "fluree-db-r2rml",
  "fluree-db-server",
  "fluree-vocab",
  "futures",
@@ -2632,7 +2602,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-connection"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2656,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-consensus"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2685,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-core"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -2720,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-credential"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -2735,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-crypto"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2752,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-cypher"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-db-core",
  "fluree-db-query",
@@ -2768,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-docs"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "pulldown-cmark",
  "rust-embed",
@@ -2779,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-iceberg"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -2787,12 +2757,14 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "bytes",
  "chrono",
  "dashmap",
  "fluree-db-core",
  "fluree-db-tabular",
  "futures",
+ "hyper-rustls 0.24.2",
  "lru 0.12.5",
  "parquet",
  "rand 0.8.5",
@@ -2809,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-indexer"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -2846,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-ledger"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -2862,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-mcp"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-db-docs",
  "fluree-db-memory",
@@ -2875,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-memory"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "chrono",
  "fluree-db-api",
@@ -2896,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-nameservice"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -2913,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-nameservice-sync"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2938,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-novelty"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2957,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-peer"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2979,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-policy"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-db-core",
  "fluree-vocab",
@@ -2992,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-query"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -3044,7 +3016,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-r2rml"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-tabular",
@@ -3061,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-reasoner"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -3078,7 +3050,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-server"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
@@ -3144,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-shacl"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -3157,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-sparql"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
@@ -3175,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-spatial"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -3208,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-storage-aws"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3229,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-storage-ipfs"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "cid",
@@ -3247,14 +3219,14 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-tabular"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "fluree-db-transact"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -3294,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-format"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -3306,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-ir"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-vocab",
  "pretty_assertions",
@@ -3317,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-json-ld"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -3330,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-turtle"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -3344,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-httpd"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3370,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-protocol"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3380,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-service"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -3398,14 +3370,14 @@ dependencies = [
 
 [[package]]
 name = "fluree-sse"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "fluree-vocab"
-version = "4.1.0"
+version = "4.1.1"
 
 [[package]]
 name = "fnv"
@@ -3983,6 +3955,7 @@ dependencies = [
  "hyper 0.14.32",
  "log",
  "rustls 0.21.12",
+ "rustls-native-certs 0.6.3",
  "tokio",
  "tokio-rustls 0.24.1",
 ]
@@ -3997,7 +3970,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "rustls 0.23.36",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.3",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -4959,6 +4932,12 @@ dependencies = [
 
 [[package]]
 name = "openssl-probe"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
+
+[[package]]
+name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
@@ -5117,12 +5096,14 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "flate2",
  "half",
  "hashbrown 0.15.5",
  "num",
  "num-bigint",
  "paste",
  "seq-macro",
+ "snap",
  "thrift",
  "twox-hash",
  "zstd",
@@ -6032,14 +6013,35 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9aace74cb666635c918e9c12bc0d348266037aa8eb599b5cba565709a8dff00"
+dependencies = [
+ "openssl-probe 0.1.6",
+ "rustls-pemfile 1.0.4",
+ "schannel",
+ "security-framework 2.11.1",
+]
+
+[[package]]
+name = "rustls-native-certs"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
 dependencies = [
- "openssl-probe",
+ "openssl-probe 0.2.1",
  "rustls-pki-types",
  "schannel",
- "security-framework",
+ "security-framework 3.5.1",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c74cae0a4cf6ccbbf5f359f08efdf8ee7e1dc532573bf0db71968cb56b1448c"
+dependencies = [
+ "base64 0.21.7",
 ]
 
 [[package]]
@@ -6209,12 +6211,25 @@ dependencies = [
 
 [[package]]
 name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.10.0",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3297343eaf830f66ede390ea39da1d462b6b0c1b000f420d0a83f898bbbe6ef"
 dependencies = [
  "bitflags 2.10.0",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
  "security-framework-sys",
@@ -6497,6 +6512,12 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "snap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "socket2"

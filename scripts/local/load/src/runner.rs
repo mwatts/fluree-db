@@ -108,27 +108,58 @@ async fn worker(
     stop: StopCondition,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    use std::sync::atomic::Ordering;
     loop {
         if *shutdown_rx.borrow() {
             return;
         }
-        if let StopCondition::TotalOps(cap) = &stop {
-            if issued.load(std::sync::atomic::Ordering::Relaxed) >= *cap {
-                return;
+        // Claim a slot before dispatching. For TotalOps mode this
+        // enforces the cap atomically — a CAS loop bumps `issued`
+        // only if the pre-increment value is strictly below the cap,
+        // so N concurrent workers at the boundary don't collectively
+        // overshoot by up to `concurrency`. Duration mode has no cap
+        // to gate against, so a plain fetch_add suffices.
+        match &stop {
+            StopCondition::TotalOps(cap) => {
+                let mut current = issued.load(Ordering::Relaxed);
+                loop {
+                    if current >= *cap {
+                        return;
+                    }
+                    match issued.compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => current = actual,
+                    }
+                }
+            }
+            StopCondition::Duration(_) => {
+                issued.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Slot claimed. Any bail-out before we hand the op to
+        // `dispatch` (or before `dispatch` returns a result to
+        // record) must refund the slot so the post-run invariant
+        // `issued == metrics.total` holds.
         let Some(op) = workload.next() else {
             // Workload had nothing to issue (e.g. transact-only with
             // empty pool, or wide-fanout in its pre-creates window).
             // Briefly yield and retry — beats spinning.
+            issued.fetch_sub(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(5)).await;
             continue;
         };
         let op_kind = op.kind;
         let ledger = op.ledger.clone();
-        issued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = tokio::select! {
-            _ = shutdown_rx.changed() => return,
+            _ = shutdown_rx.changed() => {
+                issued.fetch_sub(1, Ordering::Relaxed);
+                return;
+            },
             r = client.dispatch(op) => r,
         };
         metrics.record(
@@ -136,6 +167,7 @@ async fn worker(
             &result.ledger,
             result.outcome,
             result.latency_ns,
+            result.retried_from_leader_change,
         );
         // A landed CreateLedger adds to the pool every subsequent op
         // can target. Done after recording so the metric is stamped
