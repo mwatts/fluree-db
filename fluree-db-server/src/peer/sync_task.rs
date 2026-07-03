@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use fluree_db_api::{NotifyResult, NsNotify};
 use fluree_db_nameservice::{
     CasResult, NameServiceError, NameServiceEvent, NsRecord, RefKind, RefValue,
 };
@@ -300,11 +299,6 @@ impl PeerSyncTask {
                 "Remote ledger watermark updated (persisted to local NS)"
             );
         }
-
-        // 5. Notify LedgerManager (AFTER NS is updated, so reload sees new refs)
-        // Note: events are emitted automatically by NotifyingNameService when
-        // the CAS operations above succeed — no manual emission needed here.
-        self.refresh_cached_ledger(record).await;
     }
 
     /// Retract ledger locally and evict from cache.
@@ -322,57 +316,10 @@ impl PeerSyncTask {
             );
         }
 
-        // Note: retraction event emitted automatically by NotifyingNameService.
-
         // 2. Clear in-memory watermarks
         self.peer_state.remove_ledger(ledger_id).await;
 
-        // 3. Evict from cache
-        self.fluree.disconnect_ledger(ledger_id).await;
-
         tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
-    }
-
-    /// Notify LedgerManager to refresh a cached ledger from the NS update.
-    async fn refresh_cached_ledger(&self, record: &NsRecord) {
-        let Some(mgr) = self.fluree.ledger_manager() else {
-            return;
-        };
-
-        match mgr
-            .notify(NsNotify {
-                ledger_id: record.ledger_id.clone(),
-                record: Some(record.clone()),
-            })
-            .await
-        {
-            Ok(NotifyResult::NotLoaded) => {
-                // Not cached — do not cold-load on events
-            }
-            Ok(NotifyResult::Current) => {
-                // Already up to date
-            }
-            Ok(
-                result @ (NotifyResult::Reloaded
-                | NotifyResult::IndexUpdated
-                | NotifyResult::CommitsApplied { .. }),
-            ) => {
-                let after_t = mgr.current_t(&record.ledger_id).await;
-                tracing::debug!(
-                    alias = %record.ledger_id,
-                    after_cached_t = ?after_t,
-                    ?result,
-                    "refreshed cached ledger from SSE update"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    alias = %record.ledger_id,
-                    error = %e,
-                    "Failed to refresh cached ledger from SSE update"
-                );
-            }
-        }
     }
 
     /// Preload explicitly configured ledgers into the cache.
