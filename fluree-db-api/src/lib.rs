@@ -1149,7 +1149,7 @@ pub struct FlureeBuilder {
     /// instance instead of allocating its own, so external publishers
     /// and subscribers on `Fluree::event_bus()` share one broadcast
     /// channel.
-    event_bus_override: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
 }
 
 /// Configuration for background indexing in `FlureeBuilder`.
@@ -1364,7 +1364,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
-            event_bus_override: None,
+            event_bus: None,
         }
     }
 
@@ -1379,7 +1379,7 @@ impl FlureeBuilder {
             indexing_config: None,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
-            event_bus_override: None,
+            event_bus: None,
         }
     }
 
@@ -1446,7 +1446,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
-            event_bus_override: None,
+            event_bus: None,
         }
     }
 
@@ -1639,7 +1639,7 @@ impl FlureeBuilder {
             indexing_config,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
-            event_bus_override: None,
+            event_bus: None,
         })
     }
 
@@ -1784,7 +1784,7 @@ impl FlureeBuilder {
     /// observes notifications from every publisher wired to the
     /// supplied bus, with no bridge task between separate instances.
     pub fn with_event_bus(mut self, bus: Arc<fluree_db_nameservice::LedgerEventBus>) -> Self {
-        self.event_bus_override = Some(bus);
+        self.event_bus = Some(bus);
         self
     }
 
@@ -1793,7 +1793,7 @@ impl FlureeBuilder {
     /// a fresh bus with the historical default capacity. Called from
     /// every `build_*` path so the override behaviour is uniform.
     fn resolve_event_bus(&self) -> Arc<fluree_db_nameservice::LedgerEventBus> {
-        self.event_bus_override
+        self.event_bus
             .clone()
             .unwrap_or_else(|| Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)))
     }
