@@ -342,14 +342,19 @@ async fn build_tracked_mode(
 }
 
 /// Build a [`QueryTarget::Peer`]: an embedded Fluree whose reads go to the
-/// remote's raw storage tier (`ProxyStorage` in Raw mode, CID-verified) with
-/// a persistent per-remote disk cache for index artifacts.
+/// remote's raw storage tier with a persistent per-remote disk cache for
+/// index artifacts.
+///
+/// Storage negotiation: when the remote vends S3 credentials for the ledger
+/// (`GET /storage/credentials`), reads go directly to S3 with auto-refreshed
+/// scoped credentials; otherwise blocks proxy through the remote's HTTP
+/// endpoints (`ProxyStorage` in Raw mode, CID-verified).
 async fn build_peer_target(
     store: &TomlSyncConfigStore,
     tracked: &TrackedLedgerConfig,
     local_alias: &str,
 ) -> CliResult<QueryTarget> {
-    use fluree_db_api::{LedgerManagerConfig, NameServiceMode};
+    use fluree_db_api::{Fluree, LedgerManagerConfig, NameServiceMode};
     use fluree_db_nameservice_sync::{ProxyNameService, ProxyReadMode, ProxyStorage};
 
     let (base_url, auth) = tracked_remote_http(store, tracked, local_alias).await?;
@@ -363,11 +368,6 @@ async fn build_peer_target(
     })?;
     let client = build_client_from_auth(&base_url, &auth);
 
-    // Remote base URLs are API bases (ending in `/fluree`), so use the
-    // api-base constructors rather than the server-root ones.
-    let storage = ProxyStorage::from_api_base(base_url.clone(), token.clone(), ProxyReadMode::Raw);
-    let ns = ProxyNameService::from_api_base(base_url, token);
-
     // Persistent, per-remote artifact cache. Everything cached is
     // content-addressed and immutable, so entries never invalidate; the
     // nameservice head lookup (verify_freshness_on_cache_hit) is the only
@@ -378,9 +378,54 @@ async fn build_peer_target(
         ..Default::default()
     };
 
-    let fluree = FlureeBuilder::memory()
-        .with_ledger_cache_config(cache_config)
-        .build_with(storage, NameServiceMode::ReadOnly(std::sync::Arc::new(ns)));
+    fn assemble(
+        cache_config: LedgerManagerConfig,
+        storage: impl fluree_db_api::Storage + 'static,
+        ns: ProxyNameService,
+    ) -> Fluree {
+        FlureeBuilder::memory()
+            .with_ledger_cache_config(cache_config)
+            .build_with(storage, NameServiceMode::ReadOnly(std::sync::Arc::new(ns)))
+    }
+
+    // Remote base URLs are API bases (ending in `/fluree`), so use the
+    // api-base constructors rather than the server-root ones.
+    let ns = ProxyNameService::from_api_base(base_url.clone(), token.clone());
+
+    #[cfg(feature = "aws")]
+    let vended = match fluree_db_nameservice_sync::vended_s3::build_vended_s3_storage(
+        base_url.clone(),
+        token.clone(),
+        tracked.remote_alias.clone(),
+    )
+    .await
+    {
+        Ok(storage) => storage,
+        Err(e) => {
+            tracing::debug!(error = %e, "vended credential probe failed; using proxied reads");
+            None
+        }
+    };
+    #[cfg(not(feature = "aws"))]
+    let vended: Option<std::convert::Infallible> = None;
+
+    let fluree = match vended {
+        #[cfg(feature = "aws")]
+        Some(s3) => {
+            eprintln!(
+                "  {} reading '{}' directly from S3 (vended credentials)",
+                "notice:".dimmed(),
+                tracked.remote_alias
+            );
+            assemble(cache_config, s3, ns)
+        }
+        #[cfg(not(feature = "aws"))]
+        Some(_) => unreachable!(),
+        None => {
+            let storage = ProxyStorage::from_api_base(base_url, token, ProxyReadMode::Raw);
+            assemble(cache_config, storage, ns)
+        }
+    };
 
     Ok(QueryTarget::Peer {
         fluree: Box::new(fluree),

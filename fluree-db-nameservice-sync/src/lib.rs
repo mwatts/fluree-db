@@ -29,6 +29,8 @@ pub mod pack_client;
 pub mod proxy_nameservice;
 pub mod proxy_storage;
 mod server_sse;
+#[cfg(feature = "aws")]
+pub mod vended_s3;
 pub mod watch;
 pub mod watch_poll;
 pub mod watch_sse;

@@ -26,6 +26,16 @@ parking_lot = "0.12"
 urlencoding = { workspace = true }
 async-stream = "0.3"
 
+# Vended S3 credentials consumer (feature "aws")
+fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true, default-features = false, features = ["s3"] }
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+
+[features]
+# Consume vended S3 credentials: build an S3 reader from a grant minted by
+# a remote server's GET /storage/credentials endpoint.
+aws = ["dep:fluree-db-storage-aws", "dep:aws-config", "dep:aws-credential-types"]
+
 [dev-dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "test-util"] }

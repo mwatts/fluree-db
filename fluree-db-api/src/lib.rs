@@ -87,6 +87,8 @@ pub mod tx_builder;
 pub mod validate;
 #[cfg(feature = "vector")]
 pub mod vector_worker;
+#[cfg(feature = "aws")]
+pub mod vended_credentials;
 pub mod view;
 pub mod wire;
 

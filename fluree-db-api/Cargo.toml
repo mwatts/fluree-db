@@ -10,8 +10,9 @@ repository.workspace = true
 [features]
 default = ["native"]
 native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
-# Enable AWS-backed storage support (S3, storage-backed nameservice).
-aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws"]
+# Enable AWS-backed storage support (S3, storage-backed nameservice,
+# vended-credential minting).
+aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts"]
 # Iceberg / R2RML graph source support (pulls in AWS SDK + native deps). The
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
@@ -101,6 +102,7 @@ testcontainers = { version = "0.23", optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-sts = { workspace = true, optional = true }
 
 # HTTP client for remote search service (feature-gated)
 reqwest = { workspace = true, optional = true }
@@ -219,6 +221,11 @@ required-features = ["iceberg", "aws-testcontainers"]
 name = "it_storage_s3_testcontainers"
 path = "tests/it_storage_s3_testcontainers.rs"
 required-features = ["aws-testcontainers"]
+
+[[test]]
+name = "it_vended_credentials_testcontainers"
+path = "tests/it_vended_credentials_testcontainers.rs"
+required-features = ["aws", "aws-testcontainers"]
 
 [[test]]
 name = "it_graph_source_vector"

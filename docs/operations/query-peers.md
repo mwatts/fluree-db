@@ -142,6 +142,26 @@ Partial Content response (`Content-Range` included). The server verifies the
 the same corruption guarantee; peers use this for leaflet-granular index
 reads instead of pulling whole objects.
 
+#### `GET /v1/fluree/storage/credentials?ledger={ledger-id}`
+
+For S3-backed servers: mint short-lived STS credentials scoped to the
+ledger's S3 prefix so the peer reads index content **directly from S3**
+(native ranged reads, no origin bandwidth). Guarded exactly like raw object
+serving. Enable with:
+
+- **`--storage-vend-enabled`** (`FLUREE_STORAGE_VEND_ENABLED`)
+- **`--storage-vend-role-arn <arn>`** — IAM role the server assumes per
+  grant; the role's permissions are the ceiling, each grant is narrowed by a
+  session policy to the requested ledger's prefix. The server's own AWS
+  identity needs `sts:AssumeRole` on this role.
+- **`--storage-vend-ttl-secs`** (default 900, the STS minimum). A minted
+  grant stays valid until expiry — token revocations and `f:serveBlocks`
+  changes take effect at grant expiry, so keep TTLs short.
+
+Requires single-bucket S3 storage (split commit/index bucket layouts are
+refused). Peers probe this endpoint and fall back to proxied block reads on
+404, so enabling/disabling it is transparent to consumers.
+
 #### `POST /v1/fluree/storage/block`
 
 Fetch a block/blob by **CID** with policy mediation. The request includes the **ledger ID** so the server can authorize the request and derive the physical storage address internally. Currently supports:

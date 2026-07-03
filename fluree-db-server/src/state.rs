@@ -97,6 +97,12 @@ pub struct AppState {
     /// the presigned `.flpack` upload flow). Empty/unused unless
     /// `config.import_presign_enabled`.
     pub import_jobs: Arc<crate::import_jobs::ImportJobs>,
+
+    /// S3 vend scope for `GET /storage/credentials`, derived from the
+    /// connection config at startup. `None` when vending is disabled, the
+    /// backing storage isn't S3, or the commit/index buckets are split.
+    #[cfg(feature = "aws")]
+    pub storage_vend_scope: Option<fluree_db_api::vended_credentials::S3VendScope>,
 }
 
 /// Spawn the periodic LeafletCache stats logger task. Returned
@@ -219,6 +225,9 @@ impl AppState {
             index_config.clone(),
         ));
 
+        #[cfg(feature = "aws")]
+        let storage_vend_scope = resolve_storage_vend_scope(&config);
+
         Ok(Self {
             fluree,
             config,
@@ -237,6 +246,8 @@ impl AppState {
             query_refresh_last_checked: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
+            #[cfg(feature = "aws")]
+            storage_vend_scope,
         })
     }
 
@@ -420,6 +431,66 @@ async fn build_direct_fluree(
 
     let handle = spawn_leaflet_cache_stats_logger(&fluree);
     Ok((fluree, handle))
+}
+
+/// Derive the S3 vend scope from the server's connection config, when
+/// credential vending is enabled and the backing storage is S3.
+///
+/// Failures are downgraded to `None` with a log: the endpoint then answers
+/// 404 (consumers fall back to proxied block reads) instead of the server
+/// refusing to start.
+#[cfg(feature = "aws")]
+fn resolve_storage_vend_scope(
+    config: &ServerConfig,
+) -> Option<fluree_db_api::vended_credentials::S3VendScope> {
+    if !config.storage_vend_enabled {
+        return None;
+    }
+    if config.storage_vend_role_arn.is_none() {
+        tracing::error!(
+            "--storage-vend-enabled requires --storage-vend-role-arn; credential vending disabled"
+        );
+        return None;
+    }
+    let Some(path) = &config.connection_config else {
+        tracing::error!(
+            "--storage-vend-enabled requires S3-backed storage (connection config); \
+             credential vending disabled"
+        );
+        return None;
+    };
+
+    let json_str = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "vended credentials: cannot read connection config");
+            return None;
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "vended credentials: cannot parse connection config");
+            return None;
+        }
+    };
+    let conn = match fluree_db_connection::ConnectionConfig::from_json_ld(&json) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "vended credentials: invalid connection config");
+            return None;
+        }
+    };
+
+    let scope = fluree_db_api::vended_credentials::S3VendScope::from_connection_config(&conn);
+    if scope.is_none() {
+        tracing::error!(
+            "--storage-vend-enabled requires single-bucket S3 storage; credential vending disabled"
+        );
+    } else {
+        tracing::info!("vended S3 credentials enabled");
+    }
+    scope
 }
 
 /// Build a proxy-backed `Fluree` for peer proxy mode. Reads land

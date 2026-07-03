@@ -2384,6 +2384,37 @@ async fn test_serving_defaults_gate_and_advertisement() {
     );
 }
 
+/// Vended credentials answer 404 when vending is not configured — the
+/// consumer's signal to fall back to proxied block reads. (Positive-path
+/// minting is covered by the LocalStack test in fluree-db-api.)
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn test_vended_credentials_404_when_unconfigured() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state);
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/storage/credentials?ledger=any:main")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "file-backed server without vend config must answer 404"
+    );
+}
+
 /// Discovery advertises the coarse server-level serving capabilities.
 #[tokio::test]
 async fn test_discovery_advertises_serving_capabilities() {

@@ -231,6 +231,79 @@ pub struct BlockRequest {
 }
 
 // ============================================================================
+// Vended Credentials
+// ============================================================================
+
+/// Query params for the vended-credentials endpoint.
+#[cfg(feature = "aws")]
+#[derive(Debug, Deserialize)]
+pub struct CredentialsQuery {
+    /// Ledger alias (e.g., "mydb:main").
+    pub ledger: String,
+}
+
+/// GET /fluree/storage/credentials?ledger=...
+///
+/// Mint STS credentials scoped to the ledger's S3 prefix so an authorized
+/// peer reads index content directly from S3 (see
+/// `docs/design/remote-mounts.md`). Guarded exactly like raw object serving:
+/// bearer token scope, namespace guard, and the ledger's `f:serveBlocks`
+/// posture — all failures answer 404 (no existence leak; consumers fall
+/// back to proxied block reads).
+///
+/// Requires `--storage-vend-enabled`, `--storage-vend-role-arn`, and
+/// single-bucket S3-backed storage; otherwise the endpoint answers 404.
+#[cfg(feature = "aws")]
+pub async fn get_vended_credentials(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CredentialsQuery>,
+    StorageProxyBearer(principal): StorageProxyBearer,
+) -> Result<Json<fluree_db_api::vended_credentials::VendedS3Grant>, ServerError> {
+    let (Some(scope), Some(role_arn)) = (
+        state.storage_vend_scope.as_ref(),
+        state.config.storage_vend_role_arn.as_deref(),
+    ) else {
+        return Err(ServerError::not_found("Credential vending not available"));
+    };
+
+    // Namespace guard: `ledger` must be a real ledger (not a graph source).
+    let record = state
+        .fluree
+        .nameservice()
+        .lookup(&query.ledger)
+        .await
+        .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
+        .ok_or_else(|| ServerError::not_found("Ledger not found"))?;
+    let effective_ledger = record.ledger_id;
+
+    // Authorize: token scope must include this ledger.
+    if !principal.is_authorized_for_ledger(&effective_ledger) {
+        return Err(ServerError::not_found("Ledger not found"));
+    }
+
+    // Serving gate: the ledger's f:serveBlocks posture governs raw access.
+    // NOTE: unlike per-request block serving, a minted grant stays valid
+    // until it expires — posture changes take effect at grant expiry.
+    let serving =
+        crate::routes::serving::effective_serving(&state.fluree, &effective_ledger).await?;
+    if !serving.blocks {
+        return Err(ServerError::not_found("Ledger not found"));
+    }
+
+    let grant = fluree_db_api::vended_credentials::mint_scoped_credentials_ambient(
+        role_arn,
+        scope,
+        &effective_ledger,
+        state.config.storage_vend_ttl_secs,
+        principal.identity.as_deref(),
+    )
+    .await
+    .map_err(ServerError::Api)?;
+
+    Ok(Json(grant))
+}
+
+// ============================================================================
 // Range Requests
 // ============================================================================
 

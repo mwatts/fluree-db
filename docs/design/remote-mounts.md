@@ -118,6 +118,30 @@ selects by namespace prefix at exactly that point — so `LedgerState::load`,
 `BranchedContentStore` ancestry, and default-context reads all route with no
 changes. Admin operations (delete, list) apply only to the default backend.
 
+### Direct S3 access: vended credentials
+
+When the origin's storage is S3, it can hand full-access consumers
+short-lived credentials instead of proxying bytes: `GET
+/storage/credentials?ledger=…` (behind the same token-scope and
+`f:serveBlocks` guards as raw object serving) mints an STS `AssumeRole`
+session narrowed by a session policy to the ledger's **name-level** S3
+prefix — one grant covers every branch plus the name-scoped `@shared`
+dictionary namespace, matching the all-or-nothing raw tier. The response
+carries the credentials plus everything a reader needs (`bucket`, `region`,
+`endpoint`, `key_prefix`), and the consumer builds a normal S3 reader whose
+credentials auto-refresh from the endpoint as grants approach expiry
+(`fluree-db-nameservice-sync::vended_s3`). The CLI's peer mode probes the
+endpoint and prefers direct S3 (native ranged reads, no origin bandwidth);
+a 404 means "not vended here" and reads fall back to the HTTP proxy tier.
+
+Because everything fetched is CID-addressed, direct-from-S3 reads keep the
+same integrity and cache-forever semantics as proxied ones. Two deliberate
+limits: grants are only minted for **single-bucket** S3 layouts (a split
+commit/index configuration would need a two-tier grant), and revocation is
+expiry-bound — a minted grant outlives token revocation and `f:serveBlocks`
+changes until its TTL lapses, so TTLs default to the STS minimum (15
+minutes).
+
 ### Transport: `ProxyStorage` / `ProxyNameService`
 
 `fluree-db-nameservice-sync` (the HTTP client crate; the server re-exports
@@ -216,6 +240,7 @@ added without reworking v1:
   reinterpretation of `fluree.storage.*` (which remains full-access).
 
 Similarly reserved: `f:publicVisibility` for an anonymous (public dataset)
-tier, and origin/vended-credential handoff (`LedgerConfig.origins` already
-models prioritized external origins — S3/IPFS/CDN — so a full-access
-consumer could bypass the proxy entirely).
+tier, and generalizing the vended-credential handoff into
+`LedgerConfig.origins` (which already models prioritized external origins —
+S3/IPFS/CDN — so consumers could discover origins from the record rather
+than probing the credentials endpoint).

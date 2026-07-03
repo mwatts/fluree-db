@@ -3,7 +3,7 @@
 Track a remote ledger without storing local data. Tracked ledgers keep a lightweight record locally so you can use short aliases and the active-ledger shortcut. Two query modes are available:
 
 - **proxy** (default): reads and writes route to the remote server over HTTP — the remote executes your queries (its compute, row-level policy applied).
-- **peer**: queries execute **locally** against index blocks fetched on demand from the remote's raw storage tier, CID-verified and cached on disk per remote (see `fluree cache`). Writes still forward to the remote over HTTP. Requires a bearer token with `fluree.storage.*` scope for the ledger — the remote serves its full contents, so this mode is only offered for ledgers you may read in full (see [Remote mounts and serving tiers](../design/remote-mounts.md)).
+- **peer**: queries execute **locally** against index blocks fetched on demand from the remote's raw storage tier, CID-verified and cached on disk per remote (see `fluree cache`). Writes still forward to the remote over HTTP. Requires a bearer token with `fluree.storage.*` scope for the ledger — the remote serves its full contents, so this mode is only offered for ledgers you may read in full (see [Remote mounts and serving tiers](../design/remote-mounts.md)). When the remote vends S3 credentials (`GET /storage/credentials`), peer reads go directly to S3 automatically; otherwise blocks proxy through the remote's HTTP endpoints.
 
 Use `fluree remote ledgers <name>` to see which ledgers your token can access and which serving tiers (`query`, `blocks`) each offers.
 
