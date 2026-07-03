@@ -72,6 +72,50 @@ pub struct IndexConfig {
     pub reindex_max_bytes: usize,
 }
 
+/// Temporal metadata of the HEAD commit, tracked in memory so the commit
+/// build path can enforce event-time monotonicity and sticky dual-stamp
+/// emission with integer compares — no per-commit storage reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadTemporal {
+    /// HEAD commit's event time (`Commit.time`) as epoch milliseconds.
+    pub event_time_ms: i64,
+    /// HEAD commit's `db:receivedAt` txn-meta value (epoch milliseconds),
+    /// when present. `Some` means the ledger is in dual-stamp mode: once any
+    /// commit dual-stamps, all subsequent commits must too, so `@recorded:`
+    /// resolution stays exact from the flip point onward.
+    pub received_time_ms: Option<i64>,
+}
+
+impl HeadTemporal {
+    /// Whether the ledger is in sticky dual-stamp mode as of this commit.
+    pub fn dual_stamp(&self) -> bool {
+        self.received_time_ms.is_some()
+    }
+
+    /// Extract from a commit record. `None` when the commit has no
+    /// parseable `time` (legacy or malformed — callers fall back to
+    /// unguarded behavior rather than failing the load).
+    pub fn from_commit(commit: &Commit) -> Option<Self> {
+        let event_time_ms = fluree_db_novelty::iso_to_epoch_ms_opt(commit.time.as_deref()?)?;
+        let received_time_ms = commit.txn_meta.iter().find_map(|e| {
+            if e.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+                && e.predicate_name == fluree_vocab::db::RECEIVED_AT
+            {
+                match e.value {
+                    fluree_db_core::TxnMetaValue::Long(ms) => Some(ms),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+        Some(Self {
+            event_time_ms,
+            received_time_ms,
+        })
+    }
+}
+
 /// Ledger state combining indexed LedgerSnapshot with novelty overlay
 ///
 /// Provides a consistent view of the ledger by combining:
@@ -133,6 +177,13 @@ pub struct LedgerState {
     /// Each entry is `Arc<dyn SpatialIndexProvider>`. Set by `Fluree::ledger()`
     /// when spatial indexes are available in the binary index root.
     pub spatial_indexes: Option<TypeErasedStore>,
+    /// Temporal metadata of the HEAD commit (event time + dual-stamp flag).
+    ///
+    /// `None` means "not yet observed" — the ledger was loaded with no
+    /// novelty walk (index == head), so the commit build path lazily fetches
+    /// the head commit once and caches the result here. Kept current by
+    /// `apply_single_commit` and the commit build path.
+    pub head_temporal: Option<HeadTemporal>,
 }
 
 impl LedgerState {
@@ -219,7 +270,7 @@ impl LedgerState {
         // Load novelty from commits since index_t
         let head_commit_id = match &record.commit_head_id {
             Some(head_cid) if record.commit_t > snapshot.t => {
-                let (novelty_overlay, head_id) = Self::load_novelty(
+                let (novelty_overlay, head_id, head_temporal) = Self::load_novelty(
                     store,
                     head_cid,
                     snapshot.t,
@@ -247,6 +298,7 @@ impl LedgerState {
                     ns_record: Some(record),
                     binary_store: None,
                     spatial_indexes: None,
+                    head_temporal,
                 });
             }
             _ => record.commit_head_id.clone(),
@@ -266,6 +318,10 @@ impl LedgerState {
             ns_record: Some(record),
             binary_store: None,
             spatial_indexes: None,
+            // Index == head: no commit was walked, so the head's temporal
+            // metadata is unknown. The commit build path resolves it lazily
+            // (one head-commit fetch per loaded ledger, only when writing).
+            head_temporal: None,
         })
     }
 
@@ -277,7 +333,9 @@ impl LedgerState {
     /// Envelope deltas (namespace codes, graph IRIs) are accumulated and applied
     /// to the snapshot via `apply_envelope_deltas()` after the walk completes.
     ///
-    /// Returns the novelty overlay and the head commit's ContentId.
+    /// Returns the novelty overlay, the head commit's ContentId, and the
+    /// head commit's temporal metadata (captured from the first streamed
+    /// commit — the walk is HEAD → oldest).
     async fn load_novelty<C: ContentStore + Clone + 'static>(
         store: C,
         head_cid: &ContentId,
@@ -285,7 +343,7 @@ impl LedgerState {
         ledger_id: &str,
         snapshot: &mut LedgerSnapshot,
         dict_novelty: &mut DictNovelty,
-    ) -> Result<(Novelty, Option<ContentId>)> {
+    ) -> Result<(Novelty, Option<ContentId>, Option<HeadTemporal>)> {
         use std::collections::{HashMap, HashSet};
 
         let mut novelty = Novelty::new(index_t);
@@ -305,8 +363,16 @@ impl LedgerState {
         let stream = trace_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
+        let mut head_temporal: Option<HeadTemporal> = None;
+        let mut first_commit = true;
         while let Some(result) = stream.next().await {
             let commit = result?;
+
+            // The stream is HEAD → oldest, so the first commit is the head.
+            if first_commit {
+                head_temporal = HeadTemporal::from_commit(&commit);
+                first_commit = false;
+            }
 
             // Collect flakes for deferred replay
             let meta_flakes = generate_commit_flakes(&commit, ledger_id, commit.t);
@@ -372,7 +438,7 @@ impl LedgerState {
         // sorts, totaling `O(N log N)` regardless of M.
         novelty.bulk_apply_commits(commit_batches, &reverse_graph)?;
 
-        Ok((novelty, Some(head_cid.clone())))
+        Ok((novelty, Some(head_cid.clone()), head_temporal))
     }
 
     /// Create a new ledger state from components
@@ -396,7 +462,29 @@ impl LedgerState {
             ns_record: None,
             binary_store: None,
             spatial_indexes: None,
+            head_temporal: None,
         }
+    }
+
+    /// Resolve the HEAD commit's temporal metadata, fetching the head commit
+    /// once if it wasn't observed during load (index == head, no novelty
+    /// walk). Called by the commit path before building a new commit so the
+    /// event-time monotonicity guard and dual-stamp decision are
+    /// authoritative; at most one storage read per loaded ledger, and only
+    /// when writing — pure readers never pay it.
+    pub async fn ensure_head_temporal<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+    ) -> Result<Option<HeadTemporal>> {
+        if self.head_temporal.is_none() {
+            if let Some(cid) = &self.head_commit_id {
+                let bytes = store.get(cid).await?;
+                let commit = fluree_db_core::commit::codec::read_commit(&bytes)
+                    .map_err(|e| LedgerError::InvalidData(format!("head commit decode: {e}")))?;
+                self.head_temporal = HeadTemporal::from_commit(&commit);
+            }
+        }
+        Ok(self.head_temporal)
     }
 
     /// Get the current transaction time (max of index and novelty)
@@ -670,6 +758,30 @@ impl LedgerState {
             )));
         }
 
+        // Guard: event time must be monotonically non-decreasing along the
+        // chain. `datetime_to_t` (`@iso:` resolution) relies on this ordering;
+        // a violation would silently mis-resolve wall-clock time travel.
+        // Soft guard: only enforced when both sides are known — legacy commits
+        // without parseable times fall through rather than wedging the ledger.
+        let commit_temporal = HeadTemporal::from_commit(&commit);
+        if let (Some(prev), Some(new)) = (self.head_temporal, commit_temporal) {
+            if new.event_time_ms < prev.event_time_ms {
+                return Err(LedgerError::InvalidData(format!(
+                    "Cannot apply commit at t={commit_t}: event time {} is earlier than \
+                     the current head's event time {} (event time must be monotonically \
+                     non-decreasing)",
+                    new.event_time_ms, prev.event_time_ms
+                )));
+            }
+            if prev.dual_stamp() && !new.dual_stamp() {
+                return Err(LedgerError::InvalidData(format!(
+                    "Cannot apply commit at t={commit_t}: ledger is in dual-stamp mode \
+                     (head commit carries db:receivedAt) but this commit does not; \
+                     @recorded: resolution requires every post-flip commit to dual-stamp"
+                )));
+            }
+        }
+
         // Collect graph IRIs from graph_delta
         let graph_iris: std::collections::HashSet<String> =
             commit.graph_delta.values().cloned().collect();
@@ -737,6 +849,9 @@ impl LedgerState {
 
         // Update state
         self.head_commit_id = Some(commit_id.clone());
+        if commit_temporal.is_some() {
+            self.head_temporal = commit_temporal;
+        }
 
         // Update ns_record
         if let Some(ref mut record) = self.ns_record {

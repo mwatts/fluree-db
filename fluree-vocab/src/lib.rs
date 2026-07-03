@@ -1718,8 +1718,17 @@ pub mod db {
     /// db:previous - reference to previous commit
     pub const PREVIOUS: &str = "previous";
 
-    /// db:time - commit timestamp (epoch milliseconds)
+    /// db:time - commit timestamp (epoch milliseconds). This is the commit's
+    /// *event time*: user-suppliable (backdated historical loads) and the
+    /// axis `@iso:` time travel resolves against. Defaults to wall clock.
     pub const TIME: &str = "time";
+
+    /// db:receivedAt - wall-clock time the commit was actually recorded
+    /// (epoch milliseconds). System-controlled: emitted only on ledgers that
+    /// have used a caller-supplied event time (sticky dual-stamp mode), so
+    /// normal ledgers carry no extra metadata. The `@recorded:` time-travel
+    /// selector resolves against this axis for audit queries.
+    pub const RECEIVED_AT: &str = "receivedAt";
 
     /// db:message - commit message (optional)
     pub const MESSAGE: &str = "message";

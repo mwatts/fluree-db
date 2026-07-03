@@ -1491,7 +1491,35 @@ async fn execute_transaction(
         };
 
         let did = effective_did(&prepared_transaction.governance, author);
-        let commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
+        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
+
+        // `opts.eventTime`: caller-supplied event time for this commit
+        // (backdated historical loads). Validated for RFC 3339 shape at the
+        // boundary; monotonicity/future bounds are enforced by the commit
+        // build path against the ledger head. Recording the wall-clock
+        // receipt time alongside flips the ledger into dual-stamp mode so
+        // `@recorded:` (audit-axis) time travel stays exact.
+        if let Some(event_time_raw) = prepared_transaction
+            .body
+            .get("opts")
+            .and_then(|o| o.get("eventTime"))
+        {
+            let Some(event_time) = event_time_raw.as_str() else {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.eventTime must be an RFC 3339 timestamp string",
+                ));
+            };
+            if chrono::DateTime::parse_from_rfc3339(event_time).is_err() {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(format!(
+                    "opts.eventTime is not a valid RFC 3339 timestamp: {event_time}"
+                )));
+            }
+            commit_opts = commit_opts
+                .with_timestamp(event_time.to_string())
+                .with_received_at(chrono::Utc::now().to_rfc3339());
+        }
 
         // Pick up `opts.shapes` and `opts.uniqueProperties` from the body
         // so inline SHACL shapes and unique-property constraints reach the

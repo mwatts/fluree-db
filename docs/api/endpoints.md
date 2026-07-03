@@ -195,6 +195,20 @@ curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
   }'
 ```
 
+JSON-LD transaction with a caller-supplied event time (backdated commit — see
+[Time Travel: Event Time](../concepts/time-travel.md#event-time-backdated-commits);
+must be RFC 3339, monotonically non-decreasing along the ledger's commit
+chain, and not in the future):
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@graph": [{ "@id": "ex:alice", "ex:role": "Engineer" }],
+    "opts": { "eventTime": "2021-03-15T00:00:00Z" }
+  }'
+```
+
 SPARQL UPDATE (ledger-scoped endpoint):
 ```bash
 curl -X POST http://localhost:8090/v1/fluree/update/mydb:main \

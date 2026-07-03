@@ -99,6 +99,66 @@ Query at a specific commit using `@commit:` with a commit ContentId:
 }
 ```
 
+## Event Time: Backdated Commits
+
+Every commit carries an **event time** (`db:time` in the txn-meta graph) — the
+wall-clock instant the commit's changes are *about*. By default it is stamped
+with the current time at commit, but a transaction may supply its own:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@graph": [{ "@id": "ex:alice", "ex:role": "Engineer" }],
+  "opts": { "eventTime": "2021-03-15T00:00:00Z" }
+}
+```
+
+This is how historical data gets *real* time travel: replay a year of history
+as ordinary transactions, each stamped with the date the change actually
+happened, and `@iso:` queries work over that custom timeline with no further
+setup. (The Rust API equivalent is `CommitOpts::with_timestamp`.)
+
+Two rules keep the timeline coherent — both enforced at commit time:
+
+1. **Monotonic**: a commit's event time must be `>=` the head commit's event
+   time. `@iso:` resolution depends on this ordering; a fresh ledger's first
+   commit can carry any past time (there is no floor — pre-1970 works).
+2. **No future times**: event time may not exceed the current wall clock
+   (plus a small skew allowance). Commits are immutable, so one future-dated
+   stamp would otherwise permanently pin the ledger's timeline ahead of
+   reality.
+
+The default stamp is also clamped to the head's event time, so a system clock
+that steps backwards can no longer corrupt `@iso:` resolution.
+
+### Recorded Time: the Audit Axis (`@recorded:`)
+
+Once a ledger uses a caller-supplied event time, each commit records a second,
+system-controlled timestamp: **`db:receivedAt`** — the wall-clock time the
+commit was actually recorded. This begins at the first backdated commit and
+continues on every commit thereafter (sticky), so the audit trail has no gaps.
+Ledgers that never supply event times carry no extra metadata at all.
+
+The `@recorded:` selector time-travels along that axis:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@recorded:2026-01-15T00:00:00Z",
+  "select": ["?name"],
+  "where": [{ "@id": "?person", "ex:name": "?name" }]
+}
+```
+
+- `@iso:` answers *"what was true at this time?"* (event axis)
+- `@recorded:` answers *"what had been loaded into the ledger by this
+  time?"* (audit axis)
+
+On a ledger that never used `eventTime`, the two axes are identical and
+`@recorded:` behaves exactly like `@iso:`. Both timestamps live inside the
+signed commit envelope, so a signature attests to the claimed event time and
+the recording time together.
+
 ## Temporal Data Model
 
 ### Immutable Facts
@@ -142,8 +202,14 @@ Fluree primarily uses **transaction time** (when the fact was recorded in the da
 ```
 
 This allows you to query by both:
-- **Transaction time**: When was this recorded? (using `@t:`, `@iso:`, `@commit:`)
+- **Transaction time**: When was this recorded? (using `@t:`, `@recorded:`, `@commit:`)
 - **Valid time**: When was this true? (using standard WHERE clause filters on `ex:validFrom`/`ex:validTo`)
+
+For commit-granular valid time — importing historical data so `@iso:` time
+travel works over the dates things actually changed — see
+[Event Time: Backdated Commits](#event-time-backdated-commits) above. Explicit
+`validFrom`/`validTo` properties remain the right model for *fact*-granular
+intervals and overlapping validity.
 
 ## Snapshot and Indexing
 
@@ -393,7 +459,8 @@ Query changes for a specific property across all subjects:
 Different time specifiers have different performance characteristics:
 
 - **@t:NNN** (fastest): Direct transaction number, no resolution needed
-- **@iso:DATETIME**: O(log n) binary search through commit timestamps using POST index
+- **@iso:DATETIME**: O(log n) binary search through commit event timestamps using POST index
+- **@recorded:DATETIME**: Same POST-index probes over `db:receivedAt`; identical to `@iso:` cost (and identical *behavior* on ledgers that never used `eventTime`)
 - **@commit:CID**: Bounded SPOT scan, O(k) where k is commits matching prefix (use longer prefixes for better performance)
 
 ### Index Selection
@@ -679,11 +746,12 @@ This recreates the exact state across multiple ledgers at the time the bug occur
 
 ### Time Travel Resolution
 
-When you query with `@t:`, `@iso:`, or `@commit:`:
+When you query with `@t:`, `@iso:`, `@recorded:`, or `@commit:`:
 
 1. **@t:NNN** - Direct transaction number (fastest)
-2. **@iso:DATETIME** - Binary search through commit timestamps using POST index
-3. **@commit:CID** - Bounded SPOT scan to find matching commit
+2. **@iso:DATETIME** - Binary search through commit event timestamps using POST index
+3. **@recorded:DATETIME** - Same probes over `db:receivedAt` (audit axis), falling back to the event axis for history before the first backdated commit
+4. **@commit:CID** - Bounded SPOT scan to find matching commit
 
 ### Query Execution
 

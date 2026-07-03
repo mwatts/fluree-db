@@ -49,7 +49,9 @@ pub use commit::{
     CommitEnvelope, CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES,
     MAX_TXN_META_ENTRIES,
 };
-pub use commit_flakes::{generate_commit_flakes, stamp_graph_on_commit_flakes};
+pub use commit_flakes::{
+    generate_commit_flakes, iso_to_epoch_ms_opt, stamp_graph_on_commit_flakes,
+};
 pub use delta::compute_delta_keys;
 pub use error::{NoveltyError, Result};
 pub use fluree_db_core::commit::codec::envelope::{MAX_GRAPH_DELTA_ENTRIES, MAX_GRAPH_IRI_LENGTH};

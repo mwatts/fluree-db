@@ -185,6 +185,7 @@ fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
         fluree_db_api::TimeSpec::Latest => "@t:latest".to_string(),
         fluree_db_api::TimeSpec::AtT(t) => format!("@t:{t}"),
         fluree_db_api::TimeSpec::AtTime(iso) => format!("@iso:{iso}"),
+        fluree_db_api::TimeSpec::AtRecorded(iso) => format!("@recorded:{iso}"),
         fluree_db_api::TimeSpec::AtCommit(prefix) => format!("@commit:{prefix}"),
     }
 }

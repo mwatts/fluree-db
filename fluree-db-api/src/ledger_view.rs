@@ -180,6 +180,10 @@ impl LedgerView {
             ns_record: self.ns_record,
             binary_store: self.binary_store.map(|store| TypeErasedStore(store)),
             spatial_indexes: None,
+            // Read-path conversion: head temporal metadata is only needed by
+            // the write path, which resolves it lazily via
+            // `ensure_head_temporal`.
+            head_temporal: None,
         }
     }
 }
