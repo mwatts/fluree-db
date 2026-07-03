@@ -967,6 +967,41 @@ bootstrap_raft() {
     curl -fsS -m "$BOOTSTRAP_PROMOTE_TIMEOUT" -X POST -H 'Content-Type: application/json' \
         -d "$promote_body" "$leader_raft_url/cluster/change-membership" >/dev/null \
         || bootstrap_curl_failed "change-membership" "$BOOTSTRAP_PROMOTE_TIMEOUT" "$leader_container"
+
+    # change-membership returning 2xx means the leader accepted the
+    # config change, not that it committed and every voter converged.
+    # Poll /cluster/status until the leader reports the expected
+    # voter set — surfaces a broken quorum here rather than at the
+    # first client request.
+    info "Verifying voter set converged..."
+    local expected_voters
+    expected_voters="[$members_json]"
+    local verify_deadline
+    verify_deadline=$(( $(date +%s) + 15 ))
+    local status_json actual_voters
+    while true; do
+        status_json="$(curl -fsS -m 3 "$leader_raft_url/cluster/status" 2>/dev/null || echo "")"
+        if [ -n "$status_json" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                actual_voters="$(echo "$status_json" | jq -rc '.voters | sort' 2>/dev/null || echo "")"
+            else
+                actual_voters="$(echo "$status_json" \
+                    | grep -oE '"voters":\[[0-9,]*\]' | sed 's/"voters"://' || echo "")"
+            fi
+            if [ "$actual_voters" = "$expected_voters" ]; then
+                break
+            fi
+        fi
+        if [ "$(date +%s)" -gt "$verify_deadline" ]; then
+            err "Voter set failed to converge to $expected_voters within 15s"
+            warn "Latest /cluster/status: ${status_json:-<no response>}"
+            warn "Recent logs from $leader_container:"
+            "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+                logs --tail 20 "$leader_container" >&2 || true
+            exit 1
+        fi
+        sleep 0.5
+    done
     ok "Voter set is now {$members_json}"
 }
 
