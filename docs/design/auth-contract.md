@@ -51,9 +51,12 @@ The CLI fetches this endpoint when a remote is added (`fluree remote add`) to au
     "exchange_url": "https://data.example.com/v1/fluree/auth/exchange",
     "scopes": ["openid", "profile"],
     "redirect_port": 8400
-  }
+  },
+  "serving": { "query": true, "blocks": true }
 }
 ```
+
+The optional `serving` object advertises the server-wide serving capabilities: `query` (the server executes queries) and `blocks` (the storage proxy serves raw replication content, enabling peer/local-compute mode). Per-ledger posture may further restrict either tier — the authoritative per-ledger view is the `serving` array on `GET /v1/fluree/storage/ns/{ledger-id}` responses (see [Query peers](../operations/query-peers.md)).
 
 ### `api_base_url`
 
