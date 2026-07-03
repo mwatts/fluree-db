@@ -717,6 +717,27 @@ impl Fluree {
             )
             .await?;
 
+            // Cross-ledger ontology (f:schemaSource with f:ledger) merges the
+            // model ledger's hierarchy into policy class/property expansion.
+            let cross_ledger_schema = match view
+                .resolved_config
+                .as_ref()
+                .and_then(|c| c.reasoning.as_ref())
+            {
+                Some(reasoning) => crate::cross_ledger::resolve_schema_closure_bundle(
+                    reasoning,
+                    &view.snapshot,
+                    &mut ctx,
+                )
+                .await
+                .map_err(|e| {
+                    crate::error::ApiError::config(format!(
+                        "cross-ledger f:schemaSource resolution failed: {e}"
+                    ))
+                })?,
+                None => None,
+            };
+
             let policy_ctx =
                 crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(
                     &view.snapshot,
@@ -726,6 +747,7 @@ impl Fluree {
                     &effective_opts,
                     &[0], // identity-mode uses [0]; unused under cross-ledger
                     restrictions,
+                    cross_ledger_schema,
                 )
                 .await?;
             // Carry the per-ledger head-t captures forward onto
@@ -747,13 +769,45 @@ impl Fluree {
             vec![0]
         };
 
-        let policy_ctx = crate::policy_builder::build_policy_context_from_opts(
+        // Local policies may still entail through a cross-ledger ontology
+        // (f:schemaSource with f:ledger) — resolve it so f:onClass /
+        // f:onProperty expansion sees the model ledger's hierarchy.
+        let cross_ledger_schema = match view
+            .resolved_config
+            .as_ref()
+            .and_then(|c| c.reasoning.as_ref())
+            .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
+        {
+            Some(reasoning) => {
+                let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+                let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+                    &ledger_id_owned,
+                    self,
+                    (**view.cross_ledger_resolved_ts()).clone(),
+                );
+                crate::cross_ledger::resolve_schema_closure_bundle(
+                    reasoning,
+                    &view.snapshot,
+                    &mut ctx,
+                )
+                .await
+                .map_err(|e| {
+                    crate::error::ApiError::config(format!(
+                        "cross-ledger f:schemaSource resolution failed: {e}"
+                    ))
+                })?
+            }
+            None => None,
+        };
+
+        let policy_ctx = crate::policy_builder::build_policy_context_from_opts_with_schema(
             &view.snapshot,
             view.overlay.as_ref(),
             view.novelty_for_stats(),
             view.t,
             &effective_opts,
             &policy_graphs,
+            cross_ledger_schema,
         )
         .await?;
         Ok(view.with_policy(Arc::new(policy_ctx)))

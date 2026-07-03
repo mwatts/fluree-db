@@ -968,3 +968,101 @@ async fn policy_onproperty_governs_subproperties() {
         "property policy on ex:phone must deny the ex:homePhone subproperty"
     );
 }
+
+/// Cross-ledger RDFS entailment for policy: the class hierarchy lives in a
+/// model ledger (config `f:reasoningDefaults` / `f:schemaSource` with
+/// `f:ledger`); an `f:onClass ex:Employee` policy must govern Manager-typed
+/// subjects because `Manager rdfs:subClassOf Employee` is declared in M.
+#[tokio::test]
+async fn policy_onclass_governs_subclass_via_cross_ledger_schema() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Model ledger M: the ontology graph.
+    let model_id = "policy/xl-schema-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let ontology_iri = "http://example.org/governance/ontology";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            @prefix ex:   <http://example.org/ns/> .
+            GRAPH <{ontology_iri}> {{
+                ex:Manager rdfs:subClassOf ex:Employee .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M ontology");
+
+    // Data ledger D: config points the schema source at M; data has a
+    // Manager and an untyped-in-hierarchy Contractor.
+    let data_id = "policy/xl-schema-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let config_iri = format!("urn:fluree:{data_id}#config");
+    let r1 = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig ;
+                               f:reasoningDefaults <urn:cfg:reason> .
+                <urn:cfg:reason> f:schemaSource <urn:cfg:schema-ref> .
+                <urn:cfg:schema-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:schema-src> .
+                <urn:cfg:schema-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{ontology_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+                "@graph": [
+                    {"@id": "ex:pat", "@type": "ex:Manager", "schema:name": "Pat"},
+                    {"@id": "ex:sam", "@type": "ex:Contractor", "schema:name": "Sam"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed D data");
+
+    let policy = json!([
+        {
+            "@id": "ex:employeePolicy",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:onClass": [{"@id": "http://example.org/ns/Employee"}],
+            "f:allow": true
+        }
+    ]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": data_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger(data_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Pat"])),
+        "onClass Employee must govern Manager via M's cross-ledger hierarchy"
+    );
+}
