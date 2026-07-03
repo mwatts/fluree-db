@@ -480,16 +480,6 @@ fn score_bm25_novelty(
     score
 }
 
-/// Analyze query text with the default English analyzer and deduplicate stems.
-///
-/// Used on the `@fulltext`-datatype path where the bucket is always English.
-/// For language-aware lookup the caller should use
-/// [`analyze_and_dedup_query_with`] with the bucket's analyzer so the query
-/// stems match the arena's indexed stems.
-fn analyze_and_dedup_query(query_text: &str) -> Vec<String> {
-    analyze_and_dedup_query_with(&ENGLISH_ANALYZER, query_text)
-}
-
 /// Analyze query text with the caller-provided analyzer and deduplicate stems.
 fn analyze_and_dedup_query_with(analyzer: &Analyzer, query_text: &str) -> Vec<String> {
     let mut terms = analyzer.analyze_to_strings(query_text);
@@ -657,34 +647,56 @@ pub fn eval_fulltext<R: RowAccess>(
             p_id: lit_p_id,
             ..
         } => {
-            // Check if the datatype matches @fulltext (Sid fields: namespace_code, name)
-            let dt = dtc.datatype();
-            if !(dt.namespace_code == FLUREE_DB && dt.name.as_ref() == "fullText") {
-                return Ok(None);
-            }
-
             let text = match val {
                 FlakeValue::String(s) => s.as_str(),
                 _ => return Ok(None),
             };
 
-            // If p_id is available (from early materialization), use unified BM25
+            // Check if the datatype matches @fulltext (Sid fields: namespace_code, name)
+            let dt = dtc.datatype();
+            let is_fulltext_dt = dt.namespace_code == FLUREE_DB && dt.name.as_ref() == "fullText";
+
+            // Arena-based unified BM25 scoring — mirrors the EncodedLit arm.
+            //
+            // Materialized rows are the NORM whenever the ledger carries
+            // novelty: BinaryScanOperator disables late materialization for
+            // overlay epochs != 0, so every scanned value arrives here as
+            // `Binding::Lit` with `p_id` attached. Configured (non-`@fulltext`)
+            // values must score via their arena on this path too, otherwise
+            // `fulltext()` goes unbound for EVERY row the moment one
+            // unindexed commit exists.
             if let (Some(p_id), Some(ctx)) = (lit_p_id, ctx) {
                 let g_id = ctx.binary_g_id;
-                // `@fulltext`-datatype values carry no lang tag — always route
-                // through the English bucket, keyed by the dict-assigned `"en"` lang_id.
-                let lookup_lang_id = ctx.english_lang_id.unwrap_or(0);
+                // Resolve arena lang_id:
+                //   1. `@fulltext` datatype (never lang-tagged) → English bucket.
+                //   2. lang-tagged (rdf:langString) → the tag's dict-assigned id.
+                //   3. untagged strings → English bucket.
+                let lookup_lang_id = match dtc.lang_tag() {
+                    Some(tag) => ctx
+                        .binary_store
+                        .as_ref()
+                        .and_then(|s| s.resolve_lang_id(tag))
+                        .unwrap_or(0),
+                    None => ctx.english_lang_id.unwrap_or(0),
+                };
                 if let Some(arena) = ctx
                     .fulltext_providers
                     .and_then(|providers| providers.get(&(g_id, *p_id, lookup_lang_id)))
                 {
-                    let query_terms = analyze_and_dedup_query(&query_str);
+                    // Bucket's BCP-47 tag → analyzer; same choice that built the arena.
+                    let bucket_tag: String = ctx
+                        .binary_store
+                        .as_ref()
+                        .and_then(|s| s.resolve_language_tag(lookup_lang_id))
+                        .unwrap_or_else(|| "en".to_string());
+                    let bucket_analyzer = Analyzer::for_language(Language::from_bcp47(&bucket_tag));
+                    let query_terms = analyze_and_dedup_query_with(&bucket_analyzer, &query_str);
                     if query_terms.is_empty() {
                         return Ok(Some(ComparableValue::Double(0.0)));
                     }
 
                     let delta = get_or_build_delta(ctx, g_id, *p_id, lookup_lang_id);
-                    let doc_term_freqs = ENGLISH_ANALYZER.analyze_to_term_freqs(text);
+                    let doc_term_freqs = bucket_analyzer.analyze_to_term_freqs(text);
                     let doc_len = doc_term_freqs.values().sum::<u32>();
                     let score = score_bm25_novelty(
                         &doc_term_freqs,
@@ -697,7 +709,12 @@ pub fn eval_fulltext<R: RowAccess>(
                 }
             }
 
-            // Fallback: TF-saturation (no arena or no p_id)
+            // No arena (or no p_id): preserve pre-config semantics —
+            // non-`@fulltext` string values stay unbound; `@fulltext` values
+            // fall back to TF-saturation.
+            if !is_fulltext_dt {
+                return Ok(None);
+            }
             let score = score_tf_saturation(text, &query_str);
             Ok(Some(ComparableValue::Double(score)))
         }
@@ -854,7 +871,7 @@ mod tests {
             (30, "database query engine performance"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo");
+        let query_terms = analyze_and_dedup_query_with(&ENGLISH_ANALYZER, "cargo");
 
         // score_bm25_indexed with no delta
         let bow_10 = arena.doc_bow(10).unwrap();
@@ -883,7 +900,7 @@ mod tests {
             (20, "database performance tuning"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo runner");
+        let query_terms = analyze_and_dedup_query_with(&ENGLISH_ANALYZER, "cargo runner");
 
         // Score with unified (no delta) should produce same result as arena.score_bm25
         let bow = arena.doc_bow(10).unwrap();
@@ -909,7 +926,7 @@ mod tests {
             (20, "database performance tuning"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo");
+        let query_terms = analyze_and_dedup_query_with(&ENGLISH_ANALYZER, "cargo");
 
         // Create a delta simulating one novelty assertion with "cargo" in it
         let delta = NoveltyFulltextDelta {
@@ -937,7 +954,7 @@ mod tests {
             (20, "database performance tuning"),
         ]);
 
-        let query_terms = analyze_and_dedup_query("cargo");
+        let query_terms = analyze_and_dedup_query_with(&ENGLISH_ANALYZER, "cargo");
 
         // A novelty doc with the same content as doc 10 should score identically
         let doc_term_freqs = ENGLISH_ANALYZER.analyze_to_term_freqs("cargo nextest runner");
@@ -981,7 +998,7 @@ mod tests {
     #[test]
     fn test_analyze_and_dedup_query() {
         // Duplicate terms should be deduplicated
-        let terms = analyze_and_dedup_query("cargo cargo cargo");
+        let terms = analyze_and_dedup_query_with(&ENGLISH_ANALYZER, "cargo cargo cargo");
         // After stemming, "cargo" stays "cargo", should appear once
         let cargo_count = terms.iter().filter(|t| t.as_str() == "cargo").count();
         assert_eq!(
