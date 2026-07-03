@@ -1461,6 +1461,22 @@ mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
     mem:branch "feature/rdfs-enforcement-entailment" ;
     mem:createdAt "2026-07-03T01:47:55.655870+00:00"^^xsd:dateTime .
 
+mem:decision-01kwm1agwk619zyf6rsxrjj7ap a mem:Decision ;
+    mem:content "Remote-mount / query-peer feature v1 scope: ledger access over the block-serving (peer) path is all-or-nothing per (token, ledger) — full-access raw CAS bytes (CID-verifiable, globally cacheable) or nothing; plus a public/anonymous tier. No policy-filtered (FLKB) leaf serving to peers in v1 — fine-grained permissions require query-shipping (server executes with row-level policy). Requires adding a full-access raw mode to the storage proxy (EnforcementMode::TrustedInternal gated on token scope; today PolicyEnforced/FLKB is the only proxy mode). v2 hooks: FLKB negotiation stays in ProxyStorage, serving advertisement uses distinct \"blocks\" vs future \"blocks:filtered\", cache writes carry a CID-verified flag." ;
+    mem:tag "caching" ;
+    mem:tag "feature-design" ;
+    mem:tag "peer-mode" ;
+    mem:tag "policy" ;
+    mem:tag "remote-mounts" ;
+    mem:tag "storage-proxy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/block_fetch.rs" ;
+    mem:artifactRef "fluree-db-server/src/peer/proxy_storage.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/storage_proxy.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T13:05:10.035196+00:00"^^xsd:dateTime ;
+    mem:rationale "Avoids the two hardest v1 problems: filtered leaves are not immutable (policy changes make cached filtered views a revocation leak) and non-byte-identical payloads break CAS integrity checks. All-or-nothing keeps every peer-fetched block canonical and cache-forever." .
+
 mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
     mem:content "RDFS enforcement entailment (feature/rdfs-enforcement-entailment): always-on subclass+subproperty inference for SHACL and Policy. Epoch counters on Novelty bumped in apply_commit's routing loop (schema_epoch: subClassOf/subPropertyOf; shacl_epoch: sh:* predicates or rdf:type→SHACL-type/rdfs:Class/owl:Class) + two Arc caches on LedgerState carried across commits: SchemaHierarchyCache (core; keyed indexed-schema-t + schema_epoch) and a type-erased compiled-SHACL slot (+shacl_epoch +shapes_g_ids; data-only txns skip ShapeCompiler via ShaclEngine::from_shared_cache). RULE: enforcement uses COMMITTED hierarchy — same-txn schema does not entail (two-txn workflow, pinned by test)." ;
     mem:tag "enforcement" ;
@@ -1476,6 +1492,80 @@ mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
     mem:artifactRef "fluree-db-policy/src/index.rs" ;
     mem:branch "feature/rdfs-enforcement-entailment" ;
     mem:createdAt "2026-07-03T01:47:52.379794+00:00"^^xsd:dateTime .
+
+mem:fact-01kwktkb2r0ktxt5xaxvbwev3e a mem:Fact ;
+    mem:content "The \"query peer over HTTP\" model exists as server peer proxy mode: ProxyStorage + ProxyNameService wired via FlureeBuilder::memory().build_with(storage, NameServiceMode::ReadOnly); serving side is the StorageProxyBearer route group; GET /nameservice/snapshot filters to the token's fluree.storage.ledgers scope. ProxyStorage is mode-aware (feature/remote-mounts): ProxyReadMode::Raw fetches canonical CID-verified bytes via GET /storage/objects/{cid} (peer default; what makes indexed ledgers readable), ProxyReadMode::Filtered uses POST /storage/block FLKB negotiation. CRITICAL: no production code decodes FLKB — the filtered tier is transport-only until a leaf decoder exists on the read path. Remaining gaps: one upstream per server (no composite nameservice), no HTTP Range on ProxyStorage, no vended-credential/origin handoff." ;
+    mem:tag "auth" ;
+    mem:tag "federation" ;
+    mem:tag "nameservice" ;
+    mem:tag "peer-mode" ;
+    mem:tag "remote" ;
+    mem:tag "storage-proxy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-server/src/peer/proxy_nameservice.rs" ;
+    mem:artifactRef "fluree-db-server/src/peer/proxy_storage.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/nameservice_refs.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/storage_proxy.rs" ;
+    mem:artifactRef "fluree-db-server/src/state.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T11:07:38.968674+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future \"connect to external Fluree as a data source\" feature should extend peer proxy mode rather than invent a new graph-source kind; re-discovering this subsystem map cost four parallel explorations." .
+
+mem:constraint-01kwm1fjv37hjcfsga916mc5wv a mem:Constraint ;
+    mem:content "docs/design/ files must document permanent design — what exists and how it works — never phased plans, roadmaps, or implementation sequencing. Planning content goes in a temporary file elsewhere (scratchpad or uncommitted), not in docs/design/." ;
+    mem:tag "design-docs" ;
+    mem:tag "docs" ;
+    mem:tag "user-feedback" ;
+    mem:tag "workflow" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T13:07:55.875908+00:00"^^xsd:dateTime ;
+    mem:rationale "User feedback when starting the remote-mounts feature: a proposed design doc had drifted toward a work plan (implementation slices/phases). Same spirit as the existing rule against plan labels in code comments and commit bodies." .
+
+mem:fact-01kwm585khra36js0r49n36k06 a mem:Fact ;
+    mem:content "Tests that run a peer-mode Fluree query against an in-process axum server must use #[tokio::test(flavor = \"multi_thread\")]: lazy dict-blob materialization during query execution bridges sync→async (block_on), which starves a current-thread runtime so the in-process server can never answer the HTTP fetch — the ProxyStorage request times out after its full 60s. See test_peer_proxy_fluree_queries_indexed_ledger." ;
+    mem:tag "gotcha" ;
+    mem:tag "peer-mode" ;
+    mem:tag "sync-bridge" ;
+    mem:tag "testing" ;
+    mem:tag "tokio" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-server/tests/proxy_integration.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T14:13:47.249260+00:00"^^xsd:dateTime .
+
+mem:fact-01kwm9svy064yer4ek7rn251hh a mem:Fact ;
+    mem:content "Per-ledger serving posture = f:servingDefaults setting group (f:serveQuery/f:serveBlocks/f:publicVisibility, ledger-scoped, LedgerConfig.serving) enforced only on transaction-role servers: query gate in load_ledger_for_query (403 stable msg), blocks gate in storage_proxy/pack/commits (404). GOTCHA: @shared dict-blob addresses carry only the ledger NAME, so ProxyStorage derives a default-branch alias — any server-side per-ledger guard on block/object endpoints must branch-resolve DictBlob requests via list_branches (resolve_block_ledger in storage_proxy.rs) or non-main-branch peers break on dict fetches. Legacy per-branch dict layout ({name}/{branch}/index/objects/dicts) is also parsed by cid_and_ledger_from_address." ;
+    mem:tag "config-graph" ;
+    mem:tag "dict-blob" ;
+    mem:tag "gotcha" ;
+    mem:tag "peer-mode" ;
+    mem:tag "serving-defaults" ;
+    mem:tag "storage-proxy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/config_resolver.rs" ;
+    mem:artifactRef "fluree-db-core/src/ledger_config.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/serving.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/storage_proxy.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T15:33:21.472958+00:00"^^xsd:dateTime .
+
+mem:fact-01kwmb5yq11y50j3kbd7c5tne4 a mem:Fact ;
+    mem:content "Remote mounts: FlureeBuilder::with_remote_mount(RemoteMountSpec) applies in finalize_with_backend → CompositeNameService (prefix-routed reads, records localized to \"acme/inventory:main\", writes to mounts rejected, full publisher surface) + StorageBackend::Routed (namespace-prefix → mount backend at the content_store seam; admin ops = default only). ProxyStorage/ProxyNameService live in fluree-db-nameservice-sync (server peer/* re-exports); ProxyStorage::with_local_prefix strips the mount prefix from derived aliases. Transact writes to mounts fail at routed ProxyStorage (read-only) before the NS guard — the guard backstops create/branch/publish." ;
+    mem:tag "builder" ;
+    mem:tag "composite-nameservice" ;
+    mem:tag "peer-mode" ;
+    mem:tag "remote-mounts" ;
+    mem:tag "storage-backend" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-core/src/storage.rs" ;
+    mem:artifactRef "fluree-db-nameservice-sync/src/proxy_storage.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/mount.rs" ;
+    mem:artifactRef "fluree-db-server/tests/proxy_integration.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T15:57:26.113125+00:00"^^xsd:dateTime .
 
 mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
     mem:content "SPARQL property paths, branch feature/sparql-property-paths: closed ALL reported gaps PLUS inverse-in-composite (wired in BOTH sparql lower/path.rs AND query parse/lower.rs for JSON-LD parity). (1) ZeroOrOne p?: PathModifier::ZeroOrOne; BFS self+1hop. (2) Negated sets !: fresh ?__np{n} pred-var triple + FILTER(?p != IRI(...)); fwd/inv/mixed=UNION. (3) Nested modifiers (p*)*: collapse_modifiers (zero=any */?, unbounded=any +/*). (4) Composite-transitive (a/b)+ incl inverse steps (^a/b)+: PropertyPathPattern has predicates+first_inverse+sequence_steps:Vec<PathStep{predicates,inverse}>; operator's read_step reads SPOT/POST by direction (opposite index when retreating); single_predicate() bails on composite. ONLY UNSUPPORTED (niche): nested transitive step in a composite unit (a+/b)+ — not exercised by any W3C test." ;
