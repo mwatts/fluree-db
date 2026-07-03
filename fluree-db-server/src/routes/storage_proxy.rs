@@ -206,6 +206,12 @@ pub struct NsRecordResponse {
     /// invariant.
     #[serde(skip_serializing_if = "is_zero")]
     pub branches: u32,
+    /// Serving tiers this server offers for the ledger (`"query"`,
+    /// `"blocks"`), computed from the ledger's `f:servingDefaults`.
+    /// Clients use this to pick between query-shipping and peer (local
+    /// compute) modes. Omitted when the posture could not be resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving: Option<Vec<&'static str>>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -222,6 +228,74 @@ pub struct BlockRequest {
     pub cid: String,
     /// Ledger alias (e.g., `"mydb:main"`)
     pub ledger: String,
+}
+
+// ============================================================================
+// Range Requests
+// ============================================================================
+
+/// Parse a single-range `Range: bytes=start-end` header into a half-open
+/// byte range. Returns `None` for absent, malformed, multi-range, or
+/// suffix-form (`bytes=-N`) headers — callers fall back to a full 200
+/// response, which is always a valid way to satisfy a Range request.
+fn parse_range_header(headers: &HeaderMap) -> Option<std::ops::Range<u64>> {
+    let value = headers.get(header::RANGE)?.to_str().ok()?;
+    let spec = value.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let start: u64 = start_s.trim().parse().ok()?;
+    let end = if end_s.trim().is_empty() {
+        u64::MAX
+    } else {
+        // HTTP ranges are inclusive; convert to half-open.
+        end_s.trim().parse::<u64>().ok()?.checked_add(1)?
+    };
+    (start < end).then_some(start..end)
+}
+
+// ============================================================================
+// Ledger Resolution
+// ============================================================================
+
+/// Resolve the ledger a block/object request refers to.
+///
+/// Acts as the namespace guard (graph-source aliases and unknown ledgers
+/// resolve to `None`) and normalizes the alias to the canonical `ledger_id`.
+///
+/// Dict blobs need special handling: their `@shared` addresses carry only the
+/// ledger *name*, so proxy clients derive a default-branch alias that may not
+/// exist when the ledger lives on another branch. For dict-blob CIDs, fall
+/// back to any live branch of the same name — dict content is name-scoped,
+/// so any branch is equivalent for authorization and address derivation.
+async fn resolve_block_ledger(
+    fluree: &fluree_db_api::Fluree,
+    kind: ContentKind,
+    ledger: &str,
+) -> Result<Option<String>, ServerError> {
+    let ns = fluree.nameservice();
+    if let Some(record) = ns
+        .lookup(ledger)
+        .await
+        .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
+    {
+        return Ok(Some(record.ledger_id));
+    }
+
+    if matches!(kind, ContentKind::DictBlob { .. }) {
+        if let Ok((name, _)) = fluree_db_core::ledger_id::split_ledger_id(ledger) {
+            let branches = ns
+                .list_branches(&name)
+                .await
+                .map_err(|e| ServerError::internal(format!("Branch listing failed: {e}")))?;
+            if let Some(record) = branches.into_iter().next() {
+                return Ok(Some(record.ledger_id));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 // ============================================================================
@@ -259,6 +333,17 @@ pub async fn get_ns_record(
         .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
         .ok_or_else(|| ServerError::not_found("Ledger not found"))?;
 
+    // Advertise the serving tiers this server offers for the ledger.
+    // Best-effort: a ledger that fails to load can't resolve its posture,
+    // and the record lookup itself should still succeed.
+    let serving = match crate::routes::serving::effective_serving(&state.fluree, &ledger_id).await {
+        Ok(s) => Some(s.advertised()),
+        Err(e) => {
+            tracing::warn!(ledger_id, error = %e, "serving posture unresolved; omitting from NS record");
+            None
+        }
+    };
+
     Ok(Json(NsRecordResponse {
         // IMPORTANT: this endpoint is consumed by `fluree-db-nameservice-sync` which
         // deserializes into `NsRecord`. Therefore we must include all required
@@ -287,6 +372,7 @@ pub async fn get_ns_record(
             .map(std::string::ToString::to_string),
         source_branch: ns_record.source_branch.clone(),
         branches: ns_record.branches,
+        serving,
     }))
 }
 
@@ -329,21 +415,16 @@ pub async fn get_block(
         .content_kind()
         .filter(|k| block_fetch::is_allowed_block_kind(*k))
         .ok_or_else(|| ServerError::not_found("Block not found"))?;
-    // Suppress unused variable warning — `kind` validated above, address derived by
-    // `fetch_and_decode_block` internally.
-    let _ = kind;
 
-    // 3. Namespace guard: ensure `body.ledger` is a real ledger (not a graph source alias)
+    // 3. Namespace guard: resolve `body.ledger` to a real ledger (not a graph
+    //    source alias); dict-blob requests may need branch resolution.
     let fluree = &state.fluree;
-    fluree
-        .nameservice()
-        .lookup(&body.ledger)
-        .await
-        .map_err(|e| ServerError::internal(format!("Nameservice lookup failed: {e}")))?
+    let effective_ledger = resolve_block_ledger(fluree, kind, &body.ledger)
+        .await?
         .ok_or_else(|| ServerError::not_found("Block not found"))?;
 
     // 4. Authorize: token scope must include this ledger
-    block_fetch::authorize_ledger(&principal.to_block_access_scope(), &body.ledger)
+    block_fetch::authorize_ledger(&principal.to_block_access_scope(), &effective_ledger)
         .map_err(|_| ServerError::not_found("Block not found"))?;
 
     // Get storage proxy config for defaults and debug headers
@@ -367,14 +448,24 @@ pub async fn get_block(
     // Load ledger context for leaf decoding + policy filtering
     // Force a fresh load so policy evaluation sees current data.
     // This avoids stale-cache issues after reindex updates.
-    fluree.disconnect_ledger(&body.ledger).await;
+    fluree.disconnect_ledger(&effective_ledger).await;
 
     let handle = fluree
-        .ledger_cached(&body.ledger)
+        .ledger_cached(&effective_ledger)
         .await
         .map_err(|e| ServerError::internal(format!("Ledger load failed: {e}")))?;
     let snapshot = handle.snapshot().await;
     let to_t = snapshot.snapshot.t;
+
+    // Serving gate: honor the ledger's f:serveBlocks posture (404 per the
+    // no-existence-leak convention on this endpoint).
+    let serving = crate::routes::serving::effective_serving_from_state(
+        &handle.snapshot().await.to_ledger_state(),
+    )
+    .await?;
+    if !serving.blocks {
+        return Err(ServerError::not_found("Block not found"));
+    }
     let ledger_ctx = LedgerBlockContext {
         snapshot: &snapshot.snapshot,
         to_t,
@@ -388,7 +479,7 @@ pub async fn get_block(
         .ok_or_else(|| ServerError::internal("block fetch requires a managed storage backend"))?;
     let fetched = block_fetch::fetch_and_decode_block(
         &admin_storage,
-        &body.ledger,
+        &effective_ledger,
         &cid,
         Some(&ledger_ctx),
         &mode,
@@ -502,19 +593,30 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 /// # Query Parameters
 /// - `ledger`: Ledger alias (required, e.g., `"mydb:main"`)
 ///
+/// # Range Requests
+///
+/// A single-range `Range: bytes=start-end` header returns 206 Partial
+/// Content with a `Content-Range` header. Integrity is verified against the
+/// **full** object before slicing, so partial responses carry the same
+/// corruption guarantee as full ones. Unsupported Range forms fall back to a
+/// full 200 response; a start at or past the object length returns 416.
+///
 /// # Response Headers
 /// - `Content-Type: application/octet-stream`
 /// - `X-Fluree-Content-Kind`: content kind label (commit, txn, config, index-root, etc.)
+/// - `Content-Range` (206 responses)
 ///
 /// # Errors
 /// - 400: Invalid CID string
 /// - 404: Object not found, disallowed kind, or not authorized
+/// - 416: Range start beyond object length
 /// - 500: Hash verification failed (storage corruption)
 pub async fn get_object_by_cid(
     State(state): State<Arc<AppState>>,
     Path(cid_str): Path<String>,
     Query(query): Query<ObjectQuery>,
     StorageProxyBearer(principal): StorageProxyBearer,
+    headers: HeaderMap,
 ) -> Result<Response, ServerError> {
     // 1. Parse CID
     let id: ContentId = cid_str
@@ -528,8 +630,22 @@ pub async fn get_object_by_cid(
         _ => return Err(ServerError::not_found("Object not found")),
     };
 
-    // 3. Authorize: principal must have access to this ledger
-    if !principal.is_authorized_for_ledger(&query.ledger) {
+    // 3. Namespace guard: resolve `ledger` to a real ledger (not a graph
+    //    source alias); dict-blob requests may need branch resolution.
+    let effective_ledger = resolve_block_ledger(&state.fluree, kind, &query.ledger)
+        .await?
+        .ok_or_else(|| ServerError::not_found("Object not found"))?;
+
+    // 3b. Authorize: principal must have access to the resolved ledger.
+    if !principal.is_authorized_for_ledger(&effective_ledger) {
+        return Err(ServerError::not_found("Object not found"));
+    }
+
+    // 3c. Serving gate: the ledger's f:serveBlocks posture must allow raw
+    //     content serving.
+    let serving =
+        crate::routes::serving::effective_serving(&state.fluree, &effective_ledger).await?;
+    if !serving.blocks {
         return Err(ServerError::not_found("Object not found"));
     }
 
@@ -540,7 +656,8 @@ pub async fn get_object_by_cid(
         .admin_storage_cloned()
         .ok_or_else(|| ServerError::internal("object fetch requires a managed storage backend"))?;
     let method = admin_storage.storage_method();
-    let address = fluree_db_core::content_address(method, kind, &query.ledger, &id.digest_hex());
+    let address =
+        fluree_db_core::content_address(method, kind, &effective_ledger, &id.digest_hex());
 
     let bytes = admin_storage
         .read_bytes(&address)
@@ -550,15 +667,39 @@ pub async fn get_object_by_cid(
             other => ServerError::internal(format!("Storage read: {other}")),
         })?;
 
-    // 5. Verify integrity (format-sniffing for commits)
+    // 5. Verify integrity (format-sniffing for commits). Always against the
+    //    full object, so ranged responses inherit the guarantee.
     if !verify_object_integrity(&id, &bytes) {
         return Err(ServerError::internal(format!(
             "Hash verification failed for CID {cid_str}"
         )));
     }
 
-    // 6. Build response
+    // 6. Build response (full or ranged)
     let kind_label = kind.codec_dir_name();
+    if let Some(range) = parse_range_header(&headers) {
+        let total = bytes.len() as u64;
+        if range.start >= total {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                .body(Body::empty())
+                .map_err(|e| ServerError::internal(e.to_string()));
+        }
+        let end = range.end.min(total);
+        let slice = bytes[range.start as usize..end as usize].to_vec();
+        return Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("X-Fluree-Content-Kind", kind_label)
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{total}", range.start, end - 1),
+            )
+            .body(Body::from(slice))
+            .map_err(|e| ServerError::internal(e.to_string()));
+    }
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

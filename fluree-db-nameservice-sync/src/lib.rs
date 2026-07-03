@@ -26,6 +26,8 @@ pub mod driver;
 pub mod error;
 pub mod origin;
 pub mod pack_client;
+pub mod proxy_nameservice;
+pub mod proxy_storage;
 mod server_sse;
 pub mod watch;
 pub mod watch_poll;
@@ -45,6 +47,8 @@ pub use pack_client::{
     fetch_and_ingest_pack, ingest_pack_frame, ingest_pack_stream, ingest_pack_stream_with_header,
     peek_pack_header, PackIngestResult,
 };
+pub use proxy_nameservice::ProxyNameService;
+pub use proxy_storage::{ProxyReadMode, ProxyStorage};
 pub use watch::{RemoteEvent, RemoteWatch};
 pub use watch_poll::PollRemoteWatch;
 pub use watch_sse::SseRemoteWatch;

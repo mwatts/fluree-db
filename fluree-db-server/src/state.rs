@@ -16,7 +16,7 @@
 //! - **Proxy**: All storage reads proxied through transaction server (no storage credentials)
 
 use crate::config::{ServerConfig, ServerRole};
-use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyStorage};
+use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyReadMode, ProxyStorage};
 use crate::registry::LedgerRegistry;
 use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
@@ -437,7 +437,11 @@ fn build_proxy_fluree(
         fluree_db_api::ApiError::internal(format!("Failed to load storage proxy token: {e}"))
     })?;
 
-    let storage = ProxyStorage::new(tx_url.clone(), token.clone());
+    // Raw mode: the peer's `fluree.storage.*` token grants full read access,
+    // so it fetches canonical CAS bytes (CID-verified client-side). This is
+    // also what lets the binary index reader consume FLI3 leaves directly —
+    // the filtered (FLKB) tier has no leaf decoder on the read path.
+    let storage = ProxyStorage::new(tx_url.clone(), token.clone(), ProxyReadMode::Raw);
     let nameservice = ProxyNameService::new(tx_url, token);
 
     let ns_mode = NameServiceMode::ReadOnly(Arc::new(nameservice));

@@ -366,6 +366,96 @@ impl std::fmt::Debug for NameServiceMode {
     }
 }
 
+/// One remote mount for [`FlureeBuilder::with_remote_mount`]: the ledgers of
+/// a remote Fluree appear locally, read-only, under `prefix/`.
+///
+/// The lookup and storage are transport-agnostic — for HTTP mounts, build a
+/// `ProxyNameService` and a `ProxyStorage` (raw mode, with the matching
+/// local prefix) from `fluree-db-nameservice-sync` and pass them here.
+#[derive(Clone)]
+pub struct RemoteMountSpec {
+    prefix: String,
+    lookup: Arc<dyn NameServiceLookup>,
+    storage: StorageBackend,
+}
+
+impl std::fmt::Debug for RemoteMountSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteMountSpec")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteMountSpec {
+    /// Create a mount spec for aliases under `prefix` (no trailing slash).
+    pub fn new(
+        prefix: impl Into<String>,
+        lookup: Arc<dyn NameServiceLookup>,
+        storage: impl fluree_db_core::Storage + 'static,
+    ) -> Self {
+        Self {
+            prefix: prefix.into(),
+            lookup,
+            storage: StorageBackend::Managed(Arc::new(storage)),
+        }
+    }
+
+    /// The alias prefix this mount claims.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
+/// Wrap a backend + nameservice pair with remote mounts.
+///
+/// The nameservice becomes a [`CompositeNameService`] (prefix-routed reads,
+/// local writes, mounted writes rejected) and the backend a
+/// [`StorageBackend::Routed`] so mounted namespaces read through their own
+/// storage. No-op when `mounts` is empty. Mounts require a read-write local
+/// nameservice; on a read-only instance they are dropped with an error log.
+///
+/// [`CompositeNameService`]: fluree_db_nameservice::mount::CompositeNameService
+fn apply_remote_mounts(
+    backend: StorageBackend,
+    nameservice: NameServiceMode,
+    mounts: Vec<RemoteMountSpec>,
+) -> (StorageBackend, NameServiceMode) {
+    use fluree_db_core::storage::RoutedBackend;
+    use fluree_db_nameservice::mount::{CompositeNameService, RemoteMount};
+
+    if mounts.is_empty() {
+        return (backend, nameservice);
+    }
+
+    let publisher = match nameservice {
+        NameServiceMode::ReadWrite(publisher) => publisher,
+        NameServiceMode::ReadOnly(lookup) => {
+            tracing::error!(
+                mounts = mounts.len(),
+                "remote mounts require a read-write local nameservice; ignoring mounts"
+            );
+            return (backend, NameServiceMode::ReadOnly(lookup));
+        }
+    };
+
+    let ns_mounts: Vec<RemoteMount> = mounts
+        .iter()
+        .map(|m| RemoteMount::new(m.prefix.clone(), Arc::clone(&m.lookup)))
+        .collect();
+    let composite = CompositeNameService::new(publisher, ns_mounts)
+        .expect("mount prefixes deduplicated by FlureeBuilder::with_remote_mount");
+
+    let storage_mounts: Vec<(String, StorageBackend)> =
+        mounts.into_iter().map(|m| (m.prefix, m.storage)).collect();
+    let routed = RoutedBackend::new(backend, storage_mounts);
+
+    (
+        StorageBackend::Routed(Arc::new(routed)),
+        NameServiceMode::ReadWrite(Arc::new(composite)),
+    )
+}
+
 impl NameServiceMode {
     /// Get read-only nameservice access (always available).
     pub fn reader(&self) -> &dyn NameServiceLookup {
@@ -1143,6 +1233,8 @@ pub struct FlureeBuilder {
     novelty_thresholds: Option<IndexConfig>,
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
+    /// Read-only remote mounts applied at build time (alias-prefixed).
+    remote_mounts: Vec<RemoteMountSpec>,
 }
 
 /// Configuration for background indexing in `FlureeBuilder`.
@@ -1359,6 +1451,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            remote_mounts: Vec::new(),
         }
     }
 
@@ -1373,6 +1466,7 @@ impl FlureeBuilder {
             indexing_config: None,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            remote_mounts: Vec::new(),
         }
     }
 
@@ -1439,6 +1533,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            remote_mounts: Vec::new(),
         }
     }
 
@@ -1631,6 +1726,7 @@ impl FlureeBuilder {
             indexing_config,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            remote_mounts: Vec::new(),
         })
     }
 
@@ -1781,6 +1877,22 @@ impl FlureeBuilder {
         self
     }
 
+    /// Mount a remote Fluree's ledgers read-only under the spec's alias
+    /// prefix (e.g. prefix `acme` exposes remote `inventory:main` as
+    /// `acme/inventory:main`).
+    ///
+    /// Reads (nameservice lookups and CAS content) route to the mount;
+    /// writes to mounted aliases fail with a "read-only remote mount" error.
+    /// Registering a second mount with the same prefix replaces the first.
+    ///
+    /// Mounts require a read-write local nameservice; on a read-only
+    /// (proxy-peer) instance they are ignored with an error log.
+    pub fn with_remote_mount(mut self, spec: RemoteMountSpec) -> Self {
+        self.remote_mounts.retain(|m| m.prefix != spec.prefix);
+        self.remote_mounts.push(spec);
+        self
+    }
+
     /// Build a file-backed Fluree instance
     ///
     /// Returns an error if storage_path is not set.
@@ -1820,6 +1932,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 
@@ -1849,6 +1962,7 @@ impl FlureeBuilder {
                 attachment_provider_cell: Self::new_attachment_provider_cell(),
             },
             self.remote_connections,
+            self.remote_mounts,
         )
     }
 
@@ -1955,6 +2069,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 
@@ -1991,6 +2106,7 @@ impl FlureeBuilder {
                 attachment_provider_cell: Self::new_attachment_provider_cell(),
             },
             self.remote_connections,
+            self.remote_mounts,
         )
     }
 
@@ -2024,6 +2140,7 @@ impl FlureeBuilder {
                 attachment_provider_cell: Self::new_attachment_provider_cell(),
             },
             self.remote_connections,
+            self.remote_mounts,
         )
     }
 
@@ -2077,6 +2194,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         )
     }
 
@@ -2154,6 +2272,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 
@@ -2255,6 +2374,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 
@@ -2340,6 +2460,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 
@@ -2463,6 +2584,7 @@ impl FlureeBuilder {
         config: ConnectionConfig,
         parts: RuntimeParts,
         remote_connections: remote_service::RemoteConnectionRegistry,
+        remote_mounts: Vec<RemoteMountSpec>,
     ) -> Fluree {
         let RuntimeParts {
             backend,
@@ -2472,6 +2594,7 @@ impl FlureeBuilder {
             index_config,
             attachment_provider_cell,
         } = parts;
+        let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let leaflet_cache = make_leaflet_cache(&config);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
@@ -2618,6 +2741,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 
@@ -2688,6 +2812,7 @@ impl FlureeBuilder {
                     attachment_provider_cell,
                 },
                 self.remote_connections,
+                self.remote_mounts,
             ))
         }
     }
@@ -2748,6 +2873,7 @@ impl FlureeBuilder {
                 attachment_provider_cell,
             },
             self.remote_connections,
+            self.remote_mounts,
         ))
     }
 

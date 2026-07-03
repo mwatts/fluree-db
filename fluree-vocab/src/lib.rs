@@ -2232,6 +2232,27 @@ pub mod config_iris {
 
     /// `f:target` — property IRI that a `FullTextProperty` entry applies to.
     pub const FULL_TEXT_TARGET: &str = "https://ns.flur.ee/db#target";
+
+    // ---- Serving defaults fields (ledger-scoped) ----
+
+    /// `f:servingDefaults` — serving-posture defaults on LedgerConfig.
+    /// Ledger-scoped: ignored on GraphConfig, not subject to override control.
+    /// Declares which serving tiers the ledger's origin server offers; gates
+    /// apply only on the origin (transaction-role) serving surface, never on
+    /// read-only peers/mounts querying their own replicated copy.
+    pub const SERVING_DEFAULTS: &str = "https://ns.flur.ee/db#servingDefaults";
+
+    /// `f:serveQuery` — boolean, origin serves query execution for this
+    /// ledger. Absent means allowed.
+    pub const SERVE_QUERY: &str = "https://ns.flur.ee/db#serveQuery";
+
+    /// `f:serveBlocks` — boolean, origin serves raw CAS blocks (storage
+    /// proxy / peer replication) for this ledger. Absent means allowed.
+    pub const SERVE_BLOCKS: &str = "https://ns.flur.ee/db#serveBlocks";
+
+    /// `f:publicVisibility` — boolean, ledger may be discovered and read
+    /// without authentication. Absent means false (token required).
+    pub const PUBLIC_VISIBILITY: &str = "https://ns.flur.ee/db#publicVisibility";
 }
 
 // ============================================================================

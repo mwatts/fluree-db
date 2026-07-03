@@ -73,6 +73,17 @@ async fn commits_ledger_local(
         .await
         .map_err(ServerError::Api)?;
 
+    // Serving gate: commit blobs are raw replication content, so this honors
+    // the ledger's f:serveBlocks posture (404 per the no-existence-leak
+    // convention).
+    let serving = crate::routes::serving::effective_serving_from_state(
+        &handle.snapshot().await.to_ledger_state(),
+    )
+    .await?;
+    if !serving.blocks {
+        return Err(ServerError::not_found("Ledger not found"));
+    }
+
     let fluree = &state.fluree;
     let resp = fluree
         .export_commit_range(&handle, &params)

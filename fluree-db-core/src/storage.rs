@@ -699,6 +699,55 @@ pub enum StorageBackend {
     Managed(Arc<dyn Storage>),
     /// Append-only content-addressed storage (IPFS).
     Permanent(Arc<dyn ContentStore>),
+    /// Namespace-routed composition: mounted alias prefixes read through
+    /// their own backend, everything else uses the default backend.
+    Routed(Arc<RoutedBackend>),
+}
+
+/// Namespace-prefix routing table for [`StorageBackend::Routed`].
+///
+/// Each mount claims a ledger-name prefix (e.g. `"acme"` routes
+/// `acme/inventory:main` and every namespace under `acme/`). Store selection
+/// happens in [`StorageBackend::content_store`], the single point where a
+/// ledger's namespace is bound to a store — so ledger loading, branched-store
+/// ancestry walks, and default-context reads all route without changes.
+///
+/// Admin operations (delete, list) apply only to the default backend; mounts
+/// are read-only remote content.
+pub struct RoutedBackend {
+    default: StorageBackend,
+    mounts: Vec<(String, StorageBackend)>,
+}
+
+impl RoutedBackend {
+    /// Compose a default backend with `(prefix, backend)` mounts.
+    pub fn new(default: StorageBackend, mounts: Vec<(String, StorageBackend)>) -> Self {
+        Self { default, mounts }
+    }
+
+    /// Select the backend owning `namespace_id` (a ledger ID or name).
+    fn backend_for(&self, namespace_id: &str) -> &StorageBackend {
+        self.mounts
+            .iter()
+            .find(|(prefix, _)| {
+                namespace_id
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .map_or(&self.default, |(_, backend)| backend)
+    }
+}
+
+impl Debug for RoutedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutedBackend")
+            .field("default", &self.default)
+            .field(
+                "mounts",
+                &self.mounts.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl StorageBackend {
@@ -707,33 +756,41 @@ impl StorageBackend {
     ///
     /// For `Managed` backends, this constructs a [`StorageContentStore`] that
     /// maps CIDs to physical addresses under the namespace. For `Permanent`
-    /// backends, the inner store is returned directly.
+    /// backends, the inner store is returned directly. For `Routed` backends,
+    /// the namespace's owning backend (mount or default) is selected first.
     pub fn content_store(&self, namespace_id: &str) -> Arc<dyn ContentStore> {
         match self {
             StorageBackend::Managed(storage) => {
                 Arc::new(content_store_for(storage.clone(), namespace_id))
             }
             StorageBackend::Permanent(store) => Arc::clone(store),
+            StorageBackend::Routed(routed) => {
+                routed.backend_for(namespace_id).content_store(namespace_id)
+            }
         }
     }
 
     /// Get the underlying raw storage for admin operations (delete, list).
     ///
-    /// Returns `Some` for `Managed` backends, `None` for `Permanent`.
+    /// Returns `Some` for `Managed` backends (and the default backend of
+    /// `Routed`), `None` for `Permanent`.
     pub fn admin_storage(&self) -> Option<&dyn Storage> {
         match self {
             StorageBackend::Managed(storage) => Some(storage.as_ref()),
             StorageBackend::Permanent(_) => None,
+            StorageBackend::Routed(routed) => routed.default.admin_storage(),
         }
     }
 
     /// Clone the admin storage as an owned `Arc<dyn Storage>`, if available.
     ///
-    /// Returns `Some` for `Managed` backends, `None` for `Permanent`.
+    /// Returns `Some` for `Managed` backends (and the default backend of
+    /// `Routed`), `None` for `Permanent`.
     pub fn admin_storage_cloned(&self) -> Option<Arc<dyn Storage>> {
         match self {
             StorageBackend::Managed(storage) => Some(Arc::clone(storage)),
             StorageBackend::Permanent(_) => None,
+            StorageBackend::Routed(routed) => routed.default.admin_storage_cloned(),
         }
     }
 }
@@ -743,6 +800,7 @@ impl Debug for StorageBackend {
         match self {
             StorageBackend::Managed(s) => f.debug_tuple("Managed").field(s).finish(),
             StorageBackend::Permanent(s) => f.debug_tuple("Permanent").field(s).finish(),
+            StorageBackend::Routed(s) => f.debug_tuple("Routed").field(s).finish(),
         }
     }
 }
@@ -752,6 +810,7 @@ impl Clone for StorageBackend {
         match self {
             StorageBackend::Managed(s) => StorageBackend::Managed(Arc::clone(s)),
             StorageBackend::Permanent(s) => StorageBackend::Permanent(Arc::clone(s)),
+            StorageBackend::Routed(s) => StorageBackend::Routed(Arc::clone(s)),
         }
     }
 }

@@ -26,7 +26,8 @@ use std::sync::Arc;
 use fluree_db_core::ledger_config::{
     DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
     OntologyImportBinding, OverrideControl, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
-    RollbackGuard, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
+    RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy,
+    ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -138,6 +139,7 @@ pub async fn resolve_ledger_config(
     let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
 
     Ok(Some(LedgerConfig {
@@ -148,6 +150,7 @@ pub async fn resolve_ledger_config(
         datalog,
         transact,
         full_text,
+        serving,
         graph_overrides,
     }))
 }
@@ -1302,6 +1305,61 @@ async fn read_datalog_defaults(
         rules_source,
         allow_query_time_rules,
         override_control,
+    }))
+}
+
+/// Read serving defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_serving_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<ServingDefaults>> {
+    let group_sid = match read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::SERVING_DEFAULTS,
+    )
+    .await?
+    {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let serve_query = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::SERVE_QUERY,
+    )
+    .await?;
+    let serve_blocks = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::SERVE_BLOCKS,
+    )
+    .await?;
+    let public_visibility = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::PUBLIC_VISIBILITY,
+    )
+    .await?;
+
+    Ok(Some(ServingDefaults {
+        serve_query,
+        serve_blocks,
+        public_visibility,
     }))
 }
 

@@ -1409,7 +1409,7 @@ async fn test_block_content_negotiation_returns_flkb_for_leaf() {
 #[tokio::test]
 async fn test_proxy_storage_read_bytes_hint_returns_flkb_for_leaf() {
     use fluree_db_core::ReadHint;
-    use fluree_db_server::peer::ProxyStorage;
+    use fluree_db_server::peer::{ProxyReadMode, ProxyStorage};
     use tokio::net::TcpListener;
 
     // Create tx server state with storage proxy enabled
@@ -1513,7 +1513,7 @@ async fn test_proxy_storage_read_bytes_hint_returns_flkb_for_leaf() {
     let leaf_address = leaf_address_from_cid(&leaf_cid, "peer:test");
 
     // Create ProxyStorage pointing to our test server
-    let proxy_storage = ProxyStorage::new(server_url.clone(), token);
+    let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Filtered);
 
     // Call read_bytes_hint with PreferLeafFlakes
     let result = proxy_storage
@@ -1550,19 +1550,18 @@ async fn test_proxy_storage_read_bytes_hint_returns_flkb_for_leaf() {
     server_handle.abort();
 }
 
-/// Test that ProxyStorage.read_bytes returns FLKB for leaf blocks under PolicyEnforced
+/// Test that ProxyStorage.read_bytes returns FLKB for leaf blocks in Filtered mode
 ///
-/// Under PolicyEnforced mode (the only mode currently available via storage proxy),
-/// leaf blocks are always decoded and policy-filtered. ProxyStorage.read_bytes() uses
+/// In `ProxyReadMode::Filtered`, leaf blocks fetched via `/storage/block` are
+/// always decoded and policy-filtered. ProxyStorage.read_bytes() uses
 /// flakes-first content negotiation, so leaves come back as FLKB (not raw FLI3).
 ///
-/// Raw FLI3 leaf bytes would only be available under TrustedInternal enforcement mode,
-/// which is not yet implemented. When it is, a separate ProxyStorage variant (or mode)
-/// would be needed to opt into raw bytes.
+/// Raw FLI3 leaf bytes are available via `ProxyReadMode::Raw`, which fetches
+/// canonical CAS bytes through `/storage/objects/{cid}` instead.
 #[tokio::test]
 async fn test_proxy_storage_read_bytes_leaf_returns_flkb_under_policy() {
     use fluree_db_api::ReindexOptions;
-    use fluree_db_server::peer::ProxyStorage;
+    use fluree_db_server::peer::{ProxyReadMode, ProxyStorage};
     use tokio::net::TcpListener;
 
     // Create tx server state with storage proxy enabled
@@ -1659,7 +1658,7 @@ async fn test_proxy_storage_read_bytes_leaf_returns_flkb_under_policy() {
     let leaf_address = leaf_address_from_cid(&leaf_cid, "raw:test");
 
     // Create ProxyStorage pointing to our test server
-    let proxy_storage = ProxyStorage::new(server_url.clone(), token);
+    let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Filtered);
 
     // Call read_bytes (no hint) — under PolicyEnforced, this uses flakes-first
     // negotiation and returns FLKB for leaf blocks.
@@ -1682,6 +1681,732 @@ async fn test_proxy_storage_read_bytes_leaf_returns_flkb_under_policy() {
 
     // Cleanup: abort server
     server_handle.abort();
+}
+
+/// Test that ProxyStorage in Raw mode returns canonical, CID-verified bytes
+/// for both leaf and non-leaf blocks.
+///
+/// Raw mode fetches through `GET /storage/objects/{cid}` (full-access tier):
+/// - leaf bytes must be byte-identical to what's in the origin's storage
+///   (raw FLI3, NOT the FLKB transport format), so the binary index reader
+///   can consume them directly
+/// - non-leaf bytes (index root) must round-trip identically too
+/// - an out-of-scope token must observe NotFound (no existence leak)
+#[tokio::test]
+async fn test_proxy_storage_raw_mode_returns_canonical_bytes() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_server::peer::{ProxyReadMode, ProxyStorage};
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_addr = listener.local_addr().expect("get local addr");
+    let server_url = format!("http://{server_addr}");
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+
+    let client = reqwest::Client::new();
+    let create_resp = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "rawmode:test"}"#)
+        .send()
+        .await
+        .expect("create ledger request");
+    assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+
+    let transact_resp = client
+        .post(format!("{server_url}/v1/fluree/update"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "ledger": "rawmode:test",
+                "@context": { "ex": "http://example.org/ns/" },
+                "insert": {
+                    "@graph": [
+                        { "@id": "ex:frank", "ex:name": "Frank" },
+                        { "@id": "ex:grace", "ex:name": "Grace" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("transact request");
+    assert_eq!(transact_resp.status(), reqwest::StatusCode::OK);
+
+    let fluree = &state.fluree;
+    let reindex_result = fluree
+        .reindex("rawmode:test", ReindexOptions::default())
+        .await
+        .expect("reindex should succeed");
+    fluree
+        .refresh("rawmode:test", Default::default())
+        .await
+        .expect("refresh after reindex should succeed");
+
+    // Resolve a real leaf CID from the index root via direct storage access.
+    let admin_storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+    let root_address = fluree_db_core::content_address(
+        "file",
+        ContentKind::IndexRoot,
+        "rawmode:test",
+        &reindex_result.root_id.digest_hex(),
+    );
+    let direct_root_bytes = admin_storage
+        .read_bytes(&root_address)
+        .await
+        .expect("direct root read");
+    let leaf_cid = extract_spot_leaf_cid(&direct_root_bytes);
+    let leaf_address = leaf_address_from_cid(&leaf_cid, "rawmode:test");
+    let direct_leaf_bytes = admin_storage
+        .read_bytes(&leaf_address)
+        .await
+        .expect("direct leaf read");
+
+    let proxy_storage = ProxyStorage::new(server_url.clone(), token, ProxyReadMode::Raw);
+
+    // Leaf: canonical FLI3 bytes, identical to origin storage, not FLKB.
+    let leaf_bytes = proxy_storage
+        .read_bytes(&leaf_address)
+        .await
+        .expect("raw leaf read should succeed");
+    assert_eq!(
+        leaf_bytes, direct_leaf_bytes,
+        "raw-mode leaf bytes must be byte-identical to origin storage"
+    );
+    assert!(
+        leaf_bytes.len() < 4 || &leaf_bytes[0..4] != FLKB_MAGIC,
+        "raw-mode leaf must not be FLKB transport format"
+    );
+
+    // Non-leaf (index root): identical round-trip through the objects endpoint.
+    let root_bytes = proxy_storage
+        .read_bytes(&root_address)
+        .await
+        .expect("raw root read should succeed");
+    assert_eq!(
+        root_bytes, direct_root_bytes,
+        "raw-mode root bytes must be byte-identical to origin storage"
+    );
+
+    // Ranged reads: raw mode issues true HTTP Range requests (206) and the
+    // slice must match the equivalent slice of the direct bytes.
+    assert!(proxy_storage.supports_ranged_reads());
+    let mid = (direct_leaf_bytes.len() / 2) as u64;
+    let ranged = proxy_storage
+        .read_byte_range(&leaf_address, 8..mid)
+        .await
+        .expect("ranged leaf read should succeed");
+    assert_eq!(
+        ranged,
+        direct_leaf_bytes[8..mid as usize].to_vec(),
+        "ranged bytes must match the direct slice"
+    );
+    // Range extending past the object is clamped.
+    let tail = proxy_storage
+        .read_byte_range(&leaf_address, mid..u64::MAX)
+        .await
+        .expect("tail range read should succeed");
+    assert_eq!(tail, direct_leaf_bytes[mid as usize..].to_vec());
+    // Range starting past the object length is empty (416 → empty slice).
+    let beyond = proxy_storage
+        .read_byte_range(
+            &leaf_address,
+            (direct_leaf_bytes.len() as u64 + 10)..u64::MAX,
+        )
+        .await
+        .expect("out-of-range read should succeed as empty");
+    assert!(beyond.is_empty());
+
+    // Out-of-scope token: scoped to a different ledger → NotFound (no
+    // existence leak). A token with no storage claims at all is rejected
+    // earlier by the extractor with 401, so scope-to-another-ledger is the
+    // case that exercises the per-ledger check.
+    let pubkey = signing_key.verifying_key().to_bytes();
+    let pubkey_b64 = URL_SAFE_NO_PAD.encode(pubkey);
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "jwk": { "kty": "OKP", "crv": "Ed25519", "x": pubkey_b64 }
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = serde_json::json!({
+        "iss": did_from_pubkey(&pubkey),
+        "exp": now + 3600,
+        "iat": now,
+        "fluree.storage.all": false,
+        "fluree.storage.ledgers": ["other:ledger"]  // NOT rawmode:test
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let scoped_token = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+    let unauthorized_storage =
+        ProxyStorage::new(server_url.clone(), scoped_token, ProxyReadMode::Raw);
+    let err = unauthorized_storage
+        .read_bytes(&leaf_address)
+        .await
+        .expect_err("out-of-scope read must fail");
+    assert!(
+        matches!(err, fluree_db_core::Error::NotFound(_)),
+        "out-of-scope raw read should surface NotFound, got: {err:?}"
+    );
+
+    server_handle.abort();
+}
+
+/// End-to-end peer test: a proxy-mode `Fluree` — memory storage backed by
+/// `ProxyStorage` in Raw mode plus `ProxyNameService`, the exact wiring of
+/// `build_proxy_fluree` — executes a query against an INDEXED ledger served
+/// by the tx server over HTTP.
+///
+/// This is the capability raw mode unlocks: the peer's binary index reader
+/// consumes canonical FLI3 leaves/dicts fetched through `/storage/objects`.
+/// (The filtered FLKB tier has no leaf decoder on the read path, so indexed
+/// ledgers were previously unreadable through the proxy.)
+///
+/// Multi-thread runtime is required: lazy dict materialization bridges
+/// sync→async (block_on) during query execution, which would starve the
+/// in-process axum server on a current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_peer_proxy_fluree_queries_indexed_ledger() {
+    use fluree_db_api::{FlureeBuilder, NameServiceMode, ReindexOptions};
+    use fluree_db_server::peer::{ProxyNameService, ProxyReadMode, ProxyStorage};
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_addr = listener.local_addr().expect("get local addr");
+    let server_url = format!("http://{server_addr}");
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+
+    // Create + populate + index a ledger on the tx server.
+    let client = reqwest::Client::new();
+    let create_resp = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "peerquery:test"}"#)
+        .send()
+        .await
+        .expect("create ledger request");
+    assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+
+    let transact_resp = client
+        .post(format!("{server_url}/v1/fluree/update"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "ledger": "peerquery:test",
+                "@context": { "ex": "http://example.org/ns/" },
+                "insert": {
+                    "@graph": [
+                        { "@id": "ex:hana", "ex:name": "Hana" },
+                        { "@id": "ex:ivan", "ex:name": "Ivan" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("transact request");
+    assert_eq!(transact_resp.status(), reqwest::StatusCode::OK);
+
+    state
+        .fluree
+        .reindex("peerquery:test", ReindexOptions::default())
+        .await
+        .expect("reindex should succeed");
+    state
+        .fluree
+        .refresh("peerquery:test", Default::default())
+        .await
+        .expect("refresh after reindex should succeed");
+
+    // Build a peer exactly like build_proxy_fluree does.
+    let peer_storage = ProxyStorage::new(server_url.clone(), token.clone(), ProxyReadMode::Raw);
+    let peer_ns = ProxyNameService::new(server_url.clone(), token);
+    let peer_fluree = FlureeBuilder::memory()
+        .build_with(peer_storage, NameServiceMode::ReadOnly(Arc::new(peer_ns)));
+
+    // Query through the peer — all index reads go over HTTP.
+    let query = serde_json::json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": { "?s": ["ex:name"] },
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let result = peer_fluree
+        .graph("peerquery:test")
+        .query()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("peer query should succeed");
+
+    let rows = result.as_array().expect("query result should be an array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "peer query should see both subjects: {result}"
+    );
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("ex:name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"Hana") && names.contains(&"Ivan"),
+        "peer query should return indexed values, got: {result}"
+    );
+
+    server_handle.abort();
+}
+
+/// Remote mounts: a local Fluree (own ledgers, read-write) mounts a remote
+/// Fluree's ledgers read-only under an alias prefix.
+///
+/// Exercises the full composition:
+/// - `CompositeNameService` routes `acme/…` lookups to the remote's
+///   `ProxyNameService` and localizes records
+/// - `StorageBackend::Routed` sends `acme/…` CAS reads through the mount's
+///   `ProxyStorage` (raw, CID-verified, prefix-stripped)
+/// - a mounted indexed ledger is queryable next to a local ledger, including
+///   in one mixed dataset query
+/// - writes to mounted aliases are rejected with a clear error
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_remote_mount_queries_and_write_rejection() {
+    use fluree_db_api::{FlureeBuilder, ReindexOptions, RemoteMountSpec};
+    use fluree_db_server::peer::{ProxyNameService, ProxyReadMode, ProxyStorage};
+    use tokio::net::TcpListener;
+
+    // --- Remote origin: tx server with an indexed ledger ---
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_addr = listener.local_addr().expect("get local addr");
+    let server_url = format!("http://{server_addr}");
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+
+    let client = reqwest::Client::new();
+    let create_resp = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "inventory"}"#)
+        .send()
+        .await
+        .expect("create ledger request");
+    assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+    let transact_resp = client
+        .post(format!("{server_url}/v1/fluree/update"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "ledger": "inventory",
+                "@context": { "ex": "http://example.org/ns/" },
+                "insert": { "@id": "ex:widget", "ex:name": "Widget", "ex:sku": "W-1" }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("transact request");
+    assert_eq!(transact_resp.status(), reqwest::StatusCode::OK);
+    state
+        .fluree
+        .reindex("inventory:main", ReindexOptions::default())
+        .await
+        .expect("reindex should succeed");
+    state
+        .fluree
+        .refresh("inventory:main", Default::default())
+        .await
+        .expect("refresh should succeed");
+
+    // --- Local Fluree with the remote mounted under "acme" ---
+    let mount_storage = ProxyStorage::new(server_url.clone(), token.clone(), ProxyReadMode::Raw)
+        .with_local_prefix("acme");
+    let mount_ns = Arc::new(ProxyNameService::new(server_url.clone(), token));
+    let local = FlureeBuilder::memory()
+        .with_remote_mount(RemoteMountSpec::new("acme", mount_ns, mount_storage))
+        .build_memory();
+
+    // Local ledger with its own data.
+    local
+        .create_ledger("books")
+        .await
+        .expect("create local ledger");
+    local
+        .graph("books:main")
+        .transact()
+        .insert(&serde_json::json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "@id": "ex:moby", "ex:name": "Moby Dick"
+        }))
+        .commit()
+        .await
+        .expect("local transact");
+
+    // Query the mounted (remote, indexed) ledger by its local alias.
+    let query = serde_json::json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": { "?s": ["ex:name"] },
+        "where": { "@id": "?s", "ex:sku": "W-1" }
+    });
+    let result = local
+        .graph("acme/inventory:main")
+        .query()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("mounted query should succeed");
+    let rows = result.as_array().expect("array result");
+    assert_eq!(rows.len(), 1, "mounted query result: {result}");
+    assert_eq!(
+        rows[0].get("ex:name").and_then(|v| v.as_str()),
+        Some("Widget"),
+        "mounted query should read remote index content: {result}"
+    );
+
+    // Mixed dataset: one query over the local ledger AND the mount.
+    let mixed = serde_json::json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "from": ["books:main", "acme/inventory:main"],
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let result = local
+        .query_from()
+        .jsonld(&mixed)
+        .execute_formatted()
+        .await
+        .expect("mixed dataset query should succeed");
+    // Rows are single-var tuples: [["Moby Dick"], ["Widget"]]
+    let names: Vec<&str> = result
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|row| row.as_array()?.first()?.as_str())
+        .collect();
+    assert!(
+        names.contains(&"Widget") && names.contains(&"Moby Dick"),
+        "mixed dataset should span local + mounted ledgers, got: {result}"
+    );
+
+    // Writes to mounted aliases are rejected. The routed storage refuses
+    // first (ProxyStorage is read-only); the CompositeNameService guard
+    // backstops non-storage writes (create/branch/publish).
+    let err = local
+        .graph("acme/inventory:main")
+        .transact()
+        .insert(&serde_json::json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "@id": "ex:hack", "ex:name": "Nope"
+        }))
+        .commit()
+        .await
+        .expect_err("write to mount must fail");
+    assert!(
+        err.to_string().contains("read-only"),
+        "unexpected write-rejection error: {err}"
+    );
+    // Creating a local ledger that would shadow the mount is also rejected,
+    // at the nameservice layer.
+    let err = local
+        .create_ledger("acme/other")
+        .await
+        .expect_err("create under mount prefix must fail");
+    assert!(
+        err.to_string().contains("read-only remote mount"),
+        "unexpected create-rejection error: {err}"
+    );
+
+    server_handle.abort();
+}
+
+/// Test per-ledger serving posture (`f:servingDefaults`) enforcement and
+/// advertisement.
+///
+/// - `f:serveBlocks false` → block/objects/commits endpoints return 404,
+///   queries still served, NS record advertises `["query"]`
+/// - `f:serveQuery false` (blocks restored) → query route returns 403 with a
+///   stable message, blocks served again, NS record advertises `["blocks"]`
+///
+/// Config changes are read novelty-inclusive, so no reindex is needed after
+/// transacting the config graph.
+#[tokio::test]
+async fn test_serving_defaults_gate_and_advertisement() {
+    use fluree_db_api::ReindexOptions;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+
+    // Create + populate + index.
+    let create_body = serde_json::json!({ "ledger": "serving:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let data = serde_json::json!({
+        "ledger": "serving:test",
+        "@context": { "ex": "http://example.org/ns/" },
+        "insert": { "@id": "ex:judy", "ex:name": "Judy" }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/json")
+                .body(Body::from(data.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let reindex_result = state
+        .fluree
+        .reindex("serving:test", ReindexOptions::default())
+        .await
+        .expect("reindex should succeed");
+    state
+        .fluree
+        .refresh("serving:test", Default::default())
+        .await
+        .expect("refresh should succeed");
+    let root_cid = reindex_result.root_id.to_string();
+
+    // Small helpers over the router.
+    let fetch_block_status = |app: axum::Router, token: String, cid: String| async move {
+        let body = serde_json::json!({ "cid": cid, "ledger": "serving:test" });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/storage/block")
+                    .header("content-type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    };
+    let query_status = |app: axum::Router| async move {
+        let body = serde_json::json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "from": "serving:test",
+            "select": ["?name"],
+            "where": { "@id": "?s", "ex:name": "?name" }
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    };
+    let ns_serving = |app: axum::Router, token: String| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/fluree/storage/ns/serving:test")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "NS record fetch failed: {json}");
+        json.get("serving").cloned()
+    };
+
+    // Baseline: unconfigured ledger serves both tiers.
+    assert_eq!(
+        fetch_block_status(app.clone(), token.clone(), root_cid.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(query_status(app.clone()).await, StatusCode::OK);
+    assert_eq!(
+        ns_serving(app.clone(), token.clone()).await,
+        Some(serde_json::json!(["query", "blocks"]))
+    );
+
+    // Disable block serving via the config graph.
+    let cfg_trig = r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <urn:fluree:serving:test#config> {
+            <urn:cfg:main>    rdf:type          f:LedgerConfig .
+            <urn:cfg:main>    f:servingDefaults <urn:cfg:serving> .
+            <urn:cfg:serving> f:serveBlocks     false .
+        }
+    ";
+    state
+        .fluree
+        .graph("serving:test")
+        .transact()
+        .upsert_turtle(cfg_trig)
+        .commit()
+        .await
+        .expect("config transact should succeed");
+
+    // Blocks tier refused across all raw-content endpoints; query unaffected.
+    assert_eq!(
+        fetch_block_status(app.clone(), token.clone(), root_cid.clone()).await,
+        StatusCode::NOT_FOUND
+    );
+    let objects_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/fluree/storage/objects/{root_cid}?ledger=serving:test"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(objects_resp.status(), StatusCode::NOT_FOUND);
+    let commits_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/commits/serving:test")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commits_resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(query_status(app.clone()).await, StatusCode::OK);
+    assert_eq!(
+        ns_serving(app.clone(), token.clone()).await,
+        Some(serde_json::json!(["query"]))
+    );
+
+    // Flip: blocks on, query off.
+    let cfg_trig = r"
+        @prefix f: <https://ns.flur.ee/db#> .
+
+        GRAPH <urn:fluree:serving:test#config> {
+            <urn:cfg:serving> f:serveBlocks true .
+            <urn:cfg:serving> f:serveQuery  false .
+        }
+    ";
+    state
+        .fluree
+        .graph("serving:test")
+        .transact()
+        .upsert_turtle(cfg_trig)
+        .commit()
+        .await
+        .expect("config transact should succeed");
+
+    assert_eq!(
+        fetch_block_status(app.clone(), token.clone(), root_cid.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(query_status(app.clone()).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        ns_serving(app.clone(), token.clone()).await,
+        Some(serde_json::json!(["blocks"]))
+    );
+}
+
+/// Discovery advertises the coarse server-level serving capabilities.
+#[tokio::test]
+async fn test_discovery_advertises_serving_capabilities() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/fluree.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json.get("serving"),
+        Some(&serde_json::json!({ "query": true, "blocks": true })),
+        "discovery should advertise serving capabilities: {json}"
+    );
 }
 
 // =============================================================================

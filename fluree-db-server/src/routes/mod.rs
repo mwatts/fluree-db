@@ -16,6 +16,7 @@ mod pack;
 mod policy_auth;
 mod push;
 pub(crate) mod query;
+pub(crate) mod serving;
 mod show;
 mod storage_proxy;
 mod stream_query;
