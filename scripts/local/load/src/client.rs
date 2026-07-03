@@ -241,13 +241,17 @@ impl ClusterClient {
         } else if status == StatusCode::SERVICE_UNAVAILABLE {
             // Distinguish leader-change from overloaded by body text.
             // The server returns 503 for both; the body hint is what
-            // separates them.
+            // separates them. Overload markers are checked first so
+            // a body mentioning both (e.g. "leader is overloaded")
+            // classifies as Overloaded — retrying an overload burns
+            // the target further, whereas leader-change retries are
+            // benign.
             let body = resp.text().await.unwrap_or_default();
             let lower = body.to_ascii_lowercase();
-            if lower.contains("not the leader") || lower.contains("leader") {
-                Outcome::LeaderChange
-            } else if lower.contains("overload") || lower.contains("admission") {
+            if lower.contains("overload") || lower.contains("admission") {
                 Outcome::Overloaded
+            } else if lower.contains("leader") {
+                Outcome::LeaderChange
             } else {
                 Outcome::ServerError
             }
