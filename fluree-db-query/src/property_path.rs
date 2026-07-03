@@ -57,16 +57,12 @@ fn is_reserved_edge_predicate(p: &Sid) -> bool {
     fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
 }
 
-/// Re-encode a pattern-constant predicate `Sid` into the active graph's
-/// namespace table.
+/// Re-encode a pattern-constant predicate `Sid` into the active graph's dict.
 ///
-/// Path pattern predicates are encoded against the primary/lowering snapshot at
-/// plan time, but a path executes against a per-graph (`GRAPH <iri>`) snapshot
-/// that may assign the same IRI a different namespace code. Without re-encoding,
-/// a divergent-namespace predicate (e.g. `ex:broader`) reads the wrong SID and
-/// the traversal silently finds no edges (issue #1405). Decodes against the
-/// original snapshot (where the SID was encoded) and re-encodes against the
-/// active graph; single-graph queries round-trip to the same SID (no change).
+/// Path predicates are encoded against the primary/lowering snapshot at plan
+/// time, but a path runs against a per-`GRAPH` snapshot that may code the same
+/// IRI differently; without this the traversal reads the wrong SID and finds no
+/// edges. Single-graph round-trips to the same SID.
 #[inline]
 fn reencode_pred(ctx: &ExecutionContext<'_>, db: &fluree_db_core::LedgerSnapshot, p: &Sid) -> Sid {
     ctx.original_snapshot
@@ -298,8 +294,8 @@ impl PropertyPathOperator {
         use_post: bool,
     ) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
-        // Re-encode the traversal predicates into the active graph's dict — see
-        // `reencode_pred` (issue #1405).
+        // Re-encode traversal predicates into the active graph's dict (see
+        // `reencode_pred`).
         let preds: Vec<Sid> = preds.iter().map(|p| reencode_pred(ctx, db, p)).collect();
         let mut out = Vec::new();
         let mut seen: HashSet<Sid> = HashSet::new();
@@ -1035,14 +1031,9 @@ impl PropertyPathOperator {
         let binary_store = ctx.binary_store.as_ref();
         let resolve_sid = |term: &Ref, binding: Option<&Binding>| -> Option<Sid> {
             match term {
-                // A pattern-constant SID is encoded against the primary/lowering
-                // snapshot at plan time; re-encode it into the active graph's
-                // namespace table (matching the `Ref::Iri` arm) so a
-                // divergent-namespace path endpoint — e.g. `?c broader+ ex:top`
-                // where `ex:top`'s code differs across ledgers — is matched
-                // against the right code instead of silently finding nothing
-                // (issue #1405). Falls back to the raw SID when it can't be
-                // decoded (single-graph round-trips to the same SID).
+                // Re-encode a pattern-constant endpoint into the active graph
+                // (like the `Ref::Iri` arm) so a divergent-namespace endpoint
+                // matches; falls back to the raw SID when undecodable.
                 Ref::Sid(s) => ctx
                     .original_snapshot
                     .decode_sid(s)
