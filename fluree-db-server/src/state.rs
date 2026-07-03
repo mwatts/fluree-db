@@ -152,11 +152,7 @@ impl AppState {
         config.validate().map_err(|e| {
             fluree_db_api::ApiError::internal(format!("Invalid configuration: {e}"))
         })?;
-        // No event bus to inject on the vanilla (non-raft) path — Fluree
-        // allocates its own. The raft assembly path builds Fluree
-        // separately via `build_fluree_with_nameservice`, threading
-        // `integration.event_bus` in so the state-machine adapter and
-        // the events endpoint share a single bus instance.
+        // No external event bus to inject here — Fluree allocates its own.
         let (fluree, cache_stats_handle) = build_default_fluree(&config, None).await?;
         Self::with_fluree(config, telemetry_config, fluree, cache_stats_handle).await
     }
@@ -325,11 +321,7 @@ impl Drop for AppState {
 /// proxy or direct mode based on `config.is_proxy_storage_mode()`.
 ///
 /// `event_bus` is threaded into `FlureeBuilder::with_event_bus` when
-/// provided; the raft assembly path uses this to hand Fluree the
-/// same `LedgerEventBus` the state-machine adapter emits into, so
-/// runtime raft events reach the events endpoint's subscription on
-/// `Fluree::event_bus()`. `None` yields the historical behaviour
-/// (Fluree allocates its own bus).
+/// provided; `None` lets Fluree allocate its own bus.
 pub async fn build_default_fluree(
     config: &ServerConfig,
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,

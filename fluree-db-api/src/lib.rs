@@ -1120,6 +1120,10 @@ fn derive_index_config(config: &ConnectionConfig) -> IndexConfig {
 ///   at compile time.
 /// - **Dynamic build** (`build_client()`) returns `FlureeClient` (type-erased) —
 ///   used when the storage backend is determined at runtime from config.
+///
+/// All `build*` methods (including the synchronous ones) must be called
+/// within a tokio runtime: whenever ledger caching is enabled (the
+/// default), building spawns the local cache event listener task.
 #[derive(Debug, Clone, Default)]
 pub struct FlureeBuilder {
     config: ConnectionConfig,
@@ -1142,13 +1146,9 @@ pub struct FlureeBuilder {
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
     /// Externally-supplied event bus. When set, `Fluree` uses this
-    /// instance instead of allocating its own. Used by the raft
-    /// integration path: `RaftIntegration::bootstrap` constructs the
-    /// bus (so the state-machine adapter can emit into it during
-    /// apply), and the server assembly passes the same `Arc` here
-    /// so the events endpoint (which subscribes on
-    /// `Fluree::event_bus()`) sees runtime-fired raft events without
-    /// a second listener bridge.
+    /// instance instead of allocating its own, so external publishers
+    /// and subscribers on `Fluree::event_bus()` share one broadcast
+    /// channel.
     event_bus_override: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
 }
 
@@ -1779,14 +1779,10 @@ impl FlureeBuilder {
     /// Use a caller-supplied `LedgerEventBus` instead of allocating
     /// a new one on `build*`.
     ///
-    /// The events endpoint (and any other consumer that subscribes
-    /// via `Fluree::event_bus()`) sees notifications from every
-    /// publisher wired to this bus. In the raft server assembly this
-    /// is used to unify the state-machine adapter's event stream
-    /// with Fluree's own: `RaftIntegration::bootstrap` creates the
-    /// bus (so the adapter can emit into it during apply), and the
-    /// server assembly threads the same `Arc` here so runtime events
-    /// reach the events endpoint without a second bridge task.
+    /// Every consumer that subscribes via `Fluree::event_bus()`
+    /// (including the cache event listener spawned on build) then
+    /// observes notifications from every publisher wired to the
+    /// supplied bus, with no bridge task between separate instances.
     pub fn with_event_bus(mut self, bus: Arc<fluree_db_nameservice::LedgerEventBus>) -> Self {
         self.event_bus_override = Some(bus);
         self

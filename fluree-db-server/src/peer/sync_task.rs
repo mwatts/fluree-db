@@ -130,7 +130,8 @@ impl PeerSyncTask {
     }
 
     /// Persist remote ledger state into local FileNameService, then update
-    /// in-memory watermarks and notify LedgerManager.
+    /// in-memory watermarks. Cache refresh follows from the events the
+    /// notifying nameservice emits when the CAS operations succeed.
     async fn handle_ledger_updated(&self, record: &NsRecord) {
         let Some(ns) = self.fluree.nameservice_mode().publisher() else {
             tracing::error!("PeerSyncTask requires a read-write nameservice");
@@ -301,7 +302,9 @@ impl PeerSyncTask {
         }
     }
 
-    /// Retract ledger locally and evict from cache.
+    /// Retract ledger locally and clear its in-memory watermarks. Cache
+    /// eviction follows from the retraction event the notifying
+    /// nameservice emits.
     async fn handle_ledger_retracted(&self, ledger_id: &str) {
         // 1. Retract via Publisher::retract()
         let Some(ns) = self.fluree.nameservice_mode().publisher() else {
