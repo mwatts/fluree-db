@@ -1829,3 +1829,146 @@ async fn fulltext_configured_persisted_language_buckets() {
         "French query terms must not match English-bucket docs, got {fr_hits:?}"
     );
 }
+
+/// Perf smoke harness for per-row `fulltext()` cost at scale (run manually):
+///
+/// ```sh
+/// cargo test -p fluree-db-api --test grp_query --release \
+///     fulltext_perf_50k_labels -- --ignored --nocapture
+/// ```
+///
+/// Seeds 50k configured labels, full-reindexes, then commits ONE extra label
+/// WITHOUT indexing so the overlay epoch is non-zero — forcing the eager
+/// materialization / `Binding::Lit` path for every row, which is the
+/// production norm (the Solo/S3 27s report shape). Prints wall time for
+/// cold and warm runs; asserts only correctness (hit counts), not timing.
+#[tokio::test]
+#[ignore = "perf smoke — run manually with --ignored --nocapture"]
+async fn fulltext_perf_50k_labels() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    const N: usize = 50_000;
+    let words = [
+        "disease",
+        "syndrome",
+        "carcinoma",
+        "gene",
+        "protein",
+        "receptor",
+        "chronic",
+        "acute",
+        "cardiac",
+        "renal",
+        "hepatic",
+        "neural",
+        "benign",
+        "malignant",
+        "primary",
+        "secondary",
+        "infection",
+        "deficiency",
+        "disorder",
+        "lesion",
+    ];
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/fulltext-perf:main";
+    let no_auto = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("file fluree");
+        let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+
+        let config_iri = format!("urn:fluree:{ledger_id}#config");
+        let config_trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:fullTextDefaults <urn:config:ft> .
+                <urn:config:ft> rdf:type f:FullTextDefaults .
+                <urn:config:ft> f:property <urn:config:ft:label> .
+                <urn:config:ft:label> rdf:type f:FullTextProperty .
+                <urn:config:ft:label> f:target rdfs:label .
+            }}
+        "
+        );
+        let mut ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&config_trig)
+            .execute()
+            .await
+            .expect("write config")
+            .ledger;
+
+        // Bulk-seed N labels via turtle (3 pseudo-random pool words each).
+        let mut turtle = String::from("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
+        for i in 0..N {
+            let a = words[i % words.len()];
+            let b = words[(i / words.len() + 3) % words.len()];
+            let c = words[(i * 7 + 11) % words.len()];
+            turtle.push_str(&format!(
+                "<http://ex.test/C{i}> rdfs:label \"{a} {b} {c} entry {i}\" .\n"
+            ));
+        }
+        ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&turtle)
+            .execute()
+            .await
+            .expect("seed labels")
+            .ledger;
+        let _ = ledger;
+
+        fluree
+            .reindex(ledger_id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+
+        // One unindexed commit → overlay epoch != 0 → eager materialization.
+        let ledger = fluree.ledger(ledger_id).await.expect("reload");
+        let _ = fluree
+            .insert_with_opts(
+                ledger,
+                &json!({
+                    "@context": {
+                        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                        "ex": "http://ex.test/"
+                    },
+                    "@id": "ex:NOVELTY",
+                    "rdfs:label": "xplqr overlay entry"
+                }),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &no_auto,
+            )
+            .await
+            .expect("novelty commit");
+    }
+
+    let fluree = FlureeBuilder::file(&path).build().expect("re-open");
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    // "disease" appears in a large fraction of the pool-generated labels.
+    for run in ["cold", "warm"] {
+        let start = std::time::Instant::now();
+        let hits = persisted_query_label_hits(&fluree, &loaded, "disease").await;
+        let elapsed = start.elapsed();
+        println!(
+            "fulltext_perf_50k: {run} run: {} hits in {elapsed:?}",
+            hits.len()
+        );
+        assert!(
+            hits.len() > 1000,
+            "{run}: expected thousands of 'disease' hits, got {}",
+            hits.len()
+        );
+    }
+}
