@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod branch;
+pub mod cache;
 #[cfg(feature = "server")]
 pub mod cluster;
 pub mod completions;

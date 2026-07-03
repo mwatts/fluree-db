@@ -602,6 +602,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::track::run(action, &fluree_dir).await
         }
 
+        Commands::Cache { action } => commands::cache::run(action),
+
         Commands::Index { ledger } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::index::run_index(ledger.as_deref(), &fluree_dir).await
