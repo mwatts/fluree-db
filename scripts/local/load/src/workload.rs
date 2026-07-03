@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use ulid::Ulid;
+use xxhash_rust::xxh64::xxh64;
 
 /// Whether the workload attaches an `Idempotency-Key` HTTP header to
 /// its write requests, and how. Read ops (`Query`) and `CreateLedger`
@@ -305,12 +306,17 @@ impl Workload {
     fn gen_transact(&self, idx: u64, ledger: String) -> Op {
         // Body seed varies by idempotency mode. Anonymous / unique
         // use `idx` directly so every request emits a distinct IRI
-        // (no NamespaceConflict). Pooled uses `idx % pool_size` so
-        // the same key always emits the same body — required for
-        // dedup to trigger rather than surfacing `KeyCollision`.
+        // (no NamespaceConflict). Pooled derives from (ledger, slot)
+        // so the same slot on the same ledger emits the same body
+        // (required for dedup to trigger rather than `KeyCollision`),
+        // and the same slot on a different ledger emits a different
+        // body (so cross-ledger ops don't share cache entries).
         let body_seed = match self.tuning.idempotency_mode {
             IdempotencyMode::Anonymous | IdempotencyMode::Unique => idx,
-            IdempotencyMode::Pooled => idx % self.tuning.idempotency_pool_size.max(1),
+            IdempotencyMode::Pooled => {
+                let slot = idx % self.tuning.idempotency_pool_size.max(1);
+                xxh64(ledger.as_bytes(), slot)
+            }
         };
         let subject_id = format!("http://load.fluree/{}/s{}", self.run_id, body_seed);
         let body = json!({
@@ -320,11 +326,12 @@ impl Workload {
                 "http://load.fluree/run": self.run_id,
             }]
         });
+        let idempotency_key = self.idempotency_key_for(idx, &ledger);
         Op {
             kind: OpKind::Transact,
             ledger,
             body,
-            idempotency_key: self.idempotency_key_for(idx),
+            idempotency_key,
         }
     }
 
@@ -355,17 +362,24 @@ impl Workload {
         }
     }
 
-    /// Idempotency key for a write op at index `idx`, per the
-    /// configured mode. Keys are prefixed with the run id so
+    /// Idempotency key for a write op at index `idx` against `ledger`,
+    /// per the configured mode. Keys are prefixed with the run id so
     /// concurrent runs against the same cluster don't collide, and
+    /// pooled keys are scoped by ledger so the same slot on different
+    /// ledgers produces different keys (avoiding cross-ledger cache
+    /// collisions regardless of how the server keys its cache). Keys
     /// stay well under the `MAX_IDEMPOTENCY_KEY_LEN` cap (128 bytes).
-    fn idempotency_key_for(&self, idx: u64) -> Option<String> {
+    fn idempotency_key_for(&self, idx: u64, ledger: &str) -> Option<String> {
         match self.tuning.idempotency_mode {
             IdempotencyMode::Anonymous => None,
             IdempotencyMode::Unique => Some(format!("load-{}-u{}", self.run_id, idx)),
             IdempotencyMode::Pooled => {
                 let slot = idx % self.tuning.idempotency_pool_size.max(1);
-                Some(format!("load-{}-p{}", self.run_id, slot))
+                let ledger_digest = xxh64(ledger.as_bytes(), 0);
+                Some(format!(
+                    "load-{}-l{:x}-p{}",
+                    self.run_id, ledger_digest, slot
+                ))
             }
         }
     }
