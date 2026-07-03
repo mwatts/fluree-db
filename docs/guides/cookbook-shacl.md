@@ -375,6 +375,30 @@ ex:StrictPersonShape a sh:NodeShape ;
 
 A closed shape forbids any property not explicitly declared (or listed in `sh:ignoredProperties`). Per the SHACL spec, `rdf:type` is **not** implicitly ignored — a closed shape with `sh:targetClass` (whose instances necessarily carry `rdf:type`) must list it in `sh:ignoredProperties`, as above.
 
+## RDFS entailment in enforcement
+
+SHACL enforcement applies RDFS subclass and subproperty inference
+**always** — no configuration needed:
+
+- **Targets**: `sh:targetClass ex:Employee` also fires for instances of any
+  `rdfs:subClassOf* ex:Employee` class; `sh:targetSubjectsOf` /
+  `sh:targetObjectsOf ex:phone` also match subjects/objects of any
+  `rdfs:subPropertyOf* ex:phone` property.
+- **Paths**: a constraint on `sh:path schema:name` also governs values
+  asserted via any subproperty of `schema:name` (including through
+  sequence/inverse/alternative path steps and pair constraints).
+
+The hierarchy used is the **committed** state, kept current automatically:
+commits that assert or retract `rdfs:subClassOf` / `rdfs:subPropertyOf`
+invalidate a shared cache that rebuilds lazily; all other commits pay
+nothing. One consequence worth knowing: schema asserted in the *same*
+transaction as data does not entail for that transaction — commit the
+schema first, then the data (two transactions).
+
+Policy enforcement applies the same inference: `f:onClass` policies govern
+subclass instances and `f:onProperty` policies govern subproperties — see
+[the policy cookbook](cookbook-policies.md).
+
 ## RDFS subclass reasoning for `sh:class`
 
 `sh:class` honors `rdfs:subClassOf`. Example:
