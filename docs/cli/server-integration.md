@@ -50,6 +50,73 @@ Fallbacks (strongly recommended):
 - `GET {api_base_url}/commits/*ledger` (paginated export of commit + txn blobs)
 - `GET {api_base_url}/storage/objects/:cid?ledger=:ledger-id` (per-object fetch by CID)
 
+### `fluree track add --mode peer` (local query execution over served blocks)
+
+Peer mode runs the consumer's queries **locally** over index blocks fetched
+on demand from your server (see
+[Sharing data with downstream consumers](../guides/sharing-data.md)). It is
+read-path only — writes and every other command on a peer-tracked ledger
+use the normal data/transaction endpoints above.
+
+Required:
+
+- `GET {api_base_url}/storage/ns/:ledger-id` — NsRecord JSON. Peer mode
+  reads `commit_head_id`, `index_head_id`, `commit_t`/`index_t` (head
+  freshness is checked per query), `source_branch`/`branches` (branched
+  ledgers), and the optional `serving` array (`["query","blocks"]`) that
+  advertises the tiers on offer. Unknown fields are ignored, so additions
+  are safe.
+- `GET {api_base_url}/storage/objects/:cid?ledger=:ledger-id` — canonical
+  CAS bytes for all replication-relevant kinds **including raw index leaves
+  and dictionary blobs**. The client verifies every payload against its CID,
+  so bytes must be exact.
+
+Required semantics:
+
+- **All-or-nothing authorization.** These endpoints serve a ledger's full
+  contents with no row-level filtering, so a token must only be honored for
+  ledgers the bearer may read in full (`fluree.storage.all` /
+  `fluree.storage.ledgers` claims in the reference implementation). Return
+  **404** for out-of-scope, unknown, or serving-disabled ledgers — never
+  403 (no existence leak; the CLI treats 404 as not-found).
+- **Dict-blob branch resolution.** Shared dictionary artifacts live under a
+  name-scoped `@shared` namespace, so the client cannot know the branch and
+  derives a **default-branch** alias (e.g. `mydb:main`) even when the ledger
+  only exists on another branch. For dict-blob CIDs, resolve the `ledger`
+  parameter to any live branch of the same name before authorizing and
+  reading — otherwise peers tracking non-default branches fail on
+  dictionary fetches.
+
+Strongly recommended:
+
+- **Single-range `Range: bytes=start-end` support** on `/storage/objects`
+  (`206` + `Content-Range`, `416` past-end), verifying the full object
+  against the CID before slicing. Without it the client falls back to
+  whole-object fetches for leaflet-granular reads.
+
+Optional:
+
+- `GET {api_base_url}/storage/credentials?ledger=:ledger-id` — vended S3
+  credentials so peers read directly from S3 instead of proxying bytes
+  through your server. The CLI probes this once per peer query invocation
+  and **falls back to `/storage/objects` on 404**, so serving 404 is a
+  complete, valid implementation. If you do implement it, return the grant
+  shape documented in [endpoints](../api/endpoints.md#get-storagecredentials)
+  (`access_key_id`, `secret_access_key`, `session_token`,
+  `expires_at_epoch_secs`, `bucket`, `region`, optional `endpoint` /
+  `key_prefix`) with credentials scoped to the requested ledger's storage
+  prefix; the client auto-refreshes as grants approach expiry.
+
+### `fluree remote ledgers` (auth-filtered catalog)
+
+- `GET {api_base_url}/nameservice/snapshot` — `{ "ledgers": [NsRecord…],
+  "graph_sources": […] }`, filtered to the presented token's scope (an
+  unauthorized caller sees an empty or partial list, not an error).
+- `GET {api_base_url}/storage/ns/:ledger-id` — fetched per ledger to fill
+  the `SERVING` column from the record's `serving` array; the column
+  renders `-` when the field or record is unavailable, so this
+  degrades gracefully.
+
 ### `fluree push` (commit ingestion)
 
 - `POST {api_base_url}/push/*ledger`
