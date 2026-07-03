@@ -427,9 +427,14 @@ pub async fn validate_view(
     let shapes = ShapeCompiler::compile_from_dbs(&shape_dbs)
         .await
         .map_err(TransactError::from)?;
-    // Hierarchy comes from the real snapshot even when shapes compile from a
-    // detached inline bundle — subclass expansion must reflect the data.
-    let hierarchy = snapshot.schema_hierarchy();
+    // Hierarchy comes from the ledger's shared cache (novelty-aware) even
+    // when shapes compile from a detached inline bundle — subclass expansion
+    // must reflect the data, including unindexed schema commits.
+    let hierarchy = view
+        .schema_hierarchy_cache
+        .current(snapshot, novelty, to_t, view.novelty.schema_epoch)
+        .await
+        .map_err(TransactError::from)?;
     let cache = ShaclCache::new(
         ShaclCacheKey::new(ledger_id, to_t as u64),
         shapes,

@@ -160,6 +160,24 @@ impl ShaclEngine {
         dbs: &[GraphDbRef<'_>],
         ledger_id: impl Into<String>,
     ) -> Result<Self> {
+        // Hierarchy is schema-level — pick the first db's snapshot. NOTE:
+        // this reflects the last index build only; callers with access to
+        // the ledger's shared hierarchy cache should prefer
+        // [`Self::from_dbs_with_hierarchy`] so novelty-added subclass /
+        // subproperty relations are honored.
+        let hierarchy = dbs.first().and_then(|d| d.snapshot.schema_hierarchy());
+        Self::from_dbs_with_hierarchy(dbs, ledger_id, hierarchy).await
+    }
+
+    /// [`Self::from_dbs_with_overlay`] with an explicit RDFS hierarchy —
+    /// typically the ledger's current (novelty-aware) hierarchy from
+    /// `SchemaHierarchyCache`, so subclass targeting and RDFS inference see
+    /// relations committed since the last index build.
+    pub async fn from_dbs_with_hierarchy(
+        dbs: &[GraphDbRef<'_>],
+        ledger_id: impl Into<String>,
+        hierarchy: Option<SchemaHierarchy>,
+    ) -> Result<Self> {
         let shapes = ShapeCompiler::compile_from_dbs(dbs).await?;
 
         // Cache key pins the latest-seen `t` across all input snapshots.
@@ -168,8 +186,6 @@ impl ShaclEngine {
         let max_t = dbs.iter().map(|d| d.snapshot.t).max().unwrap_or(0);
         let key = ShaclCacheKey::new(ledger_id, max_t as u64);
 
-        // Hierarchy is schema-level — pick the first db's snapshot.
-        let hierarchy = dbs.first().and_then(|d| d.snapshot.schema_hierarchy());
         let cache = ShaclCache::new(key, shapes, hierarchy.as_ref());
 
         Ok(Self {

@@ -252,6 +252,18 @@ pub fn is_reifies_list_index(sid: &Sid) -> bool {
 /// table over byte-prefix-disambiguated arms; cost is dominated by the
 /// string-equality dispatch but stays bounded — the hot path on a
 /// non-`FLUREE_DB` SID returns after the integer compare alone.
+/// Whether a predicate affects the RDFS schema hierarchy
+/// (`rdfs:subClassOf` / `rdfs:subPropertyOf`).
+///
+/// Used by the commit path to bump the schema epoch that invalidates the
+/// shared [`SchemaHierarchy`] cache — a single integer compare on the
+/// namespace code before the (bounded) name match.
+#[inline]
+pub fn is_rdfs_hierarchy_predicate(sid: &Sid) -> bool {
+    sid.namespace_code == fluree_vocab::namespaces::RDFS
+        && matches!(sid.name.as_ref(), "subClassOf" | "subPropertyOf")
+}
+
 #[inline]
 pub fn is_reserved_reifies_predicate(sid: &Sid) -> bool {
     if sid.namespace_code != FLUREE_DB {

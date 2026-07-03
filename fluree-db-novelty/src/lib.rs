@@ -475,6 +475,11 @@ pub struct Novelty {
 
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
+    /// Epoch for the RDFS schema-hierarchy cache — bumped only when a commit
+    /// asserts or retracts `rdfs:subClassOf` / `rdfs:subPropertyOf`, so the
+    /// shared hierarchy cache stays current without any work on the (vastly
+    /// more common) commits that don't touch the schema.
+    pub schema_epoch: u64,
 
     /// Edge-annotation attachment overlay (M1 — derived from the
     /// `f:reifies*` system flakes flowing through the same pipeline).
@@ -497,6 +502,7 @@ impl Novelty {
             flake_count: 0,
             t,
             epoch: 0,
+            schema_epoch: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
@@ -814,6 +820,7 @@ impl Novelty {
         // reserved-predicate test is a single SID compare — negligible even on
         // ledgers that never use annotations.
         let mut accepted_reifies: Vec<Flake> = Vec::new();
+        let mut schema_touched = false;
         for (flake, g_id) in routed {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
@@ -822,7 +829,13 @@ impl Novelty {
             if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
                 accepted_reifies.push(flake.clone());
             }
+            // Asserting OR retracting a hierarchy edge changes the RDFS
+            // schema — invalidate the shared hierarchy cache.
+            schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
             per_graph.entry(g_id).or_default().push(flake);
+        }
+        if schema_touched {
+            self.schema_epoch += 1;
         }
 
         // Record every kept flake (assert + retract) into the current-state
@@ -910,6 +923,9 @@ impl Novelty {
             total_flakes += flakes.len();
             for flake in flakes {
                 let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+                if fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p) {
+                    self.schema_epoch += 1;
+                }
                 per_graph.entry(g_id).or_default().push(flake);
             }
         }

@@ -78,6 +78,9 @@ pub struct LedgerView {
     pub novelty: Arc<Novelty>,
     /// Dictionary novelty layer (subjects and strings since last index build)
     pub dict_novelty: Arc<fluree_db_core::DictNovelty>,
+    /// Shared cache of the current RDFS schema hierarchy (see
+    /// `LedgerState::schema_hierarchy_cache`).
+    pub schema_hierarchy_cache: Arc<fluree_db_core::SchemaHierarchyCache>,
     /// Ledger-scoped runtime IDs for predicates and datatypes.
     pub runtime_small_dicts: Arc<fluree_db_core::RuntimeSmallDicts>,
     /// Current transaction t value
@@ -108,6 +111,7 @@ impl LedgerView {
             snapshot: Arc::clone(&state.snapshot),
             novelty: Arc::clone(&state.novelty),
             dict_novelty: Arc::clone(&state.dict_novelty),
+            schema_hierarchy_cache: Arc::clone(&state.schema_hierarchy_cache),
             runtime_small_dicts: Arc::clone(&state.runtime_small_dicts),
             t: state.t(),
             head_commit_id: state.head_commit_id.clone(),
@@ -164,6 +168,7 @@ impl LedgerView {
             snapshot: self.snapshot,
             novelty: self.novelty,
             dict_novelty,
+            schema_hierarchy_cache: self.schema_hierarchy_cache,
             runtime_small_dicts: self.runtime_small_dicts,
             head_commit_id: self.head_commit_id,
             head_index_id: self.head_index_id,

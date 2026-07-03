@@ -575,7 +575,20 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         ));
     }
 
-    let engine = ShaclEngine::from_dbs_with_overlay(&shape_dbs, base.ledger_id())
+    // Current (novelty-aware) RDFS hierarchy: subclass targeting must see
+    // relations committed since the last index build. Cached on the ledger
+    // state; rebuilt only when a commit touched subClassOf/subPropertyOf.
+    let hierarchy = base
+        .schema_hierarchy_cache
+        .current(
+            &base.snapshot,
+            base.novelty.as_ref(),
+            base.t(),
+            base.novelty.schema_epoch,
+        )
+        .await
+        .map_err(fluree_db_transact::TransactError::from)?;
+    let engine = ShaclEngine::from_dbs_with_hierarchy(&shape_dbs, base.ledger_id(), hierarchy)
         .await
         .map_err(fluree_db_transact::TransactError::from)?;
     let shacl_cache = engine.cache();
