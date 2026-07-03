@@ -35,6 +35,13 @@ struct MetricsInner {
     /// Counter per outcome class. Sum over a kind gives total issued
     /// for that kind; ratio gives success rate.
     per_kind_outcome: HashMap<(OpKind, Outcome), u64>,
+    /// Per-kind count of leader-change events encountered on the
+    /// first attempt, regardless of whether the retry landed. Tracked
+    /// separately from `per_kind_outcome` so retry-success doesn't
+    /// hide the leader-change signal — an operator running this
+    /// harness against a raft cluster explicitly wants to see how
+    /// many elections happened during a chaos run.
+    per_kind_leader_change_retries: HashMap<OpKind, u64>,
     /// Per-ledger total counts (across all kinds). Surfaces hot-spots
     /// when the workload distribution isn't perfectly uniform.
     per_ledger: HashMap<String, u64>,
@@ -61,6 +68,7 @@ impl Metrics {
                 aggregate_hist,
                 per_kind_hist,
                 per_kind_outcome: HashMap::new(),
+                per_kind_leader_change_retries: HashMap::new(),
                 per_ledger: HashMap::new(),
                 total: 0,
             }),
@@ -72,7 +80,14 @@ impl Metrics {
     /// be the more accurate choice for coordinated-omission-adjusted
     /// stats, but at our cadence the raw recording is fine and easier
     /// to reason about.
-    pub fn record(&self, kind: OpKind, ledger: &str, outcome: Outcome, latency_ns: u64) {
+    pub fn record(
+        &self,
+        kind: OpKind,
+        ledger: &str,
+        outcome: Outcome,
+        latency_ns: u64,
+        retried_from_leader_change: bool,
+    ) {
         let mut g = self.inner.lock().expect("metrics lock poisoned");
         let clamped = latency_ns.clamp(HIST_MIN_NS, HIST_MAX_NS);
         let _ = g.aggregate_hist.record(clamped);
@@ -80,6 +95,9 @@ impl Metrics {
             let _ = h.record(clamped);
         }
         *g.per_kind_outcome.entry((kind, outcome)).or_insert(0) += 1;
+        if retried_from_leader_change {
+            *g.per_kind_leader_change_retries.entry(kind).or_insert(0) += 1;
+        }
         *g.per_ledger.entry(ledger.to_string()).or_insert(0) += 1;
         g.total += 1;
     }
@@ -99,6 +117,7 @@ impl Metrics {
             aggregate,
             per_kind,
             per_kind_outcome: g.per_kind_outcome.clone(),
+            per_kind_leader_change_retries: g.per_kind_leader_change_retries.clone(),
             per_ledger: g.per_ledger.clone(),
         }
     }
@@ -115,6 +134,7 @@ pub struct MetricsSnapshot {
     pub aggregate: HistogramSnapshot,
     pub per_kind: HashMap<OpKind, HistogramSnapshot>,
     pub per_kind_outcome: HashMap<(OpKind, Outcome), u64>,
+    pub per_kind_leader_change_retries: HashMap<OpKind, u64>,
     pub per_ledger: HashMap<String, u64>,
 }
 

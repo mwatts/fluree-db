@@ -33,6 +33,16 @@ impl TargetHealth {
 }
 
 /// HTTP client + routing pool.
+/// Internal result of `dispatch_inner`: the final classified outcome
+/// plus a flag capturing whether we retried past a first-attempt
+/// `LeaderChange`. The retry-was-taken signal survives even when the
+/// retry succeeds, so callers (metrics) can count leader-change events
+/// separately from terminal outcomes.
+struct DispatchOutcome {
+    outcome: Outcome,
+    retried_from_leader_change: bool,
+}
+
 ///
 /// Cheap to clone (everything inside is `Arc`'d), so every worker
 /// task gets its own handle.
@@ -131,17 +141,18 @@ impl ClusterClient {
     /// actually experiences, which is what the operator cares about).
     pub async fn dispatch(&self, op: Op) -> OpResult {
         let started = Instant::now();
-        let outcome = self.dispatch_inner(&op).await;
+        let dispatched = self.dispatch_inner(&op).await;
         let latency_ns = started.elapsed().as_nanos() as u64;
         OpResult {
             kind: op.kind,
             ledger: op.ledger,
-            outcome,
+            outcome: dispatched.outcome,
             latency_ns,
+            retried_from_leader_change: dispatched.retried_from_leader_change,
         }
     }
 
-    async fn dispatch_inner(&self, op: &Op) -> Outcome {
+    async fn dispatch_inner(&self, op: &Op) -> DispatchOutcome {
         // First attempt — round-robin target.
         let idx = self.pick_target();
         let url = self.build_url(idx, op);
@@ -158,28 +169,26 @@ impl ClusterClient {
         // double-count latency. One leader-change retry against the
         // next target is conservative but useful: it stops a single
         // election from sinking every request in flight.
-        let outcome = if matches!(outcome, Outcome::LeaderChange) {
+        if matches!(outcome, Outcome::LeaderChange) {
             self.record_outcome(idx, outcome);
             let retry_idx = self.pick_target();
             let retry_url = self.build_url(retry_idx, op);
-            match self.build_request(retry_url, op).send().await {
-                Ok(resp) => {
-                    let o = self.classify_response(resp).await;
-                    self.record_outcome(retry_idx, o);
-                    o
-                }
-                Err(e) => {
-                    let o = classify_send_error(&e);
-                    self.record_outcome(retry_idx, o);
-                    o
-                }
+            let retry_outcome = match self.build_request(retry_url, op).send().await {
+                Ok(resp) => self.classify_response(resp).await,
+                Err(e) => classify_send_error(&e),
+            };
+            self.record_outcome(retry_idx, retry_outcome);
+            DispatchOutcome {
+                outcome: retry_outcome,
+                retried_from_leader_change: true,
             }
         } else {
             self.record_outcome(idx, outcome);
-            outcome
-        };
-
-        outcome
+            DispatchOutcome {
+                outcome,
+                retried_from_leader_change: false,
+            }
+        }
     }
 
     /// Assemble the request builder from an op. Consolidates the

@@ -68,6 +68,12 @@ pub struct OpResult {
     pub ledger: String,
     pub outcome: Outcome,
     pub latency_ns: u64,
+    /// `true` if the dispatch encountered a `LeaderChange` on its
+    /// first attempt and had to retry against another target,
+    /// regardless of the retry's final outcome. Distinct from
+    /// `outcome == LeaderChange`, which means the retry itself was
+    /// also a leader-change (both attempts failed).
+    pub retried_from_leader_change: bool,
 }
 
 /// Classification of a single op's response.

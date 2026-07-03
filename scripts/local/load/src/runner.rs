@@ -136,6 +136,7 @@ async fn worker(
             &result.ledger,
             result.outcome,
             result.latency_ns,
+            result.retried_from_leader_change,
         );
         // A landed CreateLedger adds to the pool every subsequent op
         // can target. Done after recording so the metric is stamped
