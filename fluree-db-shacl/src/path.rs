@@ -17,7 +17,7 @@
 use crate::error::{Result, ShaclError};
 use crate::predicates;
 use fluree_db_core::{
-    id_datatype_sid, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid,
+    id_datatype_sid, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, SchemaHierarchy, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF, SHACL};
 use fluree_vocab::rdf_names;
@@ -344,6 +344,17 @@ async fn ordered_objects(
     Ok((items.into_iter().map(|(_, _, v)| v).collect(), all_indexed))
 }
 
+/// The predicate plus its RDFS subproperties — the always-on entailment
+/// expansion for enforcement: a step over `p` also traverses every
+/// `q rdfs:subPropertyOf p`.
+pub(crate) fn with_subproperties(p: &Sid, hierarchy: Option<&SchemaHierarchy>) -> Vec<Sid> {
+    let mut preds = vec![p.clone()];
+    if let Some(h) = hierarchy {
+        preds.extend(h.subproperties_of(p).iter().cloned());
+    }
+    preds
+}
+
 /// Evaluate a property path from `focus`, returning the reached value nodes as
 /// `(value, datatype, language)` tuples — the direct analogue of the objects
 /// of a single `SPOT` scan for a simple predicate.
@@ -351,28 +362,31 @@ pub fn eval_path<'a>(
     db: GraphDbRef<'a>,
     focus: &'a Sid,
     path: &'a PropertyPath,
+    hierarchy: Option<&'a SchemaHierarchy>,
 ) -> PathFuture<'a, Vec<PathValue>> {
     Box::pin(async move {
         match path {
-            PropertyPath::Predicate(p) => forward_step(db, focus, p).await,
-            PropertyPath::Inverse(p) => inverse_step(db, focus, p).await,
-            PropertyPath::Sequence(steps) => eval_sequence(db, focus, steps).await,
+            PropertyPath::Predicate(p) => forward_step(db, focus, p, hierarchy).await,
+            PropertyPath::Inverse(p) => inverse_step(db, focus, p, hierarchy).await,
+            PropertyPath::Sequence(steps) => eval_sequence(db, focus, steps, hierarchy).await,
             PropertyPath::Alternative(alts) => {
                 let mut out = Vec::new();
                 for alt in alts {
-                    out.extend(eval_path(db, focus, alt).await?);
+                    out.extend(eval_path(db, focus, alt, hierarchy).await?);
                 }
                 Ok(dedup(out))
             }
             PropertyPath::ZeroOrMore(inner) => {
                 let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid(), None)];
-                out.extend(closure(db, focus, inner).await?);
+                out.extend(closure(db, focus, inner, hierarchy).await?);
                 Ok(dedup(out))
             }
-            PropertyPath::OneOrMore(inner) => Ok(dedup(closure(db, focus, inner).await?)),
+            PropertyPath::OneOrMore(inner) => {
+                Ok(dedup(closure(db, focus, inner, hierarchy).await?))
+            }
             PropertyPath::ZeroOrOne(inner) => {
                 let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid(), None)];
-                out.extend(eval_path(db, focus, inner).await?);
+                out.extend(eval_path(db, focus, inner, hierarchy).await?);
                 Ok(dedup(out))
             }
             // Never evaluated: validation surfaces a violation for the owning
@@ -382,40 +396,58 @@ pub fn eval_path<'a>(
     })
 }
 
-/// Forward single-predicate step: objects of `(focus, p, ?)`.
-async fn forward_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<PathValue>> {
-    let flakes = db
-        .range(
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::subject_predicate(focus.clone(), p.clone()),
-        )
-        .await?;
-    Ok(flakes
-        .iter()
-        .map(|f| {
+/// Forward single-predicate step: objects of `(focus, p, ?)`, unioned over
+/// `p` and its RDFS subproperties.
+async fn forward_step(
+    db: GraphDbRef<'_>,
+    focus: &Sid,
+    p: &Sid,
+    hierarchy: Option<&SchemaHierarchy>,
+) -> Result<Vec<PathValue>> {
+    let mut out = Vec::new();
+    for pred in with_subproperties(p, hierarchy) {
+        let flakes = db
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject_predicate(focus.clone(), pred),
+            )
+            .await?;
+        out.extend(flakes.iter().map(|f| {
             (
                 f.o.clone(),
                 f.dt.clone(),
                 f.m.as_ref().and_then(|m| m.lang.clone()),
             )
-        })
-        .collect())
+        }));
+    }
+    Ok(out)
 }
 
-/// Inverse single-predicate step: subjects of `(?, p, focus)`.
-async fn inverse_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<PathValue>> {
-    let flakes = db
-        .range(
-            IndexType::Opst,
-            RangeTest::Eq,
-            RangeMatch::predicate_object(p.clone(), FlakeValue::Ref(focus.clone())),
-        )
-        .await?;
-    Ok(flakes
-        .iter()
-        .map(|f| (FlakeValue::Ref(f.s.clone()), id_datatype_sid(), None))
-        .collect())
+/// Inverse single-predicate step: subjects of `(?, p, focus)`, unioned over
+/// `p` and its RDFS subproperties.
+async fn inverse_step(
+    db: GraphDbRef<'_>,
+    focus: &Sid,
+    p: &Sid,
+    hierarchy: Option<&SchemaHierarchy>,
+) -> Result<Vec<PathValue>> {
+    let mut out = Vec::new();
+    for pred in with_subproperties(p, hierarchy) {
+        let flakes = db
+            .range(
+                IndexType::Opst,
+                RangeTest::Eq,
+                RangeMatch::predicate_object(pred, FlakeValue::Ref(focus.clone())),
+            )
+            .await?;
+        out.extend(
+            flakes
+                .iter()
+                .map(|f| (FlakeValue::Ref(f.s.clone()), id_datatype_sid(), None)),
+        );
+    }
+    Ok(out)
 }
 
 /// Evaluate a sequence path: chain each step, carrying `(value, dt)` only for
@@ -424,6 +456,7 @@ async fn eval_sequence(
     db: GraphDbRef<'_>,
     focus: &Sid,
     steps: &[PropertyPath],
+    hierarchy: Option<&SchemaHierarchy>,
 ) -> Result<Vec<PathValue>> {
     let mut frontier: Vec<Sid> = vec![focus.clone()];
 
@@ -431,7 +464,7 @@ async fn eval_sequence(
         let is_last = i + 1 == steps.len();
         let mut reached: Vec<PathValue> = Vec::new();
         for node in &frontier {
-            reached.extend(eval_path(db, node, step).await?);
+            reached.extend(eval_path(db, node, step, hierarchy).await?);
         }
         reached = dedup(reached);
 
@@ -456,14 +489,19 @@ async fn eval_sequence(
 
 /// Transitive closure of `inner` from `focus` (one or more steps), BFS over the
 /// reference nodes reached. Non-reference values are terminal value nodes.
-async fn closure(db: GraphDbRef<'_>, focus: &Sid, inner: &PropertyPath) -> Result<Vec<PathValue>> {
+async fn closure(
+    db: GraphDbRef<'_>,
+    focus: &Sid,
+    inner: &PropertyPath,
+    hierarchy: Option<&SchemaHierarchy>,
+) -> Result<Vec<PathValue>> {
     let mut out: Vec<PathValue> = Vec::new();
     // Seed `visited` with the focus so a cycle back to it isn't re-expanded.
     let mut visited: HashSet<Sid> = HashSet::from([focus.clone()]);
     let mut queue: Vec<Sid> = vec![focus.clone()];
 
     while let Some(node) = queue.pop() {
-        for (value, dt, lang) in eval_path(db, &node, inner).await? {
+        for (value, dt, lang) in eval_path(db, &node, inner, hierarchy).await? {
             if let FlakeValue::Ref(sid) = &value {
                 if visited.insert(sid.clone()) {
                     queue.push(sid.clone());

@@ -4532,3 +4532,144 @@ async fn shacl_compile_cache_invalidates_on_new_shapes() {
         .unwrap_err();
     assert_shacl_violation(err, "at least 1");
 }
+
+#[tokio::test]
+async fn shacl_path_sees_subproperty_values() {
+    // RDFS entailment (always on): a constraint on schema:name also governs
+    // values asserted via ex:firstName when firstName ⊑ name.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/subprop-path:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {
+                        "@id": "ex:NameShape",
+                        "@type": "sh:NodeShape",
+                        "sh:targetClass": {"@id": "ex:User"},
+                        "sh:property": [{
+                            "@id": "ex:sp-name-ps",
+                            "sh:path": {"@id": "schema:name"},
+                            "sh:maxLength": 4
+                        }]
+                    },
+                    {"@id": "ex:firstName", "rdfs:subPropertyOf": {"@id": "schema:name"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    // Direct schema:name within limit + firstName value over the limit:
+    // the subproperty value must violate maxLength on schema:name.
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:al",
+                "@type": "ex:User",
+                "schema:name": "Al",
+                "ex:firstName": "Alexander"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "exceeds maximum");
+
+    // Conforming subproperty value passes.
+    let ledger2 = fluree
+        .create_ledger("shacl/subprop-path-ok:main")
+        .await
+        .unwrap();
+    let ledger2 = fluree
+        .upsert(
+            ledger2,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {
+                        "@id": "ex:NameShape",
+                        "@type": "sh:NodeShape",
+                        "sh:targetClass": {"@id": "ex:User"},
+                        "sh:property": [{
+                            "@id": "ex:sp2-name-ps",
+                            "sh:path": {"@id": "schema:name"},
+                            "sh:maxLength": 4
+                        }]
+                    },
+                    {"@id": "ex:firstName", "rdfs:subPropertyOf": {"@id": "schema:name"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .upsert(
+            ledger2,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bo",
+                "@type": "ex:User",
+                "ex:firstName": "Bo"
+            }),
+        )
+        .await
+        .expect("conforming subproperty value must pass");
+}
+
+#[tokio::test]
+async fn shacl_target_subjects_of_sees_subproperties() {
+    // sh:targetSubjectsOf(ex:phone) must also target subjects that only
+    // carry ex:homePhone ⊑ ex:phone.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/subprop-target:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {
+                        "@id": "ex:PhoneOwnerShape",
+                        "@type": "sh:NodeShape",
+                        "sh:targetSubjectsOf": {"@id": "ex:phone"},
+                        "sh:property": [{
+                            "@id": "ex:tso-name-ps",
+                            "sh:path": {"@id": "schema:name"},
+                            "sh:minCount": 1
+                        }]
+                    },
+                    {"@id": "ex:homePhone", "rdfs:subPropertyOf": {"@id": "ex:phone"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:nameless",
+                "ex:homePhone": "555-0100"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
+}

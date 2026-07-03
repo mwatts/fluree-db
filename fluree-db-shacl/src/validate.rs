@@ -86,6 +86,9 @@ struct ClassMembershipCtx<'a> {
     /// vocabulary), when `f:shapesSource` is cross-ledger. Consulted on demand
     /// for `sh:class` membership after the local lookup misses.
     cross_ledger: Option<CrossLedgerMembership<'a>>,
+    /// Current RDFS hierarchy for always-on entailment: property paths and
+    /// pair constraints traverse `p` plus its subproperties.
+    hierarchy: Option<&'a SchemaHierarchy>,
 }
 
 /// SHACL validation engine
@@ -288,33 +291,36 @@ impl ShaclEngine {
         // are actually used as `SubjectsOf` targets are probed, so this is
         // bounded by the shape-set size, not the data size.
         for predicate in self.cache.by_target_subjects_of.keys() {
-            let flakes = db
-                .range(
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::subject_predicate(focus_node.clone(), predicate.clone()),
-                )
-                .await?;
-            if !flakes.is_empty() {
-                applicable_shapes.extend(self.cache.shapes_for_subjects_of(predicate));
+            for probe in crate::path::with_subproperties(predicate, self.hierarchy.as_ref()) {
+                let flakes = db
+                    .range(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject_predicate(focus_node.clone(), probe),
+                    )
+                    .await?;
+                if !flakes.is_empty() {
+                    applicable_shapes.extend(self.cache.shapes_for_subjects_of(predicate));
+                    break;
+                }
             }
         }
 
         // By `sh:targetObjectsOf(p)`: focus must currently appear as the
         // object of `p` (OPST existence check). Same bounded-cost argument.
         for predicate in self.cache.by_target_objects_of.keys() {
-            let flakes = db
-                .range(
-                    IndexType::Opst,
-                    RangeTest::Eq,
-                    RangeMatch::predicate_object(
-                        predicate.clone(),
-                        FlakeValue::Ref(focus_node.clone()),
-                    ),
-                )
-                .await?;
-            if !flakes.is_empty() {
-                applicable_shapes.extend(self.cache.shapes_for_objects_of(predicate));
+            for probe in crate::path::with_subproperties(predicate, self.hierarchy.as_ref()) {
+                let flakes = db
+                    .range(
+                        IndexType::Opst,
+                        RangeTest::Eq,
+                        RangeMatch::predicate_object(probe, FlakeValue::Ref(focus_node.clone())),
+                    )
+                    .await?;
+                if !flakes.is_empty() {
+                    applicable_shapes.extend(self.cache.shapes_for_objects_of(predicate));
+                    break;
+                }
             }
         }
 
@@ -332,6 +338,7 @@ impl ShaclEngine {
             membership_g_ids: &self.membership_g_ids,
             cache: &self.class_cache,
             cross_ledger,
+            hierarchy: self.hierarchy.as_ref(),
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -386,6 +393,7 @@ impl ShaclEngine {
             membership_g_ids: &self.membership_g_ids,
             cache: &self.class_cache,
             cross_ledger,
+            hierarchy: self.hierarchy.as_ref(),
         };
         for shape in self.cache.all_shapes() {
             if shape.deactivated {
@@ -424,24 +432,24 @@ impl ShaclEngine {
                         }
                     }
                     crate::compile::TargetType::ObjectsOf(predicate) => {
-                        let flakes = db
-                            .range(
-                                IndexType::Psot,
-                                RangeTest::Eq,
-                                RangeMatch::predicate(predicate.clone()),
-                            )
-                            .await?;
-                        for flake in &flakes {
-                            if matches!(flake.o, FlakeValue::Ref(_)) {
-                                continue;
-                            }
-                            let lit = crate::compile::LiteralTarget {
-                                value: flake.o.clone(),
-                                datatype: flake.dt.clone(),
-                                lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
-                            };
-                            if !literal_targets.contains(&lit) {
-                                literal_targets.push(lit);
+                        for pred in
+                            crate::path::with_subproperties(predicate, self.hierarchy.as_ref())
+                        {
+                            let flakes = db
+                                .range(IndexType::Psot, RangeTest::Eq, RangeMatch::predicate(pred))
+                                .await?;
+                            for flake in &flakes {
+                                if matches!(flake.o, FlakeValue::Ref(_)) {
+                                    continue;
+                                }
+                                let lit = crate::compile::LiteralTarget {
+                                    value: flake.o.clone(),
+                                    datatype: flake.dt.clone(),
+                                    lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+                                };
+                                if !literal_targets.contains(&lit) {
+                                    literal_targets.push(lit);
+                                }
                             }
                         }
                     }
@@ -687,32 +695,26 @@ async fn get_focus_nodes(
             // `validate_literal_focus` in `validate_all_with_membership`.
             TargetType::LiteralNode(_) => {}
             TargetType::SubjectsOf(predicate) => {
-                // Find all subjects that have this predicate
-                let flakes = db
-                    .range(
-                        IndexType::Psot,
-                        RangeTest::Eq,
-                        RangeMatch::predicate(predicate.clone()),
-                    )
-                    .await?;
-
-                for flake in flakes {
-                    focus_nodes.push(flake.s.clone());
+                // Subjects of the predicate — or of any RDFS subproperty.
+                for pred in crate::path::with_subproperties(predicate, hierarchy) {
+                    let flakes = db
+                        .range(IndexType::Psot, RangeTest::Eq, RangeMatch::predicate(pred))
+                        .await?;
+                    for flake in flakes {
+                        focus_nodes.push(flake.s.clone());
+                    }
                 }
             }
             TargetType::ObjectsOf(predicate) => {
-                // Find all objects of triples with this predicate
-                let flakes = db
-                    .range(
-                        IndexType::Psot,
-                        RangeTest::Eq,
-                        RangeMatch::predicate(predicate.clone()),
-                    )
-                    .await?;
-
-                for flake in flakes {
-                    if let FlakeValue::Ref(obj) = &flake.o {
-                        focus_nodes.push(obj.clone());
+                // Objects of the predicate — or of any RDFS subproperty.
+                for pred in crate::path::with_subproperties(predicate, hierarchy) {
+                    let flakes = db
+                        .range(IndexType::Psot, RangeTest::Eq, RangeMatch::predicate(pred))
+                        .await?;
+                    for flake in flakes {
+                        if let FlakeValue::Ref(obj) = &flake.o {
+                            focus_nodes.push(obj.clone());
+                        }
                     }
                 }
             }
@@ -1012,13 +1014,20 @@ async fn focus_value_violations<'a>(
             | Constraint::Disjoint(target_prop)
             | Constraint::LessThan(target_prop)
             | Constraint::LessThanOrEquals(target_prop) => {
-                let target_flakes = db
-                    .range(
-                        IndexType::Spot,
-                        RangeTest::Eq,
-                        RangeMatch::subject_predicate(focus_node.clone(), target_prop.clone()),
-                    )
-                    .await?;
+                let mut target_flakes = Vec::new();
+                for pred in crate::path::with_subproperties(
+                    target_prop,
+                    class_ctx.and_then(|c| c.hierarchy),
+                ) {
+                    target_flakes.extend(
+                        db.range(
+                            IndexType::Spot,
+                            RangeTest::Eq,
+                            RangeMatch::subject_predicate(focus_node.clone(), pred),
+                        )
+                        .await?,
+                    );
+                }
                 let target_values: Vec<FlakeValue> =
                     target_flakes.iter().map(|f| f.o.clone()).collect();
                 violations.extend(validate_pair_constraint(
@@ -1466,13 +1475,19 @@ fn validate_nested_shape<'a>(
             // scan; complex path → evaluate the AST (same as top-level shapes).
             let (values, datatypes, langs): (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) =
                 if let Some(pred) = path.as_predicate() {
-                    let flakes = db
-                        .range(
-                            IndexType::Spot,
-                            RangeTest::Eq,
-                            RangeMatch::subject_predicate(focus_node.clone(), pred.clone()),
-                        )
-                        .await?;
+                    let mut flakes = Vec::new();
+                    for probe in
+                        crate::path::with_subproperties(pred, class_ctx.and_then(|c| c.hierarchy))
+                    {
+                        flakes.extend(
+                            db.range(
+                                IndexType::Spot,
+                                RangeTest::Eq,
+                                RangeMatch::subject_predicate(focus_node.clone(), probe),
+                            )
+                            .await?,
+                        );
+                    }
                     (
                         flakes.iter().map(|f| f.o.clone()).collect(),
                         flakes.iter().map(|f| f.dt.clone()).collect(),
@@ -1483,7 +1498,13 @@ fn validate_nested_shape<'a>(
                     )
                 } else {
                     crate::path::split_path_values(
-                        crate::path::eval_path(db, focus_node, path).await?,
+                        crate::path::eval_path(
+                            db,
+                            focus_node,
+                            path,
+                            class_ctx.and_then(|c| c.hierarchy),
+                        )
+                        .await?,
                     )
                 };
 
@@ -1747,13 +1768,18 @@ async fn validate_property_shape<'a>(
     // language column feeds sh:uniqueLang / sh:languageIn.
     let (values, datatypes, langs): (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) =
         if let Some(pred) = prop_shape.path.as_predicate() {
-            let flakes = db
-                .range(
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::subject_predicate(focus_node.clone(), pred.clone()),
-                )
-                .await?;
+            let mut flakes = Vec::new();
+            for probe in crate::path::with_subproperties(pred, class_ctx.and_then(|c| c.hierarchy))
+            {
+                flakes.extend(
+                    db.range(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject_predicate(focus_node.clone(), probe),
+                    )
+                    .await?,
+                );
+            }
             (
                 flakes.iter().map(|f| f.o.clone()).collect(),
                 flakes.iter().map(|f| f.dt.clone()).collect(),
@@ -1764,7 +1790,13 @@ async fn validate_property_shape<'a>(
             )
         } else {
             crate::path::split_path_values(
-                crate::path::eval_path(db, focus_node, &prop_shape.path).await?,
+                crate::path::eval_path(
+                    db,
+                    focus_node,
+                    &prop_shape.path,
+                    class_ctx.and_then(|c| c.hierarchy),
+                )
+                .await?,
             )
         };
 
@@ -1777,13 +1809,20 @@ async fn validate_property_shape<'a>(
             | Constraint::Disjoint(target_prop)
             | Constraint::LessThan(target_prop)
             | Constraint::LessThanOrEquals(target_prop) => {
-                let target_flakes = db
-                    .range(
-                        IndexType::Spot,
-                        RangeTest::Eq,
-                        RangeMatch::subject_predicate(focus_node.clone(), target_prop.clone()),
-                    )
-                    .await?;
+                let mut target_flakes = Vec::new();
+                for pred in crate::path::with_subproperties(
+                    target_prop,
+                    class_ctx.and_then(|c| c.hierarchy),
+                ) {
+                    target_flakes.extend(
+                        db.range(
+                            IndexType::Spot,
+                            RangeTest::Eq,
+                            RangeMatch::subject_predicate(focus_node.clone(), pred),
+                        )
+                        .await?,
+                    );
+                }
                 let target_values: Vec<FlakeValue> =
                     target_flakes.iter().map(|f| f.o.clone()).collect();
 

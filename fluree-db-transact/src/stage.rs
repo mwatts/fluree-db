@@ -2158,8 +2158,21 @@ pub async fn stage_with_shacl(
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
         .collect();
 
-    // Create SHACL engine from cache
-    let engine = ShaclEngine::new(shacl_cache.clone());
+    // Create SHACL engine from cache, with the current (novelty-aware) RDFS
+    // hierarchy so subproperty/subclass entailment applies on this legacy
+    // path too.
+    let base = view.base();
+    let hierarchy = base
+        .schema_hierarchy_cache
+        .current(
+            &base.snapshot,
+            base.novelty.as_ref(),
+            base.t(),
+            base.novelty.schema_epoch,
+        )
+        .await?;
+    let engine =
+        ShaclEngine::from_shared_cache(std::sync::Arc::new(shacl_cache.clone()), hierarchy);
 
     // Validate staged flakes against shapes (per graph). `None` for
     // `enabled_graphs` means "validate every graph with staged flakes" —
@@ -2224,9 +2237,11 @@ impl ShaclValidationOutcome {
 /// Returns a [`ShaclValidationOutcome`] split into reject / warn buckets.
 /// The caller decides whether to propagate an error, log warnings, or both.
 #[cfg(feature = "shacl")]
+#[allow(clippy::too_many_arguments)]
 pub async fn validate_view_with_shacl(
     view: &StagedLedger,
-    shacl_cache: &ShaclCache,
+    shacl_cache: std::sync::Arc<ShaclCache>,
+    hierarchy: Option<fluree_db_core::SchemaHierarchy>,
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
@@ -2244,8 +2259,8 @@ pub async fn validate_view_with_shacl(
     // `cross_ledger_db` is a live handle into a model ledger holding the
     // controlled vocabulary (cross-ledger `f:shapesSource`), consulted on
     // demand for `sh:class` membership.
-    let engine =
-        ShaclEngine::new(shacl_cache.clone()).with_membership_graphs(membership_g_ids.to_vec());
+    let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
+        .with_membership_graphs(membership_g_ids.to_vec());
     let enabled_graphs: Option<HashSet<GraphId>> =
         per_graph_policy.map(|m| m.keys().copied().collect());
     let report = validate_staged_nodes(

@@ -607,6 +607,9 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         )
         .await
         .map_err(fluree_db_transact::TransactError::from)?;
+    // SchemaHierarchy clones are refcount bumps; keep one for the staged
+    // validation pass (the other moves into engine construction).
+    let hierarchy_for_validation = hierarchy.clone();
     // Cross-transaction compile reuse: skip the ~40 predicate scans of
     // ShapeCompiler when nothing shape-affecting changed since the last
     // compile of the same shape-source graphs.
@@ -651,7 +654,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             engine
         }
     };
-    let shacl_cache = engine.cache();
+    let shacl_cache = engine.shared_cache();
 
     // No config + no shapes → skip (backward compat: shapes-exist heuristic).
     if !has_config && shacl_cache.is_empty() {
@@ -665,6 +668,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     let outcome = validate_view_with_shacl(
         view,
         shacl_cache,
+        hierarchy_for_validation,
         ctx.graph_sids,
         ctx.tracker,
         per_graph_policy.as_ref(),
