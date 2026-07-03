@@ -366,6 +366,20 @@ async fn resolve_cross_ledger_shapes_for_tx(
 /// same mechanism — schema, policy, and SHACL shapes can live in any graph
 /// the ledger knows about, including the config graph itself.
 #[cfg(feature = "shacl")]
+/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
+/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
+/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
+/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
+/// compiled target index bakes in subclass expansion), and the same shape
+/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
+struct CachedShaclCompile {
+    snapshot_t: i64,
+    shacl_epoch: u64,
+    schema_epoch: u64,
+    shapes_g_ids: Vec<GraphId>,
+    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
+}
+
 pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
@@ -524,6 +538,9 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     // every data graph. Cross-ledger value-sets aren't supported yet, so that
     // branch falls back to the default graph.
     let membership_g_ids: Vec<fluree_db_core::GraphId>;
+    // Set on the plain same-ledger path — the only shape source eligible for
+    // cross-transaction compile reuse.
+    let mut cacheable_shape_g_ids: Option<Vec<GraphId>> = None;
     let mut shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
         if let (Some(wire), Some(staged_ns)) = (ctx.cross_ledger_shapes, ctx.staged_ns) {
             let bundle = wire
@@ -549,6 +566,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             //     concrete graph IDs; default to `[0]` when unset.
             let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
             membership_g_ids = shapes_g_ids.clone();
+            cacheable_shape_g_ids = Some(shapes_g_ids.clone());
             shapes_g_ids
                 .iter()
                 .map(|g_id| base.as_graph_db_ref(*g_id))
@@ -563,6 +581,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     //     staged namespace registry at `stage_with_config_shacl`
     //     entry, so encoding is consistent with the live tx.
     if let Some(bundle) = ctx.inline_shape_bundle.clone() {
+        cacheable_shape_g_ids = None;
         inline_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
             base.novelty.as_ref(),
             bundle,
@@ -588,9 +607,50 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         )
         .await
         .map_err(fluree_db_transact::TransactError::from)?;
-    let engine = ShaclEngine::from_dbs_with_hierarchy(&shape_dbs, base.ledger_id(), hierarchy)
-        .await
-        .map_err(fluree_db_transact::TransactError::from)?;
+    // Cross-transaction compile reuse: skip the ~40 predicate scans of
+    // ShapeCompiler when nothing shape-affecting changed since the last
+    // compile of the same shape-source graphs.
+    let reuse_key = cacheable_shape_g_ids.as_ref().map(|g_ids| {
+        (
+            base.snapshot.t,
+            base.novelty.shacl_epoch,
+            base.novelty.schema_epoch,
+            g_ids.clone(),
+        )
+    });
+    let shared_compile: Option<std::sync::Arc<fluree_db_shacl::ShaclCache>> =
+        reuse_key.as_ref().and_then(|key| {
+            let slot = base.shacl_compile_cache.read();
+            let entry = slot
+                .as_ref()?
+                .clone()
+                .downcast::<CachedShaclCompile>()
+                .ok()?;
+            (entry.snapshot_t == key.0
+                && entry.shacl_epoch == key.1
+                && entry.schema_epoch == key.2
+                && entry.shapes_g_ids == key.3)
+                .then(|| std::sync::Arc::clone(&entry.cache))
+        });
+    let engine = match shared_compile {
+        Some(cache) => ShaclEngine::from_shared_cache(cache, hierarchy),
+        None => {
+            let engine =
+                ShaclEngine::from_dbs_with_hierarchy(&shape_dbs, base.ledger_id(), hierarchy)
+                    .await
+                    .map_err(fluree_db_transact::TransactError::from)?;
+            if let Some((snapshot_t, shacl_epoch, schema_epoch, shapes_g_ids)) = reuse_key {
+                *base.shacl_compile_cache.write() = Some(std::sync::Arc::new(CachedShaclCompile {
+                    snapshot_t,
+                    shacl_epoch,
+                    schema_epoch,
+                    shapes_g_ids,
+                    cache: engine.shared_cache(),
+                }));
+            }
+            engine
+        }
+    };
     let shacl_cache = engine.cache();
 
     // No config + no shapes → skip (backward compat: shapes-exist heuristic).

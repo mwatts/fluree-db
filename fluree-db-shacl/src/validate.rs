@@ -24,6 +24,7 @@ use fluree_vocab::rdf_names;
 use fluree_vocab::shacl as sh_vocab;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Per-transaction memo for `sh:class` value-membership verdicts.
 ///
@@ -94,8 +95,10 @@ struct ClassMembershipCtx<'a> {
 /// - A shape targeting `Animal` will also apply to instances of `Dog`
 ///   (if `Dog rdfs:subClassOf Animal`)
 pub struct ShaclEngine {
-    /// Cached compiled shapes
-    cache: ShaclCache,
+    /// Cached compiled shapes. `Arc`-shared so a transaction can reuse the
+    /// previous transaction's compile when no SHACL-affecting flake landed
+    /// in between (see `Novelty::shacl_epoch`).
+    cache: Arc<ShaclCache>,
     /// Schema hierarchy for RDFS reasoning (optional)
     hierarchy: Option<SchemaHierarchy>,
     /// Extra graphs consulted when resolving `sh:class` value membership —
@@ -113,7 +116,7 @@ impl ShaclEngine {
     /// For full RDFS reasoning support, use `new_with_hierarchy` instead.
     pub fn new(cache: ShaclCache) -> Self {
         Self {
-            cache,
+            cache: Arc::new(cache),
             hierarchy: None,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
@@ -126,11 +129,30 @@ impl ShaclEngine {
     /// shapes targeting a class will also apply to instances of subclasses.
     pub fn new_with_hierarchy(cache: ShaclCache, hierarchy: SchemaHierarchy) -> Self {
         Self {
-            cache,
+            cache: Arc::new(cache),
             hierarchy: Some(hierarchy),
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Create an engine around an already-compiled, shared shape cache —
+    /// the cross-transaction reuse path: when no SHACL-affecting flake
+    /// landed since the previous compile, enforcement skips the ~40
+    /// predicate scans of `ShapeCompiler` entirely.
+    pub fn from_shared_cache(cache: Arc<ShaclCache>, hierarchy: Option<SchemaHierarchy>) -> Self {
+        Self {
+            cache,
+            hierarchy,
+            membership_g_ids: Vec::new(),
+            class_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The shared handle to the compiled shape cache (for cross-transaction
+    /// reuse bookkeeping).
+    pub fn shared_cache(&self) -> Arc<ShaclCache> {
+        Arc::clone(&self.cache)
     }
 
     /// Build an engine by compiling shapes from a single-graph database with
@@ -189,7 +211,7 @@ impl ShaclEngine {
         let cache = ShaclCache::new(key, shapes, hierarchy.as_ref());
 
         Ok(Self {
-            cache,
+            cache: Arc::new(cache),
             hierarchy,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),

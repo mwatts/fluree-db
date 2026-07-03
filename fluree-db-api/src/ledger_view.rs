@@ -81,6 +81,9 @@ pub struct LedgerView {
     /// Shared cache of the current RDFS schema hierarchy (see
     /// `LedgerState::schema_hierarchy_cache`).
     pub schema_hierarchy_cache: Arc<fluree_db_core::SchemaHierarchyCache>,
+    /// Cross-transaction compiled-SHACL cache slot (see
+    /// `LedgerState::shacl_compile_cache`).
+    pub shacl_compile_cache: Arc<parking_lot::RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
     /// Ledger-scoped runtime IDs for predicates and datatypes.
     pub runtime_small_dicts: Arc<fluree_db_core::RuntimeSmallDicts>,
     /// Current transaction t value
@@ -112,6 +115,7 @@ impl LedgerView {
             novelty: Arc::clone(&state.novelty),
             dict_novelty: Arc::clone(&state.dict_novelty),
             schema_hierarchy_cache: Arc::clone(&state.schema_hierarchy_cache),
+            shacl_compile_cache: Arc::clone(&state.shacl_compile_cache),
             runtime_small_dicts: Arc::clone(&state.runtime_small_dicts),
             t: state.t(),
             head_commit_id: state.head_commit_id.clone(),
@@ -169,6 +173,7 @@ impl LedgerView {
             novelty: self.novelty,
             dict_novelty,
             schema_hierarchy_cache: self.schema_hierarchy_cache,
+            shacl_compile_cache: self.shacl_compile_cache,
             runtime_small_dicts: self.runtime_small_dicts,
             head_commit_id: self.head_commit_id,
             head_index_id: self.head_index_id,

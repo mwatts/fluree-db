@@ -480,6 +480,12 @@ pub struct Novelty {
     /// shared hierarchy cache stays current without any work on the (vastly
     /// more common) commits that don't touch the schema.
     pub schema_epoch: u64,
+    /// Epoch for the compiled-SHACL cache — bumped only when a commit
+    /// asserts or retracts SHACL vocabulary (any `sh:*` predicate, or an
+    /// `rdf:type` edge to a SHACL / class type). Lets transaction
+    /// enforcement reuse the previously compiled shapes when nothing
+    /// shape-affecting changed.
+    pub shacl_epoch: u64,
 
     /// Edge-annotation attachment overlay (M1 — derived from the
     /// `f:reifies*` system flakes flowing through the same pipeline).
@@ -503,6 +509,7 @@ impl Novelty {
             t,
             epoch: 0,
             schema_epoch: 0,
+            shacl_epoch: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
@@ -821,6 +828,7 @@ impl Novelty {
         // ledgers that never use annotations.
         let mut accepted_reifies: Vec<Flake> = Vec::new();
         let mut schema_touched = false;
+        let mut shacl_touched = false;
         for (flake, g_id) in routed {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
@@ -830,12 +838,17 @@ impl Novelty {
                 accepted_reifies.push(flake.clone());
             }
             // Asserting OR retracting a hierarchy edge changes the RDFS
-            // schema — invalidate the shared hierarchy cache.
+            // schema — invalidate the shared hierarchy cache. Likewise any
+            // SHACL-vocabulary flake invalidates the compiled-shapes cache.
             schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
+            shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
             per_graph.entry(g_id).or_default().push(flake);
         }
         if schema_touched {
             self.schema_epoch += 1;
+        }
+        if shacl_touched {
+            self.shacl_epoch += 1;
         }
 
         // Record every kept flake (assert + retract) into the current-state
@@ -925,6 +938,9 @@ impl Novelty {
                 let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
                 if fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p) {
                     self.schema_epoch += 1;
+                }
+                if fluree_db_core::namespaces::is_shacl_affecting_flake(&flake) {
+                    self.shacl_epoch += 1;
                 }
                 per_graph.entry(g_id).or_default().push(flake);
             }

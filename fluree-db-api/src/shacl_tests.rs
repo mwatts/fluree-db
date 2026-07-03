@@ -4446,3 +4446,89 @@ async fn shacl_same_transaction_schema_not_entailed() {
         .await
         .expect("same-transaction schema must not entail for enforcement");
 }
+
+#[tokio::test]
+async fn shacl_compile_cache_invalidates_on_new_shapes() {
+    // Data-only transactions reuse the compiled shapes; committing new
+    // shapes must invalidate the reuse so the next transaction enforces
+    // them. Exercises the shacl_epoch invalidation path end to end.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/compile-cache:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:NameShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:User"},
+                "sh:property": [{
+                    "@id": "ex:cc-name-ps",
+                    "sh:path": {"@id": "schema:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    // Two data-only transactions (compile reused on the second).
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:u1", "@type": "ex:User", "schema:name": "One"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:u2", "@type": "ex:User", "schema:name": "Two"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    // New shape commits -> shacl_epoch bumps -> next txn must enforce it.
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:EmailShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:User"},
+                "sh:property": [{
+                    "@id": "ex:cc-email-ps",
+                    "sh:path": {"@id": "schema:email"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:u3", "@type": "ex:User", "schema:name": "Three"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
+}

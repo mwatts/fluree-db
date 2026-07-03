@@ -42,6 +42,7 @@ full = ["native", "credential", "iceberg", "shacl", "ipfs"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
+parking_lot = "0.12"
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
 fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-policy = { path = "../fluree-db-policy" }
