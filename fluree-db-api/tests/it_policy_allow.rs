@@ -831,3 +831,140 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
         })
         .await;
 }
+
+/// RDFS entailment for policy enforcement (always on): a class policy
+/// governs instances of subclasses.
+#[tokio::test]
+async fn policy_onclass_governs_subclass_instances() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/onclass-subclass:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Schema first (separate transaction), then data.
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+                "@id": "ex:Manager",
+                "rdfs:subClassOf": {"@id": "ex:Employee"}
+            }),
+        )
+        .await
+        .expect("schema txn");
+    let _ = fluree
+        .insert(
+            ledger1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+                "@graph": [
+                    {"@id": "ex:pat", "@type": "ex:Manager", "schema:name": "Pat"},
+                    {"@id": "ex:sam", "@type": "ex:Contractor", "schema:name": "Sam"}
+                ]
+            }),
+        )
+        .await
+        .expect("data txn");
+
+    // Policy allows viewing Employees only; Manager ⊑ Employee must qualify.
+    let policy = json!([
+        {
+            "@id": "ex:employeePolicy",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:onClass": [{"@id": "http://example.org/ns/Employee"}],
+            "f:allow": true
+        }
+    ]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Pat"])),
+        "class policy on Employee must govern Manager instances (and not Contractor)"
+    );
+}
+
+/// RDFS entailment for policy enforcement (always on): a property policy
+/// governs subproperties.
+#[tokio::test]
+async fn policy_onproperty_governs_subproperties() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/onproperty-subprop:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "rdfs": "http://www.w3.org/2000/01/rdf-schema#"},
+                "@id": "ex:homePhone",
+                "rdfs:subPropertyOf": {"@id": "ex:phone"}
+            }),
+        )
+        .await
+        .expect("schema txn");
+    let _ = fluree
+        .insert(
+            ledger1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+                "@id": "ex:alice",
+                "schema:name": "Alice",
+                "ex:homePhone": "555-0100"
+            }),
+        )
+        .await
+        .expect("data txn");
+
+    // Deny ex:phone; homePhone ⊑ phone must be denied too.
+    let policy = json!([
+        {
+            "@id": "ex:denyPhone",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:onProperty": [{"@id": "http://example.org/ns/phone"}],
+            "f:allow": false
+        },
+        {
+            "@id": "ex:allowAll",
+            "@type": "f:AccessPolicy",
+            "f:action": "f:view",
+            "f:allow": true
+        }
+    ]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:homePhone": "?v"}
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([])),
+        "property policy on ex:phone must deny the ex:homePhone subproperty"
+    );
+}

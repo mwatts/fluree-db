@@ -334,8 +334,26 @@ async fn build_policy_context_from_opts_inner(
         snapshot.stats.clone()
     };
 
-    let view_set = build_policy_set(restrictions.clone(), stats.as_ref(), PolicyAction::View);
-    let modify_set = build_policy_set(restrictions, stats.as_ref(), PolicyAction::Modify);
+    // Current RDFS hierarchy (always-on entailment for enforcement): class
+    // policies govern subclass instances, property policies govern
+    // subproperties. Two bound-predicate scans + closure — small next to the
+    // stats assembly and policy parsing above.
+    let hierarchy = fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, overlay, to_t)
+        .await
+        .map_err(|e| ApiError::internal(format!("policy hierarchy computation failed: {e}")))?;
+
+    let view_set = build_policy_set(
+        restrictions.clone(),
+        stats.as_ref(),
+        PolicyAction::View,
+        hierarchy.as_ref(),
+    );
+    let modify_set = build_policy_set(
+        restrictions,
+        stats.as_ref(),
+        PolicyAction::Modify,
+        hierarchy.as_ref(),
+    );
 
     // Check if this is a root policy (unrestricted access).
     //

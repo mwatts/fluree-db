@@ -231,7 +231,10 @@ where
     R: Fn(&str) -> Option<Sid>,
 {
     let restrictions = wire_to_restrictions(wire, resolve_iri, None)?;
-    Ok(build_policy_set(restrictions, stats, action_filter))
+    // Cross-ledger wire policies apply in the data ledger's term space, but
+    // this path has no hierarchy handle yet — no RDFS expansion (matches the
+    // pre-entailment behavior for wire policies).
+    Ok(build_policy_set(restrictions, stats, action_filter, None))
 }
 
 #[cfg(test)]
@@ -389,7 +392,7 @@ mod tests {
             for_classes: HashSet::new(),
             class_check_needed: false,
         };
-        let local_set = build_policy_set(vec![local_restriction], None, PolicyAction::View);
+        let local_set = build_policy_set(vec![local_restriction], None, PolicyAction::View, None);
 
         // (b) Wire form translated against the same Sid bindings.
         let wire = PolicyArtifactWire {
