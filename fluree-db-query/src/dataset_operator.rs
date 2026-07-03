@@ -370,7 +370,19 @@ impl Operator for DatasetOperator {
                 // *before* opening any operators so we can consistently
                 // disable binary stores for all graphs when provenance
                 // stamping is needed.
-                let multi_ledger = graphs.windows(2).any(|w| w[0].ledger_id != w[1].ledger_id);
+                // A single active graph can still belong to a multi-ledger
+                // dataset (e.g. the default graph alongside named graphs from
+                // other ledgers). Its bindings may cross a graph boundary —
+                // seed a GRAPH block or a cross-graph join — and be stamped, so
+                // they must materialize to `Binding::Sid` rather than late
+                // `Binding::EncodedSid` (which `stamp_provenance` cannot decode
+                // without the store), exactly as when the active graphs
+                // themselves span ledgers (issue #1405).
+                let multi_ledger = graphs.windows(2).any(|w| w[0].ledger_id != w[1].ledger_id)
+                    || ctx
+                        .dataset
+                        .as_ref()
+                        .is_some_and(|d| d.spans_multiple_ledgers());
                 self.needs_provenance = multi_ledger;
 
                 for graph in &graphs {

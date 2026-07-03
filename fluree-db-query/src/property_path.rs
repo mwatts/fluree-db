@@ -57,6 +57,24 @@ fn is_reserved_edge_predicate(p: &Sid) -> bool {
     fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
 }
 
+/// Re-encode a pattern-constant predicate `Sid` into the active graph's
+/// namespace table.
+///
+/// Path pattern predicates are encoded against the primary/lowering snapshot at
+/// plan time, but a path executes against a per-graph (`GRAPH <iri>`) snapshot
+/// that may assign the same IRI a different namespace code. Without re-encoding,
+/// a divergent-namespace predicate (e.g. `ex:broader`) reads the wrong SID and
+/// the traversal silently finds no edges (issue #1405). Decodes against the
+/// original snapshot (where the SID was encoded) and re-encodes against the
+/// active graph; single-graph queries round-trip to the same SID (no change).
+#[inline]
+fn reencode_pred(ctx: &ExecutionContext<'_>, db: &fluree_db_core::LedgerSnapshot, p: &Sid) -> Sid {
+    ctx.original_snapshot
+        .decode_sid(p)
+        .and_then(|iri| db.encode_iri(&iri))
+        .unwrap_or_else(|| p.clone())
+}
+
 /// Property path operator - transitive graph traversal
 ///
 /// Supports two execution modes:
@@ -280,10 +298,13 @@ impl PropertyPathOperator {
         use_post: bool,
     ) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
+        // Re-encode the traversal predicates into the active graph's dict — see
+        // `reencode_pred` (issue #1405).
+        let preds: Vec<Sid> = preds.iter().map(|p| reencode_pred(ctx, db, p)).collect();
         let mut out = Vec::new();
         let mut seen: HashSet<Sid> = HashSet::new();
         for node in nodes {
-            for pred in preds {
+            for pred in &preds {
                 let (index, range_match) = if use_post {
                     (
                         IndexType::Post,
@@ -642,7 +663,8 @@ impl PropertyPathOperator {
             }
         } else {
             for pred in &self.pattern.predicates {
-                let range_match = RangeMatch::predicate(pred.clone());
+                // Re-encode into the active graph's dict — see `reencode_pred`.
+                let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
                 let flakes = range_with_overlay(
                     db,
                     ctx.binary_g_id,
@@ -785,7 +807,8 @@ impl PropertyPathOperator {
         let mut seen: HashSet<Sid> = HashSet::new();
         let mut out = Vec::new();
         for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::predicate(pred.clone());
+            // Re-encode into the active graph's dict — see `reencode_pred`.
+            let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
@@ -830,7 +853,8 @@ impl PropertyPathOperator {
                 .flat_map(|s| s.predicates.iter()),
         );
         for pred in all_preds {
-            let range_match = RangeMatch::predicate(pred.clone());
+            // Re-encode into the active graph's dict — see `reencode_pred`.
+            let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
@@ -1011,7 +1035,19 @@ impl PropertyPathOperator {
         let binary_store = ctx.binary_store.as_ref();
         let resolve_sid = |term: &Ref, binding: Option<&Binding>| -> Option<Sid> {
             match term {
-                Ref::Sid(s) => Some(s.clone()),
+                // A pattern-constant SID is encoded against the primary/lowering
+                // snapshot at plan time; re-encode it into the active graph's
+                // namespace table (matching the `Ref::Iri` arm) so a
+                // divergent-namespace path endpoint — e.g. `?c broader+ ex:top`
+                // where `ex:top`'s code differs across ledgers — is matched
+                // against the right code instead of silently finding nothing
+                // (issue #1405). Falls back to the raw SID when it can't be
+                // decoded (single-graph round-trips to the same SID).
+                Ref::Sid(s) => ctx
+                    .original_snapshot
+                    .decode_sid(s)
+                    .and_then(|iri| db_for_encode.encode_iri(&iri))
+                    .or_else(|| Some(s.clone())),
                 Ref::Iri(iri) => db_for_encode.encode_iri(iri),
                 Ref::Var(_) => binding.and_then(|b| match b {
                     Binding::Sid { sid: s, .. } => Some(s.clone()),
