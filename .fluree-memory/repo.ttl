@@ -906,7 +906,7 @@ mem:fact-01kn800ps56as4xe2kycr10yq1 a mem:Fact ;
     mem:createdAt "2026-04-02T21:01:33.861145+00:00"^^xsd:dateTime .
 
 mem:fact-01knjakv2d3t3y7av973g38tm7 a mem:Fact ;
-    mem:content "Incremental indexing has two notable gotchas in `fluree-db-indexer`: 1) when incremental fulltext refresh cannot fetch/decode the prior fulltext arena, `build/incremental.rs` starts from `FulltextArena::new()` and then writes a replacement arena built from novelty only, which can drop historical `fulltext()` scoring data for that `(g_id,p_id)`; 2) incremental schema refresh carries forward the base schema if base-store load fails, which leaves `snapshot.schema` stale for reasoning until a later successful refresh/rebuild. Also, `IndexerConfig.incremental_max_commit_bytes` defaults to `None`, and only the embedded orchestrator populates it from `reindex_max_bytes`." ;
+    mem:content "Incremental indexing gotchas in `fluree-db-indexer`: 1) fulltext prior-arena fetch/decode failure now HARD-FAILS the incremental build (incremental.rs ~1482; recovery contract = build_index_for_ledger falls back to full rebuild) — the old silent start-from-empty fallback that dropped historical fulltext scoring is FIXED; 2) incremental schema refresh carries forward the base schema if base-store load fails, which leaves `snapshot.schema` stale for reasoning until a later successful refresh/rebuild. Also, `IndexerConfig.incremental_max_commit_bytes` defaults to `None`, and only the embedded orchestrator populates it from `reindex_max_bytes`." ;
     mem:tag "fulltext" ;
     mem:tag "incremental-indexing" ;
     mem:tag "indexer" ;
@@ -1619,6 +1619,37 @@ mem:fact-01ktyzzbs4ewxqpgvssvj72tt5 a mem:Fact ;
     mem:branch "fix/decimal-exactness" ;
     mem:createdAt "2026-06-12T22:41:50.884413+00:00"^^xsd:dateTime ;
     mem:rationale "Continuation point for the decimal fix series; the remaining priority-4 cluster (canonical identity) is the prerequisite for issues #1324/#1325." .
+
+mem:fact-01kwn1qw4yhk6fy47xhmc9d7dm a mem:Fact ;
+    mem:content "fulltext() must handle BOTH binding shapes: BinaryScanOperator disables late materialization whenever overlay epoch != 0 (binary_scan.rs), so with ANY novelty every scanned value reaches eval_fulltext as Binding::Lit (p_id + lang in dtc), not EncodedLit. The Lit arm originally scored only @fulltext-datatype values → configured (f:fullTextDefaults) predicates returned unbound for EVERY row the moment one unindexed commit existed (Solo/S3 2026-07-03 bug; memory-mode tests passed because they queried exactly at index_t with empty novelty). Fixed on fix/fulltext-persisted-arena-lookup: Lit arm mirrors EncodedLit arena lookup. Persisted (file-backed, fresh-process) reproducers now in it_query_fulltext.rs." ;
+    mem:tag "binding" ;
+    mem:tag "bm25" ;
+    mem:tag "fulltext" ;
+    mem:tag "materialization" ;
+    mem:tag "novelty" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_fulltext.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/fulltext.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-03T22:31:41.982333+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future change to materialization gates or fulltext eval must keep both arms (EncodedLit and Lit) scoring configured predicates, or the field regression recurs invisibly (memory tests won't catch it)." .
+
+mem:fact-01kwn4gk9gz7vp31r6g9awth8g a mem:Fact ;
+    mem:content "fulltext() per-row eval is hot: PreparedFulltextQuery (eval/fulltext.rs) caches bucket analyzer choice, query stems, arena term_ids, IDFs, and effective stats per (store_id, epoch, to_t, g_id, p_id, lang_id, query) — moka + thread-local one-slot memo; per-row = doc_bow probe + one u32 binary search per term (50k rows: 1.45s→61ms, 24x). store_id in the key pins term_ids to the arena instance. Analyzer::shared(lang) is the per-language static (for_language CLONES the whole stopword set — never call per row). Materialized Lit rows resolve string_id→BoW instead of re-analyzing text. Next lever if still slow: posting-driven retrieval/WAND pushdown (graph-source BM25 already has WAND)." ;
+    mem:tag "bm25" ;
+    mem:tag "cache" ;
+    mem:tag "fulltext" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_fulltext.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/analyzer.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/fulltext.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-03T23:20:09.264477+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future work on fulltext eval or analyzers must preserve the once-per-query invariant; the ignored fulltext_perf_50k_labels test is the regression harness." .
 
 mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
     mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;
