@@ -173,6 +173,13 @@ pub struct Workload {
     tuning: WorkloadTuning,
     ledgers: LedgerState,
     op_counter: Arc<AtomicU64>,
+    /// Count of `CreateLedger` ops the workload has *dispatched*
+    /// against `wide-fanout`'s cap — separate from the landed count in
+    /// `ledgers`, which trails by the create-op latency. Under
+    /// concurrency + non-trivial create latency, many creates can
+    /// be in flight before the first lands; a landed-count cap check
+    /// would let them all through and overshoot `target_ledger_count`.
+    creates_dispatched: Arc<AtomicU64>,
     /// Run-unique prefix the workload mixes into every generated
     /// ledger name + IRI. Stops collisions if two runs share a
     /// cluster.
@@ -193,6 +200,7 @@ impl Workload {
             tuning,
             ledgers,
             op_counter: Arc::new(AtomicU64::new(0)),
+            creates_dispatched: Arc::new(AtomicU64::new(0)),
             run_id: Ulid::new().to_string(),
         }
     }
@@ -227,16 +235,28 @@ impl Workload {
     }
 
     fn next_wide_fanout(&self, idx: u64) -> Option<Op> {
-        let creates_so_far = self.ledgers.len() as u64;
         let max_creates = self.tuning.target_ledger_count;
         let create_every = self.tuning.wide_fanout_create_every.max(1);
-        // Cap creates at the target; after that, transact-only on the pool.
-        let want_create = creates_so_far < max_creates && idx.is_multiple_of(create_every);
-        if want_create {
-            Some(self.gen_create(idx))
-        } else {
-            self.next_transact_against_pool(idx)
+        if idx.is_multiple_of(create_every) {
+            // Claim a slot under the cap atomically: only bump the
+            // counter (and dispatch) if the pre-increment value is
+            // still below the target. A concurrent worker that races
+            // in gets a stale `current` from the CAS failure and
+            // retries with the fresh value.
+            let mut current = self.creates_dispatched.load(Ordering::Relaxed);
+            while current < max_creates {
+                match self.creates_dispatched.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(self.gen_create(idx)),
+                    Err(actual) => current = actual,
+                }
+            }
         }
+        self.next_transact_against_pool(idx)
     }
 
     fn next_multitenant(&self, idx: u64) -> Option<Op> {
