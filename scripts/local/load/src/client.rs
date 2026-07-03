@@ -32,7 +32,6 @@ impl TargetHealth {
     }
 }
 
-/// HTTP client + routing pool.
 /// Internal result of `dispatch_inner`: the final classified outcome
 /// plus a flag capturing whether we retried past a first-attempt
 /// `LeaderChange`. The retry-was-taken signal survives even when the
@@ -43,6 +42,7 @@ struct DispatchOutcome {
     retried_from_leader_change: bool,
 }
 
+/// HTTP client + routing pool.
 ///
 /// Cheap to clone (everything inside is `Arc`'d), so every worker
 /// task gets its own handle.
@@ -132,6 +132,12 @@ impl ClusterClient {
             let now_ms = self.start.elapsed().as_millis() as u64;
             let until = now_ms.saturating_add(self.blacklist_window.as_millis() as u64);
             health.blacklist_until.store(until, Ordering::Relaxed);
+            // Clear the streak once the blacklist penalty has been
+            // applied. When the window expires and the target rejoins
+            // round-robin, it gets a fresh `blacklist_threshold`
+            // failures' worth of runway before being blacklisted
+            // again, matching the "consecutive failures" contract.
+            health.consecutive_failures.store(0, Ordering::Relaxed);
         }
     }
 
