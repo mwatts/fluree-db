@@ -560,10 +560,9 @@ impl FlureeServerBuilder {
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher> =
                 raft_ns.clone();
             let ns_mode = fluree_db_api::NameServiceMode::ReadWrite(publisher);
-            state::build_fluree_with_nameservice(&self.config, ns_mode, raft_event_bus.clone())
-                .await?
+            state::build_fluree_with_nameservice(&self.config, ns_mode, raft_event_bus).await?
         } else {
-            state::build_default_fluree(&self.config, raft_event_bus.clone()).await?
+            state::build_default_fluree(&self.config, raft_event_bus).await?
         };
         #[cfg(not(feature = "raft"))]
         let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config, None).await?;
