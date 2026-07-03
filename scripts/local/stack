@@ -602,16 +602,16 @@ cmd_up() {
     info "Starting containers..."
     "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d >/dev/null
 
-    info "Waiting for raft nodes to come up..."
+    info "Waiting for nodes to come up..."
     local deadline
     deadline=$(( $(date +%s) + 60 ))
     local i
     for i in $(seq 1 "$node_count"); do
-        local url
-        url="$(node_host_public_url "$i")/health"
-        while ! curl -fsS -m 2 "$url" >/dev/null 2>&1; do
+        local public_url
+        public_url="$(node_host_public_url "$i")/health"
+        while ! curl -fsS -m 2 "$public_url" >/dev/null 2>&1; do
             if [ "$(date +%s)" -gt "$deadline" ]; then
-                err "Timed out waiting for node $i ($url)"
+                err "Timed out waiting for node $i public listener ($public_url)"
                 warn "Recent logs:"
                 "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
                     logs --tail 20 "$(node_host "$i")"
@@ -619,6 +619,26 @@ cmd_up() {
             fi
             sleep 0.5
         done
+        # In raft mode, also verify the raft listener is bound before
+        # returning. Bootstrap's /cluster/* calls dial the raft port
+        # directly — a public listener that comes up before the raft
+        # one fails add-learner with connection-refused. Curl without
+        # -f accepts any HTTP response (including pre-init 4xx/5xx)
+        # since the goal is "listener is bound", not "endpoint says OK".
+        if [ "$mode" = "raft" ]; then
+            local raft_url
+            raft_url="$(node_host_raft_url "$i")/cluster/status"
+            while ! curl -sS -m 2 -o /dev/null "$raft_url" 2>/dev/null; do
+                if [ "$(date +%s)" -gt "$deadline" ]; then
+                    err "Timed out waiting for node $i raft listener ($raft_url)"
+                    warn "Recent logs:"
+                    "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+                        logs --tail 20 "$(node_host "$i")"
+                    exit 1
+                fi
+                sleep 0.5
+            done
+        fi
         ok "Node $i healthy at $(node_host_public_url "$i")"
     done
 
