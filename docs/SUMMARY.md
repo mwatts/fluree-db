@@ -74,6 +74,7 @@
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
   - [Access control policies](guides/cookbook-policies.md)
+  - [Sharing data with downstream consumers](guides/sharing-data.md)
   - [SHACL validation](guides/cookbook-shacl.md)
   - [Edge annotations](guides/cookbook-edge-annotations.md)
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
