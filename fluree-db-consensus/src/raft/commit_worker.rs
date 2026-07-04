@@ -1069,6 +1069,13 @@ impl Worker {
             // head. The retry loop refreshes the local view and
             // re-stages the same entry.
             Err(NameServiceError::ApplyLagged(msg)) => Err(WorkerError::Lagged(msg)),
+            // Ambiguous outcome — the ApplyHead may have committed
+            // with only the response lost. `Raft` is not a
+            // rejection (see [`WorkerError::is_rejection`]), so the
+            // caller keeps the staged blob while it backs off.
+            Err(NameServiceError::ProposeUnresolved(msg)) => Err(WorkerError::Raft(format!(
+                "publish_commit unresolved: {msg}"
+            ))),
             Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
         }
     }

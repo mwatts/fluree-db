@@ -65,6 +65,20 @@ pub enum NameServiceError {
     /// [`Self::Storage`] (transient; retry the same propose).
     #[error("Apply built on lagging view: {0}")]
     ApplyLagged(String),
+
+    /// A propose toward the replicated log ended without a
+    /// determinable outcome — transport failure, lost response, or
+    /// leader step-down between submission and reply. The work may
+    /// have committed: callers must not treat this as "nothing
+    /// happened" (in particular, must not release resources a
+    /// committed outcome would reference) and recover by
+    /// re-checking replicated state or rebuilding the propose.
+    /// Distinguished from [`Self::Storage`] (backend error; nothing
+    /// was submitted) and from the decided apply outcomes
+    /// ([`Self::ApplyStale`], [`Self::ApplyLagged`],
+    /// [`Self::ApplyRejected`]).
+    #[error("Propose outcome unresolved: {0}")]
+    ProposeUnresolved(String),
 }
 
 impl From<LedgerIdParseError> for NameServiceError {
@@ -129,5 +143,13 @@ impl NameServiceError {
     /// view and rebuild the propose rather than dropping the work.
     pub fn apply_lagged(msg: impl Into<String>) -> Self {
         Self::ApplyLagged(msg.into())
+    }
+
+    /// Create a [`Self::ProposeUnresolved`] error signaling that a
+    /// propose's outcome could not be determined and may have
+    /// committed. Callers keep any resources the committed outcome
+    /// would reference and re-check replicated state before acting.
+    pub fn propose_unresolved(msg: impl Into<String>) -> Self {
+        Self::ProposeUnresolved(msg.into())
     }
 }

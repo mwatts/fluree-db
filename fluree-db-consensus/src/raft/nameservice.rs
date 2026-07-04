@@ -999,8 +999,9 @@ fn map_propose_error<E: FromRaftWriteError>(
 ///   on — same drop-and-advance recovery as the queue-front race.
 /// - [`NotLeader`](ApplyStagedCommitError::NotLeader),
 ///   [`RaftPropose`](ApplyStagedCommitError::RaftPropose) →
-///   [`Storage`](NameServiceError::Storage). Transient; worker
-///   retries.
+///   [`ProposeUnresolved`](NameServiceError::ProposeUnresolved).
+///   The propose may have committed on the leader; the worker
+///   keeps its staged blob and retries.
 fn classify_apply_staged_commit_outcome(
     outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError>,
     queue_id: u64,
@@ -1029,10 +1030,14 @@ fn classify_apply_staged_commit_outcome(
         Err(ApplyStagedCommitError::AlreadyStashed { queue_id }) => Err(
             NameServiceError::apply_stale(format!("queue_id {queue_id} already in flight")),
         ),
+        // NotLeader can't distinguish "stale leader lookup, nothing
+        // submitted" from "stepped down mid-propose, entry may still
+        // commit"; RaftPropose fatals can likewise strike after the
+        // entry was appended. Both leave the outcome unresolved.
         Err(
             e @ (ApplyStagedCommitError::NotLeader { .. } | ApplyStagedCommitError::RaftPropose(_)),
-        ) => Err(NameServiceError::storage(format!(
-            "leader rejected apply_staged_commit: {e}"
+        ) => Err(NameServiceError::propose_unresolved(format!(
+            "leader could not resolve apply_staged_commit: {e}"
         ))),
     }
 }
@@ -1108,8 +1113,11 @@ impl RaftNameService {
             // Ok would tell the worker the head landed, leaving the
             // staged receipt in place to later override the
             // genuinely-committed receipt from the new leader.
+            // Step-down window: if leadership was lost after the
+            // entry was accepted, it can still commit under the new
+            // leader — the outcome is unresolved, not failed.
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
-                Err(NameServiceError::storage(
+                Err(NameServiceError::propose_unresolved(
                     "ApplyHead forwarded to leader (stepped down between stage and propose); \
                      caller should drop the stash and let the new leader's worker re-stage"
                         .to_string(),
@@ -1120,7 +1128,9 @@ impl RaftNameService {
                     "unexpected ChangeMembershipError on ApplyHead: {e}"
                 )))
             }
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+            // A fatal raft error can strike after the entry was
+            // appended; it may still replicate and commit.
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::propose_unresolved(format!(
                 "raft fatal during ApplyHead: {f}"
             ))),
         }
@@ -1213,22 +1223,35 @@ impl RaftNameService {
             .send()
             .await
             .map_err(|e| {
-                NameServiceError::storage(format!("apply_staged_commit POST to leader: {e}"))
+                // The request may have reached the leader before the
+                // failure (timeout covers send + response read), so
+                // the propose may have committed.
+                NameServiceError::propose_unresolved(format!(
+                    "apply_staged_commit POST to leader: {e}"
+                ))
             })?;
 
         if !resp.status().is_success() {
-            return Err(NameServiceError::storage(format!(
+            // A non-2xx can arise before the propose (request decode
+            // rejected) or after it (post-propose handler failure);
+            // the status alone can't distinguish them.
+            return Err(NameServiceError::propose_unresolved(format!(
                 "apply_staged_commit returned HTTP {}",
                 resp.status()
             )));
         }
 
         let body_bytes = resp.bytes().await.map_err(|e| {
-            NameServiceError::storage(format!("read apply_staged_commit body: {e}"))
+            // 2xx headers arrived, so the leader computed an outcome;
+            // it was lost with the body.
+            NameServiceError::propose_unresolved(format!("read apply_staged_commit body: {e}"))
         })?;
         let outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> =
             postcard::from_bytes(&body_bytes).map_err(|e| {
-                NameServiceError::storage(format!(
+                // Outcome delivered but unreadable — includes a newer
+                // leader sending a response variant this node doesn't
+                // know yet (rolling upgrade).
+                NameServiceError::propose_unresolved(format!(
                     "postcard decode of apply_staged_commit response: {e}"
                 ))
             })?;
@@ -2585,25 +2608,29 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_not_leader_is_transient_storage() {
-        // Mid-flight leader change. Transient: the next round
-        // discovers the new leader and retries against it.
+    fn classify_outcome_not_leader_is_propose_unresolved() {
+        // Mid-flight leader change. The propose may have been
+        // accepted before the step-down and can still commit under
+        // the new leader — the worker keeps its staged blob and
+        // retries once the next round discovers the new leader.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::NotLeader { leader: Some(2) }),
             7,
         );
         let err = r.expect_err("not_leader must be Err");
         assert!(
-            matches!(err, NameServiceError::Storage(_)),
-            "expected Storage, got {err:?}"
+            matches!(err, NameServiceError::ProposeUnresolved(_)),
+            "expected ProposeUnresolved, got {err:?}"
         );
     }
 
     #[test]
-    fn classify_outcome_raft_propose_is_transient_storage() {
+    fn classify_outcome_raft_propose_is_propose_unresolved() {
         // Raft fatal (membership-change error, log fsync stuck,
-        // etc.). Transient at this layer — openraft's own retry
-        // machinery and the worker's backoff handle recovery.
+        // etc.) can strike after the entry was appended, so the
+        // outcome is unresolved rather than failed; the worker
+        // keeps its staged blob while openraft's retry machinery
+        // and the worker's backoff handle recovery.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::RaftPropose(
                 "log fsync failed".into(),
@@ -2612,8 +2639,8 @@ mod tests {
         );
         let err = r.expect_err("raft_propose must be Err");
         assert!(
-            matches!(err, NameServiceError::Storage(_)),
-            "expected Storage, got {err:?}"
+            matches!(err, NameServiceError::ProposeUnresolved(_)),
+            "expected ProposeUnresolved, got {err:?}"
         );
     }
 
