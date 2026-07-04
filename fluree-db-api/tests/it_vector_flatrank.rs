@@ -1288,7 +1288,7 @@ async fn vector_flatrank_perf_50k() {
         expected.len()
     );
 
-    let query = json!({
+    let query_dot = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "select": ["?x", "?score"],
         "values": [["?targetVec"],
@@ -1303,7 +1303,7 @@ async fn vector_flatrank_perf_50k() {
 
     for run in ["cold", "warm"] {
         let start = std::time::Instant::now();
-        let result = support::query_jsonld(&fluree, &ledger, &query)
+        let result = support::query_jsonld(&fluree, &ledger, &query_dot)
             .await
             .expect("dotProduct query");
         let rows = result.to_jsonld(&ledger.snapshot).unwrap();
@@ -1389,5 +1389,51 @@ async fn vector_flatrank_perf_50k() {
             got, expected_count,
             "{name}: hit count must match scalar recomputation"
         );
+    }
+
+    // ── Indexed phase ──────────────────────────────────────────────────────
+    // Full reindex, then reload: novelty is empty (overlay epoch 0), so the
+    // scan late-materializes and `?vec` reaches eval as EncodedLit VECTOR_ID
+    // — the packed-f32-shard path, exercised with the same verification.
+    let reindex_start = std::time::Instant::now();
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload indexed");
+    println!(
+        "vector_perf_50k: reindexed in {:?} (t={})",
+        reindex_start.elapsed(),
+        ledger.t()
+    );
+
+    for run in ["indexed cold", "indexed warm"] {
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query_dot)
+            .await
+            .expect("indexed dotProduct query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        let arr = rows.as_array().unwrap().clone();
+        println!(
+            "vector_perf_50k: dotProduct {run} run: {} hits in {:?}",
+            arr.len(),
+            start.elapsed()
+        );
+
+        assert_eq!(
+            arr.len(),
+            expected.len(),
+            "{run}: hit count must match scalar recomputation"
+        );
+        for (rank, (exp_idx, exp_score)) in expected.iter().take(5).enumerate() {
+            let row = arr[rank].as_array().unwrap();
+            let id = row[0].as_str().unwrap();
+            let score = row[1].as_f64().unwrap();
+            assert_eq!(id, format!("ex:v{exp_idx}"), "{run}: rank {rank} id");
+            assert!(
+                (score - exp_score).abs() <= 1e-6 * exp_score.abs().max(1.0),
+                "{run}: rank {rank} score {score} != scalar {exp_score}"
+            );
+        }
     }
 }

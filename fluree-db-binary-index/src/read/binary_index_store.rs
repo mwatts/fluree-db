@@ -986,6 +986,32 @@ impl BinaryIndexStore {
         }
     }
 
+    /// Zero-copy lookup of an indexed vector by arena handle.
+    ///
+    /// Returns the shard-backed [`VectorSlice`](crate::arena::vector::VectorSlice)
+    /// for `(g_id, p_id, handle)` — `as_f32()` borrows the packed shard data
+    /// directly, with no per-call allocation or f64 widening (unlike the
+    /// `decode_value` path, which collects a fresh `Vec<f64>` per call).
+    /// `None` when the predicate has no arena or the handle is out of range
+    /// (e.g. an ephemeral novelty handle) — callers fall back to the
+    /// decoding path in that case.
+    pub fn vector_slice(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        handle: u32,
+    ) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        let arena = match self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        arena.lookup_vector(handle)
+    }
+
     /// Find the existing vector arena handle for the given quantized f32
     /// `value` under `(g_id, p_id)`. Returns `None` if no arena exists for
     /// the predicate, or if the value isn't stored.
