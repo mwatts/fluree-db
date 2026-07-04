@@ -18,6 +18,7 @@ use crate::raft::storage::{
 };
 use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
+use fluree_db_api::LedgerManager;
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{LedgerEventBus, NameServiceEvent};
@@ -29,7 +30,7 @@ use openraft::{
 use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 
@@ -110,6 +111,17 @@ where
     /// node so admin clears and idempotency eviction don't orphan
     /// envelope blobs on followers.
     release_tx: Option<UnboundedSender<(String, ContentId)>>,
+    /// Late-bound handle to the api-layer ledger cache. The adapter
+    /// reports commit-head advances into its watermark
+    /// ([`LedgerManager::note_head_advance`]) inline during `apply`
+    /// and `install_snapshot`, before broadcasting events — a
+    /// lossless channel, unlike the bounded event bus, and a bare
+    /// memory write, so apply latency is unaffected. A cell rather
+    /// than a builder field because the cache is constructed after
+    /// the adapter: bootstrap clones the cell out, and server
+    /// assembly fills it once `Fluree` exists. Empty cell → applies
+    /// proceed without reporting.
+    ledger_manager: Arc<OnceLock<Arc<LedgerManager>>>,
 }
 
 impl<S> StateMachineAdapter<S>
@@ -139,7 +151,14 @@ where
             waiter_map: None,
             staged_receipts: None,
             release_tx: None,
+            ledger_manager: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Clone out the late-binding ledger-cache cell so the
+    /// integration layer can fill it after `Fluree` exists.
+    pub fn ledger_manager_cell(&self) -> Arc<OnceLock<Arc<LedgerManager>>> {
+        Arc::clone(&self.ledger_manager)
     }
 
     /// Construct an adapter and restore state + `last_applied` +
@@ -463,6 +482,22 @@ where
                 }
             }
         }
+        // Report commit-head advances to the ledger cache first —
+        // synchronous and lossless, unlike the bounded event bus —
+        // so a cache hit racing this apply already compares against
+        // the new watermark.
+        if let Some(manager) = self.ledger_manager.get() {
+            for event in &events {
+                if let NameServiceEvent::LedgerCommitPublished {
+                    ledger_id,
+                    commit_t,
+                    ..
+                } = event
+                {
+                    manager.note_head_advance(ledger_id, *commit_t);
+                }
+            }
+        }
         // Emit after the state write lock drops so subscribers
         // can't block apply progress.
         if let Some(bus) = self.event_bus.as_ref() {
@@ -546,6 +581,16 @@ where
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
         let new_state = NameServiceState::from_snapshot(&bytes).map_err(read_state_err)?;
+        // A snapshot install advances heads in bulk without
+        // per-entry applies, so the per-apply watermark report
+        // never fires for them. Capture every restored head here
+        // and report after the state swap, so caches behind the
+        // restored state revalidate.
+        let restored_heads: Vec<(String, i64)> = new_state
+            .refs
+            .iter()
+            .map(|(key, entry)| (key.ledger_id(), entry.t))
+            .collect();
         let membership_bytes =
             postcard::to_allocvec(&meta.last_membership).map_err(write_state_err)?;
 
@@ -565,6 +610,12 @@ where
         *self.state.write().await = new_state;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+
+        if let Some(manager) = self.ledger_manager.get() {
+            for (ledger_id, commit_t) in &restored_heads {
+                manager.note_head_advance(ledger_id, *commit_t);
+            }
+        }
 
         // The snapshot replaces the state machine wholesale. Any
         // queue_id tracked by this node's waiter map or staged-
@@ -1085,6 +1136,85 @@ mod tests {
             }
             other => panic!("expected LedgerRetracted, got {other:?}"),
         }
+    }
+
+    /// A real `LedgerManager` over memory backends, for asserting
+    /// watermark reports through [`LedgerManager::head_watermark`].
+    fn memory_ledger_manager() -> Arc<LedgerManager> {
+        use fluree_db_api::{LedgerManagerConfig, NameServiceMode};
+        use fluree_db_core::{MemoryStorage, StorageBackend};
+        use fluree_db_nameservice::memory::MemoryNameService;
+
+        Arc::new(LedgerManager::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new())),
+            LedgerManagerConfig::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn apply_reports_commit_head_advances_to_ledger_manager() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+        let manager = memory_ledger_manager();
+        sm.ledger_manager_cell()
+            .set(Arc::clone(&manager))
+            .ok()
+            .expect("cell empty");
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        seed_branch_head(&sm, "test/db", "main", cid(7), 10).await;
+        // CreateBranch emits `LedgerCommitPublished` for the new
+        // branch at the source head — the cache's watermark must
+        // reflect the same advance the event carries.
+        sm.apply([Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(RaftCommand::CreateBranch(
+                crate::raft::state_machine::NewBranch {
+                    ledger_id: "test/db".into(),
+                    branch: "feature".into(),
+                    source_branch: "main".into(),
+                    at_commit: None,
+                    applied_at_millis: 3_000,
+                },
+            )),
+        }])
+        .await
+        .unwrap();
+
+        assert_eq!(manager.head_watermark("test/db:feature"), Some(10));
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_reports_restored_heads_to_ledger_manager() {
+        let source_storage = Arc::new(MemoryRaftStorage::new());
+        let mut source = StateMachineAdapter::new(Arc::clone(&source_storage));
+        source
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        seed_branch_head(&source, "test/db", "main", cid(7), 42).await;
+        let mut builder = source.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        // A snapshot install moves heads in bulk with no per-entry
+        // applies; the sweep must report every restored head or
+        // caches keyed on the old state never revalidate.
+        let target_storage = Arc::new(MemoryRaftStorage::new());
+        let mut target = StateMachineAdapter::new(target_storage);
+        let manager = memory_ledger_manager();
+        target
+            .ledger_manager_cell()
+            .set(Arc::clone(&manager))
+            .ok()
+            .expect("cell empty");
+
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.head_watermark("test/db:main"), Some(42));
     }
 
     #[tokio::test]

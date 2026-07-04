@@ -572,6 +572,22 @@ impl FlureeServerBuilder {
             AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
                 .await?;
 
+        // Hand the ledger cache to the raft adapter: consensus
+        // apply advances heads without the local writer pipeline,
+        // and its synchronous, lossless watermark report is what
+        // keeps cache hits from serving state the replicated head
+        // has moved past. (The event bus also carries these
+        // advances, but it is bounded and can drop under load — it
+        // drives reconciliation, not staleness.)
+        #[cfg(feature = "raft")]
+        if let Some(((integration, _), manager)) = self
+            .raft
+            .as_ref()
+            .zip(state_inner.fluree.ledger_manager())
+        {
+            integration.attach_ledger_manager(Arc::clone(manager));
+        }
+
         #[cfg(feature = "raft")]
         let raft_listener_parts = self.raft.as_ref().map(|(integration, listen_addr)| {
             // Consensus-side committer stack: `QueuedTransactor`
