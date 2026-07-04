@@ -590,6 +590,28 @@ pub fn is_blank_node_id(iri: &str) -> bool {
     iri.starts_with("_:fdb")
 }
 
+/// Resolve a stable Fluree blank-node identifier (`_:fdb-...`) directly to
+/// its stored Sid, bypassing skolemization so writes address the existing
+/// node instead of minting a fresh one. Returns `None` for ordinary blank
+/// node labels (fresh-mint semantics) and non-blank-node strings.
+///
+/// Call sites should be at parse/lowering time (once per term), never in
+/// per-solution template instantiation.
+#[inline]
+pub fn stable_blank_node_sid(iri: &str) -> Option<Sid> {
+    fluree_db_core::ns_encoding::stable_blank_node_local(iri)
+        .map(|local| Sid::new(BLANK_NODE, local))
+}
+
+/// Like [`stable_blank_node_sid`] but for a bare label with the `_:` already
+/// stripped (e.g. Turtle parser output).
+#[inline]
+pub fn stable_blank_node_sid_from_label(label: &str) -> Option<Sid> {
+    label
+        .starts_with(fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX)
+        .then(|| Sid::new(BLANK_NODE, label))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +676,32 @@ mod tests {
         assert!(is_blank_node_id("_:fdb"));
         assert!(!is_blank_node_id("_:b1"));
         assert!(!is_blank_node_id("http://example.org/thing"));
+    }
+
+    #[test]
+    fn test_stable_blank_node_sid() {
+        // A stable id round-trips to the exact Sid blank_node_sid minted.
+        let registry = NamespaceRegistry::new();
+        let minted = registry.blank_node_sid("1234-0-b0");
+        let resolved = stable_blank_node_sid("_:fdb-1234-0-b0").expect("stable id resolves");
+        assert_eq!(resolved, minted);
+
+        // Ordinary labels and non-blank strings do not resolve.
+        assert!(stable_blank_node_sid("_:b0").is_none());
+        assert!(stable_blank_node_sid("_:fdbx").is_none()); // reserved form requires `fdb-`
+        assert!(stable_blank_node_sid("http://example.org/fdb-1").is_none());
+    }
+
+    #[test]
+    fn test_stable_blank_node_sid_from_label() {
+        let registry = NamespaceRegistry::new();
+        let minted = registry.blank_node_sid("1234-0-b0");
+        assert_eq!(
+            stable_blank_node_sid_from_label("fdb-1234-0-b0"),
+            Some(minted)
+        );
+        assert!(stable_blank_node_sid_from_label("b0").is_none());
+        assert!(stable_blank_node_sid_from_label("fdbx").is_none());
     }
 
     #[test]

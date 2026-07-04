@@ -280,7 +280,10 @@ Create entities without explicit IRIs:
 }
 ```
 
-Fluree generates a unique IRI for the blank node address.
+Fluree generates a unique IRI for the blank node address, in the reserved
+`_:fdb-...` label space. Queries return that id, and it can be used later to
+address the node directly — see
+[Editing blank-node structures](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids).
 
 ## Adding to Existing Entities
 
