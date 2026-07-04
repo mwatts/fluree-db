@@ -1651,6 +1651,21 @@ mem:fact-01kwn4gk9gz7vp31r6g9awth8g a mem:Fact ;
     mem:createdAt "2026-07-03T23:20:09.264477+00:00"^^xsd:dateTime ;
     mem:rationale "Any future work on fulltext eval or analyzers must preserve the once-per-query invariant; the ignored fulltext_perf_50k_labels test is the regression harness." .
 
+mem:fact-01kwncjr1vh93xbsx3q4213w54 a mem:Fact ;
+    mem:content "Flat vector scoring (dotProduct/cosineSimilarity/euclideanDistance): eval now resolves args to borrowed &[f64] (no ComparableValue round-trip — that path Arc-copies the ENTIRE vector per conversion, value.rs FlakeValue::Vector arm) and routes through vector_math SIMD kernels (which previously had ZERO production callers). End-to-end flat-rank gains are modest (9-26% @ 50k x 256-dim; ~3% @ 1024-dim) because the scan/materialize floor (~145ms/50k rows, vector clones through the pipeline) dominates — NOT the scoring eval. Next levers: Arc-backed FlakeValue::Vector through scan/materialization, or HNSW top-k routing. Harness: vector_flatrank_perf_50k (ignored, scalar-verified)." ;
+    mem:tag "flatrank" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "simd" ;
+    mem:tag "vector" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_vector_flatrank.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/vector.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/vector_math.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-04T01:41:08.283260+00:00"^^xsd:dateTime ;
+    mem:rationale "Prevents re-optimizing eval when the flat-rank bottleneck is scan-side vector copying; documents that ComparableValue conversion of vectors is a full copy." .
+
 mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
     mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;
     mem:tag "dedup" ;
