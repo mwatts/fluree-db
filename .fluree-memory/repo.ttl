@@ -1666,6 +1666,23 @@ mem:fact-01kwncjr1vh93xbsx3q4213w54 a mem:Fact ;
     mem:createdAt "2026-07-04T01:41:08.283260+00:00"^^xsd:dateTime ;
     mem:rationale "Prevents re-optimizing eval when the flat-rank bottleneck is scan-side vector copying; documents that ComparableValue conversion of vectors is a full copy." .
 
+mem:fact-01kwnn592htcq4hcpjxtj1p69a a mem:Fact ;
+    mem:content "fast_vector_topk.rs: flat-rank top-k fast path — bind ?score dotProduct(?vec, const/1-row-VALUES) [+threshold/orderBy desc/limit, project {?s,?score}] runs as a direct shard scan: VectorArenaSnapshot pins shards once (per-row lookup_vector cache probe was the bottleneck capping gains at 2x), overlay-merging cursor rows, leaf/LEAFLET-refined subject partitions on rayon, ephemeral novelty vectors pre-decoded before the parallel section (ctx not Sync). Scores bit-identical (widen f32→f64, same dot kernel). 50k×256 indexed: 21ms→3.3ms (6.4x). GOTCHA: query VALUES vectors are NOT f32-quantized (only storage is) — ground truth = dot(quantized_row, raw_target)." ;
+    mem:tag "fast-path" ;
+    mem:tag "flatrank" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "topk" ;
+    mem:tag "vector" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_vector_flatrank.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/arena/vector.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_vector_topk.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-04T04:11:04.145477+00:00"^^xsd:dateTime ;
+    mem:rationale "Extending the fast path (cosine/euclidean, hydration join, larger projections) starts here; snapshot + partition + overlay idioms are the reusable pieces. Parity harness: vector_topk_fast_path_parity." .
+
 mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
     mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;
     mem:tag "dedup" ;
