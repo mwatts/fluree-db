@@ -106,16 +106,25 @@ pub(crate) async fn resolve_schema_closure_bundle(
     if schema_source.ledger.is_none() {
         return Ok(None);
     }
-    // Mirror the query path: the cross-ledger materializer resolves a single
-    // graph and does not walk `owl:imports` — fail closed rather than
-    // silently enforcing against a partial closure.
+    // The cross-ledger materializer resolves a single graph and does not
+    // walk `owl:imports`, so `f:followOwlImports` cannot be honored here.
+    // Skip the bundle (local-only hierarchy) rather than erroring: this
+    // resolver runs inside every transaction's enforcement setup, so a hard
+    // failure would reject every subsequent write on the ledger — including
+    // the config repair itself. The loud fail-closed rejection lives on the
+    // reasoning-query path (`resolve_configured_schema_bundle`), which is
+    // where an incomplete closure would actually change entailment results;
+    // enforcement merely falls back to the pre-feature local hierarchy.
     if reasoning.follow_owl_imports.unwrap_or(false) {
-        return Err(CrossLedgerError::TranslationFailed {
-            ledger_id: schema_source.ledger.clone().unwrap_or_default(),
-            graph_iri: schema_source.graph_selector.clone().unwrap_or_default(),
-            detail: "`f:followOwlImports` is not supported with a cross-ledger `f:schemaSource`"
-                .into(),
-        });
+        tracing::warn!(
+            model_ledger = schema_source.ledger.as_deref().unwrap_or_default(),
+            graph_selector = schema_source.graph_selector.as_deref().unwrap_or_default(),
+            "`f:followOwlImports` is not supported with a cross-ledger \
+             `f:schemaSource`; skipping cross-ledger enforcement entailment \
+             (local hierarchy only). Reasoning queries against this config \
+             fail closed."
+        );
+        return Ok(None);
     }
     let resolved = resolve_graph_ref(schema_source, ArtifactKind::SchemaClosure, ctx).await?;
     let GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact else {
