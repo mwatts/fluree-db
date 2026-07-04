@@ -1620,6 +1620,22 @@ mem:fact-01ktyzzbs4ewxqpgvssvj72tt5 a mem:Fact ;
     mem:createdAt "2026-06-12T22:41:50.884413+00:00"^^xsd:dateTime ;
     mem:rationale "Continuation point for the decimal fix series; the remaining priority-4 cluster (canonical identity) is the prerequisite for issues #1324/#1325." .
 
+mem:fact-01kwpj81fpnp0rk5s952wf3shd a mem:Fact ;
+    mem:content "Every range_with_overlay call on the V3 provider pays a full overlay-translation tax: binary_range_eq_v3 walks the graph's ENTIRE novelty unbounded (for_each_overlay_flake with None/None/leftmost), V3-translates every flake (dict probes), then sorts+resolves the whole op set — per call. Any per-flake point-lookup loop is therefore O(calls × novelty log novelty) on novelty-heavy ledgers. This livelocked filtered-DELETE staging >900s (~21k retractions via list-meta hydration); fixed by grouping hydration lookups per (g_id, s, p) with distinct-meta assignment to duplicates. Same risk: cascade_attachment_retracts (annotation ledgers), per-flake policy loops. Systemic fix = cache translated overlay ops per (epoch, g_id, index)." ;
+    mem:tag "delete" ;
+    mem:tag "novelty" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "range-provider" ;
+    mem:tag "staging" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_range.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "fix/filtered-delete-staging-hang" ;
+    mem:createdAt "2026-07-04T12:39:23.382379+00:00"^^xsd:dateTime ;
+    mem:rationale "range_with_overlay looks like a cheap point lookup at call sites but is O(novelty log novelty) per call; future per-flake lookup loops will reintroduce this livelock class." .
+
 mem:decision-01kwphem9r3gvcvj2j5842ddt6 a mem:Decision ;
     mem:content "Fulltext positioning: f:fullTextDefaults (#config graph) is the RECOMMENDED path — values keep standard xsd:string/rdf:langString datatypes (external RDF consumers see ordinary literals) and language-tagged values get per-language analyzers. The @fulltext datatype REPLACES the stored datatype with Fluree-specific f:fullText, so docs/guidance must not push it as the default; it's a quick-start for siloed databases or properties orthogonal to the core data model. Docs repositioned 2026-07 (fulltext.md, indexing-and-search README, cookbook-search, concepts/datatypes)." ;
     mem:tag "datatypes" ;
