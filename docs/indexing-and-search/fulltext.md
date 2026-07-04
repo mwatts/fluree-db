@@ -555,6 +555,15 @@ The indexed path is 7-7.5x faster because it reads precomputed BoW entries via b
 
 Scaling is near-linear. Extrapolating, the indexed path handles approximately 625K documents within a 1-second query budget.
 
+**The numbers hold with unindexed commits present.** Scoring uses prepared
+per-query state (analyzer choice, query stems, term ids, IDF weights, and
+corpus stats are computed once per query, not per row), and materialized rows
+— the norm whenever a ledger carries any novelty — resolve their `string_id`
+and score from the precomputed arena BoW rather than re-analyzing document
+text. A ledger that is a few commits ahead of its index scores at the same
+~1-2 µs/row as one that is exactly caught up; only genuinely unindexed
+documents pay per-row text analysis, proportional to the novelty footprint.
+
 ### When to consider the BM25 graph source pipeline
 
 Inline `@fulltext` works well for **tens to hundreds of thousands of documents** per predicate. For larger corpora (1M+ documents), consider the dedicated [BM25 graph source pipeline](bm25.md), which provides:
@@ -570,8 +579,15 @@ Inline `@fulltext` works well for **tens to hundreds of thousands of documents**
 |-------------|----------------|
 | < 100K docs | Inline `@fulltext` works well, especially with binary indexing |
 | 100K - 500K | Inline `@fulltext` remains viable; query times scale linearly |
-| 500K - 1M | Evaluate based on latency requirements; WAND pruning may help |
-| 1M+ | Use the [BM25 graph source](bm25.md) for production workloads |
+| 500K - 1M | Evaluate against your latency budget: inline scores every document (~1-2 µs/doc — no top-k pruning), so ~1M docs ≈ 1-2 s per query |
+| 1M+ | Use the [BM25 graph source](bm25.md) for production workloads — WAND top-k pruning makes query cost sub-linear in corpus size |
+
+Note the consistency trade: inline `@fulltext` is strongly consistent — a
+document is searchable the moment its transaction commits, including before
+the next index build. The BM25 graph source is eventually consistent (it lags
+the source ledger until its pipeline refreshes). Workloads that need
+read-your-writes search should weigh that against the graph source's speed at
+large corpus sizes.
 
 ## Comparison with `@vector`
 

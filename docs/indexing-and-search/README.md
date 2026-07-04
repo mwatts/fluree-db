@@ -277,8 +277,8 @@ let result = fluree.drop_full_text_index("products-search:main").await?;
 
 ### Vector Search
 
-- **Flat scan (inline functions)**: O(n) brute-force, viable up to ~100K vectors with binary indexing; binary index provides ~6x speedup over novelty-only scans and ~25x for filtered queries
-- **HNSW index**: O(log n) approximate nearest neighbor, recommended for 100K+ vectors or strict latency requirements
+- **Flat scan (inline functions)**: O(n) brute-force, exact and strongly consistent (novelty included). Queries matching the canonical top-k signature (`dotProduct` + threshold/order/limit over one vector predicate) run a parallel shard-scan fast path at ~6M vectors/sec (768-dim) — interactive to ~1M vectors; general-shape queries pay pipeline costs per row and stay interactive to ~100K
+- **HNSW index**: O(log n) approximate nearest neighbor, eventually consistent; recommended for multi-million-vector corpora, strict latency targets at any size, or query shapes the fast path doesn't serve
 - **Space**: ~1.5x embedding size
 - **Updates**: Incremental, O(1) per vector
 - See [Vector Search -- Performance and Scaling](vector-search.md#performance-and-scaling) for benchmark data and guidance on when to adopt HNSW

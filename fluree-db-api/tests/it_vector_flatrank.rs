@@ -1407,6 +1407,28 @@ async fn vector_flatrank_perf_50k() {
         ledger.t()
     );
 
+    let query_dot_pipeline = {
+        let mut q = query_dot.clone();
+        // Duplicate threshold filter: same semantics, but defeats the top-k
+        // fast-path detection (≤1 filter) so the generic pipeline runs.
+        q["where"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(["filter", format!("(> ?score {THRESHOLD})")]));
+        q
+    };
+    for run in ["indexed pipeline cold", "indexed pipeline warm"] {
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query_dot_pipeline)
+            .await
+            .expect("indexed pipeline query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        println!(
+            "vector_perf_50k: dotProduct {run} run: {} hits in {:?}",
+            rows.as_array().unwrap().len(),
+            start.elapsed()
+        );
+    }
     for run in ["indexed cold", "indexed warm"] {
         let start = std::time::Instant::now();
         let result = support::query_jsonld(&fluree, &ledger, &query_dot)
