@@ -87,7 +87,7 @@ pub struct DictOverlay {
 const EPHEMERAL_NUMBIG_BASE: u32 = 0x8000_0000;
 
 /// Handles above this value are ephemeral Vector entries from DictOverlay.
-const EPHEMERAL_VECTOR_BASE: u32 = 0x8000_0000;
+pub(crate) const EPHEMERAL_VECTOR_BASE: u32 = 0x8000_0000;
 
 /// Base local ID for ephemeral subjects within a namespace.
 ///

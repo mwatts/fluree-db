@@ -1012,6 +1012,26 @@ impl BinaryIndexStore {
         arena.lookup_vector(handle)
     }
 
+    /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
+    ///
+    /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops
+    /// use this to avoid the per-row shard-cache probe that
+    /// [`Self::vector_slice`] pays. `None` when the predicate has no arena.
+    pub fn vector_arena_snapshot(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> io::Result<Option<crate::arena::vector::VectorArenaSnapshot>> {
+        match self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        {
+            Some(arena) => Ok(Some(arena.snapshot()?)),
+            None => Ok(None),
+        }
+    }
+
     /// Find the existing vector arena handle for the given quantized f32
     /// `value` under `(g_id, p_id)`. Returns `None` if no arena exists for
     /// the predicate, or if the value isn't stored.
