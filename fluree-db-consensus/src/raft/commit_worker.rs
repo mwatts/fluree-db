@@ -361,16 +361,37 @@ impl Worker {
                     self.release_orphaned_commit_blob(&commit_id).await;
                     Ok(())
                 } else {
-                    // Apply didn't land. Release the staged commit
-                    // blob — the next retry rebuilds the commit with
-                    // a fresh timestamp, producing a different
-                    // `commit_id`, so this one is orphaned. Drop
-                    // `install` (write_guard releases without
-                    // calling `replace`, so this node's Fluree
-                    // handle stays at its pre-stage head — same as
-                    // every other node) and propagate the error for
-                    // the outer retry/poison logic.
-                    self.release_orphaned_commit_blob(&commit_id).await;
+                    // Apply didn't land locally. Whether the blob
+                    // can be released depends on what the failure
+                    // proves. An authoritative state-machine
+                    // rejection (`Stage`) decided the queue entry
+                    // without this commit, so the blob is orphaned
+                    // and the next retry rebuilds with a fresh
+                    // timestamp and a different `commit_id`. An
+                    // ambiguous propose failure (`Raft`: ferry
+                    // timeout, leader step-down mid-propose, lost
+                    // response) may have committed the head advance
+                    // anyway, with only the local applied state
+                    // lagging behind it — releasing then would hard-
+                    // delete the blob every node's replicated head
+                    // points at in shared storage, so it is kept
+                    // (one orphan accumulates in CAS if the propose
+                    // truly failed). Either way drop `install`
+                    // (write_guard releases without calling
+                    // `replace`, so this node's Fluree handle stays
+                    // at its pre-stage head) and propagate the error
+                    // for the outer retry/poison logic.
+                    if err.is_rejection() {
+                        self.release_orphaned_commit_blob(&commit_id).await;
+                    } else {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            commit_id = %commit_id,
+                            error = %err,
+                            "publish outcome unknown; keeping staged commit blob \
+                             (it may be the replicated head)"
+                        );
+                    }
                     Err(err)
                 }
             }
@@ -429,16 +450,15 @@ impl Worker {
             .is_some_and(|entry| &entry.head == commit_id)
     }
 
-    /// Release the staged commit blob from the local content store.
-    /// Called on the orphan paths in [`Self::try_advance_head`] —
-    /// the entry's `commit_t` won't land (either the queue front
-    /// moved past us, or the publish failed and the next retry
-    /// will rebuild the commit with a fresh timestamp, producing a
-    /// different `commit_id`). Without this release, every
-    /// transport blip or sibling-worker race leaks one blob per
-    /// failed attempt with no GC path: `release_envelopes` covers
-    /// the request body, not the staged commit; the state machine
-    /// doesn't track unreferenced commit blobs.
+    /// Release the staged commit blob from the content store.
+    /// Called on the orphan paths in [`Self::try_advance_head`],
+    /// and only when the publish outcome proves the commit can
+    /// never become the replicated head (see
+    /// [`WorkerError::is_rejection`]). Without this release,
+    /// every sibling-worker race leaks one blob per failed attempt
+    /// with no GC path: `release_envelopes` covers the request
+    /// body, not the staged commit; the state machine doesn't
+    /// track unreferenced commit blobs.
     ///
     /// Best effort — a failed release is logged but doesn't abort
     /// the worker's retry loop. `ContentStore::release` is
@@ -1493,6 +1513,25 @@ pub enum WorkerError {
     Stale(String),
 }
 
+impl WorkerError {
+    /// Whether this error is an authoritative rejection: an applied
+    /// state-machine response to this worker's own propose
+    /// (`Stale`, `Stage`), as opposed to an ambiguous outcome
+    /// (`Raft`: ferry timeout, leader step-down mid-propose, lost
+    /// response) where the propose may have committed anyway.
+    ///
+    /// A rejection proves the staged commit can never become the
+    /// replicated head — the queue entry was decided without it,
+    /// and no other proposer carries its `commit_id` — so its blob
+    /// is safe to release. On an ambiguous outcome the blob may be
+    /// the new head with only the local applied state lagging, and
+    /// `ContentStore::release` is a hard delete on storage shared
+    /// by every node, so the blob must be kept.
+    fn is_rejection(&self) -> bool {
+        matches!(self, Self::Stale(_) | Self::Stage(_))
+    }
+}
+
 /// Output of a per-op staging path before consensus has confirmed
 /// the head advance. Carries the typed receipt the adapter delivers
 /// through the waiter map plus any local state install the worker
@@ -1581,6 +1620,25 @@ mod tests {
     fn check_envelope_kind_accepts_matching_pair() {
         assert!(check_envelope_kind(BodyKind::JsonLdInsert, &sample_transact_envelope()).is_ok());
         assert!(check_envelope_kind(BodyKind::Pushed, &sample_push_envelope()).is_ok());
+    }
+
+    /// Authoritative state-machine rejections orphan the staged
+    /// commit blob; ambiguous propose failures must keep it, since
+    /// the head advance may have committed with the local applied
+    /// state lagging and `release` hard-deletes from shared storage.
+    #[test]
+    fn only_authoritative_rejections_classify_as_rejection() {
+        assert!(WorkerError::Stale("queue front moved".into()).is_rejection());
+        assert!(WorkerError::Stage(Box::new(PoisonReason::LedgerNotFound {
+            ledger_id: "test/db:main".into(),
+        }))
+        .is_rejection());
+
+        assert!(
+            !WorkerError::Raft("apply_staged_commit POST to leader: operation timed out".into())
+                .is_rejection()
+        );
+        assert!(!WorkerError::Transient("backend blip".into()).is_rejection());
     }
 
     #[test]
