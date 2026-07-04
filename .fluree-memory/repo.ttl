@@ -1620,6 +1620,21 @@ mem:fact-01ktyzzbs4ewxqpgvssvj72tt5 a mem:Fact ;
     mem:createdAt "2026-06-12T22:41:50.884413+00:00"^^xsd:dateTime ;
     mem:rationale "Continuation point for the decimal fix series; the remaining priority-4 cluster (canonical identity) is the prerequisite for issues #1324/#1325." .
 
+mem:decision-01kwphem9r3gvcvj2j5842ddt6 a mem:Decision ;
+    mem:content "Fulltext positioning: f:fullTextDefaults (#config graph) is the RECOMMENDED path — values keep standard xsd:string/rdf:langString datatypes (external RDF consumers see ordinary literals) and language-tagged values get per-language analyzers. The @fulltext datatype REPLACES the stored datatype with Fluree-specific f:fullText, so docs/guidance must not push it as the default; it's a quick-start for siloed databases or properties orthogonal to the core data model. Docs repositioned 2026-07 (fulltext.md, indexing-and-search README, cookbook-search, concepts/datatypes)." ;
+    mem:tag "datatypes" ;
+    mem:tag "docs" ;
+    mem:tag "fulltext" ;
+    mem:tag "positioning" ;
+    mem:tag "rdf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/concepts/datatypes.md" ;
+    mem:artifactRef "docs/guides/cookbook-search.md" ;
+    mem:artifactRef "docs/indexing-and-search/fulltext.md" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-04T12:25:30.680597+00:00"^^xsd:dateTime ;
+    mem:rationale "User-stated product intent (bplatz): don't steer standards-focused users to a custom datatype; @fulltext is only for silos/orthogonal properties. Future docs/examples/tutorials should default to the config path." .
+
 mem:fact-01kwn1qw4yhk6fy47xhmc9d7dm a mem:Fact ;
     mem:content "fulltext() must handle BOTH binding shapes: BinaryScanOperator disables late materialization whenever overlay epoch != 0 (binary_scan.rs), so with ANY novelty every scanned value reaches eval_fulltext as Binding::Lit (p_id + lang in dtc), not EncodedLit. The Lit arm originally scored only @fulltext-datatype values → configured (f:fullTextDefaults) predicates returned unbound for EVERY row the moment one unindexed commit existed (Solo/S3 2026-07-03 bug; memory-mode tests passed because they queried exactly at index_t with empty novelty). Fixed on fix/fulltext-persisted-arena-lookup: Lit arm mirrors EncodedLit arena lookup. Persisted (file-backed, fresh-process) reproducers now in it_query_fulltext.rs." ;
     mem:tag "binding" ;
