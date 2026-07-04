@@ -264,6 +264,14 @@ See [Vector Search](../indexing-and-search/vector-search.md) for complete docume
 
 **@fulltext** (full IRI: `https://ns.flur.ee/db#fullText`, prefix form: `f:fullText`) marks a string value for full-text search indexing. Values annotated with `@fulltext` are automatically analyzed (tokenized, stemmed, stopword-filtered) and indexed into per-predicate fulltext arenas during background index builds. This enables BM25-ranked relevance scoring via the `fulltext()` query function.
 
+Because the annotation *is* the stored datatype, tagged values are
+`f:fullText` literals rather than `xsd:string` — a custom datatype that
+external RDF consumers won't recognize. For standards-conformant data,
+prefer declaring searchable properties via `f:fullTextDefaults` in the
+ledger's `#config` graph, which full-text indexes plain `xsd:string` /
+`rdf:langString` values (with per-language analysis) without changing
+their datatypes.
+
 Without this type annotation, strings are stored as plain `xsd:string` values and support only exact matching and prefix queries -- not relevance-ranked full-text search.
 
 See [Inline Fulltext Search](../indexing-and-search/fulltext.md) for complete documentation.

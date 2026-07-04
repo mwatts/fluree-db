@@ -4,8 +4,8 @@ Inline fulltext search enables BM25-ranked text scoring directly in queries, usi
 
 Two ways to enable fulltext scoring on a property:
 
-- **Per-value annotation** (`@fulltext` datatype) — zero-config, always English. Tag individual literal values at insert time. Good for a handful of obviously-fulltext fields where English is fine.
-- **Property-level configuration** (`f:fullTextDefaults`) — declare once in the ledger's config graph which properties should be full-text indexed, and optionally which language to analyze them in. Plain-string values on those properties get indexed automatically — no `@type` annotation needed at insert time. Required when you want non-English stemming/stopwords, or when you want every value of a property indexed by default.
+- **Property-level configuration** (`f:fullTextDefaults`) — **the recommended approach.** Declare once in the ledger's `#config` graph which properties should be full-text indexed, and optionally which language to analyze them in. Your data keeps its standard datatypes — `xsd:string` and `rdf:langString` values are indexed as-is, with language-tagged values routed to per-language analyzers automatically. Nothing about the stored RDF changes.
+- **Per-value annotation** (`@fulltext` datatype) — a zero-config shortcut, always English. Tagging a value `@fulltext` **replaces its datatype** with the Fluree-specific `f:fullText` — consumers of your data see a custom datatype instead of `xsd:string`. Good for a quick start, a siloed database where RDF interoperability isn't a concern, or a property that's orthogonal to your core data model (e.g. an internal search blob). If you're building standards-conformant RDF, use `f:fullTextDefaults` instead.
 
 Both paths produce the same on-disk BM25 arenas and are queried with the same `fulltext(?var, "query")` function.
 
@@ -23,6 +23,15 @@ Use cases:
 Plain strings in Fluree are stored as `xsd:string` values. They are indexed for exact matching and prefix queries, but not for full-text search. The `@fulltext` datatype tells Fluree that a string value should be analyzed (tokenized, stemmed, stopword-filtered) and indexed for relevance scoring.
 
 `@fulltext` is a JSON-LD shorthand that resolves to the full IRI `https://ns.flur.ee/db#fullText`, which can also be written as `f:fullText` when the Fluree namespace prefix is declared in your `@context`.
+
+**The trade-off:** the value is *stored* with that datatype. Where a plain
+literal would be `"Rust programming"^^xsd:string`, a tagged one is
+`"Rust programming"^^f:fullText` — in query results, exports, and any
+downstream RDF consumer. If your data needs to stay standard RDF (shared
+vocabularies, external consumers, SPARQL federation), prefer
+[`f:fullTextDefaults`](#configured-full-text-properties-ffulltextdefaults),
+which indexes plain `xsd:string` / `rdf:langString` values without touching
+their datatypes.
 
 ### Inserting fulltext values (JSON-LD)
 
@@ -127,6 +136,12 @@ Each property produces an independent fulltext index (arena). When you query wit
 
 `@fulltext` annotations are fully portable across Fluree's data distribution pipeline. Import, export, push, and pull all preserve `@fulltext` type annotations, and indexes are rebuilt transparently on the receiving side.
 
+Portability *outside* Fluree is where the custom datatype shows: an export
+hands non-Fluree consumers literals typed `f:fullText` rather than
+`xsd:string`. Tools that dispatch on standard datatypes (validation, mapping,
+federation) will treat those values as opaque typed literals. `f:fullTextDefaults`
+avoids this entirely — the searchable values stay ordinary strings.
+
 ## Configured Full-Text Properties (`f:fullTextDefaults`)
 
 The `@fulltext` datatype is a per-value shortcut — you decide at insert time, one triple at a time, whether a string gets full-text indexed, and English is the only supported language. For many real-world workloads that's not what you want. You want to say once, at the ledger level, "index every value of `ex:title`", or "index `ex:productName` in the product catalog graph in Spanish." That's what `f:fullTextDefaults` gives you.
@@ -137,13 +152,21 @@ The `@fulltext` datatype continues to work exactly as before: any value tagged `
 
 ### When to use which
 
+Default to `f:fullTextDefaults`: it searches your data as it already is —
+standard `xsd:string` / `rdf:langString` datatypes, existing values, no
+insert-time annotation — and it's the only path with language-aware analysis.
+Reach for the `@fulltext` datatype when the custom datatype doesn't matter:
+a siloed database, a prototype, or a property orthogonal to your core model.
+
 | Need | Use |
 |------|-----|
-| English-only, a few obviously-fulltext fields, want the choice per-value | `@fulltext` datatype |
+| Standards-conformant RDF — values keep `xsd:string` / `rdf:langString` | `f:fullTextDefaults` |
+| Search over data that's already in the ledger (no value rewriting) | `f:fullTextDefaults` |
 | Non-English (or mixed languages) | `f:fullTextDefaults` with `f:defaultLanguage` |
 | Every value of a property should be searchable, no per-value opt-in | `f:fullTextDefaults` |
 | Different languages per graph (e.g. multilingual catalog) | `f:fullTextDefaults` with per-graph overrides |
-| Zero config, just works | `@fulltext` datatype |
+| Siloed / single-app database, quick start, per-value opt-in is a feature | `@fulltext` datatype |
+| Property is orthogonal to the core data model (search-only text blob) | `@fulltext` datatype |
 
 ### Setting it up
 
