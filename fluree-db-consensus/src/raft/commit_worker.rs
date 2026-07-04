@@ -226,8 +226,12 @@ impl Worker {
     /// nameservice head so a conflict rooted in stale state (e.g.
     /// a namespace allocation this node missed because it took
     /// leadership mid-write) heals instead of producing the same
-    /// failure forever. Returns once the entry has reached a
-    /// terminal state in the queue (advanced or poisoned).
+    /// failure forever. A `Lagged` rejection (staged on a view
+    /// behind the replicated head) re-stages indefinitely with a
+    /// refresh between attempts — the entry is still at the queue
+    /// front and becomes stageable as soon as the local view
+    /// catches up. Returns once the entry has reached a terminal
+    /// state in the queue (advanced or poisoned).
     async fn process_entry(&self, entry: QueueEntry) -> Result<(), WorkerError> {
         let mut attempt: u32 = 0;
         loop {
@@ -283,6 +287,41 @@ impl Worker {
                             },
                         )
                         .await;
+                }
+                Err(WorkerError::Lagged(msg)) => {
+                    // The state machine left the entry at the queue
+                    // front: this worker staged on a local view
+                    // lagging the replicated head, and the staged
+                    // commit's `t` couldn't advance it. Refresh the
+                    // local cache against the replicated head and
+                    // re-stage the same entry. Unbounded — progress
+                    // resumes as soon as local apply and cache
+                    // reconciliation deliver the newer head, and
+                    // poisoning would fail a valid entry over a
+                    // node-local condition. The staging-attempt
+                    // budget resets: each lag retry starts a fresh
+                    // stage against a newer view.
+                    attempt = 0;
+                    warn!(
+                        queue_id = entry.queue_id,
+                        %msg,
+                        "staged on a lagging view; refreshing and re-staging"
+                    );
+                    tokio::time::sleep(RAFT_BACKOFF).await;
+                    let ledger_id = self.ref_key.ledger_id();
+                    if let Err(refresh_err) = self
+                        .staging
+                        .fluree
+                        .refresh(&ledger_id, RefreshOpts::default())
+                        .await
+                    {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            error = %refresh_err,
+                            "refresh after lagged apply failed; retrying anyway"
+                        );
+                    }
+                    continue;
                 }
                 Err(WorkerError::Stage(reason)) => {
                     return self.propose_poison(entry.queue_id, *reason).await;
@@ -364,10 +403,10 @@ impl Worker {
                     // Apply didn't land locally. Whether the blob
                     // can be released depends on what the failure
                     // proves. An authoritative state-machine
-                    // rejection (`Stage`) decided the queue entry
-                    // without this commit, so the blob is orphaned
-                    // and the next retry rebuilds with a fresh
-                    // timestamp and a different `commit_id`. An
+                    // rejection (`Stage`, `Lagged`) proves this
+                    // commit will never land — any retry rebuilds
+                    // with a fresh timestamp and a different
+                    // `commit_id` — so the blob is orphaned. An
                     // ambiguous propose failure (`Raft`: ferry
                     // timeout, leader step-down mid-propose, lost
                     // response) may have committed the head advance
@@ -1025,6 +1064,11 @@ impl Worker {
             // up the new queue front once local raft applies the
             // pop.
             Err(NameServiceError::ApplyStale(msg)) => Err(WorkerError::Stale(msg)),
+            // The entry is still at the queue front, but this
+            // worker staged on a local view lagging the replicated
+            // head. The retry loop refreshes the local view and
+            // re-stages the same entry.
+            Err(NameServiceError::ApplyLagged(msg)) => Err(WorkerError::Lagged(msg)),
             Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
         }
     }
@@ -1098,6 +1142,9 @@ impl Worker {
                 }
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
+                }
+                Ok(Err(WorkerError::Lagged(_))) => {
+                    unreachable!("process_entry consumes Lagged internally and re-stages")
                 }
                 Ok(Err(WorkerError::Raft(propose_error))) => {
                     // Raft propose failed (leader stepped down, quorum
@@ -1511,24 +1558,34 @@ pub enum WorkerError {
     /// `snapshot_front` again.
     #[error("apply stale: {0}")]
     Stale(String),
+    /// The replicated apply rejected the staged commit because its
+    /// `commit_t` doesn't advance the replicated head — this worker
+    /// staged against a local view lagging the replicated state
+    /// (`DesyncReason::HeadNotMonotonic`). The entry is still at
+    /// the queue front: refresh the local view and re-stage the
+    /// same entry, rather than dropping the work ([`Self::Stale`])
+    /// or re-proposing the same staged commit ([`Self::Raft`]).
+    #[error("staged on lagging view: {0}")]
+    Lagged(String),
 }
 
 impl WorkerError {
     /// Whether this error is an authoritative rejection: an applied
     /// state-machine response to this worker's own propose
-    /// (`Stale`, `Stage`), as opposed to an ambiguous outcome
-    /// (`Raft`: ferry timeout, leader step-down mid-propose, lost
-    /// response) where the propose may have committed anyway.
+    /// (`Stale`, `Stage`, `Lagged`), as opposed to an ambiguous
+    /// outcome (`Raft`: ferry timeout, leader step-down
+    /// mid-propose, lost response) where the propose may have
+    /// committed anyway.
     ///
     /// A rejection proves the staged commit can never become the
-    /// replicated head — the queue entry was decided without it,
-    /// and no other proposer carries its `commit_id` — so its blob
-    /// is safe to release. On an ambiguous outcome the blob may be
+    /// replicated head — the state machine decided against it, and
+    /// no other proposer carries its `commit_id` — so its blob is
+    /// safe to release. On an ambiguous outcome the blob may be
     /// the new head with only the local applied state lagging, and
     /// `ContentStore::release` is a hard delete on storage shared
     /// by every node, so the blob must be kept.
     fn is_rejection(&self) -> bool {
-        matches!(self, Self::Stale(_) | Self::Stage(_))
+        matches!(self, Self::Stale(_) | Self::Stage(_) | Self::Lagged(_))
     }
 }
 
@@ -1633,6 +1690,7 @@ mod tests {
             ledger_id: "test/db:main".into(),
         }))
         .is_rejection());
+        assert!(WorkerError::Lagged("commit_t 3 <= head t 5".into()).is_rejection());
 
         assert!(
             !WorkerError::Raft("apply_staged_commit POST to leader: operation timed out".into())

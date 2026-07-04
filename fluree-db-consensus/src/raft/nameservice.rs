@@ -426,12 +426,17 @@ fn build_apply_head_command(
 /// result.
 ///
 /// - [`SmResponse::HeadApplied`] → `Ok(())`.
-/// - [`SmResponse::QueueDesync`] → `Err(ApplyStale)` with the reason
-///   inlined. Common causes are admin preemption (`QueueCleared`),
-///   former-leader straggler proposals (`WrongFront`), a stale-base
-///   commit_t (`HeadNotMonotonic`), or a state-machine invariant
-///   break. The worker maps `ApplyStale` to `WorkerError::Stale`
-///   and drops its local install — same recovery shape as the
+/// - [`SmResponse::QueueDesync`] with a `HeadNotMonotonic` reason →
+///   `Err(ApplyLagged)`. The state machine left the entry at the
+///   queue front expecting a retry: the worker staged on a local
+///   view lagging the replicated head, so it refreshes and
+///   re-stages the same entry rather than dropping it.
+/// - [`SmResponse::QueueDesync`] with any other reason →
+///   `Err(ApplyStale)` with the reason inlined. Common causes are
+///   admin preemption (`QueueCleared`), former-leader straggler
+///   proposals (`WrongFront`), or a state-machine invariant break.
+///   The worker maps `ApplyStale` to `WorkerError::Stale` and drops
+///   its local install — same recovery shape as the
 ///   follower-forward path, so the leader-owned worker doesn't
 ///   loop on a condition that can't recover by retrying the same
 ///   propose.
@@ -447,6 +452,14 @@ fn build_apply_head_command(
 fn map_apply_head_response(resp: SmResponse) -> Result<()> {
     match resp {
         SmResponse::HeadApplied { .. } => Ok(()),
+        SmResponse::QueueDesync {
+            ledger_id,
+            requested_queue_id,
+            reason: reason @ DesyncReason::HeadNotMonotonic { .. },
+        } => Err(NameServiceError::apply_lagged(format!(
+            "raft ApplyHead on {ledger_id} (queue_id={requested_queue_id}): {}",
+            describe_desync_reason(&reason)
+        ))),
         SmResponse::QueueDesync {
             ledger_id,
             requested_queue_id,
@@ -527,6 +540,24 @@ pub enum ApplyStagedCommitResponse {
         /// Queue ID currently at the front, if any. `None` means the
         /// queue is empty (likely admin-cleared between stage and propose).
         current_front_queue_id: Option<u64>,
+    },
+    /// The entry is still at the queue front, but the staged
+    /// `commit_t` doesn't advance the replicated head — the caller
+    /// staged against a local view lagging the replicated state
+    /// (`DesyncReason::HeadNotMonotonic`). The state machine left
+    /// the entry in place; the caller should refresh its local view
+    /// and re-stage the same entry.
+    ///
+    /// Appended after `Stale` so postcard's positional variant
+    /// indices keep old-follower decoding of the earlier variants
+    /// intact during a rolling upgrade; an old follower receiving
+    /// this variant fails decode and falls back to its
+    /// backoff-and-retry transport-error path.
+    Lagged {
+        /// `t` of the replicated head the propose failed to advance.
+        current_t: i64,
+        /// `t` the staged commit carried.
+        proposed_t: i64,
     },
 }
 
@@ -666,6 +697,17 @@ impl RaftNameService {
             SmResponse::HeadApplied { commit_t, .. } => {
                 Ok(ApplyStagedCommitResponse::Applied { commit_t })
             }
+            SmResponse::QueueDesync {
+                reason:
+                    DesyncReason::HeadNotMonotonic {
+                        current_t,
+                        proposed_t,
+                    },
+                ..
+            } => Ok(ApplyStagedCommitResponse::Lagged {
+                current_t,
+                proposed_t,
+            }),
             SmResponse::QueueDesync { .. } => Ok(ApplyStagedCommitResponse::Stale {
                 current_front_queue_id: self.current_front_queue_id(&ref_key).await,
             }),
@@ -937,6 +979,10 @@ fn map_propose_error<E: FromRaftWriteError>(
 /// - [`LedgerNotFound`](ApplyStagedCommitError::LedgerNotFound) →
 ///   [`NotFound`](NameServiceError::NotFound). Terminal; worker
 ///   poisons with `PoisonReason::LedgerNotFound`.
+/// - [`Lagged`](ApplyStagedCommitResponse::Lagged) →
+///   [`ApplyLagged`](NameServiceError::ApplyLagged). The entry is
+///   still at the queue front; the worker refreshes its local view
+///   and re-stages the same entry.
 /// - [`LedgerRetracted`](ApplyStagedCommitError::LedgerRetracted) →
 ///   [`Retracted`](NameServiceError::Retracted). Terminal; worker
 ///   drops the install and moves on (the retract command already
@@ -965,6 +1011,13 @@ fn classify_apply_staged_commit_outcome(
             current_front_queue_id,
         }) => Err(NameServiceError::apply_stale(format!(
             "queue_id {queue_id} no longer at front (current front: {current_front_queue_id:?})"
+        ))),
+        Ok(ApplyStagedCommitResponse::Lagged {
+            current_t,
+            proposed_t,
+        }) => Err(NameServiceError::apply_lagged(format!(
+            "queue_id {queue_id} still at front, but proposed commit_t {proposed_t} would not \
+             advance current head (t={current_t}); local view lags the replicated head"
         ))),
         Err(ApplyStagedCommitError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
         Err(ApplyStagedCommitError::LedgerRetracted(id)) => Err(NameServiceError::Retracted(id)),
@@ -2151,6 +2204,28 @@ mod tests {
     }
 
     #[test]
+    fn map_apply_head_response_head_not_monotonic_is_apply_lagged() {
+        // HeadNotMonotonic leaves the entry at the queue front —
+        // the worker must refresh and re-stage, not drop the work.
+        // Flattening it into ApplyStale (drop-and-advance) made the
+        // worker mark the entry committed and skip it forever,
+        // permanently stalling the branch queue.
+        let r = map_apply_head_response(SmResponse::QueueDesync {
+            ledger_id: "test/db:main".into(),
+            requested_queue_id: 7,
+            reason: DesyncReason::HeadNotMonotonic {
+                current_t: 5,
+                proposed_t: 3,
+            },
+        });
+        let err = r.expect_err("desync is error");
+        assert!(
+            matches!(err, NameServiceError::ApplyLagged(_)),
+            "expected ApplyLagged (refresh-and-re-stage), got {err:?}"
+        );
+    }
+
+    #[test]
     fn map_apply_head_response_queue_cleared_surfaces_clear_reason() {
         use crate::raft::state_machine::ClearReason;
         let r = map_apply_head_response(SmResponse::QueueDesync {
@@ -2383,6 +2458,31 @@ mod tests {
         );
         assert!(err.to_string().contains("queue_id 7"));
         assert!(err.to_string().contains("Some(8)"));
+    }
+
+    #[test]
+    fn classify_outcome_lagged_is_apply_lagged() {
+        // The `Lagged` shape means our queue_id is STILL at the
+        // front — the leader's state machine pushed the entry back
+        // because our staged commit_t didn't advance the replicated
+        // head. Map to `ApplyLagged` so the worker refreshes its
+        // local view and re-stages the same entry, instead of the
+        // drop-and-advance recovery `ApplyStale` triggers (which
+        // would skip the still-queued entry forever).
+        let r = classify_apply_staged_commit_outcome(
+            Ok(ApplyStagedCommitResponse::Lagged {
+                current_t: 5,
+                proposed_t: 3,
+            }),
+            7,
+        );
+        let err = r.expect_err("lagged must be Err");
+        assert!(
+            matches!(err, NameServiceError::ApplyLagged(_)),
+            "expected ApplyLagged, got {err:?}"
+        );
+        assert!(err.to_string().contains("queue_id 7"));
+        assert!(err.to_string().contains("commit_t 3"));
     }
 
     #[test]

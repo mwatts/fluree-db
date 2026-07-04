@@ -55,6 +55,16 @@ pub enum NameServiceError {
     /// against a state that will never match again.
     #[error("Apply observed stale state: {0}")]
     ApplyStale(String),
+
+    /// The replicated apply rejected the propose because it was
+    /// built on a view lagging the replicated state — the proposed
+    /// value doesn't advance the current head. The target work is
+    /// still pending, so callers should refresh their local view
+    /// and rebuild the propose. Distinguished from
+    /// [`Self::ApplyStale`] (the work is gone; drop it) and
+    /// [`Self::Storage`] (transient; retry the same propose).
+    #[error("Apply built on lagging view: {0}")]
+    ApplyLagged(String),
 }
 
 impl From<LedgerIdParseError> for NameServiceError {
@@ -111,5 +121,13 @@ impl NameServiceError {
     /// retrying.
     pub fn apply_stale(msg: impl Into<String>) -> Self {
         Self::ApplyStale(msg.into())
+    }
+
+    /// Create an [`Self::ApplyLagged`] error signaling that the
+    /// propose was built on a view lagging the replicated state and
+    /// its target is still pending. Callers refresh their local
+    /// view and rebuild the propose rather than dropping the work.
+    pub fn apply_lagged(msg: impl Into<String>) -> Self {
+        Self::ApplyLagged(msg.into())
     }
 }
