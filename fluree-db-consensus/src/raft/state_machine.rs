@@ -1609,6 +1609,17 @@ fn set_index_head(
     }
 
     let ref_key = RefKey::new(&ledger_id, &branch);
+
+    // Index publishes are writes — same tombstone semantics as the
+    // commit-head paths (`EnqueueCommand`, `ApplyHead`, `ResetHead`,
+    // `CompareAndSetRef`): a retracted branch's refs are frozen
+    // until purge + re-create.
+    if state.retracted.contains(&ref_key) {
+        return Response::LedgerRetracted {
+            ledger_id: format_ledger_id(&ledger_id, &branch),
+        };
+    }
+
     let Some(entry) = state.refs.get_mut(&ref_key) else {
         // No ref means no commits on this branch yet — nothing to
         // index. Reuse `LedgerNotFound` since `advance_ref`
@@ -1697,6 +1708,18 @@ fn apply_compare_and_set_ref(
             ledger_id: full_ledger_id,
         };
     };
+
+    // A CAS is a write — same semantics as `EnqueueCommand`,
+    // `ApplyHead`, and `ResetHead`. The retracted flag is a
+    // tombstone (the branch stays registered, so the lookup above
+    // succeeds); refuse the write until the branch is purged +
+    // re-created, or a matching `expected` would advance a
+    // tombstoned head and silently un-retract it in effect.
+    if state.retracted.contains(&key) {
+        return Response::LedgerRetracted {
+            ledger_id: full_ledger_id,
+        };
+    }
 
     // `expected = None` matches when the current ref has no `id`
     // (no `RefEntry`, or an `IndexHead` with no `index` field).
@@ -2533,6 +2556,128 @@ mod tests {
             2,
         );
         let resp = apply(&mut state, enqueue("test/db", "main", 9, None), 3);
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn compare_and_set_ref_rejects_retracted_branch_with_ledger_retracted() {
+        // The retracted flag is a tombstone and CAS is a write:
+        // even a CAS whose `expected` matches the frozen head must
+        // be refused, or a publisher holding the pre-retraction
+        // head could advance a tombstoned branch and silently
+        // un-retract it in effect.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 5);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::CompareAndSetRef {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                kind: RefKind::CommitHead,
+                expected: Some(RefValue {
+                    id: Some(cid(1)),
+                    t: 5,
+                }),
+                new: RefValue {
+                    id: Some(cid(2)),
+                    t: 6,
+                },
+                applied_at_millis: 0,
+            },
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+
+        // The frozen head is untouched.
+        let entry = state
+            .refs
+            .get(&RefKey::new("test/db", "main"))
+            .expect("retract keeps the ref entry");
+        assert_eq!(entry.head, cid(1));
+        assert_eq!(entry.t, 5);
+    }
+
+    #[test]
+    fn advance_index_head_rejects_retracted_branch_with_ledger_retracted() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 5);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::AdvanceIndexHead(NewIndexHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(9),
+                t: 5,
+                applied_at_millis: 0,
+            }),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rewrite_index_head_rejects_retracted_branch_with_ledger_retracted() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 5);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::RewriteIndexHead(NewIndexHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(9),
+                t: 5,
+                applied_at_millis: 0,
+            }),
+            3,
+        );
         assert_eq!(
             resp,
             Response::LedgerRetracted {

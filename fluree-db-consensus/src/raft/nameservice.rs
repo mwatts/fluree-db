@@ -225,6 +225,9 @@ fn build_index_head_args(
 ///   indexer should re-stage against the current commit head.
 /// - [`SmResponse::LedgerNotFound`] → `Err(not_found)`. Ledger gone
 ///   mid-build (drop / membership change).
+/// - [`SmResponse::LedgerRetracted`] → `Err(Retracted)`. Branch
+///   tombstoned mid-build; its refs are frozen, so the built index
+///   has nowhere to land.
 /// - Anything else → `Err(Storage)` "unexpected variant". None of the
 ///   other variants are reachable for this command; if one appears
 ///   it's a state-machine bug worth surfacing rather than swallowing.
@@ -243,6 +246,7 @@ fn map_advance_index_response(resp: SmResponse) -> Result<()> {
              (proposer ran ahead of applied state; re-stage from current commit head)"
         ))),
         SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        SmResponse::LedgerRetracted { ledger_id } => Err(NameServiceError::Retracted(ledger_id)),
         other => Err(NameServiceError::storage(format!(
             "unexpected Response variant for AdvanceIndexHead: {other:?}"
         ))),
@@ -1663,6 +1667,7 @@ impl RefPublisher for RaftNameService {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
             SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+            SmResponse::LedgerRetracted { ledger_id } => Err(NameServiceError::Retracted(ledger_id)),
             // `IndexAhead` from an `IndexHead` CAS proposing past
             // the branch's commit watermark maps to a `Conflict`
             // with no actual value.
