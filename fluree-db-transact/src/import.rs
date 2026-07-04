@@ -505,12 +505,17 @@ mod inner {
                     TransactError::Parse("named graph triple missing subject".to_string())
                 })?;
 
-                let s = expand_term(subject, &block.prefixes, &mut state.ns_registry)?;
-                let p = expand_term(&triple.predicate, &block.prefixes, &mut state.ns_registry)?;
+                let s = expand_term(subject, &block.prefixes, &mut state.ns_registry, &txn_id)?;
+                let p = expand_term(
+                    &triple.predicate,
+                    &block.prefixes,
+                    &mut state.ns_registry,
+                    &txn_id,
+                )?;
 
                 for obj in &triple.objects {
                     let (o, dt, lang) =
-                        expand_object(obj, &block.prefixes, &mut state.ns_registry)?;
+                        expand_object(obj, &block.prefixes, &mut state.ns_registry, &txn_id)?;
 
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
@@ -631,16 +636,22 @@ mod inner {
     }
 
     /// Expand a RawTerm to a Sid using the prefix map and namespace registry.
+    ///
+    /// Blank-node labels are skolemized with the same `{txn_id}-{label}` key
+    /// as `ImportSink::skolemize`, so a label shared between the default graph
+    /// and a named-graph block of one TriG document resolves to one node
+    /// (TriG scopes labels to the whole document), while the same label in a
+    /// different document/commit stays distinct.
     fn expand_term(
         term: &RawTerm,
         prefixes: &rustc_hash::FxHashMap<String, String>,
         ns_registry: &mut NamespaceRegistry,
+        txn_id: &str,
     ) -> Result<Sid> {
         match term {
             RawTerm::Iri(iri) => {
                 if let Some(local) = iri.strip_prefix("_:") {
-                    // Blank node - skolemize
-                    Ok(ns_registry.blank_node_sid(local))
+                    Ok(ns_registry.blank_node_sid(&format!("{txn_id}-{local}")))
                 } else {
                     Ok(ns_registry.sid_for_iri(iri))
                 }
@@ -660,11 +671,13 @@ mod inner {
         obj: &RawObject,
         prefixes: &rustc_hash::FxHashMap<String, String>,
         ns_registry: &mut NamespaceRegistry,
+        txn_id: &str,
     ) -> Result<(FlakeValue, Sid, Option<String>)> {
         match obj {
             RawObject::Iri(iri) => {
+                // Blank labels use the ImportSink skolem key; see expand_term.
                 let sid = if let Some(local) = iri.strip_prefix("_:") {
-                    ns_registry.blank_node_sid(local)
+                    ns_registry.blank_node_sid(&format!("{txn_id}-{local}"))
                 } else {
                     ns_registry.sid_for_iri(iri)
                 };

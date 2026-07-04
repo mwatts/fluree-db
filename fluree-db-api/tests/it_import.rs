@@ -1438,6 +1438,131 @@ ex:alice schema:name "Alice" .
     );
 }
 
+// TriG scopes blank-node labels to the whole document: a label shared between
+// the default graph and a GRAPH block must skolemize to ONE node, and the same
+// label in a different document (file/commit) must stay a DIFFERENT node.
+// Regression: named-graph blanks used to mint from the bare label (`fdb-b0`) —
+// diverging from the default graph within one document AND colliding across
+// every document in the ledger.
+#[tokio::test]
+async fn import_trig_blank_label_document_scoped() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // File 1: `_:shared` referenced from the default graph AND a GRAPH block.
+    let trig1 = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice ex:knows _:shared .
+_:shared schema:name "Document-scoped node" .
+
+GRAPH <http://example.org/graphs/g1> {
+    ex:bob ex:knows _:shared .
+}
+"#;
+    // File 2: the same label in another document's GRAPH block.
+    let trig2 = r#"@prefix ex: <http://example.org/> .
+
+GRAPH <http://example.org/graphs/g2> {
+    ex:carol ex:knows _:shared .
+}
+"#;
+    std::fs::write(data_dir.path().join("a.trig"), trig1).expect("write trig1");
+    std::fs::write(data_dir.path().join("b.trig"), trig2).expect("write trig2");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/trig-bnode-scope:main")
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+
+    let ledger = fluree
+        .ledger("test/trig-bnode-scope:main")
+        .await
+        .expect("load ledger");
+
+    // NOTE: bound-predicate patterns return empty on freshly bulk-imported
+    // ledgers (pre-existing quirk unrelated to blank-node scoping), so these
+    // queries scan with variable predicate and pick out the blank-node ref.
+    let knows_object = |json: &serde_json::Value, subject: &str| -> String {
+        let rows = json.as_array().expect("array result");
+        let refs: Vec<String> = rows
+            .iter()
+            .map(|r| r.as_array().expect("row"))
+            .filter(|r| r[0].as_str() == Some(subject))
+            .filter_map(|r| r[2].as_str())
+            .filter(|o| o.starts_with("_:fdb-"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected one _:fdb- ref for {subject}: {json}"
+        );
+        refs.into_iter().next().unwrap()
+    };
+
+    // Default graph: the node alice knows.
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }),
+    )
+    .await
+    .expect("default-graph query");
+    let default_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/alice",
+    );
+
+    // Named graph g1 (same document): must be the SAME node.
+    let qr = fluree
+        .query_connection(&json!({
+            "from": "test/trig-bnode-scope:main#http://example.org/graphs/g1",
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .await
+        .expect("g1 query");
+    let g1_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/bob",
+    );
+    assert_eq!(
+        g1_node, default_node,
+        "TriG label scope spans default graph and GRAPH blocks of one document"
+    );
+
+    // Named graph g2 (different document): must be a DIFFERENT node.
+    let qr = fluree
+        .query_connection(&json!({
+            "from": "test/trig-bnode-scope:main#http://example.org/graphs/g2",
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .await
+        .expect("g2 query");
+    let g2_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/carol",
+    );
+    assert_ne!(
+        g2_node, default_node,
+        "the same label in a different document must stay a distinct node"
+    );
+}
+
 // ============================================================================
 // N-Quads (.nq) import
 //
