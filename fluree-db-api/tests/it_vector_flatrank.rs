@@ -1194,3 +1194,200 @@ async fn sparql_vector_with_score_filter() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0][0], "Homer");
 }
+
+// =============================================================================
+// Perf smoke harness
+// =============================================================================
+
+/// Deterministic pseudo-random f64 in [-1, 1) (LCG; no process randomness so
+/// the test can regenerate the exact vectors for scalar verification).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next_f64(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+}
+
+/// Perf smoke harness for per-row flat vector scoring at scale (run manually):
+///
+/// ```sh
+/// cargo test -p fluree-db-api --features vector --test it_vector_flatrank \
+///     --release vector_flatrank_perf_50k -- --ignored --nocapture
+/// ```
+///
+/// Seeds 50k entities with 256-dim vectors (novelty-only, so every scanned
+/// row arrives as a materialized `Binding::Lit` — the production shape once
+/// any unindexed commit exists), then times `bind ?score (dotProduct ...)`
+/// + threshold filter. Results are verified against scalar recomputation of
+/// the same LCG-generated vectors: exact hit count, and top-5 ids/scores
+/// within 1e-9 — so before/after runs must agree on output, not just speed.
+#[tokio::test]
+#[ignore = "perf smoke — run manually with --ignored --nocapture"]
+async fn vector_flatrank_perf_50k() {
+    const N: usize = 50_000;
+    const DIMS: usize = 256;
+    const CHUNK: usize = 10_000;
+    const THRESHOLD: f64 = 11.0;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/vector-perf:main";
+    let mut ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+    // Generate all vectors once (kept for scalar verification below).
+    let mut rng = Lcg(42);
+    let vectors: Vec<Vec<f64>> = (0..N)
+        .map(|_| (0..DIMS).map(|_| rng.next_f64()).collect())
+        .collect();
+    let target: Vec<f64> = (0..DIMS).map(|_| rng.next_f64()).collect();
+
+    let seed_start = std::time::Instant::now();
+    for chunk_start in (0..N).step_by(CHUNK) {
+        let entities: Vec<serde_json::Value> = (chunk_start..(chunk_start + CHUNK).min(N))
+            .map(|i| {
+                json!({
+                    "@id": format!("ex:v{i}"),
+                    "ex:vec": {
+                        "@value": vectors[i],
+                        "@type": "https://ns.flur.ee/db#embeddingVector"
+                    }
+                })
+            })
+            .collect();
+        let txn = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": entities
+        });
+        ledger = fluree
+            .insert(ledger, &txn)
+            .await
+            .expect("seed chunk")
+            .ledger;
+    }
+    println!(
+        "vector_perf_50k: seeded {N} x {DIMS}-dim in {:?}",
+        seed_start.elapsed()
+    );
+
+    // Scalar ground truth: expected hits and top-5 (id index, score).
+    let scalar_dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let mut expected: Vec<(usize, f64)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, scalar_dot(v, &target)))
+        .filter(|(_, s)| *s > THRESHOLD)
+        .collect();
+    expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    assert!(
+        expected.len() > 100,
+        "threshold should pass a meaningful subset, got {}",
+        expected.len()
+    );
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?x", "?score"],
+        "values": [["?targetVec"],
+            [{"@value": target, "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+        "where": [
+            {"@id": "?x", "ex:vec": "?vec"},
+            ["bind", "?score", ["dotProduct", "?vec", "?targetVec"]],
+            ["filter", format!("(> ?score {THRESHOLD})")]
+        ],
+        "orderBy": [["desc", "?score"]]
+    });
+
+    for run in ["cold", "warm"] {
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("dotProduct query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        let arr = rows.as_array().unwrap().clone();
+        println!(
+            "vector_perf_50k: dotProduct {run} run: {} hits in {:?}",
+            arr.len(),
+            start.elapsed()
+        );
+
+        assert_eq!(
+            arr.len(),
+            expected.len(),
+            "{run}: hit count must match scalar recomputation"
+        );
+        for (rank, (exp_idx, exp_score)) in expected.iter().take(5).enumerate() {
+            let row = arr[rank].as_array().unwrap();
+            let id = row[0].as_str().unwrap();
+            let score = row[1].as_f64().unwrap();
+            assert_eq!(id, format!("ex:v{exp_idx}"), "{run}: rank {rank} id");
+            assert!(
+                (score - exp_score).abs() <= 1e-6 * exp_score.abs().max(1.0),
+                "{run}: rank {rank} score {score} != scalar {exp_score}"
+            );
+        }
+    }
+
+    // Cosine + euclidean: one timed pass each, count-verified against scalar.
+    for (func, name) in [
+        ("cosineSimilarity", "cosine"),
+        ("euclideanDistance", "euclidean"),
+    ] {
+        let (filter, expected_count) = match name {
+            "cosine" => {
+                let cnt = vectors
+                    .iter()
+                    .filter(|v| {
+                        let dot = scalar_dot(v, &target);
+                        let ma = scalar_dot(v, v).sqrt();
+                        let mb = scalar_dot(&target, &target).sqrt();
+                        dot / (ma * mb) > 0.2
+                    })
+                    .count();
+                ("(> ?score 0.2)".to_string(), cnt)
+            }
+            _ => {
+                let cnt = vectors
+                    .iter()
+                    .filter(|v| {
+                        v.iter()
+                            .zip(&target)
+                            .map(|(x, y)| (x - y) * (x - y))
+                            .sum::<f64>()
+                            .sqrt()
+                            < 12.0
+                    })
+                    .count();
+                ("(< ?score 12.0)".to_string(), cnt)
+            }
+        };
+        let query = json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "select": ["?x", "?score"],
+            "values": [["?targetVec"],
+                [{"@value": target, "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+            "where": [
+                {"@id": "?x", "ex:vec": "?vec"},
+                ["bind", "?score", [func, "?vec", "?targetVec"]],
+                ["filter", filter]
+            ]
+        });
+        let start = std::time::Instant::now();
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("scored query");
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        let got = rows.as_array().unwrap().len();
+        println!(
+            "vector_perf_50k: {name} run: {got} hits in {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            got, expected_count,
+            "{name}: hit count must match scalar recomputation"
+        );
+    }
+}
