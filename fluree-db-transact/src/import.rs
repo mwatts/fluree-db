@@ -151,7 +151,17 @@ mod inner {
             ns_codes = ns_codes_before,
         )
         .entered();
-        let mut sink = ImportSink::new(&mut state.ns_registry, new_t, txn_id, compress)
+        // Allocate namespace codes through the spool's shared allocator when
+        // spooling — SpoolContext resolves code→prefix at record-push time
+        // (mid-parse), so registry-only codes would fall back to an empty
+        // prefix and write suffix-only strings into the index dicts. See the
+        // matching comment in `import_trig_commit`.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(&mut worker_cache, new_t, txn_id, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -175,6 +185,17 @@ mod inner {
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
             let op_count = writer.op_count();
+
+            // Adopt this commit's shared-allocator codes into the registry so
+            // take_delta() includes them in the commit's namespace_delta.
+            let new_codes = worker_cache.into_new_codes();
+            if !new_codes.is_empty() {
+                let adopted = shared_ns.lookup_codes(&new_codes);
+                state
+                    .ns_registry
+                    .adopt_delta_for_persistence(&adopted)
+                    .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+            }
             let ns_delta = state.ns_registry.take_delta();
             let ns_codes_after = state.ns_registry.code_count();
 
@@ -285,7 +306,14 @@ mod inner {
             ns_codes = ns_codes_before,
         )
         .entered();
-        let mut sink = ImportSink::new(&mut state.ns_registry, new_t, txn_id, compress)
+        // Shared-allocator-backed allocation for spool prefix visibility;
+        // see the comment in `import_commit`.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(&mut worker_cache, new_t, txn_id, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -312,6 +340,15 @@ mod inner {
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
             let op_count = writer.op_count();
+
+            let new_codes = worker_cache.into_new_codes();
+            if !new_codes.is_empty() {
+                let adopted = shared_ns.lookup_codes(&new_codes);
+                state
+                    .ns_registry
+                    .adopt_delta_for_persistence(&adopted)
+                    .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+            }
             let ns_delta = state.ns_registry.take_delta();
             let ns_codes_after = state.ns_registry.code_count();
 
@@ -439,9 +476,25 @@ mod inner {
         )
         .entered();
 
-        // 2. Create ImportSink and parse default graph Turtle
-        let mut sink = ImportSink::new(&mut state.ns_registry, new_t, txn_id.clone(), compress)
-            .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+        // 2. Create ImportSink and parse default graph Turtle.
+        //
+        // Namespace codes MUST be allocated through the spool's shared
+        // allocator (not `state.ns_registry` directly): SpoolContext resolves
+        // code→prefix via `ns_alloc` at record-push time — i.e. DURING the
+        // parse, right after an `@prefix` directive allocates the code. Codes
+        // that only live in the registry are invisible to it, and its
+        // empty-prefix fallback would permanently write suffix-only predicate
+        // strings into the index's predicate dict (breaking bound-predicate
+        // lookups after import). Without spooling, a throwaway allocator
+        // seeded from the registry preserves exact code assignment.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink =
+            ImportSink::new_cached(&mut worker_cache, new_t, txn_id.clone(), compress)
+                .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
@@ -497,7 +550,7 @@ mod inner {
             };
 
             // Create a graph Sid (using the graph IRI's namespace + local name)
-            let graph_sid = state.ns_registry.sid_for_iri(&block.iri);
+            let graph_sid = worker_cache.sid_for_iri(&block.iri);
 
             // Process each triple in this named graph
             for triple in &block.triples {
@@ -505,17 +558,17 @@ mod inner {
                     TransactError::Parse("named graph triple missing subject".to_string())
                 })?;
 
-                let s = expand_term(subject, &block.prefixes, &mut state.ns_registry, &txn_id)?;
+                let s = expand_term(subject, &block.prefixes, &mut worker_cache, &txn_id)?;
                 let p = expand_term(
                     &triple.predicate,
                     &block.prefixes,
-                    &mut state.ns_registry,
+                    &mut worker_cache,
                     &txn_id,
                 )?;
 
                 for obj in &triple.objects {
                     let (o, dt, lang) =
-                        expand_object(obj, &block.prefixes, &mut state.ns_registry, &txn_id)?;
+                        expand_object(obj, &block.prefixes, &mut worker_cache, &txn_id)?;
 
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
@@ -557,6 +610,18 @@ mod inner {
         // Named-graph flakes are now in the spool; finish it for the index.
         let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
         drop(_parse_span);
+
+        // Adopt codes this commit allocated in the shared allocator into the
+        // registry, recording them for persistence so take_delta() below
+        // includes them in this commit's namespace_delta.
+        let new_codes = worker_cache.into_new_codes();
+        if !new_codes.is_empty() {
+            let adopted = shared_ns.lookup_codes(&new_codes);
+            state
+                .ns_registry
+                .adopt_delta_for_persistence(&adopted)
+                .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+        }
 
         // 5. Resolve txn-meta if present
         let txn_meta = if let Some(ref raw_meta) = phase1.raw_meta {
@@ -635,7 +700,11 @@ mod inner {
         })
     }
 
-    /// Expand a RawTerm to a Sid using the prefix map and namespace registry.
+    /// Expand a RawTerm to a Sid using the prefix map and worker cache.
+    ///
+    /// Allocation goes through the shared-allocator-backed [`WorkerCache`] so
+    /// the spool's prefix lookups see codes the moment they're allocated (see
+    /// the comment in `import_trig_commit`).
     ///
     /// Blank-node labels are skolemized with the same `{txn_id}-{label}` key
     /// as `ImportSink::skolemize`, so a label shared between the default graph
@@ -645,23 +714,23 @@ mod inner {
     fn expand_term(
         term: &RawTerm,
         prefixes: &rustc_hash::FxHashMap<String, String>,
-        ns_registry: &mut NamespaceRegistry,
+        ns: &mut WorkerCache,
         txn_id: &str,
     ) -> Result<Sid> {
         match term {
             RawTerm::Iri(iri) => {
                 if let Some(local) = iri.strip_prefix("_:") {
-                    Ok(ns_registry.blank_node_sid(&format!("{txn_id}-{local}")))
+                    Ok(ns.blank_node_sid(&format!("{txn_id}-{local}")))
                 } else {
-                    Ok(ns_registry.sid_for_iri(iri))
+                    Ok(ns.sid_for_iri(iri))
                 }
             }
             RawTerm::PrefixedName { prefix, local } => {
-                let ns = prefixes
+                let namespace = prefixes
                     .get(prefix.as_str())
                     .ok_or_else(|| TransactError::Parse(format!("undefined prefix: {prefix}")))?;
-                let iri = format!("{ns}{local}");
-                Ok(ns_registry.sid_for_iri(&iri))
+                let iri = format!("{namespace}{local}");
+                Ok(ns.sid_for_iri(&iri))
             }
         }
     }
@@ -670,25 +739,25 @@ mod inner {
     fn expand_object(
         obj: &RawObject,
         prefixes: &rustc_hash::FxHashMap<String, String>,
-        ns_registry: &mut NamespaceRegistry,
+        ns: &mut WorkerCache,
         txn_id: &str,
     ) -> Result<(FlakeValue, Sid, Option<String>)> {
         match obj {
             RawObject::Iri(iri) => {
                 // Blank labels use the ImportSink skolem key; see expand_term.
                 let sid = if let Some(local) = iri.strip_prefix("_:") {
-                    ns_registry.blank_node_sid(&format!("{txn_id}-{local}"))
+                    ns.blank_node_sid(&format!("{txn_id}-{local}"))
                 } else {
-                    ns_registry.sid_for_iri(iri)
+                    ns.sid_for_iri(iri)
                 };
                 Ok((FlakeValue::Ref(sid), DT_ID.clone(), None))
             }
             RawObject::PrefixedName { prefix, local } => {
-                let ns = prefixes
+                let namespace = prefixes
                     .get(prefix.as_str())
                     .ok_or_else(|| TransactError::Parse(format!("undefined prefix: {prefix}")))?;
-                let iri = format!("{ns}{local}");
-                let sid = ns_registry.sid_for_iri(&iri);
+                let iri = format!("{namespace}{local}");
+                let sid = ns.sid_for_iri(&iri);
                 Ok((FlakeValue::Ref(sid), DT_ID.clone(), None))
             }
             RawObject::String(s) => Ok((
@@ -717,11 +786,8 @@ mod inner {
                 Some(lang.clone()),
             )),
             RawObject::TypedLiteral { value, datatype } => {
-                let (fv, dt) = convert_string_literal(
-                    value,
-                    datatype,
-                    &mut NsAllocator::Exclusive(ns_registry),
-                );
+                let (fv, dt) =
+                    convert_string_literal(value, datatype, &mut NsAllocator::Cached(ns));
                 Ok((fv, dt, None))
             }
         }

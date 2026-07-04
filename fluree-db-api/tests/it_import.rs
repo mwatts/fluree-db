@@ -1489,9 +1489,9 @@ GRAPH <http://example.org/graphs/g2> {
         .await
         .expect("load ledger");
 
-    // NOTE: bound-predicate patterns return empty on freshly bulk-imported
-    // ledgers (pre-existing quirk unrelated to blank-node scoping), so these
-    // queries scan with variable predicate and pick out the blank-node ref.
+    // Scans with a variable predicate and picks out the blank-node ref, so
+    // the assertions stay focused on node identity rather than predicate
+    // resolution (covered by import_trig_bound_predicate_queryable).
     let knows_object = |json: &serde_json::Value, subject: &str| -> String {
         let rows = json.as_array().expect("array result");
         let refs: Vec<String> = rows
@@ -2206,4 +2206,95 @@ async fn import_directory_splits_large_compressed_file() {
     let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
     assert!(objs.contains(&"name-0".to_string()));
     assert!(objs.contains(&"name-39999".to_string()));
+}
+
+// Regression: the serial TriG import path allocated namespace codes only in
+// `state.ns_registry`, invisible to the SpoolContext (which resolves
+// code->prefix via the SHARED allocator at record-push time, mid-parse). Its
+// empty-prefix fallback wrote suffix-only predicate strings ("name" instead
+// of "http://schema.org/name") into the index's predicate dict, so
+// bound-predicate patterns matched nothing and results rendered bare
+// suffixes. The TriG path now allocates through a shared-allocator-backed
+// WorkerCache like the parallel Turtle path.
+#[tokio::test]
+async fn import_trig_bound_predicate_queryable() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+ex:bob schema:name "Bob" .
+
+GRAPH <http://example.org/graphs/g1> {
+    ex:event1 schema:description "login" .
+}
+"#;
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    fluree
+        .create("test/bound-pred:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger("test/bound-pred:main").await.expect("ledger");
+
+    // Full scan must render complete predicate IRIs (not bare suffixes).
+    let scan = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s","?p","?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("scan");
+    let scan_rows = scan.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let preds: Vec<&str> = scan_rows
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[1].as_str()))
+        .collect();
+    assert!(
+        preds.iter().all(|p| *p == "http://schema.org/name"),
+        "predicates must decode to full IRIs; got {scan_rows}"
+    );
+
+    // Bound-predicate pattern must match via the index predicate dict.
+    let bound = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s","?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("bound");
+    let bound_rows = bound.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        bound_rows.as_array().map(Vec::len),
+        Some(2),
+        "bound-predicate must match both subjects; got {bound_rows}"
+    );
+
+    // Named graph too: bound predicate against the GRAPH-block data.
+    let named = fluree
+        .query_connection(&json!({
+            "from": "test/bound-pred:main#http://example.org/graphs/g1",
+            "select": ["?s","?o"],
+            "where": {"@id": "?s", "http://schema.org/description": "?o"}
+        }))
+        .await
+        .expect("named bound");
+    let named_rows = named.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        named_rows.as_array().map(Vec::len),
+        Some(1),
+        "named-graph bound-predicate must match; got {named_rows}"
+    );
 }
