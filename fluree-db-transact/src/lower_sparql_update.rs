@@ -1473,7 +1473,7 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
             if let Ok(FlakeValue::Vector(v)) =
                 fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
             {
-                return UnresolvedTerm::Literal(LiteralValue::Vector(v));
+                return UnresolvedTerm::Literal(LiteralValue::Vector(v.to_vec()));
             }
         }
         _ => {}

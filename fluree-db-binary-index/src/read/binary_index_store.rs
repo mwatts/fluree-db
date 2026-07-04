@@ -978,7 +978,7 @@ impl BinaryIndexStore {
                     )
                 })?;
                 let f64_vec: Vec<f64> = vs.as_f32().iter().map(|&x| x as f64).collect();
-                Ok(FlakeValue::Vector(f64_vec))
+                Ok(FlakeValue::Vector(f64_vec.into()))
             }
             DecodeKind::SpatialArena => Err(io::Error::other(
                 "spatial arena decode not yet implemented in V6",

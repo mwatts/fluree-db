@@ -577,7 +577,7 @@ impl DictOverlay {
 
             FlakeValue::Decimal(_) => Ok(self.assign_numbig_handle(val)),
 
-            FlakeValue::Vector(v) => Ok(self.assign_vector_handle(v.as_slice())),
+            FlakeValue::Vector(v) => Ok(self.assign_vector_handle(v)),
 
             FlakeValue::GeoPoint(bits) => Ok((ObjKind::GEO_POINT, ObjKey::from_u64(bits.as_u64()))),
         }
@@ -645,7 +645,7 @@ impl DictOverlay {
             if handle >= EPHEMERAL_VECTOR_BASE {
                 let idx = (handle - EPHEMERAL_VECTOR_BASE) as usize;
                 if let Some(v) = self.ext_vectors.get(idx) {
-                    return Ok(FlakeValue::Vector(v.clone()));
+                    return Ok(FlakeValue::Vector(v.as_slice().into()));
                 }
             }
         }

@@ -361,7 +361,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         datatype.span,
                     )
                 })?;
-                Ok(FlakeValue::Vector(arr))
+                Ok(FlakeValue::Vector(arr.into()))
             }
             _ => {
                 // Default to string for unknown datatypes

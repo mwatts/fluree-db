@@ -69,7 +69,7 @@ impl DerivedSet {
             }
             FlakeValue::Vector(v) => {
                 6u8.hash(&mut hasher);
-                for f in v {
+                for f in v.iter() {
                     f.to_bits().hash(&mut hasher);
                 }
             }

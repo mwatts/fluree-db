@@ -92,7 +92,7 @@ impl Hash for FlakeValueKey {
             FlakeValue::Time(t) => t.hash(state),
             FlakeValue::Json(s) => s.hash(state),
             FlakeValue::Vector(v) => {
-                for f in v {
+                for f in v.iter() {
                     f.to_bits().hash(state);
                 }
             }

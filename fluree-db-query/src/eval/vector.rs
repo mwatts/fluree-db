@@ -53,11 +53,11 @@ pub fn eval_euclidean_distance<R: RowAccess>(
     })
 }
 
-/// A resolved vector argument: borrowed wherever possible, owned only when
-/// the value had to be decoded (EncodedLit) or came from a nested expression.
+/// A resolved vector argument: borrowed from the row/expression wherever
+/// possible, or a shared handle when the value was decoded (EncodedLit) or
+/// came from a nested expression.
 enum VecArg<'a> {
     Slice(&'a [f64]),
-    Owned(Vec<f64>),
     Shared(Arc<[f64]>),
 }
 
@@ -65,7 +65,6 @@ impl VecArg<'_> {
     fn as_slice(&self) -> &[f64] {
         match self {
             VecArg::Slice(s) => s,
-            VecArg::Owned(v) => v,
             VecArg::Shared(a) => a,
         }
     }
@@ -101,7 +100,7 @@ fn resolve_vector_arg<'a, R: RowAccess>(
                     return Ok(None);
                 };
                 match decoded {
-                    Ok(FlakeValue::Vector(v)) => Ok(Some(VecArg::Owned(v))),
+                    Ok(FlakeValue::Vector(v)) => Ok(Some(VecArg::Shared(v))),
                     Ok(_) => Ok(None),
                     Err(e) => Err(QueryError::execution(format!(
                         "decode encoded vector (o_kind={o_kind}, o_key={o_key}, p_id={p_id}): {e}"
