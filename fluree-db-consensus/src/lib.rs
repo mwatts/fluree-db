@@ -728,6 +728,29 @@ pub enum SubmissionError {
     Overloaded,
 }
 
+impl SubmissionError {
+    /// Whether this error is a settled outcome of the submission —
+    /// one that can never change — as opposed to an attempt that
+    /// ended without determining one.
+    ///
+    /// Unsettled errors mean the submission may still commit through
+    /// the replicated log: gateway-class `Execution` statuses
+    /// (not-leader, raft fatal, stranded waiter — all phrased
+    /// "retry"), and the refusal/racing signals that never executed
+    /// the submission at all. Recording an unsettled error as a
+    /// terminal idempotency-cache state would misreport a later
+    /// commit as `Failed` for the cache TTL, inviting the client to
+    /// resubmit under a fresh key — a double-apply.
+    pub fn is_settled(&self) -> bool {
+        match self {
+            // Admission refusals and racing-submission signals —
+            // this submission was never executed.
+            Self::KeyCollision | Self::AlreadyInFlight | Self::Overloaded => false,
+            Self::Execution { status, .. } => !(502..=504).contains(status),
+        }
+    }
+}
+
 /// Submit operations for processing.
 ///
 /// Each method represents an operation kind — transactions, reverts,

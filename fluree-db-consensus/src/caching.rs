@@ -489,8 +489,13 @@ impl<C: Committer> CachingCommitter<C> {
     /// fully-populated [`SubmissionState::Committed`] — the caller
     /// supplies the canonical kit (op kind + commit identity) and
     /// the typed [`OperationReceipt`] together because both come
-    /// from the same per-op response shape. Failures bypass the
-    /// projection and store directly as [`SubmissionState::Failed`].
+    /// from the same per-op response shape. Settled failures bypass
+    /// the projection and store directly as
+    /// [`SubmissionState::Failed`]; unsettled ones
+    /// ([`SubmissionError::is_settled`]) are not recorded at all —
+    /// the submission may still commit, so the slot is left to
+    /// `ClaimGuard::drop`'s `InFlight` cleanup and `status` falls
+    /// through to the replicated map for the truth.
     async fn record_outcome<R, F>(
         &self,
         cache_key: IdempotencyCacheKey,
@@ -502,6 +507,12 @@ impl<C: Committer> CachingCommitter<C> {
     {
         let final_state = match outcome {
             Ok(receipt) => project_committed(receipt),
+            // Not an outcome: the submission may still commit
+            // through the replicated log (stranded waiter, leader
+            // transition). Caching it as terminal would serve an
+            // authoritative-looking `Failed` for the cache TTL
+            // while the replicated map says `Committed`.
+            Err(err) if !err.is_settled() => return,
             Err(err) => SubmissionState::Failed(err.clone()),
         };
         let value = CachedSubmission {
@@ -1427,6 +1438,115 @@ mod tests {
             .await
             .expect("terminal state must survive");
         assert!(matches!(entry.state, SubmissionState::Committed(_)));
+    }
+
+    #[test]
+    fn settlement_classification() {
+        let execution = |status: u16| SubmissionError::Execution {
+            status,
+            message: "test".into(),
+        };
+        // Determined outcomes: bad requests, policy denials,
+        // poisons, and local internal failures that never submitted.
+        assert!(execution(400).is_settled());
+        assert!(execution(422).is_settled());
+        assert!(execution(500).is_settled());
+
+        // Gateway-class: the submission may still commit through
+        // the replicated log (not-leader, raft fatal, stranded).
+        assert!(!execution(502).is_settled());
+        assert!(!execution(503).is_settled());
+        assert!(!execution(504).is_settled());
+
+        // Never executed at all.
+        assert!(!SubmissionError::KeyCollision.is_settled());
+        assert!(!SubmissionError::AlreadyInFlight.is_settled());
+        assert!(!SubmissionError::Overloaded.is_settled());
+    }
+
+    #[tokio::test]
+    async fn unsettled_error_is_not_recorded_as_terminal_failure() {
+        // A stranded submission (504: outcome unknown) may commit on
+        // the new leader seconds later. Recording it as `Failed`
+        // would make `status()` serve that answer authoritatively
+        // for the cache TTL while the replicated map says
+        // `Committed` — inviting a resubmit under a fresh key.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k-unsettled").expect("fits cap"),
+        );
+        let body_hash = [7u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let _guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        let stranded: Result<(), SubmissionError> = Err(SubmissionError::Execution {
+            status: 504,
+            message: "submission stranded by leader transition".into(),
+        });
+        committer
+            .record_outcome(cache_key.clone(), body_hash, &stranded, |&()| {
+                unreachable!("no receipt to project")
+            })
+            .await;
+
+        let cached = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("claim marker still present");
+        assert!(
+            matches!(cached.state, SubmissionState::InFlight),
+            "unsettled outcome must not overwrite the InFlight claim, got {:?}",
+            cached.state
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_error_is_recorded_as_terminal_failure() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k-settled").expect("fits cap"),
+        );
+        let body_hash = [8u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let _guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        let poisoned: Result<(), SubmissionError> = Err(SubmissionError::Execution {
+            status: 422,
+            message: "submission poisoned".into(),
+        });
+        committer
+            .record_outcome(cache_key.clone(), body_hash, &poisoned, |&()| {
+                unreachable!("no receipt to project")
+            })
+            .await;
+
+        let cached = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("terminal state present");
+        assert!(
+            matches!(cached.state, SubmissionState::Failed(_)),
+            "settled failure must be cached as terminal, got {:?}",
+            cached.state
+        );
     }
 
     #[tokio::test]
