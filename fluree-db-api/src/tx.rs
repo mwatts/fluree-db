@@ -145,6 +145,102 @@ async fn load_transaction_config(ledger: &LedgerState) -> Option<Arc<LedgerConfi
     }
 }
 
+/// Maximum RDF-list length walked when validating a staged `f:reasoningModes`
+/// collection — a malformed cyclic list must not spin.
+const MAX_STAGED_REASONING_LIST_LEN: usize = 64;
+
+/// Reject a transaction that writes an unrecognized `f:reasoningModes` value
+/// into the ledger #config.
+///
+/// Config reasoning modes are otherwise only parsed at query time, where an
+/// unknown mode is warned-and-skipped — so a typo silently disables reasoning
+/// with no signal. This validates the modes the transaction asserts and fails
+/// the commit if any is unrecognized. Cheap: scans the staged delta once and
+/// returns immediately unless `f:reasoningModes` is actually asserted.
+///
+/// Handles the same value shapes as the config reader — a direct string
+/// literal, a direct mode IRI, and an RDF collection of either — collected
+/// from this transaction's own staged flakes.
+fn validate_staged_reasoning_modes(
+    view: &StagedLedger,
+) -> std::result::Result<(), fluree_db_transact::TransactError> {
+    let snapshot = &view.base().snapshot;
+    let Some(modes_p) = snapshot.encode_iri(config_iris::REASONING_MODES) else {
+        return Ok(());
+    };
+    let flakes = view.staged_flakes();
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut list_heads: Vec<Sid> = Vec::new();
+    for f in flakes {
+        if !f.op || f.p != modes_p {
+            continue;
+        }
+        match &f.o {
+            FlakeValue::String(s) => candidates.push(s.to_string()),
+            FlakeValue::Ref(sid) => list_heads.push(sid.clone()),
+            _ => {}
+        }
+    }
+    if candidates.is_empty() && list_heads.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve any RDF-collection heads against this transaction's own flakes.
+    if !list_heads.is_empty() {
+        if let (Some(first_p), Some(rest_p)) = (
+            snapshot.encode_iri(fluree_vocab::rdf::FIRST),
+            snapshot.encode_iri(fluree_vocab::rdf::REST),
+        ) {
+            let mut first_of: HashMap<Sid, FlakeValue> = HashMap::new();
+            let mut rest_of: HashMap<Sid, Sid> = HashMap::new();
+            for f in flakes {
+                if !f.op {
+                    continue;
+                }
+                if f.p == first_p {
+                    first_of.entry(f.s.clone()).or_insert_with(|| f.o.clone());
+                } else if f.p == rest_p {
+                    if let FlakeValue::Ref(next) = &f.o {
+                        rest_of.entry(f.s.clone()).or_insert_with(|| next.clone());
+                    }
+                }
+            }
+            for head in list_heads {
+                // A ref that is not a list node is a direct mode IRI object.
+                if !first_of.contains_key(&head) {
+                    if let Some(iri) = snapshot.decode_sid(&head) {
+                        candidates.push(iri);
+                    }
+                    continue;
+                }
+                let mut node = head;
+                for _ in 0..MAX_STAGED_REASONING_LIST_LEN {
+                    match first_of.get(&node) {
+                        Some(FlakeValue::String(s)) => candidates.push(s.to_string()),
+                        Some(FlakeValue::Ref(sid)) => {
+                            if let Some(iri) = snapshot.decode_sid(sid) {
+                                candidates.push(iri);
+                            }
+                        }
+                        _ => {}
+                    }
+                    match rest_of.get(&node) {
+                        Some(next) => node = next.clone(),
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fluree_db_query::ir::ReasoningModes::validate_mode_names(&candidates).map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "invalid f:reasoningModes in ledger #config: {e}"
+        ))
+    })
+}
+
 /// Resolve SHACL config across all graphs affected by a transaction.
 ///
 /// Starts from the ledger-wide baseline (`resolve_effective_config(config, None)`)
@@ -1655,6 +1751,8 @@ impl crate::Fluree {
         )
         .await?;
 
+        validate_staged_reasoning_modes(&view)?;
+
         Ok(StageResult {
             view,
             ns_registry,
@@ -1744,6 +1842,8 @@ impl crate::Fluree {
         )
         .await?;
 
+        validate_staged_reasoning_modes(&view)?;
+
         Ok(StageResult {
             view,
             ns_registry,
@@ -1814,6 +1914,9 @@ impl crate::Fluree {
         )
         .await
         .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+
+        validate_staged_reasoning_modes(&view)
+            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         Ok(StageResult {
             view,

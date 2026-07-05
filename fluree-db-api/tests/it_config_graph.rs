@@ -143,6 +143,89 @@ async fn config_write_json_ld() {
     );
 }
 
+/// A transaction that writes an unrecognized `f:reasoningModes` into #config
+/// must be rejected at commit, not silently accepted (and then ignored at
+/// query time).
+#[tokio::test]
+async fn config_write_rejects_unknown_reasoning_mode() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-bad-reasoning:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let config_iri = config_graph_iri(ledger_id);
+
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:owltypo .
+        }}
+    "
+    );
+
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect_err("unknown reasoning mode in #config must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reasoningModes") && msg.contains("owltypo"),
+        "error should name the offending mode, got: {msg}"
+    );
+}
+
+/// Recognized `f:reasoningModes` (multiple mode IRIs) commit normally and
+/// round-trip — the validator only rejects unrecognized names.
+#[tokio::test]
+async fn config_write_accepts_reasoning_modes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-good-reasoning:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let config_iri = config_graph_iri(ledger_id);
+
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:rdfs, f:owl2rl .
+        }}
+    "
+    );
+
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("recognized reasoning modes must commit");
+
+    let view = fluree.db(ledger_id).await.unwrap();
+    let config = view.ledger_config().expect("config attached");
+    let mut modes = config
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.modes.as_ref())
+        .expect("modes present")
+        .clone();
+    modes.sort();
+    assert_eq!(
+        modes,
+        vec![
+            "https://ns.flur.ee/db#owl2rl".to_string(),
+            "https://ns.flur.ee/db#rdfs".to_string(),
+        ]
+    );
+}
+
 // =============================================================================
 // Test 4: policy defaults apply
 // =============================================================================

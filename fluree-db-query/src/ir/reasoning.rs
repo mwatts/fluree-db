@@ -364,6 +364,23 @@ impl ReasoningModes {
         self
     }
 
+    /// Strictly validate config-declared reasoning mode strings.
+    ///
+    /// Mirrors [`Self::from_mode_strings`]'s per-item handling (strip the
+    /// `fluree:` namespace prefix, then parse) but returns the first
+    /// unrecognized mode as an error instead of warning and skipping. Used at
+    /// transaction time to reject a bad `f:reasoningModes` before it commits,
+    /// so a config typo fails loudly rather than silently disabling reasoning
+    /// at query time. The `Err` string names the offending mode and the
+    /// accepted set.
+    pub fn validate_mode_names(names: &[String]) -> Result<(), String> {
+        for name in names {
+            let short = name.strip_prefix(fluree_vocab::fluree::DB).unwrap_or(name);
+            Self::parse_single(short)?;
+        }
+        Ok(())
+    }
+
     /// Build from a list of mode name strings (e.g., from config graph).
     ///
     /// Accepts the same names as `parse_single`: "rdfs", "owl2ql",
