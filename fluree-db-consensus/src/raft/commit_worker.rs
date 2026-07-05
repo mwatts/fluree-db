@@ -536,6 +536,7 @@ impl Worker {
                     query,
                     params.as_ref(),
                     &governance,
+                    txn_opts.skolem_txn_id.clone(),
                 )
                 .await
                 .map_err(|e| stage_failure(&format!("cypher lowering failed: {e}")))?,

@@ -43,6 +43,7 @@ These shape everything below; read them first.
 | `WITH` | ◑ | Projection boundary; `WHERE`→HAVING when it references aggregates; `DISTINCT`/`ORDER BY`/`SKIP`/`LIMIT`; `collect()` carries forward as a list. Before a **write** clause only the pass-through / rename / computed-alias / filter subset is allowed (no aggregation / `DISTINCT` / `ORDER BY` / `SKIP` / `LIMIT`); `WITH` before `DELETE` deferred. |
 | `UNWIND` | ✅ | Inline lists and runtime list expressions; `$param` lists via API substitution. Before a **write** clause: `$param` lists, inline literal lists, and constant `range()` (≤ 10000 rows). |
 | `RETURN` | ✅ | `*`, aliases, `DISTINCT`, `ORDER BY`/`SKIP`/`LIMIT`. `SKIP`/`LIMIT` must be literal integers. |
+| `RETURN` on a write (`CREATE … RETURN n`) | ◑ | Bare created-entity variables (a fresh CREATE node or relationship variable), optionally aliased; one row per WHERE solution. Deferred: expressions, RETURN modifiers, MATCH-bound variables, MERGE. |
 | `UNION` / `UNION ALL` | ✅ | Column-name-match + uniform-variant rules enforced. |
 | `CALL { … }` (subquery) | ✅ | Imports `(a,b)` / `(*)`, uncorrelated broadcast, inner `UNION`, nesting, strict scope/shadowing, correlated-aggregate soundness. |
 | `CREATE` | ✅ | Nodes + relationships (relationships reify). Bare `CREATE ()` / `CREATE (n)` asserts a hidden `db:Node` existence marker (invisible to `labels()`). |

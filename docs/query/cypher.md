@@ -347,9 +347,19 @@ ORDER BY / SKIP / LIMIT
   resolution keys off the raw MATCH variables and can't honor a rename/horizon —
   `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
   `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
+- **`… RETURN <created>`** — a trailing `RETURN` of *created* entities:
+  `CREATE (n:Person {name: "Alice"}) RETURN n`,
+  `MATCH (a), (b) CREATE (a)-[e:KNOWS]->(b) RETURN e` (one row per matched
+  pair). Answered as the read path's Cypher-JSON tabular envelope; each entity
+  serializes as its identifier string. v1 surface: bare variables (optionally
+  aliased) naming a fresh `CREATE` node or relationship variable. Deferred:
+  expressions, `RETURN` modifiers, `MATCH`-bound variables, and `RETURN` with
+  `MERGE` (the matched branch's node isn't a created entity).
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;
+// or, when the statement ends in RETURN:
+let (committed, rows) = fluree.transact_cypher_returning(ledger, cypher, None).await?;
 ```
 
 Writes default to LPG mode, where every relationship reifies (carries an

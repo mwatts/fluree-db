@@ -67,7 +67,7 @@ pub use ir::{InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 pub use lower_sparql_update::{lower_sparql_update, lower_sparql_update_ast, LowerError};
 pub use namespace::{
     stable_blank_node_sid, stable_blank_node_sid_from_label, NamespaceRegistry,
-    SharedNamespaceAllocator, BLANK_NODE_PREFIX,
+    SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
 pub use parse::{
     parse_transaction, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm,

@@ -139,6 +139,10 @@ struct CypherLowering<'a> {
     /// `DELETE r` retract the base edge (the `f:reifies*` cascade then removes
     /// the bundle).
     rel_var_edges: std::collections::HashMap<String, (String, Sid, String)>,
+    /// Relationship variables already used for a CREATE relationship — each
+    /// names one created edge's annotation (label `_:cy_rel_{name}`), so a
+    /// reuse would silently merge two edges' annotations.
+    created_rel_vars: std::collections::HashSet<String>,
     /// Stable per-pattern-occurrence node labels, keyed by node span.
     /// Used so two appearances of the same node pattern in `CREATE
     /// (a)-[]->(b), (a)-[]->(c)` resolve to the same SID at staging
@@ -166,6 +170,7 @@ impl<'a> CypherLowering<'a> {
             synth_counter: 0,
             bound_vars: std::collections::HashSet::new(),
             rel_var_edges: std::collections::HashMap::new(),
+            created_rel_vars: std::collections::HashSet::new(),
             node_subject_cache: std::collections::HashMap::new(),
         }
     }
@@ -189,11 +194,10 @@ impl<'a> CypherLowering<'a> {
     }
 
     fn lower_update(&mut self, update: &Update) -> Result<(), LowerCypherError> {
-        if update.return_clause.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "RETURN on a write statement is deferred in v1",
-            ));
-        }
+        // A trailing RETURN is not part of the Txn: the API layer validates it
+        // (created-entity variables only in v1), supplies a skolem txn id via
+        // `TxnOpts::skolem_txn_id`, and reconstructs the returned rows after
+        // the commit (see `fluree-db-api::cypher_write`). Lowering ignores it.
 
         // A MERGE must be the only write. Each MERGE appends a top-level NOT
         // EXISTS guard evaluated against the pre-transaction snapshot, so
@@ -1573,7 +1577,24 @@ impl<'a> CypherLowering<'a> {
         // freshened per WHERE solution (SPARQL §3.1.3), so batched edge inserts
         // mint a distinct annotation per row. The base triple above also makes
         // the edge visible to anonymous (plain-RDF) reads.
-        let ann = self.fresh_bnode();
+        //
+        // A named relationship (`CREATE (a)-[e:T]->(b)`) uses a label derived
+        // from the variable so a trailing `RETURN e` can reconstruct the
+        // created annotation's Sid (the `cy_rel_` prefix keeps it disjoint
+        // from node-variable labels `cy_{name}`).
+        let ann = match &rel.var {
+            Some(v) => {
+                if !self.created_rel_vars.insert(v.name.clone()) {
+                    return Err(LowerCypherError::rejected(format!(
+                        "relationship variable `{}` is bound more than once in CREATE; \
+                         use a distinct name for each relationship",
+                        v.name
+                    )));
+                }
+                TemplateTerm::BlankNode(format!("_:cy_rel_{}", v.name))
+            }
+            None => self.fresh_bnode(),
+        };
         self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
         if let Some(props) = &rel.props {
             self.emit_property_triples(&ann, props)?;

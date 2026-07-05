@@ -132,6 +132,7 @@ impl Committer for LocalCommitter {
                         query,
                         params.as_ref(),
                         &governance,
+                        txn_opts.skolem_txn_id.clone(),
                     )
                     .await
                     .map_err(execution_failure)?,
@@ -419,10 +420,11 @@ pub(crate) async fn resolve_cypher_under_lock(
     query: &str,
     params: Option<&serde_json::Map<String, serde_json::Value>>,
     governance: &GovernanceOptions,
+    skolem_txn_id: Option<String>,
 ) -> Result<Txn, ApiError> {
     let snap = ledger_handle.snapshot().await;
     let plan = fluree
-        .cypher_write_plan(query, params, ledger_id, &snap.snapshot)
+        .cypher_write_plan_with_skolem(query, params, ledger_id, &snap.snapshot, skolem_txn_id)
         .await?;
     match plan {
         fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(*txn),

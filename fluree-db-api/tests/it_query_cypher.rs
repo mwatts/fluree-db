@@ -924,6 +924,104 @@ async fn transact_cypher_unwind_inline_list_batches_node_inserts() {
 }
 
 #[tokio::test]
+async fn transact_cypher_create_return_node() {
+    // `CREATE (n:UserTemp {id: 1}) RETURN n` (benchgraph
+    // `arango__single_vertex_write`) — one row carrying the created node id.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-return-node");
+    let (result, rows) = fluree
+        .transact_cypher_returning(ledger0, r#"CREATE (n:UserTemp {id: 1}) RETURN n"#, None)
+        .await
+        .expect("create with RETURN");
+    let rows = rows.expect("RETURN produces rows");
+    assert_eq!(rows["results"][0]["columns"], json!(["n"]), "{rows}");
+    let data = rows["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{rows}");
+    let id = data[0]["row"][0].as_str().expect("node id string");
+    assert!(id.starts_with("_:fdb-"), "skolemized node id: {rows}");
+
+    // The returned identity is the committed node: it must have the label.
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:UserTemp) RETURN n")
+            .await
+            .expect("verify")
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_match_create_return_edge() {
+    // `MATCH (a),(b) CREATE (a)-[e:Temp]->(b) RETURN e` (benchgraph
+    // `arango__single_edge_write`) — one row per WHERE solution.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:create-return-edge");
+    for stmt in [
+        r#"CREATE (a:User {id: 1})"#,
+        r#"CREATE (b:User {id: 2})"#,
+        r#"CREATE (c:User {id: 3})"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let (result, rows) = fluree
+        .transact_cypher_returning(
+            l,
+            r#"MATCH (a:User {id: 1}), (b:User {id: 2}) CREATE (a)-[e:Temp]->(b) RETURN e"#,
+            None,
+        )
+        .await
+        .expect("edge create with RETURN");
+    let rows = rows.expect("RETURN produces rows");
+    assert_eq!(rows["results"][0]["columns"], json!(["e"]), "{rows}");
+    let data = rows["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "one solution → one created edge: {rows}");
+    assert!(
+        data[0]["row"][0]
+            .as_str()
+            .expect("edge id")
+            .contains("cy_rel_e"),
+        "{rows}"
+    );
+
+    // Multi-solution: a broader MATCH creates one edge per pair and RETURN
+    // reports each.
+    let (_, rows) = fluree
+        .transact_cypher_returning(
+            result.ledger,
+            r#"MATCH (a:User {id: 3}), (b:User) CREATE (a)-[e:Linked]->(b) RETURN e AS edge"#,
+            None,
+        )
+        .await
+        .expect("batch edge create with RETURN");
+    let rows = rows.expect("rows");
+    assert_eq!(rows["results"][0]["columns"], json!(["edge"]), "{rows}");
+    assert_eq!(
+        rows["results"][0]["data"].as_array().expect("data").len(),
+        3,
+        "three matched targets → three created edges: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_return_of_matched_var_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:write-return-matched");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (a:User {id: 1})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let err = fluree
+        .transact_cypher_returning(l, r#"MATCH (a:User {id: 1}) SET a.x = 1 RETURN a"#, None)
+        .await
+        .expect_err("RETURN of a MATCH-bound var must be rejected");
+    assert!(format!("{err}").contains("created"), "{err}");
+}
+
+#[tokio::test]
 async fn transact_cypher_create_bare_anonymous_node() {
     // `CREATE ()` (benchgraph `create__vertex`) — an anonymous propertyless
     // node commits (via the hidden db:Node marker) and stays invisible to
