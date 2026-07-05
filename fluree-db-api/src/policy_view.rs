@@ -402,11 +402,17 @@ pub async fn build_transact_policy_context(
         return Ok(Some(policy_ctx));
     }
 
+    // Resolve (and validate) the same-ledger selector first, matching the read
+    // path's fail-closed-on-unknown-selector contract (fluree_ext.rs resolves
+    // unconditionally). Applying the no-inputs shortcut before this would let an
+    // invalid config `f:policySource` silently run as root on writes while reads
+    // fail closed — the read/write divergence this path exists to eliminate.
+    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot)?;
+
     if !effective_opts.has_any_policy_inputs() {
         return Ok(None);
     }
 
-    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot)?;
     let policy_ctx = policy_builder::build_policy_context_from_opts(
         snapshot,
         overlay,
