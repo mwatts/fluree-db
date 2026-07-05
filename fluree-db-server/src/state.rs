@@ -89,6 +89,15 @@ pub struct AppState {
     /// from stampeding the nameservice.
     query_refresh_last_checked: DashMap<String, Instant>,
 
+    /// Serving posture memo, keyed by ledger id with value `(t, posture)`.
+    ///
+    /// The peer raw-read path resolves the serving gate per object; without
+    /// this, a cold sync re-resolves the config graph for every leaf/branch/
+    /// root/dict/commit at the same `t`. One entry per ledger, overwritten when
+    /// `t` advances (a config change bumps `t`), so it stays bounded and
+    /// self-invalidating.
+    serving_posture_cache: DashMap<String, (i64, crate::routes::serving::EffectiveServing)>,
+
     /// Handle for the background leaflet cache stats logger task.
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
@@ -143,6 +152,39 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
 }
 
 impl AppState {
+    /// Serving posture for a ledger, memoized per `(ledger, t)`.
+    ///
+    /// Resolves the serving gate for the ledger's current head, reusing a
+    /// cached posture when nothing has committed since (same `t`). The cheap
+    /// work (cached handle + ledger state) still runs each call; the memo skips
+    /// the config-graph resolution — the actual per-object cost on the peer
+    /// raw-read path. See [`Self::serving_posture_cache`].
+    pub(crate) async fn effective_serving_cached(
+        &self,
+        ledger_id: &str,
+    ) -> Result<crate::routes::serving::EffectiveServing, crate::error::ServerError> {
+        let handle = self
+            .fluree
+            .ledger_cached(ledger_id)
+            .await
+            .map_err(crate::error::ServerError::Api)?;
+        // Key on the novelty-inclusive `t` (what the resolver reads via
+        // `state.t()`), NOT the indexed base `snapshot.t`: a config change lands
+        // in novelty and bumps the effective `t` without touching the base until
+        // a reindex, so keying on the base would serve a stale posture.
+        let ledger_state = handle.snapshot().await.to_ledger_state();
+        let t = ledger_state.t();
+        if let Some(entry) = self.serving_posture_cache.get(ledger_id) {
+            if entry.0 == t {
+                return Ok(entry.1);
+            }
+        }
+        let serving = crate::routes::serving::effective_serving_from_state(&ledger_state).await?;
+        self.serving_posture_cache
+            .insert(ledger_id.to_string(), (t, serving));
+        Ok(serving)
+    }
+
     /// Create new application state from config.
     ///
     /// Convenience shortcut: builds the default `Fluree` instance
@@ -244,6 +286,7 @@ impl AppState {
             raft: None,
             refresh_counter: AtomicU64::new(0),
             query_refresh_last_checked: DashMap::new(),
+            serving_posture_cache: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
             #[cfg(feature = "aws")]
