@@ -37,6 +37,9 @@ pub struct LedgerConfig {
     pub transact: Option<TransactDefaults>,
     /// Full-text indexing defaults (`f:fullTextDefaults`).
     pub full_text: Option<FullTextDefaults>,
+    /// Serving-posture defaults (`f:servingDefaults`). Ledger-scoped:
+    /// never merged per-graph and not subject to override control.
+    pub serving: Option<ServingDefaults>,
     /// Per-graph config overrides (`f:graphOverrides`).
     pub graph_overrides: Vec<GraphConfig>,
 }
@@ -146,6 +149,27 @@ pub struct DatalogDefaults {
     pub allow_query_time_rules: Option<bool>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
+}
+
+/// Serving-posture defaults from the config graph (`f:servingDefaults`).
+///
+/// Declares which serving tiers the ledger's origin server offers to callers.
+/// Gates apply only on the origin (transaction-role) serving surface: a
+/// read-only peer or mount that holds the ledger's blocks always queries its
+/// own copy freely. `None` fields mean "allowed" (an unconfigured ledger is
+/// fully served); `public_visibility` defaults to false (token required).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control — it changes only by transacting the
+/// config graph.
+#[derive(Debug, Clone, Default)]
+pub struct ServingDefaults {
+    /// `f:serveQuery` — origin executes queries for this ledger.
+    pub serve_query: Option<bool>,
+    /// `f:serveBlocks` — origin serves raw CAS blocks (storage proxy).
+    pub serve_blocks: Option<bool>,
+    /// `f:publicVisibility` — ledger is discoverable/readable without a token.
+    pub public_visibility: Option<bool>,
 }
 
 /// Full-text indexing defaults from the config graph (`f:fullTextDefaults`).

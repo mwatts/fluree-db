@@ -315,6 +315,17 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "multipart_part_size_bytes": config.import_multipart_part_size_bytes,
     });
 
+    // Advertise server-wide serving capabilities so clients can negotiate
+    // query-shipping vs peer (block-fetch) mode before authenticating.
+    // Per-ledger posture (f:servingDefaults) is advertised on the
+    // authenticated NS record lookup; this block is the coarse server-level
+    // view: queries are always served, blocks only when the storage proxy is
+    // enabled.
+    doc["serving"] = serde_json::json!({
+        "query": true,
+        "blocks": config.storage_proxy().enabled,
+    });
+
     Json(doc)
 }
 

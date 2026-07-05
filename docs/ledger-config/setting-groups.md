@@ -363,6 +363,29 @@ Some settings are structurally tied to the ledger as a whole and are **not meani
 
 Override control does not apply to ledger-scoped settings — they are changed only by writing to the config graph.
 
+### `f:servingDefaults` — serving posture
+
+Declares which serving tiers the ledger's **origin server** offers to callers. Fields (all optional; absent means allowed):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `f:serveQuery` | boolean | Origin executes queries for this ledger (`false` → query endpoints return 403 with a stable message) |
+| `f:serveBlocks` | boolean | Origin serves raw replication content — storage-proxy blocks/objects, commit blobs, pack streams (`false` → those endpoints return 404) |
+| `f:publicVisibility` | boolean | Ledger is discoverable/readable without a token (default `false`; reserved for the anonymous access tier) |
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main>    a f:LedgerConfig ;
+                      f:servingDefaults <urn:cfg:serving> .
+    <urn:cfg:serving> f:serveQuery  false ;
+                      f:serveBlocks true .
+}
+```
+
+The example above is the "bring your own compute" posture: consumers fetch index blocks and execute queries client-side (peer mode); the origin refuses to spend query compute.
+
+Serving gates bind **only the origin's serving surface** (transaction-role servers). A read-only peer or a consumer that mounts the ledger's blocks always queries its own copy freely — the posture travels with the config graph but is deliberately not enforced on replicas, since restricting what a holder of the full blocks does locally is not enforceable anyway. Peers negotiate the mode via the `serving` field on nameservice record responses (see [Query peers](../operations/query-peers.md)).
+
 > **Note:** `f:authzSource` (an identity/relationship graph used by policy evaluation) is planned as a ledger-scoped setting but is not yet implemented. When available, it will let the config graph specify which graph contains identity data (e.g., DID→role mappings) for policy resolution.
 
 ---

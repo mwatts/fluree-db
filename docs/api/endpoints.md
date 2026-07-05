@@ -911,6 +911,60 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8090/v1/fluree/storage/objects/bafybeig...leafCid?ledger=mydb:main"
 ```
 
+Single-range `Range: bytes=start-end` requests are honored with `206 Partial
+Content` (`Content-Range` included); the full object is verified against the
+CID before slicing. Unsupported Range forms fall back to a full `200`
+response; a start at or past the object length returns `416`.
+
+### GET /storage/credentials
+
+Mint STS credentials scoped to a ledger's S3 prefix, so an authorized peer
+reads index content **directly from S3** instead of proxying every object
+through this server. See [Remote mounts and serving
+tiers](../design/remote-mounts.md).
+
+**URL:**
+
+```
+GET /storage/credentials?ledger={ledger-id}
+```
+
+**Requirements (all must hold, else `404`):**
+
+- Server built with the `aws` feature and **single-bucket S3-backed storage**
+  (connection config)
+- `--storage-vend-enabled` and `--storage-vend-role-arn <arn>` configured
+- Bearer token with `fluree.storage.*` scope covering the ledger
+- The ledger's `f:serveBlocks` posture allows raw serving
+
+**Response Body** (200 OK):
+
+```json
+{
+  "access_key_id": "ASIA...",
+  "secret_access_key": "...",
+  "session_token": "...",
+  "expires_at_epoch_secs": 1751600000,
+  "bucket": "my-fluree-bucket",
+  "region": "us-east-1",
+  "key_prefix": "ledgers",
+  "scoped_prefix": "ledgers/mydb"
+}
+```
+
+The grant is an STS `AssumeRole` session narrowed by a session policy to
+`s3:GetObject` under the ledger's **name-level** prefix (covering all
+branches and the shared dictionary namespace) plus prefix-conditioned
+`s3:ListBucket`. TTL is `--storage-vend-ttl-secs` (default 900, the STS
+minimum).
+
+**Revocation caveat:** a minted grant stays valid until it expires — token
+revocations and `f:serveBlocks` changes take effect at grant expiry, so keep
+TTLs short.
+
+Consumers (CLI peer mode, `fluree-db-nameservice-sync::vended_s3`) probe this
+endpoint and fall back to proxied `/storage/objects` reads on `404`.
+
 ## Nameservice Sync Endpoints
 
 Used by replication clients and peer instances to push ref updates, initialize

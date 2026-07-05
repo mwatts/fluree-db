@@ -654,6 +654,26 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_STORAGE_PROXY_INSECURE", hide = true)]
     pub storage_proxy_insecure_accept_any_issuer: bool,
 
+    // === Vended S3 credentials (transaction server, S3-backed storage) ===
+    /// Enable GET /storage/credentials: mint STS credentials scoped to a
+    /// ledger's S3 prefix so authorized peers read index content directly
+    /// from S3 instead of proxying bytes through this server. Requires
+    /// S3-backed storage (connection config) and --storage-vend-role-arn.
+    #[arg(long, env = "FLUREE_STORAGE_VEND_ENABLED")]
+    pub storage_vend_enabled: bool,
+
+    /// IAM role ARN to assume when minting vended credentials. The role's
+    /// permissions are the ceiling; each grant is narrowed to the requested
+    /// ledger's prefix by a session policy.
+    #[arg(long, env = "FLUREE_STORAGE_VEND_ROLE_ARN")]
+    pub storage_vend_role_arn: Option<String>,
+
+    /// Vended credential TTL in seconds (STS minimum 900). Serving-posture
+    /// changes and token revocations take effect at grant expiry, so keep
+    /// this short.
+    #[arg(long, env = "FLUREE_STORAGE_VEND_TTL_SECS", default_value_t = 900)]
+    pub storage_vend_ttl_secs: i32,
+
     // === Peer storage access mode options ===
     /// Storage access mode for peer: shared (direct) or proxy (through tx server)
     #[arg(
@@ -826,6 +846,10 @@ impl Default for ServerConfig {
             storage_proxy_default_policy_class: None,
             storage_proxy_debug_headers: false,
             storage_proxy_insecure_accept_any_issuer: false,
+            // Vended credential defaults
+            storage_vend_enabled: false,
+            storage_vend_role_arn: None,
+            storage_vend_ttl_secs: 900,
             // Peer storage access mode defaults
             storage_access_mode: StorageAccessMode::Shared,
             storage_proxy_token: None,

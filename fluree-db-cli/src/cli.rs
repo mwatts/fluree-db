@@ -1005,6 +1005,12 @@ pub enum Commands {
         action: TrackAction,
     },
 
+    /// Inspect or clear the peer-mode index artifact cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
     /// Build or update the binary index for a ledger
     ///
     /// Performs incremental indexing when possible (merges only new commits
@@ -1771,6 +1777,12 @@ pub enum TrackAction {
         /// Alias on the remote (defaults to local alias)
         #[arg(long)]
         remote_alias: Option<String>,
+
+        /// Query execution mode: "proxy" (remote executes queries; default)
+        /// or "peer" (queries run locally over index blocks fetched from the
+        /// remote and cached by CID; requires a storage-scope token)
+        #[arg(long, value_parser = ["proxy", "peer"])]
+        mode: Option<String>,
     },
 
     /// Stop tracking a remote ledger
@@ -1786,6 +1798,20 @@ pub enum TrackAction {
     Status {
         /// Ledger alias (shows all if omitted)
         ledger: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CacheAction {
+    /// Show peer-cache disk usage per remote
+    Status,
+
+    /// Delete cached index artifacts (all remotes, or one with --remote).
+    /// Always safe: everything cached is content-addressed and re-fetchable.
+    Clear {
+        /// Only clear the cache for this remote
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -2066,6 +2092,13 @@ pub enum RemoteAction {
     Show {
         /// Remote name
         name: String,
+    },
+
+    /// List the ledgers your token can access on a remote, with the
+    /// serving tiers each offers ("query", "blocks")
+    Ledgers {
+        /// Remote name; defaults to the only configured remote
+        name: Option<String>,
     },
 }
 

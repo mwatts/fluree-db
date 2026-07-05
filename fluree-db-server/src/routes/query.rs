@@ -3400,9 +3400,21 @@ pub(crate) async fn load_ledger_for_query(
         ServerError::Api(e)
     })?;
 
-    // In transaction mode, just return the cached state
+    // In transaction mode, return the cached state after the serving gate:
+    // the origin honors the ledger's f:serveQuery posture. Peer-role servers
+    // skip the gate — they serve queries from their own replicated copy by
+    // design (see routes/serving.rs).
     if state.config.server_role != ServerRole::Peer {
-        return Ok(handle.snapshot().await.to_ledger_state());
+        let ledger_state = handle.snapshot().await.to_ledger_state();
+        let serving = crate::routes::serving::effective_serving_from_state(&ledger_state).await?;
+        if !serving.query {
+            set_span_error_code(span, "error:QueryServingDisabled");
+            return Err(ServerError::Api(fluree_db_api::ApiError::http(
+                403,
+                "Query serving is disabled for this ledger".to_string(),
+            )));
+        }
+        return Ok(ledger_state);
     }
 
     // In peer mode (shared storage), check freshness and potentially reload

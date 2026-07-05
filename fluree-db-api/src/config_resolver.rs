@@ -26,7 +26,8 @@ use std::sync::Arc;
 use fluree_db_core::ledger_config::{
     DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
     OntologyImportBinding, OverrideControl, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
-    RollbackGuard, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
+    RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy,
+    ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -54,6 +55,44 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+
+    // Read the config_id (@id)
+    let config_id = snapshot.decode_sid(&config_sid);
+
+    // Read each setting group
+    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
+
+    Ok(Some(LedgerConfig {
+        config_id,
+        policy,
+        shacl,
+        reasoning,
+        datalog,
+        transact,
+        full_text,
+        serving,
+        graph_overrides,
+    }))
+}
+
+/// Locate the single `f:LedgerConfig` subject in the config graph as-of `to_t`,
+/// or `None` when the ledger has no config. Shared prefix of
+/// [`resolve_ledger_config`] and [`resolve_serving_only`].
+async fn resolve_config_sid(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<Sid>> {
     // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
     // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
     // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
@@ -128,28 +167,21 @@ pub async fn resolve_ledger_config(
         with_iris.into_iter().next().unwrap().1
     };
 
-    // Read the config_id (@id)
-    let config_id = snapshot.decode_sid(&config_sid);
+    Ok(Some(config_sid))
+}
 
-    // Read each setting group
-    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
-
-    Ok(Some(LedgerConfig {
-        config_id,
-        policy,
-        shacl,
-        reasoning,
-        datalog,
-        transact,
-        full_text,
-        graph_overrides,
-    }))
+/// Resolve only the serving posture (`f:servingDefaults`), skipping the other
+/// seven setting groups. The serving gates read only `config.serving`, so this
+/// avoids the wasted group reads a full [`resolve_ledger_config`] would do.
+pub async fn resolve_serving_only(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<ServingDefaults>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+    read_serving_defaults(snapshot, overlay, to_t, &config_sid).await
 }
 
 // ============================================================================
@@ -1302,6 +1334,61 @@ async fn read_datalog_defaults(
         rules_source,
         allow_query_time_rules,
         override_control,
+    }))
+}
+
+/// Read serving defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_serving_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<ServingDefaults>> {
+    let group_sid = match read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::SERVING_DEFAULTS,
+    )
+    .await?
+    {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let serve_query = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::SERVE_QUERY,
+    )
+    .await?;
+    let serve_blocks = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::SERVE_BLOCKS,
+    )
+    .await?;
+    let public_visibility = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::PUBLIC_VISIBILITY,
+    )
+    .await?;
+
+    Ok(Some(ServingDefaults {
+        serve_query,
+        serve_blocks,
+        public_visibility,
     }))
 }
 

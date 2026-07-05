@@ -17,6 +17,7 @@ mod pack;
 mod policy_auth;
 mod push;
 pub(crate) mod query;
+pub(crate) mod serving;
 mod show;
 mod storage_proxy;
 mod stream_query;
@@ -285,6 +286,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Stub endpoints (not yet implemented)
         .route("/subscribe", get(stubs::subscribe))
         .route("/remote/:path", get(stubs::remote).post(stubs::remote));
+
+    // Vended S3 credentials (absent without the aws feature → 404)
+    #[cfg(feature = "aws")]
+    let v1 = v1.route(
+        "/storage/credentials",
+        get(storage_proxy::get_vended_credentials),
+    );
 
     // SHACL validation report (read endpoint; see routes/validate.rs)
     #[cfg(feature = "shacl")]
