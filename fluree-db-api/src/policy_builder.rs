@@ -369,23 +369,33 @@ async fn build_policy_context_from_opts_inner(
 
     // Current RDFS hierarchy (always-on entailment for enforcement): class
     // policies govern subclass instances, property policies govern
-    // subproperties. Two bound-predicate scans + closure — small next to the
-    // stats assembly and policy parsing above.
-    let hierarchy = match &cross_ledger_schema {
-        // Cross-ledger ontology: compose the model ledger's schema bundle
-        // over the local overlay so its subclass/subproperty edges merge in.
-        Some(bundle) => {
-            let composed = fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
-                overlay,
-                std::sync::Arc::clone(bundle),
-            );
-            fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, &composed, to_t).await
+    // subproperties. Only OnClass/OnProperty restrictions consult it —
+    // identity-only, default-allow, and OnSubject policies don't. Skip the
+    // O(ontology-size) schema clone + sort + scans entirely when nothing can
+    // use it, since this builder runs uncached on every governed query.
+    let needs_hierarchy = restrictions
+        .iter()
+        .any(|r| !r.for_classes.is_empty() || matches!(r.target_mode, TargetMode::OnProperty));
+    let hierarchy = if !needs_hierarchy {
+        None
+    } else {
+        match &cross_ledger_schema {
+            // Cross-ledger ontology: compose the model ledger's schema bundle
+            // over the local overlay so its subclass/subproperty edges merge in.
+            Some(bundle) => {
+                let composed = fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                    overlay,
+                    std::sync::Arc::clone(bundle),
+                );
+                fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, &composed, to_t)
+                    .await
+            }
+            None => {
+                fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, overlay, to_t).await
+            }
         }
-        None => {
-            fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, overlay, to_t).await
-        }
-    }
-    .map_err(|e| ApiError::internal(format!("policy hierarchy computation failed: {e}")))?;
+        .map_err(|e| ApiError::internal(format!("policy hierarchy computation failed: {e}")))?
+    };
 
     let view_set = build_policy_set(
         restrictions.clone(),
