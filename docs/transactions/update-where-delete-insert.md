@@ -556,6 +556,65 @@ Calculate new values based on old:
 }
 ```
 
+## Editing Blank-Node Structures (Stable `_:fdb-` Ids)
+
+Fluree skolemizes every blank node at insert time into the reserved
+`_:fdb-...` label space, and queries return those labels as the node's `@id`.
+These ids are **stable**: referencing an `_:fdb-...` id in a later query or
+transaction denotes the existing stored node rather than minting a fresh one
+(the blank-node-syntax equivalent of RDF 1.1 §3.5 skolem IRIs). This makes
+blank-node-rooted structures — OWL restrictions, address objects, RDF lists —
+editable in place, without retracting and re-asserting the whole subtree.
+
+Workflow: query for the node's id, then use it as an ordinary `@id`:
+
+```json
+{
+  "select": "?r",
+  "where": { "@id": "ex:ClassA", "ex:restriction": "?r" }
+}
+```
+
+returns e.g. `"_:fdb-1751612345678901234-0-b0"`, which can then be edited
+directly:
+
+```json
+{
+  "where":  { "@id": "_:fdb-1751612345678901234-0-b0", "owl:someValuesFrom": "?old" },
+  "delete": { "@id": "_:fdb-1751612345678901234-0-b0", "owl:someValuesFrom": "?old" },
+  "insert": { "@id": "_:fdb-1751612345678901234-0-b0", "owl:someValuesFrom": { "@id": "ex:Gadget" } }
+}
+```
+
+The parent's reference to the node is untouched and the node keeps its
+identity across the edit.
+
+The same ids work in SPARQL, in all of SELECT patterns, `DELETE`/`INSERT`
+templates, `DELETE DATA`, `INSERT DATA`, and `DELETE WHERE`:
+
+```sparql
+DELETE { _:fdb-1751612345678901234-0-b0 owl:someValuesFrom ?old }
+INSERT { _:fdb-1751612345678901234-0-b0 owl:someValuesFrom ex:Gadget }
+WHERE  { _:fdb-1751612345678901234-0-b0 owl:someValuesFrom ?old }
+```
+
+Notes:
+
+- Only labels beginning with the reserved `_:fdb-` prefix behave this way.
+  Ordinary client-authored labels (`_:b0`) keep standard RDF semantics: a
+  fresh node per transaction on the write side, and an existential variable
+  in SPARQL WHERE patterns. Clients cannot accidentally collide with the
+  reserved space — transaction skolemization wraps client labels with a
+  transaction id before prefixing `fdb-`.
+- Strictly per spec, SPARQL forbids blank nodes in `DELETE` templates and
+  treats WHERE-pattern labels as variables; accepting `_:fdb-` ids as
+  constants is a deliberate Fluree extension (the same one Virtuoso's
+  `nodeID://` refs and Jena's `<_:label>` syntax provide).
+- Some stable ids minted by bulk import embed `:` characters (e.g.
+  `_:fdb-lubm:main-1-genid10`). These are addressable from JSON-LD, but the
+  SPARQL grammar does not allow `:` inside blank-node labels, so such ids
+  cannot be written in SPARQL syntax.
+
 ## Error Handling
 
 ### No Match

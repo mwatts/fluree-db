@@ -1648,6 +1648,11 @@ fn convert_named_graphs_to_templates(
         match term {
             RawTerm::Iri(iri) => {
                 if let Some(local) = iri.strip_prefix("_:") {
+                    // Stable Fluree blank-node ids address the existing node;
+                    // other labels skolemize fresh at staging.
+                    if let Some(sid) = fluree_db_transact::stable_blank_node_sid_from_label(local) {
+                        return Ok(TemplateTerm::Sid(sid));
+                    }
                     Ok(TemplateTerm::BlankNode(local.to_string()))
                 } else {
                     Ok(TemplateTerm::Sid(ns_registry.sid_for_iri(iri)))
@@ -1670,6 +1675,11 @@ fn convert_named_graphs_to_templates(
         match obj {
             RawObject::Iri(iri) => {
                 if let Some(local) = iri.strip_prefix("_:") {
+                    // Stable Fluree blank-node ids resolve to the stored node
+                    // (see convert_term).
+                    if let Some(sid) = fluree_db_transact::stable_blank_node_sid_from_label(local) {
+                        return Ok((TemplateTerm::Sid(sid), None));
+                    }
                     Ok((TemplateTerm::BlankNode(local.to_string()), None))
                 } else {
                     Ok((TemplateTerm::Sid(ns_registry.sid_for_iri(iri)), None))
@@ -3040,4 +3050,45 @@ impl crate::Fluree {
 #[allow(dead_code)]
 fn _ensure_error_used(e: ApiError) -> ApiError {
     e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_transact::{RawObject, RawTerm, RawTriple};
+
+    /// TriG named-graph blocks (upsert/insert-turtle path): a stable
+    /// `_:fdb-...` id must resolve to the stored node's Sid, while ordinary
+    /// labels stay `TemplateTerm::BlankNode` for fresh skolemization at
+    /// staging.
+    #[test]
+    fn named_graph_stable_blank_node_resolves_to_sid() {
+        let block = NamedGraphBlock {
+            iri: "http://example.org/g1".to_string(),
+            triples: vec![RawTriple {
+                subject: Some(RawTerm::Iri("_:fdb-1234-0-b0".to_string())),
+                predicate: RawTerm::Iri("http://example.org/knows".to_string()),
+                objects: vec![RawObject::Iri("_:other".to_string())],
+            }],
+            prefixes: rustc_hash::FxHashMap::default(),
+        };
+        let mut ns = NamespaceRegistry::new();
+        let (templates, _delta) =
+            convert_named_graphs_to_templates(&[block], &mut ns).expect("convert");
+        assert_eq!(templates.len(), 1);
+
+        let expected = ns.blank_node_sid("1234-0-b0");
+        match &templates[0].subject {
+            TemplateTerm::Sid(sid) => {
+                assert_eq!(sid, &expected, "stable id must address the stored node");
+            }
+            other => panic!("stable id must resolve to a Sid, got {other:?}"),
+        }
+        match &templates[0].object {
+            TemplateTerm::BlankNode(label) => {
+                assert_eq!(label, "other", "ordinary labels keep fresh-mint semantics");
+            }
+            other => panic!("ordinary label must stay BlankNode, got {other:?}"),
+        }
+    }
 }

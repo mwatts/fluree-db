@@ -236,6 +236,43 @@ mod inner {
                 .get_or_insert(sid.namespace_code, sid.name.as_bytes())
         }
 
+        /// Resolve a namespace code to its prefix via the shared allocator,
+        /// caching the result.
+        ///
+        /// A miss for a real (non-OVERFLOW) code means an importer allocated
+        /// the code outside the shared allocator — the dict entry would then
+        /// permanently store a suffix-only string ("name" instead of
+        /// "http://schema.org/name"), silently breaking bound-predicate
+        /// lookups on the imported ledger. Panic in debug so tests catch it;
+        /// warn in release. (OVERFLOW Sids legitimately carry the full IRI in
+        /// `name`, so an empty prefix is correct for them.)
+        fn cache_prefix(&mut self, code: u16) {
+            if self.ns_prefix_cache.contains_key(&code) {
+                return;
+            }
+            let prefix = match self.ns_alloc.get_prefix(code) {
+                Some(p) => p,
+                None => {
+                    debug_assert!(
+                        code >= fluree_vocab::namespaces::OVERFLOW,
+                        "namespace code {code} not registered in the shared allocator — \
+                         the spool dict would store a suffix-only string; allocate import \
+                         codes through the SpoolConfig's ns_alloc (see import_commit)"
+                    );
+                    #[cfg(not(debug_assertions))]
+                    if code < fluree_vocab::namespaces::OVERFLOW {
+                        tracing::warn!(
+                            code,
+                            "namespace code missing from shared allocator; spool dict entry \
+                             will store a bare suffix and bound lookups on it will miss"
+                        );
+                    }
+                    String::new()
+                }
+            };
+            self.ns_prefix_cache.insert(code, prefix);
+        }
+
         /// Assign a global predicate ID via `DictWorkerCache`.
         fn assign_predicate_id(&mut self, sid: &Sid) -> u32 {
             // Look up the namespace prefix, then use parts-based insertion
@@ -245,10 +282,7 @@ mod inner {
             // because that would borrow the whole `SpoolContext` mutably and
             // prevent a simultaneous mutable borrow of `self.predicates`.
             let code = sid.namespace_code;
-            if !self.ns_prefix_cache.contains_key(&code) {
-                let prefix = self.ns_alloc.get_prefix(code).unwrap_or_default();
-                self.ns_prefix_cache.insert(code, prefix);
-            }
+            self.cache_prefix(code);
             let prefix = self
                 .ns_prefix_cache
                 .get(&code)
@@ -260,10 +294,7 @@ mod inner {
         /// Assign a global datatype ID via `DictWorkerCache`.
         fn assign_datatype_id(&mut self, sid: &Sid) -> u16 {
             let code = sid.namespace_code;
-            if !self.ns_prefix_cache.contains_key(&code) {
-                let prefix = self.ns_alloc.get_prefix(code).unwrap_or_default();
-                self.ns_prefix_cache.insert(code, prefix);
-            }
+            self.cache_prefix(code);
             let prefix = self
                 .ns_prefix_cache
                 .get(&code)
@@ -826,6 +857,27 @@ mod inner {
             }
         }
 
+        /// A namespace code the shared allocator has never seen must fail
+        /// loudly (debug builds) instead of silently writing a suffix-only
+        /// string into the spool's predicate dict. Regression pin for the
+        /// serial-TriG-import bug where codes were allocated only in
+        /// `state.ns_registry` and bound-predicate lookups matched nothing.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "not registered in the shared allocator")]
+        fn spool_prefix_miss_panics_in_debug() {
+            let ns = NamespaceRegistry::new();
+            let config = make_spool_config(&ns);
+            let path = std::env::temp_dir().join(format!(
+                "fluree-spool-prefix-miss-{}.spool",
+                std::process::id()
+            ));
+            let mut ctx = SpoolContext::new(&path, 0, 0, &config).unwrap();
+            // A user-range code allocated outside the shared allocator.
+            let rogue = Sid::new(fluree_vocab::namespaces::USER_START, "name");
+            let _ = ctx.assign_predicate_id(&rogue);
+        }
+
         #[test]
         fn test_basic_iri_triple() {
             let mut ns = NamespaceRegistry::new();
@@ -959,9 +1011,13 @@ mod inner {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
-            let mut ns = NamespaceRegistry::new();
+            let ns = NamespaceRegistry::new();
             let config = make_spool_config(&ns);
-            let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
+            // Allocate through the config's shared allocator (production
+            // wiring) so spool prefix lookups resolve mid-parse.
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), true).unwrap();
 
             // Attach spool context
             let spool_path = dir.join("chunk_0.spool");
@@ -1027,9 +1083,13 @@ mod inner {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
-            let mut ns = NamespaceRegistry::new();
+            let ns = NamespaceRegistry::new();
             let config = make_spool_config(&ns);
-            let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
+            // Allocate through the config's shared allocator (production
+            // wiring) so spool prefix lookups resolve mid-parse.
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
             let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
@@ -1075,9 +1135,13 @@ mod inner {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
 
-            let mut ns = NamespaceRegistry::new();
+            let ns = NamespaceRegistry::new();
             let config = make_spool_config(&ns);
-            let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
+            // Allocate through the config's shared allocator (production
+            // wiring) so spool prefix lookups resolve mid-parse.
+            let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
+            let mut sink =
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
             let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
