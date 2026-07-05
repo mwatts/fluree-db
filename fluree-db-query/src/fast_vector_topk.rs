@@ -104,6 +104,14 @@ pub fn detect_vector_topk(query: &Query) -> Option<VectorTopKSpec> {
         _ => return None,
     };
 
+    // A bare LIMIT with no ORDER BY means "any k rows"; the generic pipeline
+    // returns them in scan order, so imposing top-k-by-score here would change
+    // which rows come back. Only serve LIMIT alongside DESC(?score) — otherwise
+    // decline so the shape routes to the pipeline unchanged.
+    if query.limit.is_some() && order_var.is_none() {
+        return None;
+    }
+
     // Walk WHERE: exactly one triple, one dotProduct bind, ≤1 threshold
     // filter, ≤1 single-row VALUES supplying the target var.
     let mut triple: Option<(VarId, Ref, VarId)> = None;
@@ -292,7 +300,12 @@ impl Fold {
         match need {
             Some(n) => Fold::TopK {
                 need: n,
-                heap: BinaryHeap::with_capacity(n + 1),
+                // Cap the eager reservation: `n` is a user literal (limit +
+                // offset), so a large-but-legal LIMIT would otherwise reserve an
+                // oversized heap per partition. The heap grows if genuinely
+                // needed, and `push` caps it at `need`. `saturating_add` also
+                // avoids the `n + 1` overflow debug-panic at pathological limits.
+                heap: BinaryHeap::with_capacity(n.saturating_add(1).min(4096)),
             },
             None => Fold::All(Vec::new()),
         }
