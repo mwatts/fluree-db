@@ -182,6 +182,13 @@ async fn build_policy_context_from_opts_inner(
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
 ) -> Result<PolicyContext> {
+    // A cross-ledger `f:policySource` is only ever passed here when configured,
+    // so its presence — even with an empty restriction set — means policy
+    // governs this request. It must count as an explicit policy input so a
+    // policy class that selects zero model-ledger rules cannot collapse to a
+    // root (unrestricted) context; `default_allow` governs instead.
+    let has_cross_ledger_source = cross_ledger_restrictions.is_some();
+
     struct PolicyStatsLookup<'a> {
         overlay: &'a dyn fluree_db_core::OverlayProvider,
     }
@@ -344,7 +351,8 @@ async fn build_policy_context_from_opts_inner(
     // be false so that `default_allow` (not a blanket bypass) governs access.
     let has_explicit_policy_input = opts.identity.is_some()
         || opts.policy_class.as_ref().is_some_and(|v| !v.is_empty())
-        || opts.policy.is_some();
+        || opts.policy.is_some()
+        || has_cross_ledger_source;
     let is_root = !has_explicit_policy_input
         && view_set.restrictions.is_empty()
         && modify_set.restrictions.is_empty();
