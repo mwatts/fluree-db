@@ -469,6 +469,8 @@ impl Fluree {
                         inline_shape_bundle: None,
                         cross_ledger_membership: None,
                     },
+                    // Commit replay resolves config internally.
+                    None,
                 )
                 .await
                 .map_err(|e| ApiError::http(422, e.to_string()))?;
