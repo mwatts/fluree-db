@@ -316,30 +316,16 @@ pub(crate) struct StagedShaclContext<'a> {
 /// type would preserve the variant.
 #[cfg(feature = "shacl")]
 async fn resolve_cross_ledger_shapes_for_tx(
-    ledger: &LedgerState,
+    config: Option<&LedgerConfig>,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<
     Option<std::sync::Arc<crate::cross_ledger::ResolvedGraph>>,
     fluree_db_transact::TransactError,
 > {
-    // Load the same config the same-ledger SHACL path loads (from
-    // pre-tx state). resolve_ledger_config returns None on a fresh
-    // ledger with no #config — in that case there's no cross-ledger
-    // to dispatch.
-    let config = match crate::config_resolver::resolve_ledger_config(
-        &ledger.snapshot,
-        ledger.novelty.as_ref(),
-        ledger.t(),
-    )
-    .await
-    {
-        Ok(Some(c)) => c,
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            return Err(fluree_db_transact::TransactError::Parse(format!(
-                "failed to load ledger config while resolving cross-ledger f:shapesSource: {e}"
-            )));
-        }
+    // No #config → no cross-ledger to dispatch. Config is resolved once by the
+    // caller and shared with the schema resolver.
+    let Some(config) = config else {
+        return Ok(None);
     };
     let shapes_source = config.shacl.as_ref().and_then(|s| s.shapes_source.as_ref());
     let Some(source) = shapes_source else {
@@ -372,25 +358,15 @@ async fn resolve_cross_ledger_shapes_for_tx(
 #[cfg(feature = "shacl")]
 async fn resolve_cross_ledger_schema_for_tx(
     ledger: &LedgerState,
+    config: Option<&LedgerConfig>,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<
     Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
     fluree_db_transact::TransactError,
 > {
-    let config = match crate::config_resolver::resolve_ledger_config(
-        &ledger.snapshot,
-        ledger.novelty.as_ref(),
-        ledger.t(),
-    )
-    .await
-    {
-        Ok(Some(c)) => c,
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            return Err(fluree_db_transact::TransactError::Parse(format!(
-                "failed to load ledger config while resolving cross-ledger f:schemaSource: {e}"
-            )));
-        }
+    // No #config → nothing to dispatch. Config is resolved once by the caller.
+    let Some(config) = config else {
+        return Ok(None);
     };
     let Some(reasoning) = config.reasoning.as_ref() else {
         return Ok(None);
@@ -829,19 +805,34 @@ async fn stage_with_config_shacl(
     let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 
-    // Detect cross-ledger SHACL config at the API boundary BEFORE
-    // staging starts: read D's resolved config and, if
-    // f:shapesSource carries f:ledger, resolve the wire artifact
-    // from M now so the per-tx ResolveCtx benefits from memo +
-    // governance cache. The wire is then threaded through
-    // staging as an internal governance input and compiled
-    // against the staged namespace registry at validation time.
-    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, resolve_ctx).await?;
+    // Detect cross-ledger governance at the API boundary BEFORE staging
+    // starts. Resolve D's config once from pre-tx state and share it across
+    // both resolvers below — each used to re-run the config-graph scan + parse
+    // independently. `None` (no #config) short-circuits both to no dispatch.
+    let config = crate::config_resolver::resolve_ledger_config(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await
+    .map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "failed to load ledger config for cross-ledger governance resolution: {e}"
+        ))
+    })?;
+
+    // When f:shapesSource carries f:ledger, resolve the wire artifact from M
+    // now so the per-tx ResolveCtx benefits from memo + governance cache. The
+    // wire is threaded through staging as an internal governance input and
+    // compiled against the staged namespace registry at validation time.
+    let cross_ledger_shapes =
+        resolve_cross_ledger_shapes_for_tx(config.as_ref(), resolve_ctx).await?;
     // Same boundary for the cross-ledger ontology: when
     // f:reasoningDefaults/f:schemaSource points at M, resolve the schema
     // wire (t-cached) so the enforcement hierarchy can merge M's
     // subclass/subproperty edges.
-    let cross_ledger_schema = resolve_cross_ledger_schema_for_tx(&ledger, resolve_ctx).await?;
+    let cross_ledger_schema =
+        resolve_cross_ledger_schema_for_tx(&ledger, config.as_ref(), resolve_ctx).await?;
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
