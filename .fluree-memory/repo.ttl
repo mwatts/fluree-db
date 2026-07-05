@@ -1447,6 +1447,35 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
+    mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
+    mem:tag "crate-boundary" ;
+    mem:tag "engine" ;
+    mem:tag "hierarchy" ;
+    mem:tag "shacl" ;
+    mem:tag "tx-path" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/validate.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T01:47:55.655870+00:00"^^xsd:dateTime .
+
+mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
+    mem:content "RDFS enforcement entailment (feature/rdfs-enforcement-entailment): always-on subclass+subproperty inference for SHACL and Policy. Epoch counters on Novelty bumped in apply_commit's routing loop (schema_epoch: subClassOf/subPropertyOf; shacl_epoch: sh:* predicates or rdf:type→SHACL-type/rdfs:Class/owl:Class) + two Arc caches on LedgerState carried across commits: SchemaHierarchyCache (core; keyed indexed-schema-t + schema_epoch) and a type-erased compiled-SHACL slot (+shacl_epoch +shapes_g_ids; data-only txns skip ShapeCompiler via ShaclEngine::from_shared_cache). RULE: enforcement uses COMMITTED hierarchy — same-txn schema does not entail (two-txn workflow, pinned by test)." ;
+    mem:tag "enforcement" ;
+    mem:tag "entailment" ;
+    mem:tag "epoch-cache" ;
+    mem:tag "policy" ;
+    mem:tag "rdfs" ;
+    mem:tag "shacl" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:artifactRef "fluree-db-core/src/schema_hierarchy.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/lib.rs" ;
+    mem:artifactRef "fluree-db-policy/src/index.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T01:47:52.379794+00:00"^^xsd:dateTime .
 mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
     mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
     mem:tag "dataset" ;

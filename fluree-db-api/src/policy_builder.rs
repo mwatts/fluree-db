@@ -125,6 +125,7 @@ pub async fn build_policy_context_from_opts(
         opts,
         policy_graphs,
         None,
+        None,
     )
     .await
 }
@@ -152,6 +153,34 @@ pub async fn build_policy_context_from_opts(
 /// subject-existence check because identity binding always resolves
 /// against the data ledger; cross-ledger never contributes identity
 /// records.
+/// [`build_policy_context_from_opts`] plus a pre-resolved cross-ledger
+/// ontology bundle (`f:reasoningDefaults` / `f:schemaSource` with
+/// `f:ledger`): the model ledger's subclass/subproperty edges merge into the
+/// policy entailment hierarchy. Policies themselves remain same-ledger.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_policy_context_from_opts_with_schema(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &GovernanceOptions,
+    policy_graphs: &[fluree_db_core::GraphId],
+    cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
+) -> Result<PolicyContext> {
+    build_policy_context_from_opts_inner(
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        opts,
+        policy_graphs,
+        None,
+        cross_ledger_schema,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn build_policy_context_from_opts_with_cross_ledger(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -160,6 +189,7 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
     opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Vec<PolicyRestriction>,
+    cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
     build_policy_context_from_opts_inner(
         snapshot,
@@ -169,10 +199,12 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
         opts,
         policy_graphs,
         Some(cross_ledger_restrictions),
+        cross_ledger_schema,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_policy_context_from_opts_inner(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -181,6 +213,7 @@ async fn build_policy_context_from_opts_inner(
     opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
+    cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
     // A cross-ledger `f:policySource` is only ever passed here when configured,
     // so its presence — even with an empty restriction set — means policy
@@ -341,8 +374,48 @@ async fn build_policy_context_from_opts_inner(
         snapshot.stats.clone()
     };
 
-    let view_set = build_policy_set(restrictions.clone(), stats.as_ref(), PolicyAction::View);
-    let modify_set = build_policy_set(restrictions, stats.as_ref(), PolicyAction::Modify);
+    // Current RDFS hierarchy (always-on entailment for enforcement): class
+    // policies govern subclass instances, property policies govern
+    // subproperties. Only OnClass/OnProperty restrictions consult it —
+    // identity-only, default-allow, and OnSubject policies don't. Skip the
+    // O(ontology-size) schema clone + sort + scans entirely when nothing can
+    // use it, since this builder runs uncached on every governed query.
+    let needs_hierarchy = restrictions
+        .iter()
+        .any(|r| !r.for_classes.is_empty() || matches!(r.target_mode, TargetMode::OnProperty));
+    let hierarchy = if !needs_hierarchy {
+        None
+    } else {
+        match &cross_ledger_schema {
+            // Cross-ledger ontology: compose the model ledger's schema bundle
+            // over the local overlay so its subclass/subproperty edges merge in.
+            Some(bundle) => {
+                let composed = fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                    overlay,
+                    std::sync::Arc::clone(bundle),
+                );
+                fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, &composed, to_t)
+                    .await
+            }
+            None => {
+                fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, overlay, to_t).await
+            }
+        }
+        .map_err(|e| ApiError::internal(format!("policy hierarchy computation failed: {e}")))?
+    };
+
+    let view_set = build_policy_set(
+        restrictions.clone(),
+        stats.as_ref(),
+        PolicyAction::View,
+        hierarchy.as_ref(),
+    );
+    let modify_set = build_policy_set(
+        restrictions,
+        stats.as_ref(),
+        PolicyAction::Modify,
+        hierarchy.as_ref(),
+    );
 
     // Check if this is a root policy (unrestricted access).
     //

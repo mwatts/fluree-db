@@ -905,6 +905,10 @@ fn finalize_state_with_base(
         snapshot,
         novelty: new_novelty,
         dict_novelty,
+        // Carry the hierarchy cache across commits — the schema epoch check
+        // invalidates it only when a commit touched subClassOf/subPropertyOf.
+        schema_hierarchy_cache: base.schema_hierarchy_cache,
+        shacl_compile_cache: base.shacl_compile_cache,
         runtime_small_dicts,
         head_commit_id: Some(commit_cid.clone()),
         head_index_id: base.head_index_id,

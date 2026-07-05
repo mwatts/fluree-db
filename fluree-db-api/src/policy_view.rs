@@ -370,6 +370,27 @@ pub async fn build_transact_policy_context(
         .and_then(|r| r.policy.as_ref())
         .and_then(|p| p.policy_source.as_ref());
 
+    // Cross-ledger ontology (f:schemaSource with f:ledger): resolve once so
+    // f:onClass / f:onProperty expansion sees the model ledger's hierarchy.
+    let cross_ledger_schema = match resolved
+        .as_ref()
+        .and_then(|r| r.reasoning.as_ref())
+        .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
+    {
+        Some(reasoning) => {
+            let ledger_id: String = snapshot.ledger_id.to_string();
+            let mut schema_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
+            crate::cross_ledger::resolve_schema_closure_bundle(reasoning, snapshot, &mut schema_ctx)
+                .await
+                .map_err(|e| {
+                    crate::error::ApiError::config(format!(
+                        "cross-ledger f:schemaSource resolution failed: {e}"
+                    ))
+                })?
+        }
+        None => None,
+    };
+
     if let Some(source) = source.filter(|s| s.ledger.is_some()) {
         let ledger_id: String = snapshot.ledger_id.to_string();
         let mut ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
@@ -397,6 +418,7 @@ pub async fn build_transact_policy_context(
             // in D's default graph — the probe searches [0] only.
             &[0],
             restrictions,
+            cross_ledger_schema.clone(),
         )
         .await?;
         return Ok(Some(policy_ctx));
@@ -413,13 +435,14 @@ pub async fn build_transact_policy_context(
         return Ok(None);
     }
 
-    let policy_ctx = policy_builder::build_policy_context_from_opts(
+    let policy_ctx = policy_builder::build_policy_context_from_opts_with_schema(
         snapshot,
         overlay,
         novelty_for_stats,
         to_t,
         &effective_opts,
         &policy_graphs,
+        cross_ledger_schema,
     )
     .await?;
     Ok(Some(policy_ctx))

@@ -463,6 +463,7 @@ impl Fluree {
                         // re-validate same-ledger only.
                         cross_ledger_shapes: None,
                         staged_ns: None,
+                        cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no
                         // `opts` payload.

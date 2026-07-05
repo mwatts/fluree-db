@@ -94,6 +94,17 @@ pub struct LedgerState {
     /// Tracks novel dictionary entries introduced since the last index build.
     /// Populated during commit, read during queries, reset at index application.
     pub dict_novelty: Arc<DictNovelty>,
+    /// Shared cache of the current RDFS schema hierarchy (subclass /
+    /// subproperty closure over indexed + novelty state). Invalidated by
+    /// `Novelty::schema_epoch`; consumed by SHACL enforcement, policy
+    /// targeting, and rdfs query reasoning. `Arc`-shared so clones and read
+    /// views reuse one entry.
+    pub schema_hierarchy_cache: Arc<fluree_db_core::SchemaHierarchyCache>,
+    /// Cross-transaction compiled-SHACL cache slot. Type-erased (the ledger
+    /// crate stays SHACL-agnostic); owned and downcast by the API layer's
+    /// enforcement path, invalidated via `Novelty::shacl_epoch`. `Arc`-shared
+    /// and carried across commits like the hierarchy cache.
+    pub shacl_compile_cache: Arc<parking_lot::RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
     /// Ledger-scoped runtime IDs for predicates and datatypes.
     ///
     /// Persisted IDs are seeded when a binary index store is attached; novelty-only
@@ -226,6 +237,10 @@ impl LedgerState {
                     snapshot: Arc::new(snapshot),
                     novelty: Arc::new(novelty_overlay),
                     dict_novelty: Arc::new(dict_novelty),
+                    schema_hierarchy_cache: Arc::new(
+                        fluree_db_core::SchemaHierarchyCache::default(),
+                    ),
+                    shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
                     runtime_small_dicts: Arc::new(runtime_small_dicts),
                     head_commit_id: head_id,
                     head_index_id,
@@ -243,6 +258,8 @@ impl LedgerState {
             snapshot: Arc::new(snapshot),
             novelty: Arc::new(Novelty::new(novelty_t)),
             dict_novelty: Arc::new(dict_novelty),
+            schema_hierarchy_cache: Arc::new(fluree_db_core::SchemaHierarchyCache::default()),
+            shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
             runtime_small_dicts: Arc::new(RuntimeSmallDicts::new()),
             head_commit_id,
             head_index_id,
@@ -371,6 +388,8 @@ impl LedgerState {
             snapshot: Arc::new(snapshot),
             novelty: Arc::new(novelty),
             dict_novelty: Arc::new(dict_novelty),
+            schema_hierarchy_cache: Arc::new(fluree_db_core::SchemaHierarchyCache::default()),
+            shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
             runtime_small_dicts: Arc::new(runtime_small_dicts),
             head_commit_id: None,
             head_index_id: None,
