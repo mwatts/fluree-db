@@ -1567,6 +1567,21 @@ mem:fact-01kwmb5yq11y50j3kbd7c5tne4 a mem:Fact ;
     mem:branch "feature/remote-mounts" ;
     mem:createdAt "2026-07-03T15:57:26.113125+00:00"^^xsd:dateTime .
 
+mem:fact-01kws95166gqpjjfda0nvmkraq a mem:Fact ;
+    mem:content "Any per-(ledger,t) cache of config-derived server state MUST key on the novelty-inclusive t (LedgerState::t() / state.t()), NOT the indexed base snapshot.snapshot.t. A config-graph change (e.g. f:servingDefaults) commits into novelty and bumps the effective t WITHOUT advancing the indexed base t until a reindex. Keying on the base t serves a stale posture across config changes. This exact bug hit AppState::effective_serving_cached and was caught by test_serving_defaults_gate_and_advertisement (proxy_integration.rs): got 200 expecting 404 because the cached entry didn't invalidate. resolve_ledger_config / effective_serving_from_state resolve at state.t(), so the cache key must match." ;
+    mem:tag "cache" ;
+    mem:tag "config-graph" ;
+    mem:tag "novelty" ;
+    mem:tag "server" ;
+    mem:tag "serving" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/config_resolver.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/serving.rs" ;
+    mem:artifactRef "fluree-db-server/src/state.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-05T13:58:10.886197+00:00"^^xsd:dateTime ;
+    mem:rationale "Non-obvious: indexed snapshot t and effective (novelty-inclusive) t diverge between a commit and the next reindex; config changes live in novelty, so t-keyed caches of config-derived state silently go stale if keyed on the base t." .
+
 mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
     mem:content "SPARQL property paths, branch feature/sparql-property-paths: closed ALL reported gaps PLUS inverse-in-composite (wired in BOTH sparql lower/path.rs AND query parse/lower.rs for JSON-LD parity). (1) ZeroOrOne p?: PathModifier::ZeroOrOne; BFS self+1hop. (2) Negated sets !: fresh ?__np{n} pred-var triple + FILTER(?p != IRI(...)); fwd/inv/mixed=UNION. (3) Nested modifiers (p*)*: collapse_modifiers (zero=any */?, unbounded=any +/*). (4) Composite-transitive (a/b)+ incl inverse steps (^a/b)+: PropertyPathPattern has predicates+first_inverse+sequence_steps:Vec<PathStep{predicates,inverse}>; operator's read_step reads SPOT/POST by direction (opposite index when retreating); single_predicate() bails on composite. ONLY UNSUPPORTED (niche): nested transitive step in a composite unit (a+/b)+ — not exercised by any W3C test." ;
     mem:tag "negated-set" ;
