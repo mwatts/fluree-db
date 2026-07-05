@@ -23,12 +23,24 @@ pub enum TargetType {
     Class(Sid),
     /// sh:targetNode - specific node(s)
     Node(Vec<Sid>),
+    /// sh:targetNode with literal targets — the focus "node" is a literal
+    /// value, validated directly against the shape's value constraints.
+    LiteralNode(Vec<LiteralTarget>),
     /// sh:targetSubjectsOf - subjects of triples with this predicate
     SubjectsOf(Sid),
     /// sh:targetObjectsOf - objects of triples with this predicate
     ObjectsOf(Sid),
     /// Implicit class targeting (shape is also a class)
     ImplicitClass(Sid),
+}
+
+/// A literal `sh:targetNode` target: the value plus the datatype / language
+/// needed to validate and report it faithfully.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiteralTarget {
+    pub value: FlakeValue,
+    pub datatype: Sid,
+    pub lang: Option<String>,
 }
 
 /// Severity level for constraint violations
@@ -281,6 +293,27 @@ impl ShapeCompiler {
                 }
             }
 
+            let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+
+            // Register subjects explicitly typed sh:NodeShape. A shape whose
+            // only markers are `rdf:type sh:NodeShape` plus value constraints
+            // (e.g. an implicit-class-target shape carrying just sh:in) would
+            // otherwise never be created — no target/property predicate ever
+            // calls get_or_create_shape for it.
+            let node_shape_type = Sid::new(SHACL, "NodeShape");
+            let flakes = db
+                .range(
+                    IndexType::Opst,
+                    RangeTest::Eq,
+                    RangeMatch::predicate_object(
+                        rdf_type.clone(),
+                        FlakeValue::Ref(node_shape_type),
+                    ),
+                )
+                .await?;
+            for flake in &flakes {
+                compiler.get_or_create_shape(&flake.s);
+            }
             // Expand rdf:first/rdf:rest lists referenced by sh:in / sh:and /
             // sh:or / sh:xone / sh:ignoredProperties. Run after each graph so
             // that lists whose head lives in this graph can resolve — a list
@@ -561,6 +594,25 @@ impl ShapeCompiler {
                     }
                     if !found {
                         shape.targets.push(TargetType::Node(vec![node.clone()]));
+                    }
+                } else {
+                    // Literal target node: the focus is the literal itself.
+                    let lit = LiteralTarget {
+                        value: flake.o.clone(),
+                        datatype: flake.dt.clone(),
+                        lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+                    };
+                    let shape = self.get_or_create_shape(&flake.s);
+                    let mut found = false;
+                    for target in &mut shape.targets {
+                        if let TargetType::LiteralNode(lits) = target {
+                            lits.push(lit.clone());
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        shape.targets.push(TargetType::LiteralNode(vec![lit]));
                     }
                 }
             }
@@ -867,7 +919,18 @@ impl ShapeCompiler {
         for (id, data) in &shapes {
             // Resolve property shapes
             let mut prop_shapes = Vec::new();
-            for ps_id in &data.property_shape_ids {
+            // A property shape can carry its own targets (`ex:S a
+            // sh:PropertyShape ; sh:path ... ; sh:targetNode ...`) with no
+            // wrapping node shape — the shape then validates its own focus
+            // nodes: attach its own path-bearing entry alongside any
+            // sh:property references.
+            let mut ps_ids: Vec<&Sid> = data.property_shape_ids.iter().collect();
+            if ps_map.get(id).is_some_and(|own| own.path.is_some())
+                && !data.property_shape_ids.contains(id)
+            {
+                ps_ids.push(id);
+            }
+            for ps_id in ps_ids {
                 if let Some(ps_data) = ps_map.get(ps_id) {
                     if ps_data.deactivated {
                         continue;

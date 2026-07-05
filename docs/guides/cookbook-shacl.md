@@ -12,6 +12,7 @@ This guide covers:
 - [Predicate-target shapes](#predicate-target-shapes) — `sh:targetSubjectsOf` / `sh:targetObjectsOf`
 - [Per-graph enable/disable and warn vs reject](#per-graph-configuration) modes
 - [Storing shapes in a named graph](#storing-shapes-in-a-named-graph) with `f:shapesSource`
+- [Validation reports](#validation-reports-fluree-validate) — `fluree validate` over a ledger or file
 - [What isn't enforced yet](#not-yet-supported)
 
 ## When SHACL runs
@@ -25,9 +26,10 @@ This means you can start using SHACL **without writing any config** — just tra
 
 **Bulk import is deliberately exempt.** The bulk-import pipeline never runs
 SHACL — it is a trusted, high-throughput load path. If your source data must
-conform, validate it *before* importing (e.g. run a SHACL report over the
-source with your shapes) so the ledger starts clean; transaction-time
-validation keeps it clean from there.
+conform, validate it *before* importing — `fluree validate source.ttl
+--shacl shapes.ttl` produces a full report (see
+[Validation reports](#validation-reports-fluree-validate)) — so the ledger
+starts clean; transaction-time validation keeps it clean from there.
 
 The `shacl` feature must be enabled at build time (it's on by default for the server and CLI binaries). See [Standards and feature flags](../reference/compatibility.md).
 
@@ -371,7 +373,7 @@ ex:StrictPersonShape a sh:NodeShape ;
   sh:property [ sh:path schema:name ; sh:minCount 1 ] .
 ```
 
-A closed shape forbids any property not explicitly declared (or listed in `sh:ignoredProperties`). `rdf:type` is implicitly ignored per the SHACL spec.
+A closed shape forbids any property not explicitly declared (or listed in `sh:ignoredProperties`). Per the SHACL spec, `rdf:type` is **not** implicitly ignored — a closed shape with `sh:targetClass` (whose instances necessarily carry `rdf:type`) must list it in `sh:ignoredProperties`, as above.
 
 ## RDFS subclass reasoning for `sh:class`
 
@@ -593,9 +595,36 @@ SHACL validation runs consistently on every write surface:
 
 All three routes go through the same post-stage helper, so the ledger's configured SHACL posture (enable/disable, mode, per-graph, shapes source) applies uniformly.
 
+## Validation reports (`fluree validate`)
+
+Transaction-time enforcement rejects (or warns about) *new* writes.
+`fluree validate` answers the complementary questions: *is my existing data
+clean?* and *is this source file clean before I import it?* It produces a
+W3C-shaped `sh:ValidationReport` instead of an error:
+
+```bash
+fluree validate mydb                            # ledger vs its attached shapes
+fluree validate mydb --shacl proposed.ttl       # trial stricter shapes (replaces attached)
+fluree validate data.ttl --shacl shapes.ttl     # standalone file, ephemeral in-memory ledger
+fluree validate data.ttl --format turtle        # W3C report as Turtle (also: jsonld)
+```
+
+Ad-hoc shapes (`--shacl`) **replace** the attached shapes by default so
+"does this data conform to these rules?" is answered exactly;
+`--include-attached` unions both sets. Exit codes make it CI-friendly:
+0 = conforms, 1 = findings at/above `--fail-on` (default `violation`).
+See the [`fluree validate` reference](../cli/validate.md).
+
+The same core is served over HTTP as
+[`GET|POST /validate/{ledger}`](../api/endpoints.md#getpost-validateledger)
+(JSON summary by default; `Accept: application/ld+json` or `text/turtle`
+for the W3C report), and exposed in Rust as `fluree_db_api::validate` —
+`Fluree::validate_ledger(alias, &ValidateOptions)` returns a `ValidateReport`
+with per-result constraint-component IRIs, severities, and messages, plus
+`to_jsonld()` / `to_turtle()` serializers.
+
 ## Not yet supported
 
-- `sh:targetNode` with a literal value — only IRI/blank-node targets are compiled.
 - `sh:sparql` (SPARQL-based constraints).
 
 These are tracked in the SHACL compliance effort.

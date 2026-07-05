@@ -2167,7 +2167,9 @@ pub async fn stage_with_shacl(
     let report =
         validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
 
-    if !report.conforms {
+    // Reject on violations only — spec-level `conforms` is also false for
+    // warnings/infos, which must not block a commit.
+    if report.violation_count() > 0 {
         return Err(TransactError::ShaclViolation(format_shacl_report(&report)));
     }
 
@@ -2423,10 +2425,11 @@ async fn validate_staged_nodes(
         }
     }
 
-    // Check conformance
-    let conforms = all_results
-        .iter()
-        .all(|r| r.severity != fluree_db_shacl::Severity::Violation);
+    // Spec semantics: `sh:conforms` is true iff there are NO results, matching
+    // `ShaclEngine::validate_staged` so `ValidationReport.conforms` means the
+    // same thing across crates. Enforcement gates here key off
+    // `violation_count()` (warnings/info don't reject), not `conforms`.
+    let conforms = all_results.is_empty();
 
     Ok(ValidationReport {
         conforms,
@@ -2454,12 +2457,7 @@ fn format_shacl_report(report: &ValidationReport) -> String {
         .enumerate()
     {
         writeln!(&mut output, "  {}. {}", i + 1, result.message).ok();
-        writeln!(
-            &mut output,
-            "     Focus node: {}{}",
-            result.focus_node.namespace_code, result.focus_node.name
-        )
-        .ok();
+        writeln!(&mut output, "     Focus node: {}", result.focus_node).ok();
         if let Some(path) = &result.result_path {
             writeln!(
                 &mut output,
