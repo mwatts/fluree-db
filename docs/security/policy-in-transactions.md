@@ -248,6 +248,7 @@ Every committed transaction carries the asserting identity in its commit metadat
 - **Required policies short-circuit.** A failure rejects the transaction immediately without checking remaining flakes.
 - **Batch transactions amortize loading.** Loading the policy set is per-transaction, not per-flake — large batched transactions pay the load cost once.
 - **Cache identity properties.** The identity's `@type`, `f:policyClass`, and any role tags used in `f:query` are loaded once per transaction.
+- **Config resolution is memoized.** Learning whether a ledger declares policy requires reading its `#config` graph, which the write path now does on every transaction. That read is cached per-ledger and invalidated only when a commit actually writes the config graph, so a configured-but-static ledger under sustained writes resolves its config once per config change — not once per write (nor once per stage/commit retry). Unconfigured ledgers short-circuit before any scan. The cache is a fail-safe fast path: it is consulted only at head with a live handle, and any miss or ambiguity resolves fresh, so it can never serve stale (fail-open) policy.
 
 ## Testing policies from the CLI
 
