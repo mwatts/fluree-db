@@ -127,7 +127,7 @@ Controls OWL/RDFS reasoning applied at query time.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `f:reasoningModes` | IRI or list | (none) | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog` |
+| `f:reasoningModes` | IRI, string, or list | (none) | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog`. Accepts repeated IRI objects (`f:reasoningModes f:rdfs, f:datalog`), string literals (`"rdfs"`), or an RDF collection of either (`( "rdfs" "datalog" )`); mode names are case-insensitive |
 | `f:schemaSource` | `f:GraphRef` | (none) | Graph containing schema triples (`rdfs:subClassOf`, etc.) |
 | `f:reasoningMaxFacts` | integer | 1,000,000 | OWL2-RL materialization budget: max derived facts before the closure is capped |
 | `f:reasoningMaxSeconds` | integer | 30 | OWL2-RL materialization budget: max wall-clock seconds before the closure is capped |

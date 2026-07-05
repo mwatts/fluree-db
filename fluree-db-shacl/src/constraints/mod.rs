@@ -5,11 +5,13 @@
 
 pub mod cardinality;
 pub mod datatype;
+pub mod lang;
 pub mod pair;
 pub mod pattern;
 pub mod value;
 
 use crate::compile::NodeKind;
+use crate::path::PropertyPath;
 use fluree_db_core::{FlakeValue, Sid};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -72,24 +74,22 @@ pub enum Constraint {
     LanguageIn(Vec<String>),
 
     // Qualified value shape constraints
-    /// sh:qualifiedValueShape with min/max counts
+    /// sh:qualifiedValueShape with min/max counts: the number of values
+    /// conforming to the nested shape must fall within the counts.
     QualifiedValueShape {
         /// The nested shape to validate against
-        shape: Arc<QualifiedShape>,
+        shape: Arc<NestedShape>,
         /// sh:qualifiedMinCount
         min_count: Option<usize>,
         /// sh:qualifiedMaxCount
         max_count: Option<usize>,
+        /// sh:qualifiedValueShapesDisjoint — when true, a value only counts
+        /// if it does NOT conform to any sibling qualified shape.
+        disjoint: bool,
+        /// Qualified shapes of the other property shapes of the same node
+        /// shape (filled during finalize; consulted only when `disjoint`).
+        sibling_shapes: Vec<Arc<NestedShape>>,
     },
-}
-
-/// A qualified shape for sh:qualifiedValueShape
-#[derive(Debug, Clone, PartialEq)]
-pub struct QualifiedShape {
-    /// The shape ID
-    pub id: Sid,
-    /// Constraints to apply
-    pub constraints: Vec<Constraint>,
 }
 
 /// Node-level constraints (applied to the focus node, not property values)
@@ -102,6 +102,11 @@ pub enum NodeConstraint {
         /// Properties to ignore when checking closed shape (sh:ignoredProperties)
         ignored_properties: HashSet<Sid>,
     },
+
+    /// sh:node - the node must conform to the referenced node shape. On a node
+    /// shape this applies to the focus node; on a property shape it applies to
+    /// each value node individually.
+    Node(Arc<NestedShape>),
 
     // Logical constraints
     /// sh:not - the nested shape must NOT match
@@ -120,12 +125,15 @@ pub struct NestedShape {
     /// The shape ID
     pub id: Sid,
     /// Property constraints (path → constraints on values at that path)
-    pub property_constraints: Vec<(Sid, Vec<Constraint>)>,
+    pub property_constraints: Vec<(PropertyPath, Vec<Constraint>)>,
     /// Node-level constraints
     pub node_constraints: Vec<NodeConstraint>,
     /// Value-level constraints (e.g. sh:datatype on an anonymous shape without sh:path).
     /// These constrain the focus node's own value/datatype rather than a nested property.
     pub value_constraints: Vec<Constraint>,
+    /// sh:message declared on an anonymous member shape. Named references get
+    /// their message from the referenced CompiledShape at validation time.
+    pub message: Option<String>,
 }
 
 impl Constraint {
@@ -177,6 +185,7 @@ impl NodeConstraint {
                     ignored_properties.len()
                 )
             }
+            NodeConstraint::Node(shape) => format!("sh:node {}", shape.id.name),
             NodeConstraint::Not(_) => "sh:not".to_string(),
             NodeConstraint::And(shapes) => format!("sh:and ({} shapes)", shapes.len()),
             NodeConstraint::Or(shapes) => format!("sh:or ({} shapes)", shapes.len()),

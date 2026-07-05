@@ -492,9 +492,13 @@ impl Fluree {
 
     /// Build an ExecutableQuery for dataset queries.
     ///
-    /// Applies reasoning from the primary view if set. When reasoning config
-    /// on the primary view declares `f:schemaSource`, resolves the schema
-    /// bundle closure and attaches it to `executable.reasoning.schema_bundle`.
+    /// Reasoning is governed by the dataset's primary view: the shared
+    /// `apply_reasoning_to_executable` choke point applies the same surface
+    /// as the single-ledger path — mode precedence, config budget, datalog
+    /// restrictions, local and cross-ledger `f:rulesSource`, and the
+    /// `f:schemaSource` bundle (local, cross-ledger, and inline ontology).
+    /// The query-time rule policy gate uses `dataset.any_non_root_policy()`
+    /// so a restricted policy on *any* source strips caller-supplied rules.
     pub(crate) async fn build_executable_for_dataset(
         &self,
         dataset: &DataSetDb,
@@ -502,86 +506,19 @@ impl Fluree {
     ) -> Result<ExecutableQuery> {
         let mut executable = prepare_for_execution(parsed);
 
-        // Apply reasoning from primary view if set
         if let Some(primary) = dataset.primary() {
-            if primary.reasoning().is_some() {
-                let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
-                let query_disabled = executable.reasoning.modes.is_disabled();
-
-                // Mode replacement keeps the query's budget — see
-                // `build_executable_for_view` for the rationale.
-                if let Some(effective) =
-                    primary.effective_reasoning(query_has_reasoning, query_disabled)
-                {
-                    let (max_facts, max_seconds) = (
-                        executable.reasoning.modes.max_facts,
-                        executable.reasoning.modes.max_seconds,
-                    );
-                    executable.reasoning.modes = effective.clone();
-                    executable.reasoning.modes.max_facts = max_facts;
-                    executable.reasoning.modes.max_seconds = max_seconds;
-                }
-            }
-
-            // Ledger-config materialization budget — after mode precedence,
-            // same rationale as `build_executable_for_view`.
-            if let Some(budget) = primary.config_reasoning_budget() {
-                budget.apply(&mut executable.reasoning.modes);
-            }
-
-            // Resolve schema bundle against the primary view's ledger
-            // (same-ledger only). Mirrors the single-view path in
-            // `view/query.rs::attach_schema_bundle`; see that method for the
-            // reasoning-disabled short-circuit rationale.
-            Self::attach_dataset_schema_bundle(primary, &mut executable).await?;
-        }
-
-        // Query-time datalog rule injection is admin-only: if any source of the
-        // dataset carries a non-root view policy, drop caller-supplied rules.
-        // See `view/query.rs::build_executable_for_view` for the rationale.
-        if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
+            self.apply_reasoning_to_executable(
+                primary,
+                &mut executable,
+                dataset.any_non_root_policy(),
+            )
+            .await?;
+        } else if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
             tracing::debug!("stripping query-time datalog rules under non-root view policy");
             executable.reasoning.modes.rules.clear();
         }
 
         Ok(executable)
-    }
-
-    async fn attach_dataset_schema_bundle(
-        primary: &crate::view::GraphDb,
-        executable: &mut ExecutableQuery,
-    ) -> Result<()> {
-        if executable.reasoning.modes.is_disabled() {
-            return Ok(());
-        }
-        let Some(resolved) = primary.resolved_config() else {
-            return Ok(());
-        };
-        let Some(reasoning) = resolved.reasoning.as_ref() else {
-            return Ok(());
-        };
-        if reasoning.schema_source.is_none() {
-            return Ok(());
-        }
-        let db_ref = primary.as_graph_db_ref();
-        let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
-            db_ref.snapshot,
-            db_ref.overlay,
-            db_ref.t,
-            reasoning,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        let flakes = crate::ontology_imports::get_or_build_schema_bundle_flakes(
-            db_ref.snapshot,
-            db_ref.overlay,
-            &bundle,
-        )
-        .await?;
-        executable.reasoning.schema_bundle = Some(flakes);
-        Ok(())
     }
 
     /// Execute against dataset (multi-ledger).
@@ -664,6 +601,8 @@ impl Fluree {
             Some((hist_from, hist_to)) => (Some(hist_from), hist_to, true),
             None => (None, primary.t, false),
         };
+
+        reject_reasoning_in_history_mode(history_mode, executable).map_err(ApiError::query)?;
 
         let prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
@@ -807,6 +746,9 @@ impl Fluree {
             None => (None, primary.t, false),
         };
 
+        reject_reasoning_in_history_mode(history_mode, executable)
+            .map_err(fluree_db_query::QueryError::InvalidQuery)?;
+
         let prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
@@ -889,6 +831,33 @@ impl Fluree {
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
     ApiError::Query(err)
+}
+
+/// Reject an explicit reasoning request on a history/changes dataset query.
+///
+/// A history/changes query enumerates the persisted flake deltas over a
+/// `(from, to)` t-range; reasoning derives *virtual* facts by forward-chaining
+/// at a single state and never persists them, so the two do not compose — the
+/// derived overlay would be computed against the latest state and silently
+/// dropped rather than applied at any point in the range. Config reasoning
+/// defaults are already not applied in history mode (see the dataset builder),
+/// so this only fires when a query explicitly asks for a mode. Fail loudly
+/// instead of returning results that silently omit entailments.
+///
+/// Mirrors the reasoning gate in `prepare_execution_with_config`
+/// (`executable.reasoning.modes.has_any_enabled()`); `"reasoning": "none"`
+/// sets no mode flag and is therefore allowed.
+fn reject_reasoning_in_history_mode(
+    history_mode: bool,
+    executable: &ExecutableQuery,
+) -> std::result::Result<(), String> {
+    if history_mode && executable.reasoning.modes.has_any_enabled() {
+        return Err("reasoning is not supported for history/changes queries \
+             (a from–to time range); remove the reasoning mode or query a \
+             single point in time"
+            .to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

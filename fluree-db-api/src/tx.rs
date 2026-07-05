@@ -145,6 +145,102 @@ async fn load_transaction_config(ledger: &LedgerState) -> Option<Arc<LedgerConfi
     }
 }
 
+/// Maximum RDF-list length walked when validating a staged `f:reasoningModes`
+/// collection — a malformed cyclic list must not spin.
+const MAX_STAGED_REASONING_LIST_LEN: usize = 64;
+
+/// Reject a transaction that writes an unrecognized `f:reasoningModes` value
+/// into the ledger #config.
+///
+/// Config reasoning modes are otherwise only parsed at query time, where an
+/// unknown mode is warned-and-skipped — so a typo silently disables reasoning
+/// with no signal. This validates the modes the transaction asserts and fails
+/// the commit if any is unrecognized. Cheap: scans the staged delta once and
+/// returns immediately unless `f:reasoningModes` is actually asserted.
+///
+/// Handles the same value shapes as the config reader — a direct string
+/// literal, a direct mode IRI, and an RDF collection of either — collected
+/// from this transaction's own staged flakes.
+fn validate_staged_reasoning_modes(
+    view: &StagedLedger,
+) -> std::result::Result<(), fluree_db_transact::TransactError> {
+    let snapshot = &view.base().snapshot;
+    let Some(modes_p) = snapshot.encode_iri(config_iris::REASONING_MODES) else {
+        return Ok(());
+    };
+    let flakes = view.staged_flakes();
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut list_heads: Vec<Sid> = Vec::new();
+    for f in flakes {
+        if !f.op || f.p != modes_p {
+            continue;
+        }
+        match &f.o {
+            FlakeValue::String(s) => candidates.push(s.to_string()),
+            FlakeValue::Ref(sid) => list_heads.push(sid.clone()),
+            _ => {}
+        }
+    }
+    if candidates.is_empty() && list_heads.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve any RDF-collection heads against this transaction's own flakes.
+    if !list_heads.is_empty() {
+        if let (Some(first_p), Some(rest_p)) = (
+            snapshot.encode_iri(fluree_vocab::rdf::FIRST),
+            snapshot.encode_iri(fluree_vocab::rdf::REST),
+        ) {
+            let mut first_of: HashMap<Sid, FlakeValue> = HashMap::new();
+            let mut rest_of: HashMap<Sid, Sid> = HashMap::new();
+            for f in flakes {
+                if !f.op {
+                    continue;
+                }
+                if f.p == first_p {
+                    first_of.entry(f.s.clone()).or_insert_with(|| f.o.clone());
+                } else if f.p == rest_p {
+                    if let FlakeValue::Ref(next) = &f.o {
+                        rest_of.entry(f.s.clone()).or_insert_with(|| next.clone());
+                    }
+                }
+            }
+            for head in list_heads {
+                // A ref that is not a list node is a direct mode IRI object.
+                if !first_of.contains_key(&head) {
+                    if let Some(iri) = snapshot.decode_sid(&head) {
+                        candidates.push(iri);
+                    }
+                    continue;
+                }
+                let mut node = head;
+                for _ in 0..MAX_STAGED_REASONING_LIST_LEN {
+                    match first_of.get(&node) {
+                        Some(FlakeValue::String(s)) => candidates.push(s.to_string()),
+                        Some(FlakeValue::Ref(sid)) => {
+                            if let Some(iri) = snapshot.decode_sid(sid) {
+                                candidates.push(iri);
+                            }
+                        }
+                        _ => {}
+                    }
+                    match rest_of.get(&node) {
+                        Some(next) => node = next.clone(),
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fluree_db_query::ir::ReasoningModes::validate_mode_names(&candidates).map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "invalid f:reasoningModes in ledger #config: {e}"
+        ))
+    })
+}
+
 /// Resolve SHACL config across all graphs affected by a transaction.
 ///
 /// Starts from the ledger-wide baseline (`resolve_effective_config(config, None)`)
@@ -307,30 +403,17 @@ pub(crate) struct StagedShaclContext<'a> {
 /// type would preserve the variant.
 #[cfg(feature = "shacl")]
 async fn resolve_cross_ledger_shapes_for_tx(
-    ledger: &LedgerState,
+    config: Option<&LedgerConfig>,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<
     Option<std::sync::Arc<crate::cross_ledger::ResolvedGraph>>,
     fluree_db_transact::TransactError,
 > {
-    // Load the same config the same-ledger SHACL path loads (from
-    // pre-tx state). resolve_ledger_config returns None on a fresh
-    // ledger with no #config — in that case there's no cross-ledger
-    // to dispatch.
-    let config = match crate::config_resolver::resolve_ledger_config(
-        &ledger.snapshot,
-        ledger.novelty.as_ref(),
-        ledger.t(),
-    )
-    .await
-    {
-        Ok(Some(c)) => c,
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            return Err(fluree_db_transact::TransactError::Parse(format!(
-                "failed to load ledger config while resolving cross-ledger f:shapesSource: {e}"
-            )));
-        }
+    // Config is resolved once by the caller against pre-tx state and shared
+    // with the same-ledger SHACL policy pass. `None` means no #config on a
+    // fresh ledger — nothing cross-ledger to dispatch.
+    let Some(config) = config else {
+        return Ok(None);
     };
     let shapes_source = config.shacl.as_ref().and_then(|s| s.shapes_source.as_ref());
     let Some(source) = shapes_source else {
@@ -437,11 +520,17 @@ fn resolve_shapes_source_g_ids(
 pub(crate) async fn apply_shacl_policy_to_staged_view(
     view: &StagedLedger,
     ctx: StagedShaclContext<'_>,
+    preresolved_config: Option<Arc<LedgerConfig>>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let base = view.base();
 
-    // 1. Load config from pre-transaction state.
-    let config = load_transaction_config(base).await;
+    // 1. Config from pre-transaction state. The caller may pass a config it
+    //    already resolved against the same pre-tx state (shared with the
+    //    cross-ledger shapes pass); otherwise load it here.
+    let config = match preresolved_config {
+        Some(c) => Some(c),
+        None => load_transaction_config(base).await,
+    };
 
     // 2. Build per-graph policy from the config (if any). Each graph has its
     //    own enabled/mode. Graphs absent from the policy map are disabled.
@@ -680,6 +769,13 @@ async fn stage_with_config_shacl(
     let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 
+    // Resolve the ledger #config ONCE against pre-tx state and share it across
+    // both SHACL passes below (cross-ledger shapes dispatch + the per-graph
+    // policy in apply_shacl_policy_to_staged_view). Both read the same pre-tx
+    // LedgerState, so a single resolution is equivalent and avoids a second
+    // config-graph scan per transaction.
+    let tx_config = load_transaction_config(&ledger).await;
+
     // Detect cross-ledger SHACL config at the API boundary BEFORE
     // staging starts: read D's resolved config and, if
     // f:shapesSource carries f:ledger, resolve the wire artifact
@@ -687,7 +783,8 @@ async fn stage_with_config_shacl(
     // governance cache. The wire is then threaded through
     // staging as an internal governance input and compiled
     // against the staged namespace registry at validation time.
-    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, resolve_ctx).await?;
+    let cross_ledger_shapes =
+        resolve_cross_ledger_shapes_for_tx(tx_config.as_deref(), resolve_ctx).await?;
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -799,6 +896,7 @@ async fn stage_with_config_shacl(
             inline_shape_bundle,
             cross_ledger_membership,
         },
+        tx_config,
     )
     .await?;
 
@@ -1666,6 +1764,8 @@ impl crate::Fluree {
         )
         .await?;
 
+        validate_staged_reasoning_modes(&view)?;
+
         Ok(StageResult {
             view,
             ns_registry,
@@ -1755,6 +1855,8 @@ impl crate::Fluree {
         )
         .await?;
 
+        validate_staged_reasoning_modes(&view)?;
+
         Ok(StageResult {
             view,
             ns_registry,
@@ -1825,6 +1927,9 @@ impl crate::Fluree {
         )
         .await
         .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+
+        validate_staged_reasoning_modes(&view)
+            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         Ok(StageResult {
             view,
@@ -2395,6 +2500,8 @@ impl crate::Fluree {
                 inline_shape_bundle: None,
                 cross_ledger_membership: None,
             },
+            // Turtle insert path resolves config internally.
+            None,
         )
         .await
         .map_err(ApiError::from)?;

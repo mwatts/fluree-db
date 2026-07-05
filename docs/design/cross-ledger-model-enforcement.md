@@ -475,7 +475,10 @@ mode can be added without rewriting the failure taxonomy.
   imports, and rdf:type for the schema-class set) are projected
   into a `SchemaBundleFlakes` against D's snapshot and feed D's
   reasoner. Single-graph only today; transitive `owl:imports`
-  recursion across multiple model ledgers is reserved.
+  recursion across multiple model ledgers is reserved, and
+  `f:followOwlImports true` combined with a cross-ledger
+  `f:schemaSource` fails closed (`ApiError::OntologyImport`)
+  rather than silently reasoning over the starting graph alone.
 - Per-request memo + per-instance governance cache, both keyed
   on `(ArtifactKind, canonical_model_ledger_id, graph_iri,
   resolved_t)`.

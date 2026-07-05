@@ -874,6 +874,27 @@ pub mod shacl {
     /// sh:path IRI
     pub const PATH: &str = "http://www.w3.org/ns/shacl#path";
 
+    /// sh:inversePath IRI
+    pub const INVERSE_PATH: &str = "http://www.w3.org/ns/shacl#inversePath";
+
+    /// sh:alternativePath IRI
+    pub const ALTERNATIVE_PATH: &str = "http://www.w3.org/ns/shacl#alternativePath";
+
+    /// sh:zeroOrMorePath IRI
+    pub const ZERO_OR_MORE_PATH: &str = "http://www.w3.org/ns/shacl#zeroOrMorePath";
+
+    /// sh:oneOrMorePath IRI
+    pub const ONE_OR_MORE_PATH: &str = "http://www.w3.org/ns/shacl#oneOrMorePath";
+
+    /// sh:zeroOrOnePath IRI
+    pub const ZERO_OR_ONE_PATH: &str = "http://www.w3.org/ns/shacl#zeroOrOnePath";
+
+    /// sh:node IRI
+    pub const NODE: &str = "http://www.w3.org/ns/shacl#node";
+
+    /// sh:deactivated IRI
+    pub const DEACTIVATED: &str = "http://www.w3.org/ns/shacl#deactivated";
+
     // ========================================================================
     // Cardinality Constraints
     // ========================================================================
@@ -1148,6 +1169,25 @@ pub mod shacl_names {
     pub const PATH: &str = "path";
 
     // ========================================================================
+    // Property Path Expressions
+    // ========================================================================
+
+    /// sh:inversePath local name (inverse path `^p`)
+    pub const INVERSE_PATH: &str = "inversePath";
+
+    /// sh:alternativePath local name (alternative path `p1|p2`, points to an RDF list)
+    pub const ALTERNATIVE_PATH: &str = "alternativePath";
+
+    /// sh:zeroOrMorePath local name (`p*`)
+    pub const ZERO_OR_MORE_PATH: &str = "zeroOrMorePath";
+
+    /// sh:oneOrMorePath local name (`p+`)
+    pub const ONE_OR_MORE_PATH: &str = "oneOrMorePath";
+
+    /// sh:zeroOrOnePath local name (`p?`)
+    pub const ZERO_OR_ONE_PATH: &str = "zeroOrOnePath";
+
+    // ========================================================================
     // Cardinality Constraints
     // ========================================================================
 
@@ -1166,6 +1206,9 @@ pub mod shacl_names {
 
     /// sh:nodeKind local name
     pub const NODE_KIND: &str = "nodeKind";
+
+    /// sh:node local name (value/focus must conform to the referenced node shape)
+    pub const NODE: &str = "node";
 
     /// sh:class local name
     pub const CLASS: &str = "class";
@@ -1305,6 +1348,9 @@ pub mod shacl_names {
     // ========================================================================
     // Severity Levels
     // ========================================================================
+
+    /// sh:deactivated local name (true = the shape is ignored entirely)
+    pub const DEACTIVATED: &str = "deactivated";
 
     /// sh:severity local name
     pub const SEVERITY: &str = "severity";

@@ -143,6 +143,89 @@ async fn config_write_json_ld() {
     );
 }
 
+/// A transaction that writes an unrecognized `f:reasoningModes` into #config
+/// must be rejected at commit, not silently accepted (and then ignored at
+/// query time).
+#[tokio::test]
+async fn config_write_rejects_unknown_reasoning_mode() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-bad-reasoning:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let config_iri = config_graph_iri(ledger_id);
+
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:owltypo .
+        }}
+    "
+    );
+
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect_err("unknown reasoning mode in #config must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reasoningModes") && msg.contains("owltypo"),
+        "error should name the offending mode, got: {msg}"
+    );
+}
+
+/// Recognized `f:reasoningModes` (multiple mode IRIs) commit normally and
+/// round-trip — the validator only rejects unrecognized names.
+#[tokio::test]
+async fn config_write_accepts_reasoning_modes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-good-reasoning:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let config_iri = config_graph_iri(ledger_id);
+
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:rdfs, f:owl2rl .
+        }}
+    "
+    );
+
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("recognized reasoning modes must commit");
+
+    let view = fluree.db(ledger_id).await.unwrap();
+    let config = view.ledger_config().expect("config attached");
+    let mut modes = config
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.modes.as_ref())
+        .expect("modes present")
+        .clone();
+    modes.sort();
+    assert_eq!(
+        modes,
+        vec![
+            "https://ns.flur.ee/db#owl2rl".to_string(),
+            "https://ns.flur.ee/db#rdfs".to_string(),
+        ]
+    );
+}
+
 // =============================================================================
 // Test 4: policy defaults apply
 // =============================================================================
@@ -3060,4 +3143,115 @@ async fn constraints_source_cross_ledger_fails_closed() {
         msg.contains("cross-ledger") || msg.contains("f:ledger"),
         "expected cross-ledger rejection, got: {msg}"
     );
+}
+
+// =============================================================================
+// reasoningModes value shapes: string literal and RDF collection
+// =============================================================================
+//
+// `f:reasoningModes f:rdfs` (IRI objects) is covered by
+// `reasoning_defaults_apply` above. Users also naturally write string
+// literals and RDF collections — both previously parsed to *no modes*
+// silently, so config-declared reasoning never engaged and queries
+// returned non-entailed results with no error. These pin the permissive
+// reader.
+
+/// Shared body: seed subProperty ontology + data, write the given
+/// `f:reasoningModes` statement(s) into config, query WITHOUT a
+/// "reasoning" key, and expect the RDFS expansion to fire.
+///
+/// `modes_stmts` is one or more full Turtle statements on
+/// `<urn:config:reasoning>` (plus any list-node triples they need).
+async fn assert_reasoning_modes_shape_engages(ledger_id: &str, modes_stmts: &str) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    {"@id": "ex:childName", "rdfs:subPropertyOf": {"@id": "ex:name"}},
+                    {"@id": "ex:alice", "ex:childName": "Alice"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            {modes_stmts}
+        }}
+    "
+    );
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ledger_id,
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let result = fluree.query_connection(&query).await.expect("query");
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let jsonld = result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld");
+
+    assert_eq!(
+        jsonld,
+        json!(["Alice"]),
+        "config `{modes_stmts}` should engage RDFS reasoning"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_modes_string_literal_engages() {
+    assert_reasoning_modes_shape_engages(
+        "it/config-reasoning-modes-string:main",
+        r#"<urn:config:reasoning> f:reasoningModes "rdfs" ."#,
+    )
+    .await;
+}
+
+// The two collection tests write the `rdf:first`/`rdf:rest` structure
+// explicitly (a JSON-LD `@list` or any list-producing ingest lands the
+// same triples) because the Turtle parser does not support the `( .. )`
+// collection shorthand.
+
+#[tokio::test]
+async fn reasoning_modes_rdf_collection_engages() {
+    assert_reasoning_modes_shape_engages(
+        "it/config-reasoning-modes-collection:main",
+        r#"<urn:config:reasoning> f:reasoningModes <urn:config:modes-list> .
+            <urn:config:modes-list> rdf:first "rdfs" ;
+                                    rdf:rest  rdf:nil ."#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reasoning_modes_collection_of_iris_engages() {
+    assert_reasoning_modes_shape_engages(
+        "it/config-reasoning-modes-iri-collection:main",
+        r"<urn:config:reasoning> f:reasoningModes <urn:config:modes-list> .
+            <urn:config:modes-list> rdf:first f:rdfs ;
+                                    rdf:rest  rdf:nil .",
+    )
+    .await;
 }

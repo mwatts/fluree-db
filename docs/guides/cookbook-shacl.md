@@ -23,6 +23,12 @@ Fluree decides whether to run SHACL validation on each transaction using this or
 
 This means you can start using SHACL **without writing any config** — just transact shapes and they're enforced.
 
+**Bulk import is deliberately exempt.** The bulk-import pipeline never runs
+SHACL — it is a trusted, high-throughput load path. If your source data must
+conform, validate it *before* importing (e.g. run a SHACL report over the
+source with your shapes) so the ledger starts clean; transaction-time
+validation keeps it clean from there.
+
 The `shacl` feature must be enabled at build time (it's on by default for the server and CLI binaries). See [Standards and feature flags](../reference/compatibility.md).
 
 ## Enabling SHACL via the config graph
@@ -91,8 +97,65 @@ ex:PersonShape a sh:NodeShape ;
 | `sh:targetNode <N>` | The specific subject `<N>` |
 | `sh:targetSubjectsOf <P>` | Every subject that currently has predicate `<P>` |
 | `sh:targetObjectsOf <P>` | Every node that currently appears as the object of `<P>` |
+| implicit (shape `a rdfs:Class`) | A shape that is also a class targets its own instances — no explicit target needed |
 
 See [Predicate-target shapes](#predicate-target-shapes) for notes on how the staged-path validator discovers focus nodes for `sh:targetSubjectsOf` / `sh:targetObjectsOf`.
+
+## Property paths
+
+`sh:path` is usually a single predicate, but it can also be a **property path expression**. The path is evaluated against the focus node to produce the set of *value nodes* the constraints then apply to — so `sh:minCount`, `sh:datatype`, `sh:class`, etc. all work over a path exactly as they do over a plain predicate.
+
+| Path form | Turtle syntax | Reaches |
+|-----------|---------------|---------|
+| Predicate | `sh:path ex:knows` | objects of `ex:knows` |
+| Inverse | `sh:path [ sh:inversePath ex:parent ]` | subjects that point at the focus via `ex:parent` (works over any path: `[ sh:inversePath ( ex:a ex:b ) ]` reaches nodes two hops upstream) |
+| Sequence | `sh:path ( ex:knows schema:name )` | names of the people the focus knows |
+| Alternative | `sh:path [ sh:alternativePath ( ex:email ex:altEmail ) ]` | values via **either** predicate |
+| Zero-or-more | `sh:path [ sh:zeroOrMorePath ex:parent ]` | the focus **and** all transitive `ex:parent` ancestors |
+| One-or-more | `sh:path [ sh:oneOrMorePath ex:parent ]` | all transitive `ex:parent` ancestors (excludes the focus) |
+| Zero-or-one | `sh:path [ sh:zeroOrOnePath ex:parent ]` | the focus and its direct parents |
+
+These nest: `sh:path ( [ sh:inversePath ex:parent ] schema:name )` reaches the names of the focus's children.
+
+```turtle
+# Every Parent must have at least one child (something points at it via ex:parent),
+# and each place a Person knows-of must be named.
+ex:ParentShape a sh:NodeShape ;
+  sh:targetClass ex:Parent ;
+  sh:property [
+    sh:path [ sh:inversePath ex:parent ] ;
+    sh:minCount 1 ;
+    sh:message "A Parent must have at least one child"
+  ] .
+
+ex:SocialiteShape a sh:NodeShape ;
+  sh:targetClass ex:Socialite ;
+  sh:property [
+    sh:path ( ex:knows schema:name ) ;
+    sh:datatype xsd:string ;
+    sh:minCount 1
+  ] .
+```
+
+In **JSON-LD**, a sequence path is written with `@list`, and the blank-node forms are written as nested objects:
+
+```json
+{
+  "@id": "ex:SocialiteShape",
+  "@type": "sh:NodeShape",
+  "sh:targetClass": { "@id": "ex:Socialite" },
+  "sh:property": [{
+    "sh:path": { "@list": [ { "@id": "ex:knows" }, { "@id": "schema:name" } ] },
+    "sh:datatype": { "@id": "xsd:string" },
+    "sh:minCount": 1
+  }, {
+    "sh:path": { "sh:inversePath": { "@id": "ex:parent" } },
+    "sh:minCount": 1
+  }]
+}
+```
+
+**Not supported:** the inverse of a composite path (e.g. `[ sh:inversePath ( ex:a ex:b ) ]`). `sh:inversePath` may only wrap a single predicate. An unsupported or unresolvable path doesn't silently pass — it produces a violation whenever the owning shape validates a focus node, so any transaction touching data that shape targets is rejected with a clear message. A broken path only affects the shape's own targets, not unrelated writes.
 
 ## Constraint patterns
 
@@ -144,6 +207,23 @@ ex:UserShape a sh:NodeShape ;
 ```
 
 `sh:pattern` accepts an optional `sh:flags` string (e.g. `"i"` for case-insensitive).
+
+### Language constraints
+
+`sh:languageIn` restricts values to language-tagged literals whose tag matches
+one of the given basic language ranges (`"en"` also matches `"en-US"`, per
+SPARQL `langMatches`); untagged values violate. `sh:uniqueLang true` forbids
+two values of the property from sharing a language tag.
+
+```turtle
+ex:LabelShape a sh:NodeShape ;
+  sh:targetClass ex:Labeled ;
+  sh:property [
+    sh:path ex:label ;
+    sh:languageIn ( "en" "fr" ) ;
+    sh:uniqueLang true
+  ] .
+```
 
 ### Node kind
 
@@ -217,6 +297,69 @@ ex:ContactShape a sh:NodeShape ;
 ```
 
 Available: `sh:not`, `sh:and`, `sh:or`, `sh:xone`.
+
+### Shape-based constraints (`sh:node`)
+
+`sh:node` validates a node against another node shape. On a property shape it
+applies to each value; directly on a node shape it applies to the focus node
+itself. The referenced shape is usually targetless — it fires only where it is
+referenced.
+
+```turtle
+ex:AddressShape a sh:NodeShape ;
+  sh:property [ sh:path ex:postalCode ; sh:minCount 1 ] .
+
+ex:PersonShape a sh:NodeShape ;
+  sh:targetClass ex:Person ;
+  sh:property [
+    sh:path ex:address ;
+    sh:node ex:AddressShape
+  ] .
+```
+
+Recursive references are safe: a shape may reference itself (directly or via a
+chain), and validation over cyclic data (e.g. a mutual `ex:knows` graph)
+terminates — a node already being validated against a shape higher in the
+evaluation is assumed conforming, matching common SHACL engine behavior.
+
+### Qualified value shapes
+
+`sh:qualifiedValueShape` counts how many values conform to a shape and checks
+the count against `sh:qualifiedMinCount` / `sh:qualifiedMaxCount` — unlike
+`sh:node`, values that don't conform are fine as long as enough do.
+
+```turtle
+ex:TeamShape a sh:NodeShape ;
+  sh:targetClass ex:Team ;
+  sh:property [
+    sh:path ex:member ;
+    sh:qualifiedValueShape ex:BadgedMemberShape ;
+    sh:qualifiedMinCount 1
+  ] .
+```
+
+`sh:qualifiedValueShapesDisjoint true` additionally excludes values that
+conform to a *sibling* qualified shape — e.g. a crew needing one pilot and one
+navigator as distinct members rejects a single member holding both roles.
+
+### Constraints on the node itself
+
+Value constraints declared directly on a node shape (without `sh:path`) apply
+to the focus node. Combined with a predicate target this restricts which nodes
+may appear in a position:
+
+```turtle
+# Only ex:active / ex:inactive may be used as an ex:status value.
+ex:StatusShape a sh:NodeShape ;
+  sh:targetObjectsOf ex:status ;
+  sh:in ( ex:active ex:inactive ) .
+```
+
+### Deactivating a shape
+
+`sh:deactivated true` turns a shape off without deleting it — it stops firing
+for its targets and is treated as conforming when referenced via `sh:node` or
+logical constraints.
 
 ### Closed shapes
 
@@ -452,12 +595,10 @@ All three routes go through the same post-stage helper, so the ledger's configur
 
 ## Not yet supported
 
-The following SHACL constructs are parsed/compiled but currently **no-ops** at validation time. Shapes using them load without error but don't constrain data:
+- `sh:targetNode` with a literal value — only IRI/blank-node targets are compiled.
+- `sh:sparql` (SPARQL-based constraints).
 
-- `sh:uniqueLang`, `sh:languageIn` — require language-tag metadata on flakes, which isn't yet threaded through the validation path.
-- `sh:qualifiedValueShape` (+ `sh:qualifiedMinCount` / `sh:qualifiedMaxCount`) — requires recursive nested-shape counting.
-
-These are tracked in the SHACL compliance effort. Contributors: see [Contributing / SHACL implementation](../contributing/shacl-implementation.md).
+These are tracked in the SHACL compliance effort.
 
 ## Shapes are data
 
@@ -481,4 +622,3 @@ Because shapes live as regular RDF in your ledger:
 - [Setting Groups — SHACL](../ledger-config/setting-groups.md#shacl-defaults) — Configuration reference for `f:shaclDefaults`
 - [Override Control](../ledger-config/override-control.md) — Per-graph / query-time override rules
 - [Writing Config Data](../ledger-config/writing-config.md) — How to transact into the config graph
-- [Contributing / SHACL implementation](../contributing/shacl-implementation.md) — How the pipeline works internally (for contributors)
