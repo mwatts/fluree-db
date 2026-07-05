@@ -28,8 +28,8 @@ use std::path::PathBuf;
 
 use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
 use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
-use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};

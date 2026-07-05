@@ -2213,7 +2213,10 @@ mod tests {
         // A commit touching the config graph advances the marker to commit_t.
         n.apply_commit(vec![make_graph_flake(2, 1, 1, 7, cfg_g.clone())], 7, &rg)
             .unwrap();
-        assert_eq!(n.config_write_t, 7, "config write advances marker to commit_t");
+        assert_eq!(
+            n.config_write_t, 7,
+            "config write advances marker to commit_t"
+        );
 
         // A later data-only commit must neither bump nor regress the marker.
         n.apply_commit(vec![make_flake(3, 1, 1, 9, true)], 9, &rg)
@@ -2229,11 +2232,8 @@ mod tests {
         rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
 
         let mut n = Novelty::new(0);
-        n.bulk_apply_commits(
-            vec![(vec![make_flake(1, 1, 1, 3, true)], 3)],
-            &rg,
-        )
-        .unwrap();
+        n.bulk_apply_commits(vec![(vec![make_flake(1, 1, 1, 3, true)], 3)], &rg)
+            .unwrap();
         assert_eq!(n.config_write_t, 0, "bulk data-only load leaves marker");
 
         n.bulk_apply_commits(
