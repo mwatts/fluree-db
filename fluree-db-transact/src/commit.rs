@@ -512,6 +512,19 @@ fn resolve_commit_times(
             })?,
             None => now_ms,
         };
+        // Symmetric with the event axis: a caller-supplied receivedAt (reachable
+        // from the Rust API / CLI — the HTTP route always passes `now`) must not
+        // be in the future. The audit axis is immutable and monotonic, so a
+        // future stamp would permanently pin the ledger's timeline ahead of
+        // reality.
+        if ms > now_ms + MAX_EVENT_TIME_FUTURE_SKEW_MS {
+            return Err(TransactError::InvalidEventTime(format!(
+                "receivedAt '{}' is in the future; the audit axis is immutable and \
+                 monotonic, so a future receivedAt would permanently pin the ledger's \
+                 timeline ahead of reality",
+                epoch_ms_to_rfc3339(ms)?
+            )));
+        }
         let prev = head.and_then(|h| h.received_time_ms);
         Some(prev.map_or(ms, |p| ms.max(p)))
     } else {
@@ -1847,6 +1860,16 @@ mod tests {
             recv >= now_ms - 1000,
             "receivedAt must be clamped monotonic"
         );
+    }
+
+    #[test]
+    fn resolve_times_rejects_future_received_at() {
+        // Symmetric with the event axis: a caller-supplied receivedAt in the
+        // future is rejected so the immutable audit axis can't be pinned ahead.
+        let tomorrow = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let err = resolve_commit_times(Some("2020-01-01T00:00:00Z".into()), Some(tomorrow), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("future"));
     }
 
     #[test]

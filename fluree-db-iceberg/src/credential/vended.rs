@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Temporary storage credentials vended by a REST catalog.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VendedCredentials {
     /// AWS access key ID
     pub access_key_id: String,
@@ -23,6 +23,23 @@ pub struct VendedCredentials {
     pub region: Option<String>,
     /// Use path-style S3 access
     pub path_style: bool,
+}
+
+/// Redacting `Debug`: never leak the secret access key or session token via a
+/// `{:?}` in a log or error. The access key ID is an identifier (not usable
+/// without the secret) and is shown to aid debugging.
+impl std::fmt::Debug for VendedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendedCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"***")
+            .field("session_token", &self.session_token.as_ref().map(|_| "***"))
+            .field("expires_at", &self.expires_at)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("path_style", &self.path_style)
+            .finish()
+    }
 }
 
 impl VendedCredentials {
@@ -470,5 +487,26 @@ mod tests {
 
         cache.invalidate(&key).await;
         assert!(cache.get(&key).await.is_none());
+    }
+
+    #[test]
+    fn debug_redacts_secret_and_session_token() {
+        let creds = VendedCredentials {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "super-secret-key".to_string(),
+            session_token: Some("super-secret-session".to_string()),
+            expires_at: None,
+            endpoint: None,
+            region: Some("us-east-1".to_string()),
+            path_style: false,
+        };
+        let dbg = format!("{creds:?}");
+        assert!(!dbg.contains("super-secret-key"), "secret leaked: {dbg}");
+        assert!(
+            !dbg.contains("super-secret-session"),
+            "session token leaked: {dbg}"
+        );
+        // The access key ID (an identifier, unusable without the secret) is shown.
+        assert!(dbg.contains("AKIAEXAMPLE"));
     }
 }

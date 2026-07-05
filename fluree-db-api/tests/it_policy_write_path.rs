@@ -272,6 +272,76 @@ async fn config_policy_source_named_graph_enforced_on_writes() {
     );
 }
 
+/// A same-ledger `f:policySource` with an *invalid* graph selector must
+/// fail closed on writes even when the request carries no policy inputs
+/// and config declares no `f:defaultAllow`/`f:policyClass`. The read path
+/// (`wrap_policy`) resolves the selector unconditionally and errors on an
+/// unknown graph; the write builder must do the same rather than silently
+/// running under root — the read/write divergence this path eliminates.
+#[tokio::test]
+async fn config_invalid_policy_source_fails_closed_on_writes() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/write-invalid-source:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:User"
+            }),
+        )
+        .await
+        .expect("seed data");
+
+    // Config declares ONLY a policySource whose graph selector points at a
+    // graph that does not exist in this ledger's registry. No policyClass
+    // or defaultAllow — so the request has no policy inputs and the pre-fix
+    // no-inputs shortcut would have returned Ok(None) (root) before ever
+    // validating the selector.
+    let missing_graph_iri = "http://example.org/nonexistent-policy-graph";
+    let config_iri = config_graph_iri(ledger_id);
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:graphSelector <{missing_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed config");
+    let ledger = r2.ledger;
+
+    let result = build_transact_policy_context(
+        &fluree,
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &GovernanceOptions::default(),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "an invalid same-ledger f:policySource must fail closed on writes, got: {result:?}"
+    );
+}
+
 /// Cross-ledger `f:policySource`: model ledger M holds the policy rules;
 /// data ledger D's config points at M. A write to D that violates M's
 /// modify rules must be rejected — with NO policy inputs on the request.

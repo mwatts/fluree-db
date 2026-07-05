@@ -211,7 +211,20 @@ impl MemoryStore {
         }
 
         debug!("Creating memory ledger");
-        self.fluree.create_ledger(MEMORY_LEDGER).await?;
+        match self.fluree.create_ledger(MEMORY_LEDGER).await {
+            Ok(_) => {}
+            Err(fluree_db_api::ApiError::LedgerExists(_)) => {
+                // Concurrent tool calls race through `is_initialized() ==
+                // false` together (initialize takes no lock — mutation paths
+                // already hold the mutation lock when they call it, so it
+                // must not re-acquire). Losing the create race means another
+                // task is initializing; let it transact the schema.
+                debug!("Memory ledger created concurrently — skipping init");
+                self.ensure_file_structure()?;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         debug!("Transacting memory schema");
         let schema = memory_schema_jsonld();
@@ -790,9 +803,13 @@ WHERE {{\n\
     ) -> Result<Vec<(String, f64)>> {
         self.initialize().await?;
 
+        // Escape backslashes before quotes — the s-expression parser resolves
+        // `\\` and `\"`, and content with an unescaped `"` followed by `)`
+        // used to wedge the parser in an infinite loop (a permanently pinned
+        // tokio worker per occurrence).
         let bind_expr = format!(
             "(fulltext ?content \"{}\")",
-            query_text.replace('"', "\\\"")
+            query_text.replace('\\', "\\\\").replace('"', "\\\"")
         );
 
         let query = json!({
@@ -1213,6 +1230,39 @@ mod tests {
         assert!(
             store.is_initialized().await.expect("check initialized"),
             "ledger_exists should accept the normalized __memory:main ledger id"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_fulltext_survives_quotes_and_parens_in_query() {
+        // Regression for the MCP hang: content with a quote-then-paren
+        // sequence, fed back as the related-memories recall query, used to
+        // wedge the s-expression parser in an infinite loop.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize");
+
+        let content = r#"emit_list_item stores index metadata ("not rdf-list bnodes") and silently prunes operator-kept rows. Applies to the scalar-Eq push.""#;
+        let input = crate::types::MemoryInput {
+            kind: MemoryKind::Fact,
+            content: content.to_string(),
+            tags: vec!["repro".to_string()],
+            scope: crate::types::Scope::Repo,
+            severity: None,
+            artifact_refs: vec![],
+            branch: None,
+            rationale: Some(r#"backslash \ and "quotes" too"#.to_string()),
+            alternatives: None,
+        };
+        store.add(input).await.expect("add");
+
+        let hits = store
+            .recall_fulltext(content, 4)
+            .await
+            .expect("recall must parse, not hang");
+        assert!(
+            !hits.is_empty(),
+            "the just-added memory should match its own content"
         );
     }
 

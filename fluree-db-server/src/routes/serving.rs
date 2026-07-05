@@ -12,7 +12,7 @@
 //! access tier.
 
 use crate::error::ServerError;
-use fluree_db_api::{config_resolver, Fluree, LedgerState};
+use fluree_db_api::{config_resolver, LedgerState};
 use fluree_db_core::ledger_config::ServingDefaults;
 use fluree_db_core::OverlayProvider;
 
@@ -60,26 +60,12 @@ pub(crate) async fn effective_serving_from_state(
     state: &LedgerState,
 ) -> Result<EffectiveServing, ServerError> {
     let overlay: &dyn OverlayProvider = &*state.novelty;
-    let config = config_resolver::resolve_ledger_config(&state.snapshot, overlay, state.t())
+    let serving = config_resolver::resolve_serving_only(&state.snapshot, overlay, state.t())
         .await
         .map_err(|e| ServerError::internal(format!("Serving config resolution failed: {e}")))?;
-    Ok(EffectiveServing::from_config(
-        config.as_ref().and_then(|c| c.serving.as_ref()),
-    ))
+    Ok(EffectiveServing::from_config(serving.as_ref()))
 }
 
-/// Resolve the serving posture for a ledger by alias.
-///
-/// Loads (or reuses) the cached ledger handle. Callers on anti-leak paths
-/// should map load failures to their endpoint's 404 convention.
-pub(crate) async fn effective_serving(
-    fluree: &Fluree,
-    ledger_id: &str,
-) -> Result<EffectiveServing, ServerError> {
-    let handle = fluree
-        .ledger_cached(ledger_id)
-        .await
-        .map_err(ServerError::Api)?;
-    let state = handle.snapshot().await.to_ledger_state();
-    effective_serving_from_state(&state).await
-}
+// Resolving serving posture by ledger alias goes through
+// `AppState::effective_serving_cached`, which memoizes the posture per
+// `(ledger, t)` — see fluree-db-server/src/state.rs.

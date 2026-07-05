@@ -55,6 +55,44 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+
+    // Read the config_id (@id)
+    let config_id = snapshot.decode_sid(&config_sid);
+
+    // Read each setting group
+    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
+
+    Ok(Some(LedgerConfig {
+        config_id,
+        policy,
+        shacl,
+        reasoning,
+        datalog,
+        transact,
+        full_text,
+        serving,
+        graph_overrides,
+    }))
+}
+
+/// Locate the single `f:LedgerConfig` subject in the config graph as-of `to_t`,
+/// or `None` when the ledger has no config. Shared prefix of
+/// [`resolve_ledger_config`] and [`resolve_serving_only`].
+async fn resolve_config_sid(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<Sid>> {
     // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
     // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
     // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
@@ -129,30 +167,21 @@ pub async fn resolve_ledger_config(
         with_iris.into_iter().next().unwrap().1
     };
 
-    // Read the config_id (@id)
-    let config_id = snapshot.decode_sid(&config_sid);
+    Ok(Some(config_sid))
+}
 
-    // Read each setting group
-    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
-    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
-
-    Ok(Some(LedgerConfig {
-        config_id,
-        policy,
-        shacl,
-        reasoning,
-        datalog,
-        transact,
-        full_text,
-        serving,
-        graph_overrides,
-    }))
+/// Resolve only the serving posture (`f:servingDefaults`), skipping the other
+/// seven setting groups. The serving gates read only `config.serving`, so this
+/// avoids the wasted group reads a full [`resolve_ledger_config`] would do.
+pub async fn resolve_serving_only(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<ServingDefaults>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+    read_serving_defaults(snapshot, overlay, to_t, &config_sid).await
 }
 
 // ============================================================================
@@ -1967,7 +1996,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: "urn:other:graph".into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2044,7 +2073,7 @@ mod tests {
 
     #[test]
     fn ledger_wide_override_none_blocks_per_graph_reasoning() {
-        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2-rl]` | → **rdfs**
+        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2rl]` | → **rdfs**
         let config = LedgerConfig {
             reasoning: Some(ReasoningDefaults {
                 modes: Some(vec!["rdfs".into()]),
@@ -2054,7 +2083,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::DEFAULT_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2121,7 +2150,7 @@ mod tests {
                     ..Default::default()
                 }),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 shacl: None,
@@ -2138,7 +2167,7 @@ mod tests {
         assert_eq!(p.default_allow, Some(false));
         // Reasoning: per-graph wins (AllowAll)
         let r = resolved.reasoning.unwrap();
-        assert_eq!(r.modes.as_deref(), Some(&["owl2-rl".into()][..]));
+        assert_eq!(r.modes.as_deref(), Some(&["owl2rl".into()][..]));
     }
 
     #[test]
@@ -2147,7 +2176,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::DEFAULT_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-ql".into()]),
+                    modes: Some(vec!["owl2ql".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2163,7 +2192,7 @@ mod tests {
         assert!(resolved.reasoning.is_some());
         assert_eq!(
             resolved.reasoning.unwrap().modes.as_deref(),
-            Some(&["owl2-ql".into()][..])
+            Some(&["owl2ql".into()][..])
         );
     }
 
@@ -2173,7 +2202,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::TXN_META_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2338,14 +2367,14 @@ mod tests {
     fn config_reasoning_with_allow_all_gives_default_unless() {
         let resolved = ResolvedConfig {
             reasoning: Some(ReasoningDefaults {
-                modes: Some(vec!["owl2-rl".into()]),
+                modes: Some(vec!["owl2rl".into()]),
                 override_control: OverrideControl::AllowAll,
                 ..Default::default()
             }),
             ..Default::default()
         };
         let (modes, prec) = merge_reasoning(&resolved, None).unwrap();
-        assert_eq!(modes, vec!["owl2-rl".to_string()]);
+        assert_eq!(modes, vec!["owl2rl".to_string()]);
         assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
     }
 

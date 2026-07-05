@@ -133,11 +133,19 @@ that steps backwards can no longer corrupt `@iso:` resolution.
 
 ### Recorded Time: the Audit Axis (`@recorded:`)
 
-Once a ledger uses a caller-supplied event time, each commit records a second,
-system-controlled timestamp: **`db:receivedAt`** — the wall-clock time the
-commit was actually recorded. This begins at the first backdated commit and
-continues on every commit thereafter (sticky), so the audit trail has no gaps.
-Ledgers that never supply event times carry no extra metadata at all.
+When the server pairs a caller-supplied event time with a second,
+system-controlled timestamp — **`db:receivedAt`**, the wall-clock time the
+commit was actually recorded — the ledger gains an audit axis. The HTTP
+transact route does this automatically (it pairs `eventTime` with the current
+time); programmatically it is enabled by `CommitOpts::with_received_at`. Once a
+commit dual-stamps, every commit thereafter does too (sticky), so the audit
+trail has no gaps.
+
+The audit axis is *not* triggered by event time alone. A ledger that only ever
+backdates via `CommitOpts::with_timestamp` (for example fluree-memory's git
+replay) is event-axis-only and carries no `db:receivedAt`; on it, `@recorded:`
+falls back to the event axis. Ledgers that never supply event times carry no
+extra metadata at all.
 
 The `@recorded:` selector time-travels along that axis:
 
