@@ -548,9 +548,19 @@ where
         }
         if let Some(tx) = self.release_tx.as_ref() {
             for release in releases {
-                // Receiver dropped → release task gone. Nothing the
-                // adapter can do; let send_release fail silently.
-                let _ = tx.send(release);
+                // Receiver dropped → release task already gone
+                // (shutdown window, or the task died). The blob
+                // leaks; log its CID so an operator or offline
+                // sweep can reclaim it.
+                if let Err(tokio::sync::mpsc::error::SendError((ledger_id, cid))) =
+                    tx.send(release)
+                {
+                    tracing::warn!(
+                        %ledger_id,
+                        %cid,
+                        "release channel closed; envelope blob will leak"
+                    );
+                }
             }
         }
         Ok(responses)

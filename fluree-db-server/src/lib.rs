@@ -121,6 +121,40 @@ pub struct FlureeServer {
     )>,
 }
 
+/// How long in-flight requests get to complete after a shutdown
+/// signal before remaining connections are closed. Long-lived
+/// response streams (the SSE events endpoint) never complete on
+/// their own — without this bound they would hold graceful shutdown
+/// open past the process supervisor's kill deadline, and the
+/// post-serve teardown below (worker drain, CAS release drain)
+/// would never run at all.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves when the process receives SIGTERM (unix service
+/// managers, Kubernetes) or SIGINT (ctrl-c).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("SIGINT handler installs on any supported platform");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler installs on unix")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+}
+
 impl FlureeServer {
     /// Create a new server with the given configuration.
     ///
@@ -317,8 +351,41 @@ impl FlureeServer {
             "Fluree server starting"
         );
 
-        // Run server
-        let result = axum::serve(listener, self.router).await;
+        // Run the server until it errors or a shutdown signal
+        // arrives. On signal, stop accepting and give in-flight
+        // requests `SHUTDOWN_GRACE` to finish; then fall through to
+        // the teardown below regardless, closing whatever remains
+        // (long-lived SSE streams never finish on their own). The
+        // teardown is what drains the raft workers and the CAS
+        // release channel — reaching it on SIGTERM is the entire
+        // point of handling the signal.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                info!("shutdown signal received; draining");
+                shutdown.cancel();
+            });
+        }
+        let graceful = shutdown.clone();
+        let serve =
+            axum::serve(listener, self.router).with_graceful_shutdown(async move {
+                graceful.cancelled().await;
+            });
+        let result = tokio::select! {
+            result = serve => result,
+            () = async {
+                shutdown.cancelled().await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => {
+                tracing::warn!(
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "drain window elapsed; closing remaining connections"
+                );
+                Ok(())
+            }
+        };
 
         // Cancel background tasks on shutdown
         warm_task.abort();
@@ -352,6 +419,27 @@ impl FlureeServer {
             // eviction scheduler) has actually stopped, not just
             // been signalled.
             handle.shutdown().await;
+        }
+        #[cfg(feature = "raft")]
+        if let Some(integration) = self.state.raft.as_ref() {
+            // Stop the raft core before draining the release
+            // channel. A live core keeps committing and applying
+            // entries throughout this teardown (this node may be
+            // the leader), and any apply landing after the drain
+            // below pushes its release envelopes into a closed
+            // channel — a leak. Core shutdown stops replication,
+            // elections, and applies; surviving peers elect a new
+            // leader. Bounded so a wedged core can't hold the
+            // release drain (the thing this ordering protects)
+            // hostage.
+            match tokio::time::timeout(SHUTDOWN_GRACE, integration.raft.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "raft core shutdown failed"),
+                Err(_) => tracing::warn!(
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "raft core shutdown timed out; proceeding with teardown"
+                ),
+            }
         }
         #[cfg(feature = "raft")]
         if let Some((task, cancel)) = self.raft_release_task {
@@ -843,12 +931,35 @@ async fn release_one(
     ledger_id: &str,
     cid: &fluree_db_core::ContentId,
 ) {
-    if let Err(err) = fluree.content_store(ledger_id).release(cid).await {
-        tracing::warn!(
-            %ledger_id,
-            %cid,
-            error = %err,
-            "failed to release envelope from content store"
-        );
+    // `ContentStore::release` is idempotent, so retrying a transient
+    // backend failure is safe; without the retries a single blip
+    // leaks the blob permanently (nothing re-proposes a release).
+    const RELEASE_ATTEMPTS: u32 = 3;
+    const RELEASE_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let store = fluree.content_store(ledger_id);
+    for attempt in 1..=RELEASE_ATTEMPTS {
+        match store.release(cid).await {
+            Ok(()) => return,
+            Err(err) if attempt < RELEASE_ATTEMPTS => {
+                tracing::debug!(
+                    %ledger_id,
+                    %cid,
+                    attempt,
+                    error = %err,
+                    "release failed; retrying"
+                );
+                tokio::time::sleep(RELEASE_BASE_BACKOFF * 2u32.pow(attempt - 1)).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %ledger_id,
+                    %cid,
+                    attempts = RELEASE_ATTEMPTS,
+                    error = %err,
+                    "failed to release envelope from content store; blob will leak"
+                );
+            }
+        }
     }
 }
