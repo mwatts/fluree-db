@@ -1909,7 +1909,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: "urn:other:graph".into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -1986,7 +1986,7 @@ mod tests {
 
     #[test]
     fn ledger_wide_override_none_blocks_per_graph_reasoning() {
-        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2-rl]` | → **rdfs**
+        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2rl]` | → **rdfs**
         let config = LedgerConfig {
             reasoning: Some(ReasoningDefaults {
                 modes: Some(vec!["rdfs".into()]),
@@ -1996,7 +1996,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::DEFAULT_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2063,7 +2063,7 @@ mod tests {
                     ..Default::default()
                 }),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 shacl: None,
@@ -2080,7 +2080,7 @@ mod tests {
         assert_eq!(p.default_allow, Some(false));
         // Reasoning: per-graph wins (AllowAll)
         let r = resolved.reasoning.unwrap();
-        assert_eq!(r.modes.as_deref(), Some(&["owl2-rl".into()][..]));
+        assert_eq!(r.modes.as_deref(), Some(&["owl2rl".into()][..]));
     }
 
     #[test]
@@ -2089,7 +2089,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::DEFAULT_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-ql".into()]),
+                    modes: Some(vec!["owl2ql".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2105,7 +2105,7 @@ mod tests {
         assert!(resolved.reasoning.is_some());
         assert_eq!(
             resolved.reasoning.unwrap().modes.as_deref(),
-            Some(&["owl2-ql".into()][..])
+            Some(&["owl2ql".into()][..])
         );
     }
 
@@ -2115,7 +2115,7 @@ mod tests {
             graph_overrides: vec![GraphConfig {
                 target_graph: config_iris::TXN_META_GRAPH.into(),
                 reasoning: Some(ReasoningDefaults {
-                    modes: Some(vec!["owl2-rl".into()]),
+                    modes: Some(vec!["owl2rl".into()]),
                     ..Default::default()
                 }),
                 policy: None,
@@ -2280,14 +2280,14 @@ mod tests {
     fn config_reasoning_with_allow_all_gives_default_unless() {
         let resolved = ResolvedConfig {
             reasoning: Some(ReasoningDefaults {
-                modes: Some(vec!["owl2-rl".into()]),
+                modes: Some(vec!["owl2rl".into()]),
                 override_control: OverrideControl::AllowAll,
                 ..Default::default()
             }),
             ..Default::default()
         };
         let (modes, prec) = merge_reasoning(&resolved, None).unwrap();
-        assert_eq!(modes, vec!["owl2-rl".to_string()]);
+        assert_eq!(modes, vec!["owl2rl".to_string()]);
         assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
     }
 

@@ -379,6 +379,121 @@ async fn custom_class_policy_skipped_when_data_ledger_omits_class() {
     );
 }
 
+/// A configured cross-ledger `f:policySource` whose `f:policyClass`
+/// selects **zero** model-ledger rules must NOT collapse to a root
+/// (unrestricted) context. With `defaultAllow=false` the empty
+/// restriction set has to deny — a configured policy source that
+/// happens to match no rules is still "policy is in effect," not
+/// "no policy." Regression for the fail-open where an empty
+/// cross-ledger restriction set on an anonymous request made
+/// `is_root=true` and dropped enforcement entirely.
+#[tokio::test]
+async fn empty_cross_ledger_restrictions_fail_closed_under_default_deny() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-filter/empty-deny/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/empty-policies";
+
+    // M holds a custom-typed (ex:OrgPolicy) rule — nothing typed
+    // f:AccessPolicy lives here.
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:orgDenyUsers
+                    rdf:type    ex:OrgPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M custom-typed policy");
+
+    let data_id = "test/cross-ledger-filter/empty-deny/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:User",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .unwrap();
+    let data = r1.ledger;
+
+    // D config: defaultAllow=false; NO f:policyClass at all. For an
+    // anonymous request the resolver applies its default {f:AccessPolicy}
+    // filter, which matches NONE of M's rules (typed ex:OrgPolicy), so
+    // the restriction set is empty — but `effective_opts.policy_class`
+    // stays None, so nothing marks the request as policy-bearing except
+    // the configured cross-ledger source itself. The built context must
+    // still enforce (fall back to defaultAllow=false) rather than
+    // treating the empty set as root.
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config with cross-ledger source, no policyClass");
+
+    let wrapped = fluree
+        .db_with_policy(data_id, &GovernanceOptions::default())
+        .await
+        .expect("db_with_policy");
+
+    let users = fluree
+        .query(
+            &wrapped,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": "?u",
+                "where": {"@id": "?u", "@type": "ex:User"}
+            }),
+        )
+        .await
+        .expect("query ex:User");
+    let users_jsonld = users.to_jsonld(&wrapped.snapshot).expect("jsonld");
+    // alice MUST be hidden: the cross-ledger source is configured, the
+    // class filter selected no rules, and defaultAllow=false denies.
+    // If the empty restriction set collapsed to root, alice would leak.
+    assert_eq!(
+        users_jsonld,
+        json!([]),
+        "configured cross-ledger source with an empty restriction set must \
+         fail closed under defaultAllow=false, got {users_jsonld}"
+    );
+}
+
 /// Baseline: direct `f:AccessPolicy` typing is the canonical policy
 /// class, and a configuration that names it enforces the rule. This
 /// is the same shape as the data-ledger-deny test at the top of the

@@ -96,7 +96,7 @@ pub struct ShaclDefaults {
 /// Reasoning defaults from the config graph (`f:reasoningDefaults`).
 #[derive(Debug, Clone, Default)]
 pub struct ReasoningDefaults {
-    /// `f:reasoningModes` — e.g., `["rdfs"]`, `["owl2-rl"]`.
+    /// `f:reasoningModes` — e.g., `["rdfs"]`, `["owl2rl"]`.
     pub modes: Option<Vec<String>>,
     /// `f:schemaSource` — reference to graph containing schema hierarchy.
     pub schema_source: Option<GraphSourceRef>,

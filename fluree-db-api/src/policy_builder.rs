@@ -182,6 +182,13 @@ async fn build_policy_context_from_opts_inner(
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
 ) -> Result<PolicyContext> {
+    // A cross-ledger `f:policySource` is only ever passed here when configured,
+    // so its presence — even with an empty restriction set — means policy
+    // governs this request. It must count as an explicit policy input so a
+    // policy class that selects zero model-ledger rules cannot collapse to a
+    // root (unrestricted) context; `default_allow` governs instead.
+    let has_cross_ledger_source = cross_ledger_restrictions.is_some();
+
     struct PolicyStatsLookup<'a> {
         overlay: &'a dyn fluree_db_core::OverlayProvider,
     }
@@ -344,7 +351,8 @@ async fn build_policy_context_from_opts_inner(
     // be false so that `default_allow` (not a blanket bypass) governs access.
     let has_explicit_policy_input = opts.identity.is_some()
         || opts.policy_class.as_ref().is_some_and(|v| !v.is_empty())
-        || opts.policy.is_some();
+        || opts.policy.is_some()
+        || has_cross_ledger_source;
     let is_root = !has_explicit_policy_input
         && view_set.restrictions.is_empty()
         && modify_set.restrictions.is_empty();
@@ -453,6 +461,27 @@ async fn resolve_identity_binding_sid(
         Err(_) => return Ok(None),
     };
 
+    if subject_exists_in_graphs(snapshot, overlay, to_t, &identity_sid, graphs).await? {
+        Ok(Some(identity_sid))
+    } else {
+        Ok(None)
+    }
+}
+
+/// True if `subject` appears as the subject of at least one flake in any of
+/// `graphs`. A `SPOT` range capped at one flake — the cheapest existence probe.
+///
+/// Shared by identity binding under cross-ledger policy
+/// ([`resolve_identity_binding_sid`]) and same-ledger identity-mode's
+/// found-no-policies check ([`load_policies_by_identity`]) so the two agree on
+/// what "the identity exists" means (same index, same graph set).
+async fn subject_exists_in_graphs(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    to_t: i64,
+    subject: &Sid,
+    graphs: &[fluree_db_core::GraphId],
+) -> Result<bool> {
     let range_opts = RangeOptions::default().with_flake_limit(1);
     for &g_id in graphs {
         let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
@@ -460,16 +489,16 @@ async fn resolve_identity_binding_sid(
             .range_with_opts(
                 IndexType::Spot,
                 RangeTest::Eq,
-                RangeMatch::subject(identity_sid.clone()),
+                RangeMatch::subject(subject.clone()),
                 range_opts.clone(),
             )
             .await
             .map_err(|e| ApiError::internal(format!("identity existence check failed: {e}")))?;
         if !exists.is_empty() {
-            return Ok(Some(identity_sid));
+            return Ok(true);
         }
     }
-    Ok(None)
+    Ok(false)
 }
 
 /// Look up the policies for `identity_iri` via its `f:policyClass` property.
@@ -539,21 +568,8 @@ async fn load_policies_by_identity(
         // in any of the configured policy graphs. Both the policyClass lookup and this
         // existence check must cover the same set of graphs so that named-graph
         // policy configurations work consistently.
-        let range_opts = RangeOptions::default().with_flake_limit(1);
-        for &g_id in policy_graphs {
-            let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
-            let exists = db
-                .range_with_opts(
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::subject(identity_sid.clone()),
-                    range_opts.clone(),
-                )
-                .await
-                .map_err(|e| ApiError::internal(format!("identity existence check failed: {e}")))?;
-            if !exists.is_empty() {
-                return Ok(IdentityLookupResult::FoundNoPolicies { identity_sid });
-            }
+        if subject_exists_in_graphs(snapshot, overlay, to_t, &identity_sid, policy_graphs).await? {
+            return Ok(IdentityLookupResult::FoundNoPolicies { identity_sid });
         }
         return Ok(IdentityLookupResult::NotFound);
     }
