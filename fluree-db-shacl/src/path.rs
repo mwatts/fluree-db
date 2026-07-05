@@ -195,6 +195,14 @@ pub fn resolve_sh_path<'a>(
 /// blank node) into a [`PropertyPath`].
 fn resolve_path_node<'a>(db: GraphDbRef<'a>, node: &'a Sid) -> PathFuture<'a, PropertyPath> {
     Box::pin(async move {
+        // An IRI-valued sh:path is always a plain predicate (SHACL spec); only
+        // blank nodes carry path-expression structure. Short-circuit the common
+        // case to avoid six empty operator probes per property shape — resolve
+        // runs per shape per compile, and compiles happen per transaction.
+        if node.namespace_code != BLANK_NODE {
+            return Ok(PropertyPath::Predicate(node.clone()));
+        }
+
         // sh:inversePath — inverse of any path, rewritten into the AST
         // (inverse of a sequence = reversed sequence of inverses, etc.).
         if let Some(inner) = operand_path(db, node, &shacl(predicates::INVERSE_PATH)).await? {
@@ -474,8 +482,8 @@ async fn closure(db: GraphDbRef<'_>, focus: &Sid, inner: &PropertyPath) -> Resul
 
 /// Deduplicate value nodes (SHACL value nodes are a set).
 fn dedup(mut values: Vec<PathValue>) -> Vec<PathValue> {
-    let mut seen: HashSet<String> = HashSet::new();
-    values.retain(|(v, dt, lang)| seen.insert(format!("{v:?}|{dt:?}|{lang:?}")));
+    let mut seen: HashSet<(FlakeValue, Sid, Option<String>)> = HashSet::new();
+    values.retain(|(v, dt, lang)| seen.insert((v.clone(), dt.clone(), lang.clone())));
     values
 }
 

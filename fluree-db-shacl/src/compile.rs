@@ -281,28 +281,6 @@ impl ShapeCompiler {
                 }
             }
 
-            // Collect subjects typed as a class — a shape that is also a class
-            // implicitly targets its own instances (SHACL "implicit class
-            // targets"). Bound-object scans, so cost scales with the number of
-            // declared classes, not the data.
-            let rdf_type = Sid::new(RDF, rdf_names::TYPE);
-            for class_class in [
-                Sid::new(fluree_vocab::namespaces::RDFS, "Class"),
-                Sid::new(fluree_vocab::namespaces::OWL, "Class"),
-            ] {
-                let flakes = db
-                    .range(
-                        IndexType::Opst,
-                        RangeTest::Eq,
-                        RangeMatch::predicate_object(
-                            rdf_type.clone(),
-                            FlakeValue::Ref(class_class),
-                        ),
-                    )
-                    .await?;
-                class_typed.extend(flakes.iter().map(|f| f.s.clone()));
-            }
-
             // Expand rdf:first/rdf:rest lists referenced by sh:in / sh:and /
             // sh:or / sh:xone / sh:ignoredProperties. Run after each graph so
             // that lists whose head lives in this graph can resolve — a list
@@ -314,6 +292,33 @@ impl ShapeCompiler {
             // graph so a path whose blank-node structure lives in this graph can
             // resolve; a plain-predicate path resolves trivially on any graph.
             compiler.resolve_paths(*db).await?;
+        }
+
+        // Implicit class targets: a subject targets its own instances only when
+        // it is *both* a declared shape and typed as a class. When no shapes were
+        // found there is nothing to match, so skip the class-discovery scans
+        // entirely. Runs after all graphs are processed so a class declaration in
+        // one graph resolves against a shape defined in another.
+        if !compiler.shapes.is_empty() {
+            let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+            for db in dbs {
+                for class_class in [
+                    Sid::new(fluree_vocab::namespaces::RDFS, "Class"),
+                    Sid::new(fluree_vocab::namespaces::OWL, "Class"),
+                ] {
+                    let flakes = db
+                        .range(
+                            IndexType::Opst,
+                            RangeTest::Eq,
+                            RangeMatch::predicate_object(
+                                rdf_type.clone(),
+                                FlakeValue::Ref(class_class),
+                            ),
+                        )
+                        .await?;
+                    class_typed.extend(flakes.iter().map(|f| f.s.clone()));
+                }
+            }
         }
 
         compiler.apply_implicit_class_targets(&class_typed);
