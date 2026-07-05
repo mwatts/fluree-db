@@ -307,30 +307,17 @@ pub(crate) struct StagedShaclContext<'a> {
 /// type would preserve the variant.
 #[cfg(feature = "shacl")]
 async fn resolve_cross_ledger_shapes_for_tx(
-    ledger: &LedgerState,
+    config: Option<&LedgerConfig>,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<
     Option<std::sync::Arc<crate::cross_ledger::ResolvedGraph>>,
     fluree_db_transact::TransactError,
 > {
-    // Load the same config the same-ledger SHACL path loads (from
-    // pre-tx state). resolve_ledger_config returns None on a fresh
-    // ledger with no #config — in that case there's no cross-ledger
-    // to dispatch.
-    let config = match crate::config_resolver::resolve_ledger_config(
-        &ledger.snapshot,
-        ledger.novelty.as_ref(),
-        ledger.t(),
-    )
-    .await
-    {
-        Ok(Some(c)) => c,
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            return Err(fluree_db_transact::TransactError::Parse(format!(
-                "failed to load ledger config while resolving cross-ledger f:shapesSource: {e}"
-            )));
-        }
+    // Config is resolved once by the caller against pre-tx state and shared
+    // with the same-ledger SHACL policy pass. `None` means no #config on a
+    // fresh ledger — nothing cross-ledger to dispatch.
+    let Some(config) = config else {
+        return Ok(None);
     };
     let shapes_source = config.shacl.as_ref().and_then(|s| s.shapes_source.as_ref());
     let Some(source) = shapes_source else {
@@ -437,11 +424,17 @@ fn resolve_shapes_source_g_ids(
 pub(crate) async fn apply_shacl_policy_to_staged_view(
     view: &StagedLedger,
     ctx: StagedShaclContext<'_>,
+    preresolved_config: Option<Arc<LedgerConfig>>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let base = view.base();
 
-    // 1. Load config from pre-transaction state.
-    let config = load_transaction_config(base).await;
+    // 1. Config from pre-transaction state. The caller may pass a config it
+    //    already resolved against the same pre-tx state (shared with the
+    //    cross-ledger shapes pass); otherwise load it here.
+    let config = match preresolved_config {
+        Some(c) => Some(c),
+        None => load_transaction_config(base).await,
+    };
 
     // 2. Build per-graph policy from the config (if any). Each graph has its
     //    own enabled/mode. Graphs absent from the policy map are disabled.
@@ -680,6 +673,13 @@ async fn stage_with_config_shacl(
     let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 
+    // Resolve the ledger #config ONCE against pre-tx state and share it across
+    // both SHACL passes below (cross-ledger shapes dispatch + the per-graph
+    // policy in apply_shacl_policy_to_staged_view). Both read the same pre-tx
+    // LedgerState, so a single resolution is equivalent and avoids a second
+    // config-graph scan per transaction.
+    let tx_config = load_transaction_config(&ledger).await;
+
     // Detect cross-ledger SHACL config at the API boundary BEFORE
     // staging starts: read D's resolved config and, if
     // f:shapesSource carries f:ledger, resolve the wire artifact
@@ -687,7 +687,8 @@ async fn stage_with_config_shacl(
     // governance cache. The wire is then threaded through
     // staging as an internal governance input and compiled
     // against the staged namespace registry at validation time.
-    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, resolve_ctx).await?;
+    let cross_ledger_shapes =
+        resolve_cross_ledger_shapes_for_tx(tx_config.as_deref(), resolve_ctx).await?;
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -786,6 +787,7 @@ async fn stage_with_config_shacl(
             inline_shape_bundle,
             cross_ledger_membership,
         },
+        tx_config,
     )
     .await?;
 
@@ -2382,6 +2384,8 @@ impl crate::Fluree {
                 inline_shape_bundle: None,
                 cross_ledger_membership: None,
             },
+            // Turtle insert path resolves config internally.
+            None,
         )
         .await
         .map_err(ApiError::from)?;
