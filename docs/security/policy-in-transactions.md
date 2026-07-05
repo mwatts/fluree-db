@@ -83,6 +83,18 @@ Crucially, the policy is checked against the **flakes**, not the operation type.
 
 Enforcement is also independent of the **wire format**: the check runs on the staged flakes, so JSON-LD, SPARQL UPDATE, and Turtle / TriG / N-Triples writes are all governed by the same `f:modify` policy. Sending data as Turtle is not a way to bypass write policy.
 
+## Config-driven write enforcement
+
+The ledger's `#config` graph governs writes the same way it governs reads:
+
+- **Policy defaults apply without request inputs.** When `f:policyDefaults` declares `f:policyClass` (and optionally `f:defaultAllow`), transactions build a policy context from those defaults even when the request carries no `fluree-identity` / `fluree-policy-class` headers or inline `opts.policy`. A ledger configured with a modify-deny rule rejects violating writes from anonymous requests, matching read-side behavior.
+- **`f:policySource` redirects the rule lookup.** Policy rules relocated into a named graph (or a cross-ledger model ledger via `f:ledger`) are loaded from the configured source at transaction time — never silently from the default graph. Unknown graph selectors fail closed.
+- **Cross-ledger sources always engage.** A cross-ledger `f:policySource` builds a policy context unconditionally (mirroring the read path): the model ledger's `f:modify` rules apply to every transaction against the data ledger. See [Cross-ledger policy](cross-ledger-policy.md).
+- **Identities are bind-only under cross-ledger.** A request identity (header, `opts.identity`, or a verified credential's DID) resolves against the data ledger and populates `?$identity` for the model ledger's `f:query` rules — it never selects rules the way same-ledger identity-mode does. Rule selection is the policy-class chain (request `policy_class` → config `f:policyClass` → `{f:AccessPolicy}` for anonymous requests). An identity-carrying request with no policy class anywhere fails closed; declaring `f:policyClass` in the config makes authenticated writes work with no per-request changes. See [Cross-ledger policy → Identity binding](cross-ledger-policy.md#identity-binding-under-cross-ledger-policy).
+- **Override control gates request-time overrides.** A request that supplies its own policy inputs replaces the config defaults only when the config's `f:overrideControl` permits it — see [Override control](../ledger-config/override-control.md).
+
+This applies uniformly across the server transact routes (local and Raft consensus), push replication, credentialed transactions, and the CLI's local mode with policy flags.
+
 ## Targeting patterns
 
 ### Whitelist a property to a role
@@ -236,6 +248,7 @@ Every committed transaction carries the asserting identity in its commit metadat
 - **Required policies short-circuit.** A failure rejects the transaction immediately without checking remaining flakes.
 - **Batch transactions amortize loading.** Loading the policy set is per-transaction, not per-flake — large batched transactions pay the load cost once.
 - **Cache identity properties.** The identity's `@type`, `f:policyClass`, and any role tags used in `f:query` are loaded once per transaction.
+- **Config resolution is memoized.** Learning whether a ledger declares policy requires reading its `#config` graph, which the write path now does on every transaction. That read is cached per-ledger and invalidated only when a commit actually writes the config graph, so a configured-but-static ledger under sustained writes resolves its config once per config change — not once per write (nor once per stage/commit retry). Unconfigured ledgers short-circuit before any scan. The cache is a fail-safe fast path: it is consulted only at head with a live handle, and any miss or ambiguity resolves fresh, so it can never serve stale (fail-open) policy.
 
 ## Testing policies from the CLI
 

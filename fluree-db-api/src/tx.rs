@@ -2633,20 +2633,34 @@ impl crate::Fluree {
 
         let verified = crate::credential::verify_credential(credential)?;
 
-        // Build policy context with verified identity
+        // Build policy context with verified identity. Config-aware: a
+        // configured `f:policySource` redirects the policy-rule lookup to
+        // the declared graph, and config policy defaults merge in — same
+        // semantics as the consensus transact path. Under a cross-ledger
+        // f:policySource the verified identity is bind-only (?$identity);
+        // rule selection needs a f:policyClass in the ledger config, else
+        // this fails closed.
         let opts = crate::GovernanceOptions {
             identity: Some(verified.did.clone()),
             ..Default::default()
         };
-        let policy_ctx = crate::policy_builder::build_policy_context_from_opts(
+        let policy_ctx = crate::policy_view::build_transact_policy_context(
+            self,
             &ledger.snapshot,
             ledger.novelty.as_ref(),
             Some(ledger.novelty.as_ref()),
             ledger.t(),
             &opts,
-            &[0],
         )
-        .await?;
+        .await?
+        .ok_or_else(|| {
+            // opts.identity is always set above, so a same-ledger build
+            // always yields a context; None would mean the gate logic
+            // changed underneath us.
+            ApiError::internal(
+                "credential transact expected a policy context for a verified identity",
+            )
+        })?;
 
         // Context propagation: inject parent context if subject doesn't have one
         let mut txn_json = verified.subject.clone();

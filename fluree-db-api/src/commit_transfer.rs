@@ -21,7 +21,6 @@
 use crate::dataset::GovernanceOptions;
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::LedgerWriteGuard;
-use crate::policy_builder::build_policy_context_from_opts;
 use crate::tx::{IndexingMode, IndexingStatus};
 use crate::{Fluree, IndexConfig, LedgerHandle};
 use base64::Engine as _;
@@ -421,7 +420,8 @@ impl Fluree {
 
             // 4.2 Policy enforcement: build policy context from opts against current state.
             let policy_ctx =
-                build_policy_ctx_for_push(&base_state, &evolving_novelty, current_t, opts).await?;
+                build_policy_ctx_for_push(self, &base_state, &evolving_novelty, current_t, opts)
+                    .await?;
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
@@ -429,7 +429,7 @@ impl Fluree {
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
-                &policy_ctx,
+                policy_ctx.as_ref(),
                 &routing.graph_sids,
             )
             .await
@@ -885,19 +885,23 @@ fn validate_required_blobs(
 }
 
 async fn build_policy_ctx_for_push(
+    fluree: &Fluree,
     base: &LedgerState,
     evolving: &Novelty,
     current_t: i64,
     opts: &GovernanceOptions,
-) -> Result<PolicyContext> {
-    // Build policy context from opts against current state (db + evolving novelty).
-    build_policy_context_from_opts(
+) -> Result<Option<PolicyContext>> {
+    // Build policy context from opts merged with the ledger's #config policy
+    // defaults, against current state (db + evolving novelty). Config-aware:
+    // honors f:policySource (same-ledger named graphs and cross-ledger model
+    // references) instead of assuming policy rules live in the default graph.
+    crate::policy_view::build_transact_policy_context(
+        fluree,
         &base.snapshot,
         evolving,
         Some(evolving),
         current_t,
         opts,
-        &[0],
     )
     .await
 }
@@ -906,13 +910,13 @@ async fn stage_commit_flakes(
     ledger: LedgerState,
     flakes: &[Flake],
     index_config: &IndexConfig,
-    policy_ctx: &PolicyContext,
+    policy_ctx: Option<&PolicyContext>,
     graph_sids: &HashMap<GraphId, Sid>,
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
         .with_graph_sids(graph_sids);
-    if !policy_ctx.wrapper().is_root() {
+    if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }
     fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options)

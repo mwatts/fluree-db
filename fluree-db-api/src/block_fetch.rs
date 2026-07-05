@@ -381,10 +381,26 @@ pub async fn apply_policy_filter(
 
     let overlay: &dyn OverlayProvider = &NoOverlay;
 
-    let policy_ctx =
-        policy_builder::build_policy_context_from_opts(snapshot, overlay, None, to_t, &opts, &[0])
+    // Config-aware: a configured `f:policySource` redirects the policy-rule
+    // lookup to the declared graph. No `Fluree` handle is available on this
+    // path, so a cross-ledger `f:policySource` fails closed here (the
+    // resolver rejects `f:ledger`) rather than silently falling back to the
+    // default graph.
+    let policy_graphs =
+        crate::policy_view::resolve_policy_graphs_from_config(snapshot, overlay, to_t)
             .await
             .map_err(|e| BlockFetchError::PolicyBuild(e.to_string()))?;
+
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        snapshot,
+        overlay,
+        None,
+        to_t,
+        &opts,
+        &policy_graphs,
+    )
+    .await
+    .map_err(|e| BlockFetchError::PolicyBuild(e.to_string()))?;
 
     if policy_ctx.wrapper().is_root() {
         return Ok((flakes, false));

@@ -113,7 +113,8 @@ impl Committer for LocalCommitter {
         // `CommitOpts` / `TrackingOptions`.
         let mut last_error: Option<ApiError> = None;
         for attempt in 1..=MAX_TXN_RETRIES {
-            let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
+            let policy_ctx =
+                build_policy_context(&self.fluree, &ledger_handle, &governance).await?;
 
             // Cypher lowers to a `Txn` here — under the write lock and re-resolved
             // each retry attempt — rather than pre-lock in the route. A conditional
@@ -362,25 +363,31 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
     }
 }
 
-/// Build a [`PolicyContext`] from the request's policy inputs.
+/// Build a [`PolicyContext`] from the request's policy inputs merged with
+/// the ledger's `#config` policy defaults.
 ///
-/// Returns `Ok(None)` when there are no policy inputs — the transaction
-/// runs under root. The context is built from a snapshot of the ledger
-/// this node is about to stage against, so policy enforcement reflects
-/// the same state the transaction commits onto. Building it here, rather
-/// than having the caller pre-build and pass a context, keeps the policy
-/// context bound to the executing node's state — the shape a replicated
-/// implementation needs.
+/// Returns `Ok(None)` when neither the request nor the ledger config
+/// supplies any policy input — the transaction runs under root. The
+/// context is built from a snapshot of the ledger this node is about to
+/// stage against, so policy enforcement reflects the same state the
+/// transaction commits onto. Building it here, rather than having the
+/// caller pre-build and pass a context, keeps the policy context bound to
+/// the executing node's state — the shape a replicated implementation
+/// needs.
+///
+/// Delegates to `fluree_db_api::build_transact_policy_context`, which
+/// resolves `f:policySource` (same-ledger named graphs AND cross-ledger
+/// model references) and applies config `f:policyClass` / `f:defaultAllow`
+/// defaults — so writes are governed by the same config the read path
+/// enforces via `wrap_policy`.
 pub(crate) async fn build_policy_context(
+    fluree: &Fluree,
     ledger_handle: &LedgerHandle,
     governance: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>, SubmissionError> {
-    if !governance.has_any_policy_inputs() {
-        return Ok(None);
-    }
-
     let snap = ledger_handle.snapshot().await;
-    fluree_db_api::build_policy_context(
+    fluree_db_api::build_transact_policy_context(
+        fluree,
         &snap.snapshot,
         snap.novelty.as_ref(),
         Some(snap.novelty.as_ref()),
@@ -388,7 +395,6 @@ pub(crate) async fn build_policy_context(
         governance,
     )
     .await
-    .map(Some)
     .map_err(execution_failure)
 }
 

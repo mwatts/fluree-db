@@ -616,11 +616,126 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
     );
 }
 
+/// Identity + cross-ledger with a policy class available (from D's
+/// config): rules load from M via the class filter and the identity
+/// binds `?$identity` against D, driving M's f:query rules. The
+/// owner-only view rule hides bob's email from aliceIdentity while
+/// alice's own email stays visible — proving both that the request
+/// no longer fails closed and that the binding is live.
+#[tokio::test]
+async fn identity_with_policy_class_engages_cross_ledger_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-e2e/id-bind-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/id-bind-policies";
+    // Full IRIs inside f:query — it executes against D.
+    let owner_query =
+        r#"{"where": {"@id": "?$identity", "http://example.org/ns/user": {"@id": "?$this"}}}"#;
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:ownerEmailOnly
+                    rdf:type     f:AccessPolicy ;
+                    f:required   true ;
+                    f:onProperty ex:email ;
+                    f:action     f:view ;
+                    f:query      """{owner_query}""" .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M owner-only view rule");
+
+    let data_id = "test/cross-ledger-e2e/id-bind-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice", "ex:email": "alice@flur.ee"},
+                    {"@id": "ex:bob",   "@type": "ex:User", "ex:name": "Bob",   "ex:email": "bob@flur.ee"},
+                    {"@id": "ex:aliceIdentity", "ex:user": {"@id": "ex:alice"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed D users + identity");
+    let data = r1.ledger;
+
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger config with policyClass");
+
+    // Identity-carrying request — previously a hard config error.
+    let opts = GovernanceOptions {
+        identity: Some("http://example.org/ns/aliceIdentity".into()),
+        ..Default::default()
+    };
+    let wrapped = fluree
+        .db_with_policy(data_id, &opts)
+        .await
+        .expect("identity + config policyClass must not fail closed");
+
+    let emails = fluree
+        .query(
+            &wrapped,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": ["?who", "?email"],
+                "where": {"@id": "?who", "ex:email": "?email"}
+            }),
+        )
+        .await
+        .expect("query emails under cross-ledger identity binding");
+    let rendered = emails
+        .to_jsonld(&wrapped.snapshot)
+        .expect("jsonld")
+        .to_string();
+    assert!(
+        rendered.contains("alice@flur.ee"),
+        "aliceIdentity must see its own user's email via ?$identity binding, got {rendered}"
+    );
+    assert!(
+        !rendered.contains("bob@flur.ee"),
+        "aliceIdentity must NOT see bob's email — M's owner-only rule must filter it, got {rendered}"
+    );
+}
+
 /// Combining `opts.identity` with cross-ledger `f:policySource` is
-/// a fail-closed config error in Phase 1a: the model ledger
-/// contributes policy rules, the data ledger contributes identity
-/// binding, and mixing them via identity-mode would attribute
-/// policies ambiguously across ledger boundaries.
+/// a fail-closed config error when no policy class is available
+/// anywhere (request or config): the identity is bind-only and can't
+/// select rules, so the operator must name which classes govern.
 #[tokio::test]
 async fn cross_ledger_plus_identity_mode_fails_closed() {
     let fluree = FlureeBuilder::memory().build_memory();
