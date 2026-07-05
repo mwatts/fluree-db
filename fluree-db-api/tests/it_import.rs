@@ -1461,12 +1461,12 @@ GRAPH <http://example.org/graphs/g1> {
 }
 "#;
     // File 2: the same label in another document's GRAPH block.
-    let trig2 = r#"@prefix ex: <http://example.org/> .
+    let trig2 = r"@prefix ex: <http://example.org/> .
 
 GRAPH <http://example.org/graphs/g2> {
     ex:carol ex:knows _:shared .
 }
-"#;
+";
     std::fs::write(data_dir.path().join("a.trig"), trig1).expect("write trig1");
     std::fs::write(data_dir.path().join("b.trig"), trig2).expect("write trig2");
 
