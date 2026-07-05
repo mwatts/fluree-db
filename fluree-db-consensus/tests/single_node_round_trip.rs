@@ -31,8 +31,10 @@ use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
 use fluree_db_nameservice::{
-    BranchLifecycle, IndexPublisher, LedgerEventBus, LedgerLifecycle, NameServiceError,
-    NameServiceEvent, NameServiceLookup, NsRecordSnapshot, SubscriptionScope,
+    BranchLifecycle, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, IndexPublisher,
+    LedgerEventBus, LedgerLifecycle, NameServiceError, NameServiceEvent, NameServiceLookup,
+    NsRecordSnapshot, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    SubscriptionScope,
 };
 
 struct StubFactory;

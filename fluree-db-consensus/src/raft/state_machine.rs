@@ -1817,6 +1817,12 @@ fn apply_push_status(
         return Response::StatusConflict { actual: None };
     }
 
+    // `state.status` is keyed by the command's `ledger_id` verbatim;
+    // proposers canonicalize it to `name:branch` (see
+    // `RaftNameService::push_status`). Canonicalizing here instead
+    // would make mixed-version nodes replay the same log entry to
+    // different keys.
+    //
     // Absent record reads as `StatusValue::initial`; the apply uses
     // the same fallback so an initial CAS push from
     // `expected = initial` lands on a fresh branch.
@@ -1857,6 +1863,9 @@ fn apply_push_config(state: &mut NameServiceState, args: ConfigUpdate) -> Respon
         return Response::ConfigConflict { actual: None };
     }
 
+    // Keyed by the command's `ledger_id` verbatim — same
+    // canonicalize-at-the-proposer contract as `apply_push_status`.
+    //
     // Absent record reads as `ConfigValue::unborn`; the apply uses
     // the same fallback so an initial CAS push from
     // `expected = unborn` lands on a fresh branch.

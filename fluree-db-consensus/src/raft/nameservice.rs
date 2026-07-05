@@ -62,7 +62,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use fluree_db_core::ledger_id::split_ledger_id;
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
@@ -1776,6 +1776,10 @@ impl GraphSourcePublisher for RaftNameService {
 impl StatusLookup for RaftNameService {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
+        // `state.status` is keyed by the canonical `name:branch`
+        // form (`push_status` canonicalizes before proposing), so a
+        // bare-name read finds what a full-form push wrote.
+        let canonical = format_ledger_id(&name, &branch);
         let state = self.state.read().await;
         let branch_registered = state
             .ledgers
@@ -1787,7 +1791,7 @@ impl StatusLookup for RaftNameService {
         Ok(Some(
             state
                 .status
-                .get(ledger_id)
+                .get(&canonical)
                 .cloned()
                 .unwrap_or_else(StatusValue::initial),
         ))
@@ -1802,8 +1806,14 @@ impl StatusPublisher for RaftNameService {
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
+        // Canonicalize before proposing so `"db"` and `"db:main"`
+        // address the same replicated entry. The state machine keys
+        // on the command's string verbatim — canonicalizing inside
+        // apply would make mixed-version nodes replay the same log
+        // entry to different keys.
+        let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = SmCommand::PushStatus {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: format_ledger_id(&name, &branch),
             expected: expected.cloned(),
             new: new.clone(),
         };
@@ -1821,6 +1831,8 @@ impl StatusPublisher for RaftNameService {
 impl ConfigLookup for RaftNameService {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
         let (name, branch) = split_ledger_id(ledger_id)?;
+        // Same canonical keying as `get_status` above.
+        let canonical = format_ledger_id(&name, &branch);
         let state = self.state.read().await;
         let branch_registered = state
             .ledgers
@@ -1832,7 +1844,7 @@ impl ConfigLookup for RaftNameService {
         Ok(Some(
             state
                 .config
-                .get(ledger_id)
+                .get(&canonical)
                 .cloned()
                 .unwrap_or_else(ConfigValue::unborn),
         ))
@@ -1847,8 +1859,10 @@ impl ConfigPublisher for RaftNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
+        // Same canonicalize-before-propose contract as `push_status`.
+        let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = SmCommand::PushConfig(Box::new(ConfigUpdate {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: format_ledger_id(&name, &branch),
             expected: expected.cloned(),
             new: new.clone(),
         }));
@@ -2903,6 +2917,62 @@ mod tests {
         assert_eq!(record.commit_head_id, Some(cid(5)));
         assert_eq!(record.commit_t, 7);
         assert_eq!(record.index_head_id, None);
+    }
+
+    #[tokio::test]
+    async fn status_and_config_reads_normalize_ledger_id() {
+        // Entries land under the canonical `name:branch` form (what
+        // `push_status` / `push_config` propose after
+        // canonicalizing); reads with either form must find them.
+        // The full push round trip is pinned (currently ignored) in
+        // `tests/single_node_round_trip.rs` — the commands aren't
+        // postcard-serializable yet.
+        let state = fresh_state();
+        apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
+
+        let pushed_status = StatusValue::new(2, Default::default());
+        let resp = apply_cmd(
+            &state,
+            Command::PushStatus {
+                ledger_id: "test/db:main".into(),
+                expected: Some(StatusValue::initial()),
+                new: pushed_status.clone(),
+            },
+            2,
+        )
+        .await;
+        assert_eq!(resp, Response::StatusUpdated);
+
+        let pushed_config = ConfigValue::new(1, None);
+        let resp = apply_cmd(
+            &state,
+            Command::PushConfig(Box::new(ConfigUpdate {
+                ledger_id: "test/db:main".into(),
+                expected: Some(ConfigValue::unborn()),
+                new: pushed_config.clone(),
+            })),
+            3,
+        )
+        .await;
+        assert_eq!(resp, Response::ConfigUpdated);
+
+        let ns = RaftNameService::new(state, stub_raft().await);
+        assert_eq!(
+            ns.get_status("test/db").await.unwrap(),
+            Some(pushed_status.clone())
+        );
+        assert_eq!(
+            ns.get_status("test/db:main").await.unwrap(),
+            Some(pushed_status)
+        );
+        assert_eq!(
+            ns.get_config("test/db").await.unwrap(),
+            Some(pushed_config.clone())
+        );
+        assert_eq!(
+            ns.get_config("test/db:main").await.unwrap(),
+            Some(pushed_config)
+        );
     }
 
     #[tokio::test]
