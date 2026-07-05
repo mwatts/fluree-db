@@ -1262,6 +1262,26 @@ pub enum BranchAction {
         #[arg(long)]
         strategy: Option<String>,
 
+        /// Include the aggregate netted change set the merge would apply
+        /// (git-diff-style rollup, grouped by subject)
+        #[arg(long)]
+        changes: bool,
+
+        /// Cap on change entries returned, counted in flakes and cut at
+        /// subject boundaries (default: 500). Pass 0 for unbounded
+        /// (local mode only). Implies --changes.
+        #[arg(long)]
+        max_changes: Option<usize>,
+
+        /// Show only net change counts, no per-fact payload. Implies --changes.
+        #[arg(long)]
+        stat: bool,
+
+        /// Pagination cursor: only subjects sorting strictly after this full
+        /// IRI (from a previous run's next_cursor). Implies --changes.
+        #[arg(long)]
+        changes_after: Option<String>,
+
         /// Emit the raw JSON preview instead of a human-readable summary
         #[arg(long)]
         json: bool,

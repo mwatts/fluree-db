@@ -378,11 +378,12 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 
 ### `fluree branch diff` (read-only merge preview)
 
-- `GET {api_base_url}/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=`
+- `GET {api_base_url}/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_changes=&max_changes=&changes_after_subject=`
 
 Returns the rich diff between two branches — ahead/behind commit summaries,
-common ancestor, conflict keys, fast-forward eligibility — without mutating
-any nameservice or content-store state. See
+common ancestor, conflict keys, fast-forward eligibility, and (opt-in) the
+aggregate netted change set — without mutating any nameservice or
+content-store state. See
 [Merge Preview Contract](#merge-preview-contract) for the full semantic and
 response-shape spec.
 
@@ -647,6 +648,7 @@ terminal `end` record arrive in order.
 GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
    &max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
    &include_conflict_details={bool}&strategy={strategy}
+   &include_changes={bool}&max_changes={n}&changes_after_subject={iri}
 ```
 
 | Parameter | Type | Required | Server default | Description |
@@ -659,6 +661,9 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
 | `include_conflicts` | bool | No | `true` | When `false`, the conflict computation is skipped |
 | `include_conflict_details` | bool | No | `false` | When `true`, include source/target flake values for the returned conflict keys |
 | `strategy` | string | No | `take-both` | Strategy used for resolution labels in `conflicts.details[].resolution`; one of `take-both`, `abort`, `take-source`, `take-branch` |
+| `include_changes` | bool | No | `false` | When `true`, include the aggregate netted change set as `changes` |
+| `max_changes` | integer | No | `500` | Cap on `changes.entries`, counted in flakes, cut at subject boundaries. `0` = stats-only mode |
+| `changes_after_subject` | string | No | — | Pagination cursor (full subject IRI); requires `include_changes=true` |
 
 Auth follows the same pattern as `GET /branch/*ledger` (read-only): require
 a Bearer when `data_auth.mode == required`; gate on `can_read(ledger)`;
@@ -733,6 +738,28 @@ These rules are not negotiable; the CLI and other clients depend on them:
    example, reject when `target.t - ancestor.t` exceeds some threshold)
    or document that clients should pass `include_conflicts=false` for a
    cheaper preview.
+11. **Aggregate change set.** When `include_changes == true`, populate
+   `changes` with the source side's `ancestor..source_head` flakes **netted
+   per fact** — full fact identity is `(subject, predicate, object,
+   datatype, graph, language tag, list index)`; a fact survives only when
+   its oldest and newest in-range ops agree (net op = newest op), so
+   create-then-delete and delete-then-restore churn never appears. The set
+   is strategy-independent (raw source-vs-ancestor delta, before conflict
+   resolution). `assert_count` / `retract_count` / `subject_count` are
+   exact and unaffected by the cap. `entries` groups changes by subject,
+   subjects ordered by **full IRI** (this ordering is the pagination
+   contract); flakes use the same resolved tuple shape as conflict
+   details. The `max_changes` cap counts flakes but cuts at subject
+   boundaries — never split a subject across pages; a single subject
+   larger than the cap is returned whole. `max_changes=0` is stats-only
+   (exact counts, empty `entries`, `truncated=true` when changes exist).
+   When truncated by the cap, `next_cursor` is the last returned subject
+   IRI; `changes_after_subject` resumes strictly after it. The reference
+   server clamps `max_changes` with hard max `5_000`
+   (`PREVIEW_HARD_MAX_CHANGES`). `changes_after_subject` without
+   `include_changes=true` is a `400`. The source-side commit replay is
+   shared with the conflict walk when both are requested; each pagination
+   page re-pays the replay cost.
 
 ### Response (`200 OK`)
 
@@ -777,6 +804,21 @@ These rules are not negotiable; the CLI and other clients depend on them:
         }
       }
     ]
+  },
+  // present iff include_changes=true
+  "changes": {
+    "assert_count": 2,
+    "retract_count": 1,
+    "subject_count": 1,
+    "entries": [
+      {
+        "subject": "http://example.org/ns/alice",
+        "asserts": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "retracts": [["ex:alice", "ex:status", "archived", "xsd:string", false]]
+      }
+    ],
+    "truncated": false
+    // "next_cursor": "<subject IRI>" — only when truncated by the cap
   }
 }
 ```
