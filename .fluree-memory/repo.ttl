@@ -1492,6 +1492,19 @@ mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
     mem:artifactRef "fluree-db-policy/src/index.rs" ;
     mem:branch "feature/rdfs-enforcement-entailment" ;
     mem:createdAt "2026-07-03T01:47:52.379794+00:00"^^xsd:dateTime .
+mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
+    mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
+    mem:tag "dataset" ;
+    mem:tag "derived-facts" ;
+    mem:tag "history-mode" ;
+    mem:tag "reasoning" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_builder.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:branch "feature/shacl-property-paths" ;
+    mem:createdAt "2026-07-05T13:38:04.147463+00:00"^^xsd:dateTime .
 
 mem:fact-01kwktkb2r0ktxt5xaxvbwev3e a mem:Fact ;
     mem:content "The \"query peer over HTTP\" model exists as server peer proxy mode: ProxyStorage + ProxyNameService wired via FlureeBuilder::memory().build_with(storage, NameServiceMode::ReadOnly); serving side is the StorageProxyBearer route group; GET /nameservice/snapshot filters to the token's fluree.storage.ledgers scope. ProxyStorage is mode-aware (feature/remote-mounts): ProxyReadMode::Raw fetches canonical CID-verified bytes via GET /storage/objects/{cid} (peer default; what makes indexed ledgers readable), ProxyReadMode::Filtered uses POST /storage/block FLKB negotiation. CRITICAL: no production code decodes FLKB — the filtered tier is transport-only until a leaf decoder exists on the read path. Remaining gaps: one upstream per server (no composite nameservice), no HTTP Range on ProxyStorage, no vended-credential/origin handoff." ;

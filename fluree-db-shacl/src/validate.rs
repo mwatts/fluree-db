@@ -395,13 +395,19 @@ impl ShaclEngine {
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
         };
+        // Class-target focus nodes are constant across the shape loop (same
+        // `db`, same hierarchy), so memoize them per class: several shapes
+        // sharing a target class then pay the subclass BFS + instance scans
+        // once instead of once each.
+        let mut class_focus_memo: HashMap<Sid, Vec<Sid>> = HashMap::new();
         for shape in self.cache.all_shapes() {
             if shape.deactivated {
                 continue;
             }
 
             // Get focus nodes for this shape (with hierarchy expansion)
-            let focus_nodes = get_focus_nodes(db, shape, self.hierarchy.as_ref()).await?;
+            let focus_nodes =
+                get_focus_nodes(db, shape, self.hierarchy.as_ref(), &mut class_focus_memo).await?;
 
             for focus_node in focus_nodes {
                 let active = ActiveShapeChecks::default();
@@ -635,12 +641,18 @@ async fn get_focus_nodes(
     db: GraphDbRef<'_>,
     shape: &CompiledShape,
     hierarchy: Option<&SchemaHierarchy>,
+    class_focus_memo: &mut HashMap<Sid, Vec<Sid>>,
 ) -> Result<Vec<Sid>> {
     let mut focus_nodes = Vec::new();
 
     for target in &shape.targets {
         match target {
             TargetType::Class(class) | TargetType::ImplicitClass(class) => {
+                if let Some(cached) = class_focus_memo.get(class) {
+                    focus_nodes.extend(cached.iter().cloned());
+                    continue;
+                }
+
                 // Build list of classes to query: target class + all subclasses.
                 // The indexed hierarchy misses novelty-added subclass relations,
                 // so a live rdfs:subClassOf descendant walk unions them in
@@ -674,6 +686,7 @@ async fn get_focus_nodes(
 
                 // Find all instances of each class
                 let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+                let mut class_focus = Vec::new();
                 for cls in classes_to_query {
                     let flakes = db
                         .range(
@@ -684,9 +697,11 @@ async fn get_focus_nodes(
                         .await?;
 
                     for flake in flakes {
-                        focus_nodes.push(flake.s.clone());
+                        class_focus.push(flake.s.clone());
                     }
                 }
+                focus_nodes.extend(class_focus.iter().cloned());
+                class_focus_memo.insert(class.clone(), class_focus);
             }
             TargetType::Node(nodes) => {
                 focus_nodes.extend(nodes.iter().cloned());

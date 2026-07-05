@@ -233,8 +233,28 @@ fn turtle_term(iri_or_bnode: &str) -> String {
                 .collect();
             format!("_:{clean}")
         }
-        None => format!("<{iri_or_bnode}>"),
+        None => turtle_iri(iri_or_bnode),
     }
+}
+
+/// Render an IRI as a Turtle IRIREF, `\uXXXX`-escaping the characters the Turtle
+/// grammar forbids inside `<…>` (controls, space, and ``<>"{}|^`\``). The parser
+/// unescapes these back to the original codepoint, so the IRI round-trips —
+/// unlike percent-encoding, which would change the IRI's identity.
+fn turtle_iri(iri: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(iri.len() + 2);
+    out.push('<');
+    for c in iri.chars() {
+        match c {
+            '\u{00}'..='\u{20}' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('>');
+    out
 }
 
 /// Render an IRI as `sh:Name` when it lives in the SHACL namespace.
@@ -257,7 +277,7 @@ fn turtle_value_term(value: &JsonValue) -> String {
                     return format!("{}@{lang}", turtle_string(lex));
                 }
                 if let Some(dt) = obj.get("@type").and_then(|v| v.as_str()) {
-                    return format!("{}^^<{dt}>", turtle_string(lex));
+                    return format!("{}^^{}", turtle_string(lex), turtle_iri(dt));
                 }
                 return turtle_string(lex);
             }
@@ -589,7 +609,13 @@ fn value_json(
         let dt_iri = resolve(dt);
         // A String carrying the `@id` datatype is a stringified IRI
         // (STR() semantics in the string facets) — report the IRI node.
-        if dt_iri == "@id" || &*dt.name == "id" {
+        // Match the JSON-LD `@id` datatype by namespace, not the bare local
+        // name, so a real datatype whose local name is `id` (e.g.
+        // `<http://example.org/id>`) is not misreported as an IRI node.
+        let is_id_datatype = dt_iri == "@id"
+            || (dt.namespace_code == fluree_vocab::namespaces::JSON_LD
+                && &*dt.name == fluree_vocab::jsonld_names::ID);
+        if is_id_datatype {
             if let FlakeValue::String(s) = value {
                 return json!({"@id": s});
             }
@@ -696,5 +722,22 @@ mod tests {
     #[test]
     fn turtle_string_escapes_specials() {
         assert_eq!(turtle_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
+
+    #[test]
+    fn turtle_iri_escapes_illegal_chars() {
+        // Well-formed IRIs pass through unchanged.
+        assert_eq!(turtle_iri("http://ex.org/a"), "<http://ex.org/a>");
+        // Grammar-illegal chars become \uXXXX and the result still parses.
+        assert_eq!(
+            turtle_iri("http://ex.org/a b<c>"),
+            "<http://ex.org/a\\u0020b\\u003Cc\\u003E>"
+        );
+        let turtle = format!(
+            "<http://ex.org/s> <http://ex.org/p> {} .\n",
+            turtle_iri("http://ex.org/a b|c")
+        );
+        let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+        fluree_graph_turtle::parse(&turtle, &mut sink).expect("escaped IRI must parse");
     }
 }

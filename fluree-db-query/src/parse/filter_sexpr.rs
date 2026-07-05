@@ -20,8 +20,8 @@
 //!
 //! # Limitations
 //!
-//! - Quoted strings cannot contain whitespace, parentheses, or escape sequences
-//! - For complex string comparisons, use data expression format instead
+//! - Quoted strings may contain whitespace, parentheses, and backslash
+//!   escapes (`\"` and `\\`); any other `\x` sequence is preserved verbatim
 
 use super::ast::UnresolvedExpression;
 use super::error::{ParseError, Result};
@@ -36,12 +36,8 @@ use std::sync::Arc;
 /// - Atoms: `?var`, numbers, `true`/`false`, quoted strings `"text"`
 /// - Expressions: `(op arg1 arg2 ...)`
 /// - Nested: `(and (> ?x 10) (< ?y 100))`
-///
-/// # Limitations
-/// - Quoted strings cannot contain whitespace, parentheses, or escape sequences
-///   (e.g., `"Smith Jr"` with a space will not parse correctly)
-/// - For complex string comparisons, use the data expression format instead:
-///   `["filter", ["=", "?name", "Smith Jr"]]`
+/// - Quoted strings may contain whitespace, parentheses, and backslash
+///   escapes (`\"`, `\\`)
 pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
     let s = s.trim();
 
@@ -108,6 +104,51 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
     }
 }
 
+/// Byte index just past the closing quote of the string literal at the start
+/// of `s` (which must begin with `"`), honoring `\"` / `\\` escapes.
+/// Returns `None` if the literal is unterminated.
+fn quoted_string_end(s: &str) -> Option<usize> {
+    debug_assert!(s.starts_with('"'));
+    let mut escaped = false;
+    for (i, c) in s.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve backslash escapes in a string literal's contents. Only `\"` and
+/// `\\` are recognized; any other `\x` is preserved verbatim.
+fn unescape_string(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next @ ('"' | '\\')) => out.push(next),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse an atom in an S-expression (variable, number, string, boolean)
 fn parse_s_expression_atom(s: &str) -> Result<UnresolvedExpression> {
     let s = s.trim();
@@ -136,7 +177,7 @@ fn parse_s_expression_atom(s: &str) -> Result<UnresolvedExpression> {
     // String (might be quoted)
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         let unquoted = &s[1..s.len() - 1];
-        return Ok(UnresolvedExpression::string(unquoted));
+        return Ok(UnresolvedExpression::string(unescape_string(unquoted)));
     }
 
     // Plain string
@@ -161,12 +202,11 @@ fn parse_s_expression_args(s: &str) -> Result<Vec<UnresolvedExpression>> {
             args.push(parse_s_expression_list(expr_str)?);
             remaining = remaining[end + 1..].trim();
         } else if remaining.starts_with('"') {
-            // Handle quoted string as a single token (may contain whitespace/parens)
-            let after_open = &remaining[1..];
-            if let Some(close_pos) = after_open.find('"') {
-                let end = close_pos + 2; // include both quotes
-                let atom = &remaining[..end];
-                args.push(parse_s_expression_atom(atom)?);
+            // Handle quoted string as a single token (may contain
+            // whitespace/parens and `\"` / `\\` escapes)
+            if let Some(end) = quoted_string_end(remaining) {
+                let inner = &remaining[1..end - 1];
+                args.push(UnresolvedExpression::string(unescape_string(inner)));
                 remaining = remaining[end..].trim();
             } else {
                 return Err(ParseError::InvalidFilter(
@@ -178,10 +218,15 @@ fn parse_s_expression_args(s: &str) -> Result<Vec<UnresolvedExpression>> {
             let end = remaining
                 .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
                 .unwrap_or(remaining.len());
-            if end > 0 {
-                let atom = &remaining[..end];
-                args.push(parse_s_expression_atom(atom)?);
+            if end == 0 {
+                // A stray ')' consumes nothing; erroring (rather than
+                // continuing) is what guarantees this loop terminates.
+                return Err(ParseError::InvalidFilter(format!(
+                    "unexpected ')' in expression arguments: {remaining}"
+                )));
             }
+            let atom = &remaining[..end];
+            args.push(parse_s_expression_atom(atom)?);
             remaining = remaining[end..].trim();
         }
     }
@@ -233,9 +278,24 @@ fn parse_s_expression_arg(s: &str) -> Result<(UnresolvedExpression, &str)> {
         let expr = parse_s_expression_list(expr_str)?;
         return Ok((expr, &s[end + 1..]));
     }
+    if s.starts_with('"') {
+        let end = quoted_string_end(s)
+            .ok_or_else(|| ParseError::InvalidFilter("unclosed string literal".to_string()))?;
+        let inner = &s[1..end - 1];
+        return Ok((
+            UnresolvedExpression::string(unescape_string(inner)),
+            &s[end..],
+        ));
+    }
     let end = s
         .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '[' || c == ']')
         .unwrap_or(s.len());
+    if end == 0 {
+        return Err(ParseError::InvalidFilter(format!(
+            "unexpected '{}' in expression argument",
+            &s[..s.chars().next().map_or(0, char::len_utf8)]
+        )));
+    }
     let atom = &s[..end];
     let expr = parse_s_expression_atom(atom)?;
     Ok((expr, &s[end..]))
@@ -477,6 +537,62 @@ mod tests {
             }
             _ => panic!("Expected Call"),
         }
+    }
+
+    #[test]
+    fn test_stray_close_paren_errors_instead_of_looping() {
+        // Regression: a stray ')' in the argument list used to make
+        // parse_s_expression_args consume nothing and spin forever,
+        // permanently pinning a tokio worker at 100% CPU.
+        let result = parse_s_expression("(f ?x ))");
+        assert!(result.is_err(), "stray ')' must be a parse error");
+    }
+
+    #[test]
+    fn test_quoted_string_with_escapes_and_parens() {
+        // Escaped quotes inside a string literal must not terminate the
+        // token; parens inside the string are literal content.
+        let expr = parse_s_expression(r#"(fulltext ?content "prunes rows (see \"push.\") tail")"#)
+            .unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "fulltext");
+                assert_eq!(args.len(), 2);
+                match &args[1] {
+                    UnresolvedExpression::Const(_) => {}
+                    other => panic!("expected string constant, got {other:?}"),
+                }
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_fulltext_bind_roundtrip_with_hostile_content() {
+        // The exact shape that wedged the memory MCP server: user content
+        // containing a quote-then-paren, interpolated into a fulltext bind.
+        let content = r#"emit_list_item stores index metadata ("not rdf-list bnodes") and prunes operator-kept rows (scalar-Eq push.")"#;
+        let bind_expr = format!(
+            "(fulltext ?content \"{}\")",
+            content.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let expr = parse_s_expression(&bind_expr).expect("must parse, not hang");
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "fulltext");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_unescape_string_helper() {
+        assert_eq!(unescape_string(r#"a\"b"#), r#"a"b"#);
+        assert_eq!(unescape_string(r"a\\b"), r"a\b");
+        // Unrecognized escapes are preserved verbatim
+        assert_eq!(unescape_string(r"a\nb"), r"a\nb");
+        assert_eq!(unescape_string("plain"), "plain");
     }
 
     #[test]

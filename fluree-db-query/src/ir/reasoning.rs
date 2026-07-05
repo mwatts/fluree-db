@@ -311,7 +311,11 @@ impl ReasoningModes {
         Ok((max_facts, max_seconds))
     }
 
-    /// Parse a single mode string
+    /// Parse a single mode string.
+    ///
+    /// One canonical string per mode (case-insensitive); no synonyms. Reasoning
+    /// is a new feature with no backward-compat surface, so the accepted set is
+    /// kept deliberately small.
     fn parse_single(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "none" => Ok(Self::none()),
@@ -319,7 +323,7 @@ impl ReasoningModes {
                 rdfs: true,
                 ..Default::default()
             }),
-            "owl2ql" | "owl-ql" | "owlql" | "owl2-ql" => Ok(Self {
+            "owl2ql" => Ok(Self {
                 rdfs: true, // OWL2-QL implies RDFS for subclass expansion
                 owl2ql: true,
                 ..Default::default()
@@ -328,11 +332,11 @@ impl ReasoningModes {
                 datalog: true,
                 ..Default::default()
             }),
-            "owl2rl" | "owl-rl" | "owlrl" | "owl2-rl" => Ok(Self {
+            "owl2rl" => Ok(Self {
                 owl2rl: true,
                 ..Default::default()
             }),
-            "owl-datalog" | "owldatalog" | "owl_datalog" => Ok(Self {
+            "owl-datalog" => Ok(Self {
                 owl_datalog: true,
                 // owl-datalog is a superset of owl2rl - enable both
                 owl2rl: true,
@@ -358,6 +362,23 @@ impl ReasoningModes {
         self.max_facts = self.max_facts.or(other.max_facts);
         self.max_seconds = self.max_seconds.or(other.max_seconds);
         self
+    }
+
+    /// Strictly validate config-declared reasoning mode strings.
+    ///
+    /// Mirrors [`Self::from_mode_strings`]'s per-item handling (strip the
+    /// `fluree:` namespace prefix, then parse) but returns the first
+    /// unrecognized mode as an error instead of warning and skipping. Used at
+    /// transaction time to reject a bad `f:reasoningModes` before it commits,
+    /// so a config typo fails loudly rather than silently disabling reasoning
+    /// at query time. The `Err` string names the offending mode and the
+    /// accepted set.
+    pub fn validate_mode_names(names: &[String]) -> Result<(), String> {
+        for name in names {
+            let short = name.strip_prefix(fluree_vocab::fluree::DB).unwrap_or(name);
+            Self::parse_single(short)?;
+        }
+        Ok(())
     }
 
     /// Build from a list of mode name strings (e.g., from config graph).
@@ -602,8 +623,8 @@ mod tests {
 
     #[test]
     fn test_reasoning_modes_from_json_string_owl2ql() {
-        // Test various spellings
-        for spelling in &["owl2ql", "owl-ql", "owlql", "OWL2QL", "Owl-Ql"] {
+        // Canonical spelling, case-insensitive.
+        for spelling in &["owl2ql", "OWL2QL", "Owl2Ql"] {
             let value = serde_json::json!(spelling);
             let modes = ReasoningModes::from_json(&value).unwrap();
             assert!(modes.owl2ql, "Failed for spelling: {spelling}");
@@ -613,10 +634,30 @@ mod tests {
 
     #[test]
     fn test_reasoning_modes_from_json_string_owl2rl() {
-        for spelling in &["owl2rl", "owl-rl", "owlrl"] {
+        for spelling in &["owl2rl", "OWL2RL"] {
             let value = serde_json::json!(spelling);
             let modes = ReasoningModes::from_json(&value).unwrap();
             assert!(modes.owl2rl, "Failed for spelling: {spelling}");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_modes_reject_noncanonical_spellings() {
+        // One canonical string per mode — former synonyms are now errors.
+        for bad in &[
+            "owl-ql",
+            "owlql",
+            "owl2-ql",
+            "owl-rl",
+            "owlrl",
+            "owl2-rl",
+            "owldatalog",
+        ] {
+            let value = serde_json::json!(bad);
+            assert!(
+                ReasoningModes::from_json(&value).is_err(),
+                "non-canonical spelling {bad} must be rejected"
+            );
         }
     }
 
