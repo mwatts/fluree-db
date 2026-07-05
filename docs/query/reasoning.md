@@ -46,16 +46,16 @@ this query (with no defaults configured, it is a no-op affirmation).
 
 ### Valid mode strings
 
-| String | Aliases | Mode |
-|--------|---------|------|
-| `"rdfs"` | — | RDFS subclass/subproperty expansion |
-| `"owl2ql"` | `"owl-ql"`, `"owlql"`, `"owl2-ql"` | OWL 2 QL query rewriting (includes RDFS) |
-| `"owl2rl"` | `"owl-rl"`, `"owlrl"`, `"owl2-rl"` | OWL 2 RL forward-chaining materialization |
-| `"owl-datalog"` | `"owldatalog"`, `"owl_datalog"` | OWL 2 RL plus datalog rule execution (superset of `owl2rl`) |
-| `"datalog"` | — | Datalog rule execution |
-| `"none"` | — | Disable all reasoning |
+Each mode has exactly one accepted string (case-insensitive):
 
-Mode strings are case-insensitive.
+| String | Mode |
+|--------|------|
+| `"rdfs"` | RDFS subclass/subproperty expansion |
+| `"owl2ql"` | OWL 2 QL query rewriting (includes RDFS) |
+| `"owl2rl"` | OWL 2 RL forward-chaining materialization |
+| `"owl-datalog"` | OWL 2 RL plus datalog rule execution (superset of `owl2rl`) |
+| `"datalog"` | Datalog rule execution |
+| `"none"` | Disable all reasoning |
 
 ## Default behavior
 

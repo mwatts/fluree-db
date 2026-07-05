@@ -343,7 +343,7 @@ GRAPH <urn:fluree:mydb:main#config> {
         f:reasoningDefaults <urn:cfg:reasoning> .
 
     <urn:cfg:reasoning>
-        f:reasoningModes  ( "rdfs" "owl2-rl" ) ;
+        f:reasoningModes  ( "rdfs" "owl2rl" ) ;
         f:schemaSource    <urn:cfg:schema-ref> .
 
     <urn:cfg:schema-ref> rdf:type f:GraphRef ;
@@ -374,7 +374,7 @@ A few specifics that differ from cross-ledger policy:
 
 - Reasoning must be **enabled** for cross-ledger schema to take
   effect. The data ledger's config can set
-  `f:reasoningModes` (e.g., `["rdfs"]` or `["owl2-rl"]`), or
+  `f:reasoningModes` (e.g., `["rdfs"]` or `["owl2rl"]`), or
   the query can opt in via the `reasoning` option.
 - Failures during cross-ledger schema resolution surface as
   `ApiError::OntologyImport` (with the underlying
