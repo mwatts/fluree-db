@@ -1482,15 +1482,19 @@ impl<'a> CypherLowering<'a> {
     }
 
     fn lower_create_part(&mut self, part: &PatternPart) -> Result<(), LowerCypherError> {
-        require_node_anchored(&part.head)?;
         let head_subj = self.node_subject(&part.head);
         self.lower_node_create(&part.head, head_subj.clone())?;
+        // An isolated fresh node with no labels and no properties (`CREATE ()`
+        // / `CREATE (n)`) still needs a triple to exist as an RDF subject —
+        // mark it with the system node class (hidden from `labels()`).
+        // Relationship endpoints are anchored by the edge and need no marker.
+        if part.tail.is_empty() && self.is_fresh_bare_node(&part.head) {
+            self.push_node_marker(head_subj.clone());
+        }
 
         let mut prev_subj = head_subj;
         let mut prev_node = &part.head;
         for (rel, next) in &part.tail {
-            // Both nodes must be anchored if they appear in CREATE.
-            require_node_anchored(next)?;
             let next_subj = self.node_subject(next);
             self.lower_node_create(next, next_subj.clone())?;
             self.lower_rel_create(prev_node, &prev_subj, rel, next, &next_subj)?;
@@ -1665,6 +1669,27 @@ impl<'a> CypherLowering<'a> {
         Ok(terms)
     }
 
+    /// Whether a CREATE node is freshly minted (not a MATCH-bound reference)
+    /// and carries no labels or inline properties.
+    fn is_fresh_bare_node(&self, n: &NodePattern) -> bool {
+        let bound = n
+            .var
+            .as_ref()
+            .is_some_and(|v| self.bound_vars.contains(&v.name));
+        !bound && n.labels.is_empty() && n.props.is_none()
+    }
+
+    /// Assert the `db:Node` existence marker for a bare created node.
+    fn push_node_marker(&mut self, subj: TemplateTerm) {
+        let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
+        let node_sid = self.ns.sid_for_iri(fluree_vocab::fluree::NODE);
+        self.insert_templates.push(TripleTemplate::new(
+            subj,
+            TemplateTerm::Sid(rdf_type_sid),
+            TemplateTerm::Sid(node_sid),
+        ));
+    }
+
     fn node_subject(&mut self, n: &NodePattern) -> TemplateTerm {
         if let Some(var) = &n.var {
             // A var bound by a preceding MATCH references the existing
@@ -1726,15 +1751,6 @@ fn set_item_target(item: &SetItem) -> &Variable {
         | SetItem::MapReplace { target, .. }
         | SetItem::Labels { target, .. } => target,
     }
-}
-
-fn require_node_anchored(node: &NodePattern) -> Result<(), LowerCypherError> {
-    if node.labels.is_empty() && node.props.is_none() && node.var.is_none() {
-        return Err(LowerCypherError::rejected(
-            "bare `()` node in CREATE — every node needs a variable, a label, or a property",
-        ));
-    }
-    Ok(())
 }
 
 /// A standalone node in a write-statement MATCH must carry a label or a

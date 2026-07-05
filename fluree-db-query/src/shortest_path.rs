@@ -163,10 +163,13 @@ impl ShortestPathOperator {
         let mut out = Vec::new();
 
         if use_spot {
-            // Spot: (subject=node, predicate) → ref objects.
-            let range_match = RangeMatch::new()
-                .with_subject(node.clone())
-                .with_predicate(self.pattern.predicate.clone());
+            // Spot: (subject=node[, predicate]) → ref objects. Wildcard scans
+            // all of the node's out-edges and drops reserved predicates
+            // (`rdf:type`, `f:reifies*`), matching the wildcard property path.
+            let mut range_match = RangeMatch::new().with_subject(node.clone());
+            if let Some(pred) = &self.pattern.predicate {
+                range_match = range_match.with_predicate(pred.clone());
+            }
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
@@ -178,6 +181,11 @@ impl ShortestPathOperator {
             )
             .await?;
             for flake in flakes {
+                if self.pattern.predicate.is_none()
+                    && crate::property_path::is_reserved_edge_predicate(&flake.p)
+                {
+                    continue;
+                }
                 if let FlakeValue::Ref(obj) = flake.o {
                     out.push(obj);
                 }
@@ -185,26 +193,114 @@ impl ShortestPathOperator {
         }
 
         if use_post {
-            // Post: (predicate, object=node) → subjects.
-            let range_match = RangeMatch::new()
-                .with_predicate(self.pattern.predicate.clone())
-                .with_object(FlakeValue::Ref(node.clone()));
+            // Typed: Post (predicate, object=node) → subjects. Wildcard has no
+            // predicate prefix, so it probes Opst (object=node) instead.
+            let (index, range_match) = match &self.pattern.predicate {
+                Some(pred) => (
+                    IndexType::Post,
+                    RangeMatch::new()
+                        .with_predicate(pred.clone())
+                        .with_object(FlakeValue::Ref(node.clone())),
+                ),
+                None => (
+                    IndexType::Opst,
+                    RangeMatch::new().with_object(FlakeValue::Ref(node.clone())),
+                ),
+            };
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
                 overlay,
-                IndexType::Post,
+                index,
                 RangeTest::Eq,
                 range_match,
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
             for flake in flakes {
+                if self.pattern.predicate.is_none()
+                    && crate::property_path::is_reserved_edge_predicate(&flake.p)
+                {
+                    continue;
+                }
                 out.push(flake.s);
             }
         }
 
         Ok(out)
+    }
+
+    /// Post-hoc predicate lookup for one hop of a *wildcard* path: the first
+    /// non-reserved reference edge stored as `a → b`. Runs only on found
+    /// paths (≤ hop-count probes each), not during the search.
+    async fn hop_predicate(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        a: &Sid,
+        b: &Sid,
+    ) -> Result<Option<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let flakes = range_with_overlay(
+            db,
+            ctx.binary_g_id,
+            overlay,
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_subject(a.clone()),
+            RangeOptions::new().with_to_t(to_t),
+        )
+        .await?;
+        for flake in flakes {
+            if crate::property_path::is_reserved_edge_predicate(&flake.p) {
+                continue;
+            }
+            if matches!(&flake.o, FlakeValue::Ref(o) if o == b) {
+                return Ok(Some(flake.p));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Build the per-hop `(start, predicate, end)` edge tuples for a found
+    /// path. Typed patterns stamp the single predicate; wildcard patterns
+    /// resolve each hop's stored edge with [`Self::hop_predicate`] (trying
+    /// both orientations under `Either`; a hop whose predicate can't be
+    /// resolved is skipped defensively).
+    async fn build_edges(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        path: &[Sid],
+    ) -> Result<Vec<(Sid, Sid, Sid)>> {
+        let incoming = matches!(self.pattern.direction, PathDirection::Incoming);
+        if let Some(pred) = &self.pattern.predicate {
+            return Ok(path
+                .windows(2)
+                .map(|w| {
+                    if incoming {
+                        (w[1].clone(), pred.clone(), w[0].clone())
+                    } else {
+                        (w[0].clone(), pred.clone(), w[1].clone())
+                    }
+                })
+                .collect());
+        }
+        let either = matches!(self.pattern.direction, PathDirection::Either);
+        let mut edges = Vec::with_capacity(path.len().saturating_sub(1));
+        for w in path.windows(2) {
+            let (s, o) = if incoming {
+                (&w[1], &w[0])
+            } else {
+                (&w[0], &w[1])
+            };
+            if let Some(p) = self.hop_predicate(ctx, s, o).await? {
+                edges.push((s.clone(), p, o.clone()));
+            } else if either {
+                if let Some(p) = self.hop_predicate(ctx, o, s).await? {
+                    edges.push((o.clone(), p, s.clone()));
+                }
+            }
+        }
+        Ok(edges)
     }
 
     /// Bidirectional BFS for a single shortest path. Returns the node sequence
@@ -588,36 +684,26 @@ impl ShortestPathOperator {
 
         let mut rows = Vec::with_capacity(paths.len());
         for path in paths {
+            // Orient each hop's edge by the traversal direction: outgoing keeps
+            // node[i]→node[i+1]; incoming flips to the stored edge. For an
+            // undirected (`Either`) search the per-hop orientation isn't
+            // recorded, so this falls back to traversal order (best effort;
+            // wildcard hops probe both orientations).
+            //
+            // Only Cypher's `relationships(p)` reads `edges`; skip the per-hop
+            // work entirely on surfaces that don't (JSON-LD/FQL), where
+            // `needs_relationships` is false.
+            let edges: Vec<(Sid, Sid, Sid)> = if self.pattern.needs_relationships {
+                self.build_edges(ctx, &path).await?
+            } else {
+                Vec::new()
+            };
             let mut row: Vec<Binding> = Vec::with_capacity(self.in_schema.len());
             for var in self.in_schema.iter() {
                 if *var == self.pattern.path_var {
-                    // Single-typed path. Orient each hop's edge by the traversal
-                    // direction: outgoing keeps node[i]→node[i+1]; incoming flips
-                    // to the stored edge node[i+1]→node[i]. For an undirected
-                    // (`Either`) search the per-hop orientation isn't recorded, so
-                    // we fall back to traversal order (best effort).
-                    //
-                    // Only Cypher's `relationships(p)` reads `edges`; skip the
-                    // per-hop allocation/clone entirely on surfaces that don't
-                    // (JSON-LD/FQL), where `needs_relationships` is false.
-                    let edges: Vec<(Sid, Sid, Sid)> = if self.pattern.needs_relationships {
-                        let pred = self.pattern.predicate.clone();
-                        let incoming = matches!(self.pattern.direction, PathDirection::Incoming);
-                        path.windows(2)
-                            .map(|w| {
-                                if incoming {
-                                    (w[1].clone(), pred.clone(), w[0].clone())
-                                } else {
-                                    (w[0].clone(), pred.clone(), w[1].clone())
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
                     row.push(Binding::Path {
                         nodes: path.clone(),
-                        edges,
+                        edges: edges.clone(),
                     });
                 } else if let Some(col) = child_batch.column(*var) {
                     row.push(col[row_idx].clone());

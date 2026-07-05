@@ -54,6 +54,190 @@ async fn cypher_match_labeled_node_finds_jsonld_typed_subject() {
 }
 
 #[tokio::test]
+async fn cypher_untyped_single_hop_excludes_labels_and_data_properties() {
+    // `-->` must follow only relationships: not `rdf:type` (the class node is
+    // not a neighbor) and not data properties (literals are not nodes).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-hop-edge-set");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:knows": {"@id": "ex:bob"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let jsonld = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {name: "Alice"})-->(m) RETURN m"#)
+        .await
+        .expect("untyped hop query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    let rows = jsonld.as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the ex:knows edge is a relationship: {jsonld}"
+    );
+    assert_eq!(
+        rows[0][0].as_str(),
+        Some("http://example.org/bob"),
+        "{jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_untyped_undirected_hop_excludes_labels_and_data_properties() {
+    // Same edge-set rule for the undirected `--` (forward ∪ reverse union).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-undirected-edge-set");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:knows": {"@id": "ex:bob"}
+                    },
+                    {
+                        "@id": "ex:carol",
+                        "@type": "ex:Person",
+                        "ex:name": "Carol",
+                        "ex:knows": {"@id": "ex:alice"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name: "Alice"})--(m) RETURN m ORDER BY m"#,
+        )
+        .await
+        .expect("untyped undirected hop query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    let rows = jsonld.as_array().expect("rows");
+    let neighbors: Vec<&str> = rows.iter().filter_map(|r| r[0].as_str()).collect();
+    assert_eq!(
+        neighbors,
+        ["http://example.org/bob", "http://example.org/carol"],
+        "both edge orientations, no class node / literals: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_value_only_rel_var_matches_unreified_edges() {
+    // A bound relationship variable used only for its value surface
+    // (`RETURN e`, `type(e)`) must match plain-RDF edges that carry no
+    // `f:reifies*` bundle (benchgraph `match__pattern_*` on imported data).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:value-only-rel-var");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:knows": {"@id": "ex:bob"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // Typed bound rel var.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[e:knows]->(b) RETURN type(e) AS t, b"#,
+        )
+        .await
+        .expect("typed rel var over plain triple")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "plain edge must match: {cj}");
+    assert_eq!(data[0]["row"][0], json!("knows"), "type(e): {cj}");
+
+    // Untyped bound rel var: same edge-set rule as `-->` (no rdf:type /
+    // data properties), and the synthesized value still answers type(e).
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[e]->(b) RETURN type(e) AS t"#,
+        )
+        .await
+        .expect("untyped rel var over plain triple")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "only ex:knows is a relationship: {cj}");
+    assert_eq!(data[0]["row"][0], json!("knows"), "type(e): {cj}");
+}
+
+#[tokio::test]
+async fn cypher_value_only_rel_var_keeps_parallel_reified_edges_distinct() {
+    // Reified parallel edges (Cypher-created) share one base triple; a
+    // value-only rel var must still yield one row per relationship.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:value-only-parallel");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2010}]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("parallel edges")
+            .row_count(),
+        2,
+        "one row per reified relationship"
+    );
+}
+
+#[tokio::test]
 async fn cypher_property_accessor_in_where_filters_results() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:prop-accessor-where";
@@ -666,6 +850,135 @@ async fn transact_cypher_unwind_map_param_batches_node_inserts() {
             .row_count(),
         1,
         "Bob's name and age stayed on the same node"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_inline_range_batches_node_inserts() {
+    // Inline constant UNWIND source on a write (`UNWIND range(1, 100) AS x`,
+    // benchgraph `arango__unwind_range_vertex_write`) — desugars through the
+    // same path as `UNWIND $list`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-range");
+
+    let result = fluree
+        .transact_cypher(
+            ledger0,
+            r#"UNWIND range(1, 100) AS x CREATE (n:L1:L2 {p1: true, p5: x})"#,
+        )
+        .await
+        .expect("inline range batched insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:L1) RETURN n")
+            .await
+            .expect("count")
+            .row_count(),
+        100,
+        "one node per range element"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:L2) WHERE n.p5 = 42 RETURN n")
+            .await
+            .expect("p5")
+            .row_count(),
+        1,
+        "each node carries its own range value"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_inline_list_batches_node_inserts() {
+    // Inline list-literal UNWIND on a write.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-list");
+
+    let result = fluree
+        .transact_cypher(
+            ledger0,
+            r#"UNWIND ["Alice", "Bob", "Carol"] AS name CREATE (n:Person {name: name})"#,
+        )
+        .await
+        .expect("inline list batched insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("count")
+            .row_count(),
+        3
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {name: "Bob"}) RETURN n"#)
+            .await
+            .expect("bob")
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_create_bare_anonymous_node() {
+    // `CREATE ()` (benchgraph `create__vertex`) — an anonymous propertyless
+    // node commits (via the hidden db:Node marker) and stays invisible to
+    // labeled matches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-bare");
+    let result = fluree
+        .transact_cypher(ledger0, "CREATE ()")
+        .await
+        .expect("bare CREATE ()");
+    assert!(result.receipt.t >= 1, "committed");
+
+    // `CREATE ()-[:TempEdge]->()` (benchgraph `create__pattern`).
+    let result = fluree
+        .transact_cypher(result.ledger, "CREATE ()-[:TempEdge]->()")
+        .await
+        .expect("bare CREATE pattern");
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[:TempEdge]->(b) RETURN a, b")
+            .await
+            .expect("edge query")
+            .row_count(),
+        1,
+        "anonymous endpoints exist via the edge"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_create_var_only_node_has_empty_labels() {
+    // `CREATE (n)` — fresh node, no labels/props; labels(n) must hide the
+    // db:Node existence marker.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-var-only");
+    let l = fluree
+        .transact_cypher(ledger0, "CREATE (n)")
+        .await
+        .expect("CREATE (n)")
+        .ledger;
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (m:Person {name: "Alice"})"#)
+        .await
+        .expect("labeled sibling")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // The labeled match must not see the bare node.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("person")
+            .row_count(),
+        1
     );
 }
 
@@ -1533,7 +1846,10 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
     let ledger_id = "it/cypher:detach-delete-indexed";
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        std::sync::Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4304,6 +4620,116 @@ async fn cypher_var_length_rel_and_path_binding() {
             .await
             .is_err(),
         "unbounded var-length rel binding is deferred"
+    );
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_untyped_wildcard() {
+    // Untyped shortestPath (benchgraph `arango__shortest_path`): follows any
+    // relationship type, skipping rdf:type and data properties. The chain
+    // mixes KNOWS and LIKES edges, so a single-type search can't reach Dave.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:sp-untyped");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"CREATE (c:Person {name: "Carol"})"#,
+        r#"CREATE (d:Person {name: "Dave"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        r#"MATCH (b:Person {name: "Bob"}), (c:Person {name: "Carol"}) CREATE (b)-[:LIKES]->(c)"#,
+        r#"MATCH (c:Person {name: "Carol"}), (d:Person {name: "Dave"}) CREATE (c)-[:KNOWS]->(d)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+               MATCH p = shortestPath((a)-[*..15]->(d))
+               RETURN length(p) AS len, [r IN relationships(p) | type(r)] AS types"#,
+        )
+        .await
+        .expect("untyped shortestPath")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!(3), "Alice→Dave is 3 mixed hops: {cj}");
+    assert_eq!(
+        row[1],
+        json!(["KNOWS", "LIKES", "KNOWS"]),
+        "per-hop types resolved post-hoc: {cj}"
+    );
+
+    // Typed search over the same pair finds nothing (LIKES breaks the chain).
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+                   MATCH p = shortestPath((a)-[:KNOWS*..15]->(d))
+                   RETURN length(p)"#,
+            )
+            .await
+            .expect("typed control")
+            .row_count(),
+        0,
+        "typed-only search must not cross the LIKES hop"
+    );
+
+    // allShortestPaths untyped (benchgraph `arango__allshortest_paths`).
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+                   MATCH p = allShortestPaths((a)-[*..15]->(d))
+                   RETURN length(p)"#,
+            )
+            .await
+            .expect("untyped allShortestPaths")
+            .row_count(),
+        1,
+        "exactly one minimal path"
+    );
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_untyped_skips_type_and_data_edges() {
+    // The wildcard edge-set must not treat rdf:type or a data property as a
+    // hop: two nodes sharing only a class have no path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-untyped-edge-set");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+                   MATCH p = shortestPath((a)-[*..15]->(b))
+                   RETURN length(p)"#,
+            )
+            .await
+            .expect("no path via class node")
+            .row_count(),
+        0,
+        "rdf:type must not connect nodes through their shared class"
     );
 }
 

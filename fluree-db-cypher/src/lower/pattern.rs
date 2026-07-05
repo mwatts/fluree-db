@@ -47,8 +47,13 @@ fn lower_part<E: IriEncoder>(
 
     // Head node anchored. If tail is empty (single node) and the node
     // has no labels, no inline props, no participating relationships,
-    // reject.
+    // reject — unless whole-graph scans are opted in, in which case the
+    // node binds every distinct subject in the graph.
     if part.tail.is_empty() {
+        if part.head.labels.is_empty() && part.head.props.is_none() && ctx.allow_full_scan {
+            out.push(all_subjects_scan(ctx, &part.head));
+            return Ok(());
+        }
         require_node_anchored(&part.head)?;
         lower_node(ctx, &part.head, out)?;
         return Ok(());
@@ -117,10 +122,10 @@ fn lower_shortest_path<E: IriEncoder>(
             "property filters on a shortestPath relationship are deferred",
         ));
     }
-    if rel.types.len() != 1 {
+    if rel.types.len() > 1 {
         return Err(LowerError::unsupported(
-            "shortestPath needs exactly one relationship type (`-[:T*]-`); untyped and \
-             alternation forms are deferred",
+            "shortestPath over a type alternation (`-[:A|B*]-`) is deferred; use a single \
+             type or the untyped form",
         ));
     }
 
@@ -147,27 +152,60 @@ fn lower_shortest_path<E: IriEncoder>(
         None => (Some(1), Some(1)),
     };
 
-    let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
-    match ctx.encoder.encode_iri(&type_iri) {
-        Some(predicate) => out.push(Pattern::ShortestPath(ShortestPathPattern {
-            start: start_ref,
-            end: end_ref,
-            predicate,
-            direction,
-            mode,
-            path_var: path_var_id,
-            min_hops,
-            max_hops,
-            // Conservatively build edges: Cypher's `relationships(p)` may read
-            // them, and that usage isn't visible at pattern-lowering time.
-            needs_relationships: true,
-        })),
-        // Unknown relationship type ⇒ no edges ⇒ no path. An empty result over
-        // the endpoints yields no rows (mandatory MATCH drops; an OPTIONAL
-        // wrapper restores the row with the path var null).
-        None => out.push(empty_path_result(&start_ref, &end_ref)),
-    }
+    // Untyped (`-[*..15]->`) → wildcard edge-set; typed → the named predicate.
+    // An unknown relationship type ⇒ no edges ⇒ no path: an empty result over
+    // the endpoints yields no rows (mandatory MATCH drops; an OPTIONAL wrapper
+    // restores the row with the path var null).
+    let predicate = match rel.types.first() {
+        None => None,
+        Some(t) => {
+            let type_iri = ctx.resolve_predicate(&t.name)?;
+            match ctx.encoder.encode_iri(&type_iri) {
+                Some(sid) => Some(sid),
+                None => {
+                    out.push(empty_path_result(&start_ref, &end_ref));
+                    return Ok(());
+                }
+            }
+        }
+    };
+    out.push(Pattern::ShortestPath(ShortestPathPattern {
+        start: start_ref,
+        end: end_ref,
+        predicate,
+        direction,
+        mode,
+        path_var: path_var_id,
+        min_hops,
+        max_hops,
+        // Conservatively build edges: Cypher's `relationships(p)` may read
+        // them, and that usage isn't visible at pattern-lowering time.
+        needs_relationships: true,
+    }));
     Ok(())
+}
+
+/// Whole-graph node scan for an opted-in bare `MATCH (n)`: an uncorrelated
+/// `SELECT DISTINCT ?n { ?n ?p ?o }` subquery. Nodes are distinct subjects —
+/// an IRI referenced only as an object (never described) is not matched.
+fn all_subjects_scan<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    node: &NodePattern,
+) -> Pattern {
+    let subj = lookup_node_ref(ctx, node);
+    let n = match &subj {
+        Ref::Var(v) => *v,
+        // `lookup_node_ref` always yields a variable (named or anonymous).
+        _ => unreachable!("node refs are variables"),
+    };
+    let p = ctx.fresh_synth();
+    let o = ctx.fresh_synth();
+    let scan = Pattern::Triple(TriplePattern::new(subj, Ref::Var(p), Term::Var(o)));
+    Pattern::Subquery(
+        fluree_db_query::ir::SubqueryPattern::new(vec![n], vec![scan])
+            .with_distinct()
+            .with_uncorrelated(),
+    )
 }
 
 fn require_node_anchored(node: &NodePattern) -> Result<()> {
@@ -290,7 +328,12 @@ fn build_rel_hop<E: IriEncoder>(
     let pred = match rel.types.len() {
         0 => {
             // Untyped — var predicate; the executor's system-fact filter
-            // (`Query.include_system_facts = false`) hides `f:reifies*`.
+            // (`Query.include_system_facts = false`) hides `f:reifies*`, but
+            // `rdf:type` (labels) and data properties are ordinary facts and
+            // must be excluded too — Cypher `-->` follows only relationships.
+            // The edge-set filter below handles that for the plain-triple
+            // shape; annotation shapes match reified edges only, which are
+            // relationships by construction.
             Ref::Var(ctx.fresh_synth())
         }
         1 => {
@@ -323,6 +366,60 @@ fn build_rel_hop<E: IriEncoder>(
 
     push_rel_triple(ctx, &rel.var, &rel.props, pred, s, o, &mut out)?;
     Ok(out)
+}
+
+/// `MakeRel(start, pred, end)` for a value-only relationship variable, or
+/// `None` when a term isn't expressible as an expression (an IRI-anchored
+/// endpoint, or a typed predicate absent from the dictionary — which has no
+/// edges anyway); callers then keep the annotation lowering.
+fn make_rel_expr<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    pred: &Ref,
+    s: &Ref,
+    o: &Ref,
+) -> Option<Expression> {
+    let p = match pred {
+        Ref::Var(v) => Expression::Var(*v),
+        Ref::Sid(sid) => Expression::Const(FlakeValue::Ref(sid.clone())),
+        Ref::Iri(iri) => Expression::Const(FlakeValue::Ref(ctx.encoder.encode_iri(iri)?)),
+    };
+    Some(Expression::call(
+        Function::MakeRel,
+        vec![ref_to_expr(s)?, p, ref_to_expr(o)?],
+    ))
+}
+
+/// The relationship edge-set constraint for an untyped single-hop pattern
+/// (`-->`): the predicate must not be `rdf:type` (a label, not a relationship)
+/// and a variable object must be a node (data properties bind literals).
+/// Matches the edge-set the untyped var-length wildcard path traverses.
+fn untyped_edge_set_filter<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    pvar: fluree_db_query::var_registry::VarId,
+    o: &Ref,
+) -> Expression {
+    let not_type = Expression::ne(
+        Expression::Var(pvar),
+        Expression::call(
+            Function::Iri,
+            vec![Expression::Const(FlakeValue::String(
+                ctx.rdf_type_iri().to_string(),
+            ))],
+        ),
+    );
+    match o {
+        Ref::Var(ov) => Expression::binary(
+            Function::And,
+            not_type,
+            Expression::binary(
+                Function::Or,
+                Expression::call(Function::IsIri, vec![Expression::Var(*ov)]),
+                Expression::call(Function::IsBlank, vec![Expression::Var(*ov)]),
+            ),
+        ),
+        // An anchored object is a node by construction.
+        _ => not_type,
+    }
 }
 
 /// Lower a variable-length relationship `-[:T*m..n]->`. Anonymous, single-typed
@@ -810,11 +907,57 @@ fn push_rel_triple<E: IriEncoder>(
     o: Ref,
     out: &mut Vec<Pattern>,
 ) -> Result<()> {
-    let edge_o: Term = o.into();
+    let edge_o: Term = o.clone().into();
+
+    // Value-only bound relationship variable — the statement never reads the
+    // relationship's *properties*, only its value surface (`RETURN e`,
+    // `type(e)`, `startNode(e)`, …). Match the plain base triple so unreified
+    // (plain-RDF) edges count too, and bind the variable per annotation when
+    // the edge is reified (parallel edges stay distinct) or to a synthesized
+    // relationship value when it isn't. Property-reading statements keep the
+    // annotation-only lowering below.
+    if let (Some(v), None) = (rel_var, rel_props) {
+        if !ctx.is_annotation_dependent(&v.name) {
+            if let Some(rel_value) = make_rel_expr(ctx, &pred, &s, &o) {
+                let var = ctx.intern_var(&v.name);
+                out.push(Pattern::Triple(TriplePattern::new(
+                    s.clone(),
+                    pred.clone(),
+                    edge_o.clone(),
+                )));
+                if let Ref::Var(pv) = &pred {
+                    out.push(Pattern::Filter(untyped_edge_set_filter(ctx, *pv, &o)));
+                }
+                // `f:reifies*` absent from the dictionary ⇒ no edge in this
+                // ledger is reified ⇒ skip the per-edge annotation probe.
+                let expr = if ctx
+                    .encoder
+                    .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
+                    .is_some()
+                {
+                    let ann = ctx.fresh_synth();
+                    out.push(Pattern::Optional(vec![Pattern::EdgeAnnotation {
+                        edge: TriplePattern::new(s, pred, edge_o),
+                        annotation: Ref::Var(ann),
+                        body: Vec::new(),
+                    }]));
+                    Expression::call(Function::Coalesce, vec![Expression::Var(ann), rel_value])
+                } else {
+                    rel_value
+                };
+                out.push(Pattern::Bind { var, expr });
+                return Ok(());
+            }
+        }
+    }
+
     match (rel_var, rel_props) {
         (None, None) => {
             // Shape 1 — plain triple, set semantics.
-            out.push(Pattern::Triple(TriplePattern::new(s, pred, edge_o)));
+            out.push(Pattern::Triple(TriplePattern::new(s, pred.clone(), edge_o)));
+            if let Ref::Var(pv) = &pred {
+                out.push(Pattern::Filter(untyped_edge_set_filter(ctx, *pv, &o)));
+            }
             Ok(())
         }
         (Some(v), props) => {

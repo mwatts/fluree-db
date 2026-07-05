@@ -190,6 +190,21 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<Binding>> {
     match func {
+        // COALESCE in binding position must preserve structured values
+        // (List / Map / Rel / Path) — the scalar path would collapse them to
+        // Unbound. Same rule as the spec's comparable-path coalesce: first
+        // argument that evaluates without error and is bound wins.
+        Function::Coalesce => {
+            for arg in args {
+                match arg.try_eval_to_binding(row, ctx) {
+                    Ok(Binding::Unbound | Binding::Poisoned) => continue,
+                    Ok(b) => return Ok(Some(b)),
+                    Err(err) if err.can_demote_in_expression() => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(Some(Binding::Unbound))
+        }
         Function::ListIndex => Ok(Some(eval_list_index_to_binding(args, row, ctx)?)),
         Function::Labels => Ok(Some(metadata::eval_labels_to_binding(args, row, ctx)?)),
         Function::Keys => Ok(Some(metadata::eval_keys_to_binding(args, row, ctx)?)),

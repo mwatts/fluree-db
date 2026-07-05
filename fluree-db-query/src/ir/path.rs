@@ -263,8 +263,11 @@ pub struct ShortestPathPattern {
     pub start: Ref,
     /// End node ref (Var or Sid — literals not allowed).
     pub end: Ref,
-    /// Predicate to traverse (resolved to Sid).
-    pub predicate: Sid,
+    /// Predicate to traverse (resolved to Sid). `None` is the untyped
+    /// (wildcard) form: any relationship edge is followed — reference-valued
+    /// objects only, excluding `rdf:type` and the `f:reifies*` system
+    /// predicates (the same edge-set as the wildcard [`PropertyPathPattern`]).
+    pub predicate: Option<Sid>,
     /// Traversal direction.
     pub direction: PathDirection,
     /// Single vs. all-shortest-paths.
@@ -278,8 +281,10 @@ pub struct ShortestPathPattern {
     /// Whether the emitted path value's per-hop `edges` are consumed (only
     /// Cypher's `relationships(p)` reads them). When `false` the operator skips
     /// building the per-hop edge tuples — a pure allocation/clone savings on the
-    /// JSON-LD/FQL surface, which has no `relationships()` function. Edges are
-    /// derivable from `nodes` + this pattern's single `predicate`/`direction`.
+    /// JSON-LD/FQL surface, which has no `relationships()` function. For a
+    /// typed pattern edges are derivable from `nodes` + `predicate`/`direction`;
+    /// a wildcard pattern resolves each found hop's predicate with a post-hoc
+    /// probe.
     pub needs_relationships: bool,
 }
 

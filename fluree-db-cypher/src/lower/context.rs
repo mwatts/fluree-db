@@ -34,6 +34,16 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// query variable, and property access on it lowers to eval-time member
     /// access rather than an outer-pattern join.
     scopes: Vec<HashMap<String, VarId>>,
+    /// Variables used on the relationship *annotation* surface somewhere in
+    /// the statement (`e.prop`, `properties(e)`, …). A bound relationship
+    /// variable outside this set can bind a synthesized relationship value
+    /// from the plain base triple instead of requiring a reifier bundle.
+    annotation_dependent: std::collections::HashSet<String>,
+    /// Allow a bare `MATCH (n)` (no label, property, or relationship) to
+    /// lower to a whole-graph distinct-subject scan. Off by default — a full
+    /// scan is rarely what a production query intends; benchmarks and ad-hoc
+    /// exploration opt in (server flag `FLUREE_CYPHER_ALLOW_FULL_SCAN`).
+    pub allow_full_scan: bool,
 }
 
 impl<'a, E: IriEncoder> LoweringContext<'a, E> {
@@ -45,7 +55,27 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             vocab: "http://example.org/".to_string(),
             overrides: HashMap::new(),
             scopes: Vec::new(),
+            annotation_dependent: std::collections::HashSet::new(),
+            allow_full_scan: false,
         }
+    }
+
+    /// Opt in to whole-graph scans for bare `MATCH (n)` patterns.
+    pub fn with_allow_full_scan(mut self, allow: bool) -> Self {
+        self.allow_full_scan = allow;
+        self
+    }
+
+    /// Record the statement-wide annotation-surface variable set (see
+    /// [`super::annotation_use`]).
+    pub(super) fn set_annotation_dependent(&mut self, vars: std::collections::HashSet<String>) {
+        self.annotation_dependent = vars;
+    }
+
+    /// Whether `name` is used on the relationship annotation surface
+    /// anywhere in the statement.
+    pub(super) fn is_annotation_dependent(&self, name: &str) -> bool {
+        self.annotation_dependent.contains(name)
     }
 
     /// Push a new loop-local scope. Pair with [`Self::exit_scope`].

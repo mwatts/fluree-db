@@ -289,7 +289,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 Some(predicate) => Ok(vec![Pattern::ShortestPath(ShortestPathPattern {
                     start: start_ref,
                     end: end_ref,
-                    predicate,
+                    predicate: Some(predicate),
                     direction: *direction,
                     mode: *mode,
                     path_var: path_var_id,

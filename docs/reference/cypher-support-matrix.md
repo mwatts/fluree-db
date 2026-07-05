@@ -41,11 +41,11 @@ These shape everything below; read them first.
 | `MATCH` | ✅ | Node/relationship patterns, `WHERE`. |
 | `OPTIONAL MATCH` | ✅ | Nullable bindings; poisoned-binding semantics. |
 | `WITH` | ◑ | Projection boundary; `WHERE`→HAVING when it references aggregates; `DISTINCT`/`ORDER BY`/`SKIP`/`LIMIT`; `collect()` carries forward as a list. Before a **write** clause only the pass-through / rename / computed-alias / filter subset is allowed (no aggregation / `DISTINCT` / `ORDER BY` / `SKIP` / `LIMIT`); `WITH` before `DELETE` deferred. |
-| `UNWIND` | ✅ | Inline lists and runtime list expressions; `$param` lists via API substitution. |
+| `UNWIND` | ✅ | Inline lists and runtime list expressions; `$param` lists via API substitution. Before a **write** clause: `$param` lists, inline literal lists, and constant `range()` (≤ 10000 rows). |
 | `RETURN` | ✅ | `*`, aliases, `DISTINCT`, `ORDER BY`/`SKIP`/`LIMIT`. `SKIP`/`LIMIT` must be literal integers. |
 | `UNION` / `UNION ALL` | ✅ | Column-name-match + uniform-variant rules enforced. |
 | `CALL { … }` (subquery) | ✅ | Imports `(a,b)` / `(*)`, uncorrelated broadcast, inner `UNION`, nesting, strict scope/shadowing, correlated-aggregate soundness. |
-| `CREATE` | ✅ | Nodes + relationships (relationships reify). |
+| `CREATE` | ✅ | Nodes + relationships (relationships reify). Bare `CREATE ()` / `CREATE (n)` asserts a hidden `db:Node` existence marker (invisible to `labels()`). |
 | `MERGE` (node) | ✅ | Find-or-create with `ON CREATE SET`. `ON MATCH SET` deferred (for **all** MERGE forms — node and relationship). |
 | `MERGE` (relationship) | ◑ | Standalone + bound-endpoint forms; `ON CREATE SET`. Deferred: property-bearing rel MERGE (`-[:T {p:v}]->`), multi-hop / multi-part MERGE, multiple `MERGE` clauses, and `MERGE` combined with another write clause in one statement. |
 | `SET` / `REMOVE` | ✅ | Properties, `+=` map merge, labels. |
@@ -60,17 +60,17 @@ These shape everything below; read them first.
 | Feature | Status | Notes |
 |---------|:------:|-------|
 | Node pattern (labels, inline props) | ✅ | |
-| Bare unconstrained `MATCH (n)` | ⟂ | Rejected — a node must be constrained by a label, property, or relationship (no whole-graph scan). |
+| Bare unconstrained `MATCH (n)` | ◑ | Rejected by default (a node must be constrained by a label, property, or relationship). Opt in to a whole-graph distinct-subject scan with the server flag `FLUREE_CYPHER_ALLOW_FULL_SCAN=1`. |
 | Directed typed relationship `-[:T]->`, `<-[:T]-` | ✅ | |
 | Type alternation `-[:A\|B]->` | ✅ | `Union` of concrete predicates. |
 | Undirected `-[:T]-` | ✅ | Forward ∪ reverse `Union`. |
-| Untyped relationship `-[r]->` | ✅ | Variable predicate; system facts hidden. |
+| Untyped relationship `-->` / `-[r]->` | ✅ | Follows relationships only: `rdf:type`, `f:reifies*`, and data properties (literal objects) are excluded from the hop. |
 | Bounded var-length `-[:T*m..n]->` | ✅ | **Enumerates trails** (one row per path, relationship-uniqueness). |
 | Unbounded var-length `-[:T*]->` | ⟂ | **Reachability** (one row per reachable endpoint), not path enumeration. |
 | Untyped var-length `-[*m..n]->` | ⟂ | Wildcard reachability over node→node edges; excludes `rdf:type`/`f:reifies*`. A direction is required (`-[*]-` deferred); an unbounded lower bound above 1 (`-[*2..]->`) deferred — give an upper bound or name a type. |
 | Bounded var-length **binding** `-[r:T*m..n]->` / `p = …` | ✅ | `r` = rel list, `p` = path; via per-branch construction. |
 | Unbounded var-length binding | ⏳ | Needs a path-enumeration operator. |
-| `shortestPath` / `allShortestPaths` | ✅ | Anchored, single typed predicate; `All` emits one row per minimal path. |
+| `shortestPath` / `allShortestPaths` | ✅ | Anchored; single typed predicate or the untyped wildcard form (`shortestPath((a)-[*..15]->(b))`, same edge-set as untyped var-length); `All` emits one row per minimal path. Type alternation deferred. |
 | `relationships(p)` / `nodes(p)` / `pathPairs(p)` / `length(p)` | ✅ | `relationships(p)` carries the stored edge orientation. |
 | Bounded type-alternation var-length `-[:A\|B*1..3]->` | ⏳ | Use the unbounded form. |
 | Undirected **unbounded** path `-[:T*]-` | ⏳ | |

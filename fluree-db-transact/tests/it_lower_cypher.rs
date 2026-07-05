@@ -151,23 +151,33 @@ fn create_undirected_relationship_is_rejected() {
 }
 
 #[test]
-fn create_bare_node_is_rejected() {
-    let out = parse_cypher("CREATE ()");
-    // Empty parens may parse, but parsing a node with no var/label/props
-    // depends on the parser shape. Try both — if parse fails, that's
-    // an acceptable rejection point too.
-    if out.has_errors() {
-        return;
-    }
-    let ast = out.ast.unwrap();
-    let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(
-        &ast,
-        &mut ns,
-        TxnOpts::default(),
-        CypherLowerOpts::default(),
+fn create_bare_node_asserts_existence_marker() {
+    // `CREATE ()` — an anonymous propertyless node still needs one triple to
+    // exist as an RDF subject; it gets the hidden `db:Node` marker class.
+    let txn = lower("CREATE ()");
+    assert_eq!(
+        txn.insert_templates.len(),
+        1,
+        "templates: {:?}",
+        txn.insert_templates
     );
-    assert!(r.is_err(), "expected rejection of bare CREATE ()");
+    assert!(matches!(
+        txn.insert_templates[0].subject,
+        TemplateTerm::BlankNode(_)
+    ));
+}
+
+#[test]
+fn create_bare_pattern_needs_no_marker() {
+    // `CREATE ()-[:TempEdge]->()` — the edge anchors both endpoints:
+    // 1 base edge + 3 reifier bundle triples, no markers.
+    let txn = lower("CREATE ()-[:TempEdge]->()");
+    assert_eq!(
+        txn.insert_templates.len(),
+        4,
+        "templates: {:?}",
+        txn.insert_templates
+    );
 }
 
 #[test]
@@ -267,6 +277,36 @@ fn match_set_property_emits_update_with_optional_old_value() {
         txn.insert_templates[0].object,
         TemplateTerm::Value(_)
     ));
+}
+
+#[test]
+fn match_set_property_to_negative_literal() {
+    // `-1` is unary minus over a literal; the parser folds it so write
+    // lowering sees a plain literal (benchgraph `update__vertex_on_property`).
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) SET n.property = -1"#);
+    assert_eq!(txn.insert_templates.len(), 1);
+    match &txn.insert_templates[0].object {
+        TemplateTerm::Value(fluree_db_core::FlakeValue::Long(v)) => assert_eq!(*v, -1),
+        other => panic!("expected Long(-1), got {other:?}"),
+    }
+}
+
+#[test]
+fn create_node_with_negative_property_values() {
+    let txn = lower(r#"CREATE (n:Point {x: -1, y: -2.5, z: - -3})"#);
+    // 1 label + 3 properties.
+    assert_eq!(txn.insert_templates.len(), 4);
+    let values: Vec<_> = txn
+        .insert_templates
+        .iter()
+        .filter_map(|t| match &t.object {
+            TemplateTerm::Value(v) => Some(v.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(values.contains(&fluree_db_core::FlakeValue::Long(-1)));
+    assert!(values.contains(&fluree_db_core::FlakeValue::Double(-2.5)));
+    assert!(values.contains(&fluree_db_core::FlakeValue::Long(3)));
 }
 
 #[test]
