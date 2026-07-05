@@ -1102,24 +1102,34 @@ async fn hydrate_list_index_meta_for_retractions(
     retractions: &mut [Flake],
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> Result<()> {
-    for flake in retractions.iter_mut() {
+    use std::collections::BTreeMap;
+
+    // Group candidates by (graph, subject, predicate): one range lookup per
+    // group, not one per retraction. Every `range_with_overlay` call pays a
+    // full overlay translation of the graph's novelty (walk + translate +
+    // sort), so per-flake lookups make filtered-DELETE staging
+    // O(matched_triples × novelty log novelty) — observed as a >900s livelock
+    // for ~21k matched triples on a novelty-heavy ledger. Grouped, the cost
+    // scales with distinct (subject, predicate) pairs instead.
+    let mut groups: HashMap<(GraphId, Sid, Sid), Vec<usize>> = HashMap::new();
+    for (idx, flake) in retractions.iter().enumerate() {
         // Only retractions with no metadata are candidates.
-        if flake.op {
+        if flake.op || flake.m.is_some() {
             continue;
         }
-        if flake.m.is_some() {
-            continue;
-        }
-
-        // Resolve the correct graph for this retraction flake.
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
+        groups
+            .entry((g_id, flake.s.clone(), flake.p.clone()))
+            .or_default()
+            .push(idx);
+    }
 
-        // Find currently asserted matching flakes (db + novelty overlay) and copy list index meta if present.
+    for ((g_id, s, p), members) in groups {
+        // Find currently asserted flakes for this (subject, predicate)
+        // (db + novelty overlay) and copy list index meta where present.
         let rm = fluree_db_core::RangeMatch::new()
-            .with_subject(flake.s.clone())
-            .with_predicate(flake.p.clone())
-            .with_object(flake.o.clone())
-            .with_datatype(flake.dt.clone());
+            .with_subject(s)
+            .with_predicate(p);
 
         let found = fluree_db_core::range_with_overlay(
             &ledger.snapshot,
@@ -1132,11 +1142,36 @@ async fn hydrate_list_index_meta_for_retractions(
         )
         .await?;
 
-        if let Some(existing) = found
-            .into_iter()
-            .find(|f| f.op && f.m.as_ref().and_then(|m| m.i).is_some())
-        {
-            flake.m = existing.m;
+        // Index asserted list-carrying metas per object value, in index
+        // order. Every matching retraction copies the FIRST dt-compatible
+        // meta — mirroring the per-flake lookup's `.find()` this replaces:
+        // identical duplicates then collapse in the accumulator, so a value
+        // asserted at N list positions loses exactly one entry per distinct
+        // WHERE binding (pinned by the `object-probe-list-retract` case in
+        // `it_join_batched_overlay.rs`).
+        let mut metas: BTreeMap<FlakeValue, Vec<(Sid, fluree_db_core::FlakeMeta)>> =
+            BTreeMap::new();
+        for f in found {
+            if f.op {
+                if let Some(m) = f.m.filter(|m| m.i.is_some()) {
+                    metas.entry(f.o).or_default().push((f.dt, m));
+                }
+            }
+        }
+        if metas.is_empty() {
+            continue;
+        }
+
+        for idx in members {
+            let flake = &mut retractions[idx];
+            if let Some(candidates) = metas.get(&flake.o) {
+                if let Some((_, m)) = candidates
+                    .iter()
+                    .find(|(dt, _)| fluree_db_core::dt_compatible(&flake.dt, dt))
+                {
+                    flake.m = Some(m.clone());
+                }
+            }
         }
     }
 

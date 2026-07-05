@@ -477,6 +477,14 @@ pub struct Novelty {
 
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
+    /// Globally-unique content-version stamp (see
+    /// [`OverlayProvider::content_version`]): refreshed from a process-wide
+    /// counter on every content mutation, so no two novelty states with
+    /// different flake content ever share a version — across instances,
+    /// clones, and ledgers. Clones share the version until one mutates,
+    /// which is exactly right: identical content, identical key. `0` means
+    /// "empty since construction" (all empty overlays are equivalent).
+    content_version: u64,
     /// Epoch for the RDFS schema-hierarchy cache — bumped only when a commit
     /// asserts or retracts `rdfs:subClassOf` / `rdfs:subPropertyOf`, so the
     /// shared hierarchy cache stays current without any work on the (vastly
@@ -510,6 +518,10 @@ pub struct Novelty {
     fact_state: NoveltyFactState,
 }
 
+/// Process-wide counter backing [`Novelty::content_version`]. Starts at 1 so
+/// `0` uniquely means "empty since construction".
+static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
@@ -519,6 +531,7 @@ impl Novelty {
             flake_count: 0,
             t,
             epoch: 0,
+            content_version: 0,
             schema_epoch: 0,
             shacl_epoch: 0,
             config_write_t: 0,
@@ -538,6 +551,15 @@ impl Novelty {
                 NoveltyError::InvalidGraph(format!("flake references unknown graph Sid: {g_sid}"))
             }),
         }
+    }
+
+    /// Stamp a fresh globally-unique content version. Pair with every
+    /// `epoch += 1`: `epoch` drives lineage-local cache invalidation, while
+    /// the content version keys cross-instance caches (see
+    /// [`OverlayProvider::content_version`]).
+    fn refresh_content_version(&mut self) {
+        self.content_version =
+            NEXT_CONTENT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.
@@ -669,6 +691,7 @@ impl Novelty {
         if merges > 0 {
             self.recompute_totals();
             self.epoch += 1;
+            self.refresh_content_version();
         }
         merges
     }
@@ -825,6 +848,7 @@ impl Novelty {
         // From here on every step is infallible.
         self.t = self.t.max(commit_t);
         self.epoch += 1; // Bump epoch once per commit
+        self.refresh_content_version();
 
         // Advance the config-graph write marker so the resolved-config cache
         // (see `LedgerHandle`) invalidates iff this commit touched config.
@@ -967,6 +991,7 @@ impl Novelty {
         if per_graph.is_empty() {
             self.t = max_t;
             self.epoch += 1;
+            self.refresh_content_version();
             return Ok(());
         }
 
@@ -1075,6 +1100,7 @@ impl Novelty {
 
         self.t = max_t;
         self.epoch += 1;
+        self.refresh_content_version();
         self.recompute_totals();
 
         tracing::debug!(
@@ -1149,6 +1175,7 @@ impl Novelty {
         self.fact_state = fs;
 
         self.epoch += 1;
+        self.refresh_content_version();
     }
 
     /// Comparator-ordered k-way merge over one graph's segments for `index` and
@@ -1402,6 +1429,10 @@ impl OverlayProvider for Novelty {
         // compaction rebuild from survivors), so "no live bytes" (`size == 0`)
         // and "no flakes" coincide — just defer to `is_empty()`.
         self.is_empty()
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        Some(self.content_version)
     }
 
     fn for_each_overlay_flake(
@@ -1669,6 +1700,44 @@ mod tests {
         assert_eq!(novelty.t, 1);
         assert_eq!(novelty.epoch, 1); // Epoch bumped once
         assert!(novelty.size > 0);
+    }
+
+    #[test]
+    fn content_version_is_globally_unique_across_divergent_clones() {
+        let mut a = Novelty::new(0);
+        assert_eq!(
+            OverlayProvider::content_version(&a),
+            Some(0),
+            "empty-since-construction novelty reports version 0"
+        );
+
+        let rg = no_graphs();
+        a.apply_commit(vec![make_flake(1, 1, 100, 1, true)], 1, &rg)
+            .unwrap();
+        let v_a1 = OverlayProvider::content_version(&a).unwrap();
+        assert_ne!(v_a1, 0, "mutation stamps a fresh version");
+
+        // A clone shares the version while content is identical.
+        let mut b = a.clone();
+        assert_eq!(OverlayProvider::content_version(&b), Some(v_a1));
+
+        // Divergent mutations from the same base must never share a version
+        // (per-instance `epoch` DOES collide here: both go 1 → 2).
+        a.apply_commit(vec![make_flake(2, 1, 200, 2, true)], 2, &rg)
+            .unwrap();
+        b.apply_commit(vec![make_flake(3, 1, 300, 2, true)], 2, &rg)
+            .unwrap();
+        assert_eq!(a.epoch, b.epoch, "epochs collide across divergent clones");
+        let v_a2 = OverlayProvider::content_version(&a).unwrap();
+        let v_b2 = OverlayProvider::content_version(&b).unwrap();
+        assert_ne!(v_a2, v_b2, "content versions must not collide");
+        assert_ne!(v_a2, v_a1);
+        assert_ne!(v_b2, v_a1);
+
+        // clear_up_to changes content, so it must also refresh the version.
+        let before_clear = OverlayProvider::content_version(&a).unwrap();
+        a.clear_up_to(1);
+        assert_ne!(OverlayProvider::content_version(&a).unwrap(), before_clear);
     }
 
     #[test]
