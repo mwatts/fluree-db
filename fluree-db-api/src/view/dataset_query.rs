@@ -602,6 +602,8 @@ impl Fluree {
             None => (None, primary.t, false),
         };
 
+        reject_reasoning_in_history_mode(history_mode, executable).map_err(ApiError::query)?;
+
         let prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
@@ -744,6 +746,9 @@ impl Fluree {
             None => (None, primary.t, false),
         };
 
+        reject_reasoning_in_history_mode(history_mode, executable)
+            .map_err(fluree_db_query::QueryError::InvalidQuery)?;
+
         let prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
@@ -826,6 +831,33 @@ impl Fluree {
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
     ApiError::Query(err)
+}
+
+/// Reject an explicit reasoning request on a history/changes dataset query.
+///
+/// A history/changes query enumerates the persisted flake deltas over a
+/// `(from, to)` t-range; reasoning derives *virtual* facts by forward-chaining
+/// at a single state and never persists them, so the two do not compose — the
+/// derived overlay would be computed against the latest state and silently
+/// dropped rather than applied at any point in the range. Config reasoning
+/// defaults are already not applied in history mode (see the dataset builder),
+/// so this only fires when a query explicitly asks for a mode. Fail loudly
+/// instead of returning results that silently omit entailments.
+///
+/// Mirrors the reasoning gate in `prepare_execution_with_config`
+/// (`executable.reasoning.modes.has_any_enabled()`); `"reasoning": "none"`
+/// sets no mode flag and is therefore allowed.
+fn reject_reasoning_in_history_mode(
+    history_mode: bool,
+    executable: &ExecutableQuery,
+) -> std::result::Result<(), String> {
+    if history_mode && executable.reasoning.modes.has_any_enabled() {
+        return Err("reasoning is not supported for history/changes queries \
+             (a from–to time range); remove the reasoning mode or query a \
+             single point in time"
+            .to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

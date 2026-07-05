@@ -95,6 +95,8 @@ The ledger's `#config` graph governs writes the same way it governs reads:
 
 This applies uniformly across the server transact routes (local and Raft consensus), push replication, credentialed transactions, and the CLI's local mode with policy flags.
 
+> **Trusted-admin exception.** Config-driven write enforcement is applied at the consensus commit boundary. Direct in-process library writes — the embedded `Fluree::insert_turtle` / `insert_turtle_with_opts` methods, and `fluree insert`/`upsert`/`update` in local mode invoked without policy flags — are a **trusted-admin path**: they stage under root and do **not** resolve config-declared `f:policySource` / `f:modify` defaults. An embedded integrator that needs config policy enforced on writes must go through the server transact routes (or supply an explicit `PolicyContext`). This is deliberate: a process with direct storage access is already inside the trust boundary.
+
 ## Targeting patterns
 
 ### Whitelist a property to a role
@@ -248,6 +250,7 @@ Every committed transaction carries the asserting identity in its commit metadat
 - **Required policies short-circuit.** A failure rejects the transaction immediately without checking remaining flakes.
 - **Batch transactions amortize loading.** Loading the policy set is per-transaction, not per-flake — large batched transactions pay the load cost once.
 - **Cache identity properties.** The identity's `@type`, `f:policyClass`, and any role tags used in `f:query` are loaded once per transaction.
+- **Config resolution is memoized.** Learning whether a ledger declares policy requires reading its `#config` graph, which the write path now does on every transaction. That read is cached per-ledger and invalidated only when a commit actually writes the config graph, so a configured-but-static ledger under sustained writes resolves its config once per config change — not once per write (nor once per stage/commit retry). Unconfigured ledgers short-circuit before any scan. The cache is a fail-safe fast path: it is consulted only at head with a live handle, and any miss or ambiguity resolves fresh, so it can never serve stale (fail-open) policy.
 
 ## Testing policies from the CLI
 
