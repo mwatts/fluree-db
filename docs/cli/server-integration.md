@@ -387,6 +387,33 @@ content-store state. See
 [Merge Preview Contract](#merge-preview-contract) for the full semantic and
 response-shape spec.
 
+**Using the CLI from external apps.** Applications that shell out to the
+CLI (instead of calling the HTTP endpoint directly) get the same diff
+through `fluree branch diff`:
+
+```bash
+# Machine-readable: --json emits the raw preview (identical shape to the
+# HTTP response body, including the `changes` object when requested)
+fluree branch diff dev --changes --json --remote origin -l mydb
+
+# Cheap stats-only probe (exact net counts, no payload)
+fluree branch diff dev --stat --json --remote origin -l mydb
+
+# Page a large diff: read changes.next_cursor from the previous output
+fluree branch diff dev --changes --json --changes-after '<subject-iri>' \
+  --remote origin -l mydb
+```
+
+The CLI resolves the same three modes everywhere: `--remote <name>` targets
+a configured remote server, tracked ledgers route through their tracking
+remote automatically, and plain local ledgers compute the preview in-process
+(no server required). In all modes `--json` output is the `MergePreview`
+JSON documented below, so an app can parse one shape regardless of where
+the ledger lives. Errors surface as a nonzero exit code with a message on
+stderr. Note the CLI cap convention: `--max-changes 0` means *unbounded*
+(local mode only; over HTTP the server's cap still applies) — stats-only
+mode is spelled `--stat`, which maps to `max_changes=0` on the wire.
+
 ## Policy Enforcement Contract
 
 CLI policy flags ride on every data API request as both HTTP headers and (for
