@@ -227,7 +227,7 @@ Cypher targets a ledger directly (no `FROM`/dataset clause) — send the stateme
 with `Content-Type: application/cypher` to the ledger-scoped query endpoint:
 
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query/mydb/main \
+curl -X POST http://localhost:8090/v1/fluree/query/mydb:main \
   -H "Content-Type: application/cypher" \
   --data 'MATCH (person:Person) RETURN person.name'
 ```
