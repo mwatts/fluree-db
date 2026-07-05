@@ -448,7 +448,8 @@ impl Fluree {
 
     /// Load a view at a flexible time specification.
     ///
-    /// Resolves `@t:`, `@iso:`, `@commit:`, or `latest` time specifications.
+    /// Resolves `@t:`, `@iso:`, `@recorded:`, `@commit:`, or `latest` time
+    /// specifications.
     pub(crate) async fn load_graph_db_at(
         &self,
         ledger_id: &str,
@@ -477,6 +478,21 @@ impl Fluree {
                     target_epoch_ms += 1;
                 }
                 let resolved_t = time_resolve::datetime_to_t(
+                    &ledger.snapshot,
+                    Some(ledger.novelty.as_ref()),
+                    target_epoch_ms,
+                    current_t,
+                )
+                .await?;
+                self.load_graph_db_at_t(ledger_id, resolved_t).await
+            }
+            TimeSpec::AtRecorded(iso) => {
+                let handle = self.ledger_cached(ledger_id).await?;
+                let snapshot = handle.snapshot().await;
+                let ledger = snapshot.to_ledger_state();
+                let current_t = ledger.t();
+                let target_epoch_ms = time_resolve::iso_to_target_epoch_ms(&iso)?;
+                let resolved_t = time_resolve::recorded_to_t(
                     &ledger.snapshot,
                     Some(ledger.novelty.as_ref()),
                     target_epoch_ms,

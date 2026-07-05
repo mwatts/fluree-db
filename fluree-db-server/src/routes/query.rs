@@ -2305,6 +2305,9 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
                 fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
                 fluree_db_core::ledger_id::LedgerIdTimeSpec::AtIso(iso) => TimeSpec::AtTime(iso),
                 fluree_db_core::ledger_id::LedgerIdTimeSpec::AtCommit(c) => TimeSpec::AtCommit(c),
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtRecorded(r) => {
+                    TimeSpec::AtRecorded(r)
+                }
             });
             let selector = frag
                 .map(GraphSelector::from_str)
@@ -2341,6 +2344,9 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
                 fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
                 fluree_db_core::ledger_id::LedgerIdTimeSpec::AtIso(iso) => TimeSpec::AtTime(iso),
                 fluree_db_core::ledger_id::LedgerIdTimeSpec::AtCommit(c) => TimeSpec::AtCommit(c),
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtRecorded(r) => {
+                    TimeSpec::AtRecorded(r)
+                }
             });
             let selector = frag
                 .map(GraphSelector::from_str)

@@ -95,6 +95,11 @@ pub enum TransactError {
     #[error("Empty transaction: no flakes to commit")]
     EmptyTransaction,
 
+    /// Invalid commit event time (unparseable, future-dated, or earlier
+    /// than the head commit's event time)
+    #[error("Invalid event time: {0}")]
+    InvalidEventTime(String),
+
     /// Novelty at maximum size (backpressure)
     #[error("Novelty at maximum size, reindexing required")]
     NoveltyAtMax,

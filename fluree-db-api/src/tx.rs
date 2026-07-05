@@ -2151,11 +2151,28 @@ impl crate::Fluree {
     /// Commit a staged transaction (persists commit record + publishes nameservice head).
     pub async fn commit_staged(
         &self,
-        view: StagedLedger,
+        mut view: StagedLedger,
         ns_registry: NamespaceRegistry,
         index_config: &IndexConfig,
         commit_opts: CommitOpts,
     ) -> Result<(CommitReceipt, LedgerState)> {
+        // Resolve head temporal metadata if it wasn't observed at load time
+        // (index == head, no novelty walk): the event-time monotonicity
+        // guard and sticky dual-stamp decision in `build_commit` need it.
+        // Gated on `None` so it costs nothing once resolved; uses the
+        // branch-aware store because a branched ledger's head commit may
+        // live in an ancestor's namespace.
+        if view.base().head_temporal.is_none() && view.base().head_commit_id.is_some() {
+            let ledger_id = view.db().ledger_id.clone();
+            let store = self
+                .content_store_for_record_or_id(view.base().ns_record.as_ref(), &ledger_id)
+                .await?;
+            view.base_mut()
+                .ensure_head_temporal(store.as_ref())
+                .await
+                .map_err(fluree_db_transact::TransactError::from)?;
+        }
+
         let content_store = self.content_store(view.db().ledger_id.as_str());
         let publisher = self.publisher()?;
         let (receipt, ledger) = commit_txn(

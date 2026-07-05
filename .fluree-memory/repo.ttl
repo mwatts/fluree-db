@@ -1202,6 +1202,20 @@ mem:fact-01krb618x0axad5mj8jev4ej0s a mem:Fact ;
     mem:branch "feature/edge-annotations" ;
     mem:createdAt "2026-05-11T09:31:32.640122+00:00"^^xsd:dateTime .
 
+mem:constraint-01kwscqt5qs9raejdt9drmr0xe a mem:Constraint ;
+    mem:content "Event-time validation belongs at the BUILD path (resolve_commit_times), NOT replay. resolve_commit_times rejects new commits with future/backwards event time or future receivedAt (bounded by MAX_EVENT_TIME_FUTURE_SKEW_MS=5min). apply_single_commit (incremental catch-up over already-durable commits) must only WARN on non-monotonic event time, never Err: history is immutable and the full-reload path load_novelty has no guard, so erroring wedges catch-up inconsistently. Separately: dual-stamp (db:receivedAt) is gated on received.is_some()||head.dual_stamp() — with_timestamp alone does NOT flip it (event-axis-only, e.g. fluree-memory git replay); the server pairs eventTime with with_received_at(now)." ;
+    mem:tag "commit" ;
+    mem:tag "dual-stamp" ;
+    mem:tag "event-time" ;
+    mem:tag "receivedat" ;
+    mem:tag "replay" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:branch "feature/event-time-commits" ;
+    mem:createdAt "2026-07-05T15:00:52.023159+00:00"^^xsd:dateTime ;
+    mem:rationale "Hard-erroring on replay broke incremental catch-up for pre-existing non-monotonic chains (NTP/raft skew), inconsistent with the unguarded full-reload path." .
+
 mem:constraint-01kv5g47r2z640tkx6nxd1d8qm a mem:Constraint ;
     mem:content "To roll back / delete a freshly-created ledger you must call `drop_ledger(name, mode)` with the BARE name (it rejects a `:branch` suffix), NOT `drop_branch` — drop_branch refuses the root branch (source_branch=None). Use `split_ledger_id(id)` to strip the branch. Also: after a commits-only restore, `handle.snapshot.t` is the INDEX t (0, no index built), not the commit-head t — assert restore success via `nameservice().lookup(id).commit_t` or a query, not snapshot.t." ;
     mem:tag "drop" ;

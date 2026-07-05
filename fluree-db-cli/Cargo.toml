@@ -66,6 +66,7 @@ fluree-db-mcp = { path = "../fluree-db-mcp" }
 fluree-db-server = { path = "../fluree-db-server", optional = true }
 
 clap = { workspace = true }
+chrono.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
