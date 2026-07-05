@@ -978,11 +978,57 @@ impl BinaryIndexStore {
                     )
                 })?;
                 let f64_vec: Vec<f64> = vs.as_f32().iter().map(|&x| x as f64).collect();
-                Ok(FlakeValue::Vector(f64_vec))
+                Ok(FlakeValue::Vector(f64_vec.into()))
             }
             DecodeKind::SpatialArena => Err(io::Error::other(
                 "spatial arena decode not yet implemented in V6",
             )),
+        }
+    }
+
+    /// Zero-copy lookup of an indexed vector by arena handle.
+    ///
+    /// Returns the shard-backed [`VectorSlice`](crate::arena::vector::VectorSlice)
+    /// for `(g_id, p_id, handle)` — `as_f32()` borrows the packed shard data
+    /// directly, with no per-call allocation or f64 widening (unlike the
+    /// `decode_value` path, which collects a fresh `Vec<f64>` per call).
+    /// `None` when the predicate has no arena or the handle is out of range
+    /// (e.g. an ephemeral novelty handle) — callers fall back to the
+    /// decoding path in that case.
+    pub fn vector_slice(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        handle: u32,
+    ) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        let arena = match self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        arena.lookup_vector(handle)
+    }
+
+    /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
+    ///
+    /// See [`crate::arena::vector::LazyVectorArena::snapshot`] — scan loops
+    /// use this to avoid the per-row shard-cache probe that
+    /// [`Self::vector_slice`] pays. `None` when the predicate has no arena.
+    pub fn vector_arena_snapshot(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> io::Result<Option<crate::arena::vector::VectorArenaSnapshot>> {
+        match self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        {
+            Some(arena) => Ok(Some(arena.snapshot()?)),
+            None => Ok(None),
         }
     }
 

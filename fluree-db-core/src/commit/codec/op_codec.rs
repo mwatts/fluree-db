@@ -236,7 +236,7 @@ fn encode_object(
         FlakeValue::Vector(v) => {
             buf.push(OTag::Vector as u8);
             encode_varint(v.len() as u64, buf);
-            for &element in v {
+            for &element in v.iter() {
                 buf.extend_from_slice(&element.to_le_bytes());
             }
         }
@@ -656,7 +656,7 @@ mod tests {
         let flake = Flake::new(
             Sid::new(101, "x"),
             Sid::new(101, "embedding"),
-            FlakeValue::Vector(vec![1.0, 2.5, -3.7]),
+            FlakeValue::Vector(vec![1.0, 2.5, -3.7].into()),
             Sid::new(2, "vector"),
             1,
             true,
@@ -687,7 +687,7 @@ mod tests {
         let flake = Flake::new(
             Sid::new(101, "x"),
             Sid::new(101, "embedding"),
-            FlakeValue::Vector(vec![]),
+            FlakeValue::Vector(vec![].into()),
             Sid::new(2, "vector"),
             1,
             true,
@@ -702,6 +702,6 @@ mod tests {
         let mut pos = 0;
         let decoded = decode_op(&buf, &mut pos, &read_dicts, 1).unwrap();
         assert_eq!(pos, buf.len());
-        assert_eq!(decoded.o, FlakeValue::Vector(vec![]));
+        assert_eq!(decoded.o, FlakeValue::Vector(vec![].into()));
     }
 }

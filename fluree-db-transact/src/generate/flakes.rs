@@ -443,7 +443,7 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
     // is reserved as the `FlakeValue::max()` upper-bound sentinel, and the shared
     // vector arena hard-rejects them. Catch any path that bypassed
     // `coerce_array_to_vector`'s upstream check (e.g. a future direct
-    // construction of `FlakeValue::Vector(vec![])`).
+    // construction of `FlakeValue::Vector(vec![].into())`).
     if is_vector_dt {
         if let FlakeValue::Vector(v) = val {
             if v.is_empty() {
@@ -673,7 +673,7 @@ mod tests {
         // vector arena rejects it; the write-path guard must catch it even if
         // it bypassed coerce_array_to_vector.
         let err = validate_value_dt_pair(
-            &FlakeValue::Vector(Vec::new()),
+            &FlakeValue::Vector(Vec::new().into()),
             &Sid::new(FLUREE_DB, "embeddingVector"),
         )
         .expect_err("empty vector must be rejected");
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn test_validate_pair_accepts_non_empty_vector() {
         validate_value_dt_pair(
-            &FlakeValue::Vector(vec![0.1, 0.2]),
+            &FlakeValue::Vector(vec![0.1, 0.2].into()),
             &Sid::new(FLUREE_DB, "embeddingVector"),
         )
         .expect("non-empty vector with embeddingVector dt is valid");

@@ -541,7 +541,7 @@ fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
         FlakeValue::Duration(v) => v.original().hash(state),
         FlakeValue::String(v) => v.hash(state),
         FlakeValue::Vector(v) => {
-            for item in v {
+            for item in v.iter() {
                 item.to_bits().hash(state);
             }
         }

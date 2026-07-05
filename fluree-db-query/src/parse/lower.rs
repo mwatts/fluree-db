@@ -502,7 +502,7 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
                 LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
                 LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
-                LiteralValue::Vector(v) => FlakeValue::Vector(v.clone()),
+                LiteralValue::Vector(v) => FlakeValue::Vector(v.as_slice().into()),
             };
 
             match dtc {
@@ -1848,7 +1848,7 @@ fn lower_literal(lit: &LiteralValue) -> FlakeValue {
         LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
         LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
         LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
-        LiteralValue::Vector(v) => FlakeValue::Vector(v.clone()),
+        LiteralValue::Vector(v) => FlakeValue::Vector(v.as_slice().into()),
     }
 }
 
