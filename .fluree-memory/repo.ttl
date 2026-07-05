@@ -1461,6 +1461,33 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:decision-01kwsmdnf7mhnbvn29qgf2j2cx a mem:Decision ;
+    mem:content "Merge-preview include_changes nets per FULL fact key (g,s,p,o,dt,lang,i) — NOT Flake Eq/Hash (ignores g) and NOT (s,p,o,dt,g) alone (collides lang tags + list positions). Netting contract = \"net commit effect\": fact survives iff oldest and newest in-range ops agree (net op = newest); re-assert of a pre-range value nets as assert because the merge replays it. Changes are strategy-independent (raw source-vs-ancestor delta, pre-conflict-resolution) — under TakeSource/TakeBranch the merge commit differs on conflict keys; conflicts.details covers those." ;
+    mem:tag "branches" ;
+    mem:tag "diff" ;
+    mem:tag "flake-identity" ;
+    mem:tag "merge-preview" ;
+    mem:tag "netting" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/merge_preview.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/delta.rs" ;
+    mem:branch "feature/merge-preview-changes" ;
+    mem:createdAt "2026-07-05T17:15:08.135861+00:00"^^xsd:dateTime ;
+    mem:rationale "Pairing-only netting cannot distinguish ancestor-state diff from commit-effect diff without loading ancestor state; net-commit-effect is cheap and equals what merge_branch applies minus cancelling pairs." .
+
+mem:fact-01kwsmdy5pms38yy81d0bdxprb a mem:Fact ;
+    mem:content "Merge-preview changes pagination: subjects sorted by full IRI (decode_sid) — that ordering IS the cursor contract (changes_after_subject resumes strictly after). max_changes counts flakes, cuts at subject boundaries, first subject of a page returned whole even over cap; Some(0)=stats-only (exact counts, truncated=true, no source-state load); CLI --stat maps to Some(0) while CLI --max-changes 0 keeps the CLI's 0=unbounded convention (None locally, param omitted remotely). Source-side walk is shared: compute_delta_keys_and_changes yields conflict keys + netted flakes in one trace_commits_by_id pass (iterate commit.flakes.rev() so within-commit order stays reverse-chronological)." ;
+    mem:tag "branches" ;
+    mem:tag "cli" ;
+    mem:tag "merge-preview" ;
+    mem:tag "pagination" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/merge_preview.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/branch.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/delta.rs" ;
+    mem:branch "feature/merge-preview-changes" ;
+    mem:createdAt "2026-07-05T17:15:17.046896+00:00"^^xsd:dateTime .
+
 mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
     mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
     mem:tag "crate-boundary" ;
