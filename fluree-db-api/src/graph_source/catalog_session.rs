@@ -57,12 +57,15 @@ impl CachedLoadTable {
         }
     }
 
-    /// Rebuild a `LoadTableResponse` (the `config` map is debug-only and dropped).
+    /// Rebuild a `LoadTableResponse` (the `config` map is debug-only and dropped;
+    /// the inline `metadata` is a preview-only convenience the scan path never
+    /// reads, so it is likewise not retained across the cache).
     pub(crate) fn to_response(&self) -> LoadTableResponse {
         LoadTableResponse {
             metadata_location: self.metadata_location.clone(),
             credentials: self.credentials.clone(),
             config: HashMap::default(),
+            metadata: None,
         }
     }
 
@@ -161,6 +164,7 @@ mod tests {
             metadata_location: loc.to_string(),
             config: HashMap::default(),
             credentials: creds,
+            metadata: None,
         }
     }
 

@@ -848,21 +848,34 @@ async fn stage_with_config_shacl(
         cross_ledger_shapes.as_deref(),
     ) {
         (Some(m_db), Some(ns_map), Some(resolved)) => {
-            crate::cross_ledger::resolve_selector_g_id(&m_db.snapshot, &resolved.graph_iri)
-                .map_err(|e| {
-                    fluree_db_transact::TransactError::Parse(format!(
-                        "cross-ledger value-set graph resolution failed: {e}"
-                    ))
-                })?
-                .map(|g_id| fluree_db_shacl::CrossLedgerMembership {
-                    model_db: fluree_db_core::GraphDbRef::new(
-                        &m_db.snapshot,
-                        g_id,
-                        m_db.overlay.as_ref(),
-                        m_db.t,
-                    ),
-                    data_ns_map: ns_map,
-                })
+            // The value-set vocabulary lives in the same M graph the shapes were
+            // compiled from, so a miss here should be unreachable. Error loudly
+            // rather than silently dropping membership — a silent `None` would
+            // make every M-only value fall through to "not a member" and reject
+            // the write with spurious `sh:class` violations.
+            let g_id =
+                crate::cross_ledger::resolve_selector_g_id(&m_db.snapshot, &resolved.graph_iri)
+                    .map_err(|e| {
+                        fluree_db_transact::TransactError::Parse(format!(
+                            "cross-ledger value-set graph resolution failed: {e}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        fluree_db_transact::TransactError::Parse(format!(
+                    "cross-ledger value-set graph {} not present in model ledger {} at t={} \
+                     (shapes resolved but vocabulary graph missing)",
+                    resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
+                ))
+                    })?;
+            Some(fluree_db_shacl::CrossLedgerMembership {
+                model_db: fluree_db_core::GraphDbRef::new(
+                    &m_db.snapshot,
+                    g_id,
+                    m_db.overlay.as_ref(),
+                    m_db.t,
+                ),
+                data_ns_map: ns_map,
+            })
         }
         _ => None,
     };
