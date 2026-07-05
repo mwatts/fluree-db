@@ -99,9 +99,52 @@ impl PartialOrd for TypedValue {
             (TypedValue::TimestampTz(a), TypedValue::TimestampTz(b)) => a.partial_cmp(b),
             (TypedValue::String(a), TypedValue::String(b)) => a.partial_cmp(b),
             (TypedValue::Bytes(a), TypedValue::Bytes(b)) => a.partial_cmp(b),
+            // UUIDs compare lexicographically by their 16 big-endian bytes
+            // (matching Iceberg's UUID bound ordering).
+            (TypedValue::Uuid(a), TypedValue::Uuid(b)) => Some(a.cmp(b)),
+            // Decimals compare by real value. Without these arms a multi-file
+            // decimal column's min/max aggregation kept the FIRST file's bound
+            // (partial_cmp → None → "keep current") instead of the true extremum.
+            (
+                TypedValue::Decimal {
+                    unscaled: a,
+                    scale: sa,
+                    ..
+                },
+                TypedValue::Decimal {
+                    unscaled: b,
+                    scale: sb,
+                    ..
+                },
+            ) => decimal_cmp(*a, *sa, *b, *sb),
             _ => None,
         }
     }
+}
+
+/// Compare two decimals by real value, normalizing to a common scale.
+///
+/// Same-scale decimals — the common case, since a single Iceberg column has one
+/// fixed scale — compare by unscaled value directly. Differing scales are
+/// brought to a common scale with checked arithmetic; an overflow yields `None`
+/// (incomparable) rather than a wrong answer.
+fn decimal_cmp(a: i128, sa: i8, b: i128, sb: i8) -> Option<std::cmp::Ordering> {
+    if sa == sb {
+        return Some(a.cmp(&b));
+    }
+    let common = sa.max(sb);
+    let a_adj = rescale(a, i32::from(common) - i32::from(sa))?;
+    let b_adj = rescale(b, i32::from(common) - i32::from(sb))?;
+    Some(a_adj.cmp(&b_adj))
+}
+
+/// Multiply `value` by `10^exp` (`exp >= 0`), returning `None` on i128 overflow.
+fn rescale(value: i128, exp: i32) -> Option<i128> {
+    let mut acc = value;
+    for _ in 0..exp {
+        acc = acc.checked_mul(10)?;
+    }
+    Some(acc)
 }
 
 /// Decode Iceberg-encoded bytes into a typed value.
@@ -535,6 +578,47 @@ mod tests {
 
         assert_eq!(a.lt(&b), Some(true));
         assert_eq!(b.gt(&a), Some(true));
+    }
+
+    #[test]
+    fn test_decimal_partial_cmp() {
+        use std::cmp::Ordering;
+        let d = |unscaled, scale| TypedValue::Decimal {
+            unscaled,
+            precision: 18,
+            scale,
+        };
+        // Same scale → compare unscaled directly.
+        assert_eq!(d(12345, 2).partial_cmp(&d(999, 2)), Some(Ordering::Greater));
+        assert_eq!(d(999, 2).partial_cmp(&d(12345, 2)), Some(Ordering::Less));
+        assert_eq!(d(500, 2).partial_cmp(&d(500, 2)), Some(Ordering::Equal));
+        // Negative values order correctly.
+        assert_eq!(d(-5, 2).partial_cmp(&d(5, 2)), Some(Ordering::Less));
+        // Differing scales normalize to the same real value: 1.0 (scale 1) ==
+        // 1.00 (scale 2) → Equal; 1.5 > 1.00.
+        assert_eq!(d(10, 1).partial_cmp(&d(100, 2)), Some(Ordering::Equal));
+        assert_eq!(d(15, 1).partial_cmp(&d(100, 2)), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn test_uuid_partial_cmp() {
+        use std::cmp::Ordering;
+        let mut lo = [0u8; 16];
+        lo[15] = 1;
+        let mut hi = [0u8; 16];
+        hi[0] = 1; // most-significant byte set → larger
+        assert_eq!(
+            TypedValue::Uuid(lo).partial_cmp(&TypedValue::Uuid(hi)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            TypedValue::Uuid(hi).partial_cmp(&TypedValue::Uuid(lo)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            TypedValue::Uuid(lo).partial_cmp(&TypedValue::Uuid(lo)),
+            Some(Ordering::Equal)
+        );
     }
 
     #[test]

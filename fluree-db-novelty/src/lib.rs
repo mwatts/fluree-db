@@ -65,7 +65,7 @@ pub use runtime_stats::{
 pub use stats::current_stats;
 
 use fact_state::NoveltyFactState;
-use fluree_db_core::{Flake, GraphId, IndexType, Sid};
+use fluree_db_core::{Flake, GraphId, IndexType, Sid, CONFIG_GRAPH_ID};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -497,6 +497,15 @@ pub struct Novelty {
     /// shape-affecting changed.
     pub shacl_epoch: u64,
 
+    /// Highest `commit_t` at which the ledger config graph (`CONFIG_GRAPH_ID`)
+    /// received a write. Monotonic within a novelty window; resets to 0 when
+    /// novelty is rebuilt (e.g. reindex) — a downward reset only forces a
+    /// re-resolve, never a stale read. Used as the fail-safe invalidation key
+    /// for the resolved-config cache on `LedgerHandle`: config content at head
+    /// is fully determined by this marker, so a matching marker guarantees the
+    /// cached config is current. Stays 0 for ledgers that never write config.
+    pub config_write_t: i64,
+
     /// Edge-annotation attachment overlay (M1 — derived from the
     /// `f:reifies*` system flakes flowing through the same pipeline).
     /// Updated automatically by [`Self::apply_commit`] /
@@ -525,6 +534,7 @@ impl Novelty {
             content_version: 0,
             schema_epoch: 0,
             shacl_epoch: 0,
+            config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
@@ -840,6 +850,12 @@ impl Novelty {
         self.epoch += 1; // Bump epoch once per commit
         self.refresh_content_version();
 
+        // Advance the config-graph write marker so the resolved-config cache
+        // (see `LedgerHandle`) invalidates iff this commit touched config.
+        if checked.contains(&CONFIG_GRAPH_ID) {
+            self.config_write_t = self.config_write_t.max(commit_t);
+        }
+
         // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m) is
         // already **currently asserted** in this graph's novelty window. This
         // prevents duplicate facts from accumulating when the same triple is
@@ -1064,6 +1080,13 @@ impl Novelty {
             // Replace the graph with one consolidated segment (chunked only if it
             // somehow exceeds the local-index width).
             self.set_graph_segments(g_id, kept, true);
+
+            // Keep the config-graph write marker current on the bulk path too
+            // (mirrors `apply_commit`), so the resolved-config cache invalidates
+            // after a bulk import that writes config.
+            if g_id == CONFIG_GRAPH_ID {
+                self.config_write_t = self.config_write_t.max(max_t);
+            }
 
             // Update attachment overlay after the per-graph batch is committed.
             // Malformed bundles are skipped + warned + counted on
@@ -2267,6 +2290,61 @@ mod tests {
             before,
             "re-assert after compaction must still dedup"
         );
+    }
+
+    // ===== Config-graph write marker (resolved-config cache invalidation) =====
+
+    /// `config_write_t` must advance to `commit_t` exactly when a commit touches
+    /// `CONFIG_GRAPH_ID`, stay put on data-only commits, and never regress. This
+    /// is the fail-safe invalidation key for the resolved-config cache: a
+    /// matching marker proves config is unchanged, and a data-only write can
+    /// never spuriously invalidate (churn) nor a config write fail to (stale).
+    #[test]
+    fn config_write_marker_tracks_only_config_graph() {
+        let cfg_g = Sid::new(9, "config-graph");
+        let mut rg = HashMap::new();
+        rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
+
+        let mut n = Novelty::new(0);
+        assert_eq!(n.config_write_t, 0, "marker starts at 0");
+
+        // Data-only commit (default graph, g = None) must not move the marker.
+        n.apply_commit(vec![make_flake(1, 1, 1, 5, true)], 5, &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 0, "default-graph write leaves marker");
+
+        // A commit touching the config graph advances the marker to commit_t.
+        n.apply_commit(vec![make_graph_flake(2, 1, 1, 7, cfg_g.clone())], 7, &rg)
+            .unwrap();
+        assert_eq!(
+            n.config_write_t, 7,
+            "config write advances marker to commit_t"
+        );
+
+        // A later data-only commit must neither bump nor regress the marker.
+        n.apply_commit(vec![make_flake(3, 1, 1, 9, true)], 9, &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 7, "later data-only write leaves marker");
+    }
+
+    /// The bulk (cold-load) path maintains the same marker as `apply_commit`.
+    #[test]
+    fn config_write_marker_tracks_config_graph_on_bulk() {
+        let cfg_g = Sid::new(9, "config-graph");
+        let mut rg = HashMap::new();
+        rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
+
+        let mut n = Novelty::new(0);
+        n.bulk_apply_commits(vec![(vec![make_flake(1, 1, 1, 3, true)], 3)], &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 0, "bulk data-only load leaves marker");
+
+        n.bulk_apply_commits(
+            vec![(vec![make_graph_flake(2, 1, 1, 8, cfg_g.clone())], 8)],
+            &rg,
+        )
+        .unwrap();
+        assert_eq!(n.config_write_t, 8, "bulk config load advances marker");
     }
 
     /// A same-`t` assert+retract of one identity must resolve to ABSENT in

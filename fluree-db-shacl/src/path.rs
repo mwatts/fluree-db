@@ -195,6 +195,14 @@ pub fn resolve_sh_path<'a>(
 /// blank node) into a [`PropertyPath`].
 fn resolve_path_node<'a>(db: GraphDbRef<'a>, node: &'a Sid) -> PathFuture<'a, PropertyPath> {
     Box::pin(async move {
+        // An IRI-valued sh:path is always a plain predicate (SHACL spec); only
+        // blank nodes carry path-expression structure. Short-circuit the common
+        // case to avoid six empty operator probes per property shape — resolve
+        // runs per shape per compile, and compiles happen per transaction.
+        if node.namespace_code != BLANK_NODE {
+            return Ok(PropertyPath::Predicate(node.clone()));
+        }
+
         // Bare RDF list → sequence path. Checked before the operator keys:
         // an (ill-formed) node carrying both a list structure and an
         // operator reads as the sequence, matching the W3C suite's
@@ -515,8 +523,8 @@ async fn closure(
 
 /// Deduplicate value nodes (SHACL value nodes are a set).
 fn dedup(mut values: Vec<PathValue>) -> Vec<PathValue> {
-    let mut seen: HashSet<String> = HashSet::new();
-    values.retain(|(v, dt, lang)| seen.insert(format!("{v:?}|{dt:?}|{lang:?}")));
+    let mut seen: HashSet<(FlakeValue, Sid, Option<String>)> = HashSet::new();
+    values.retain(|(v, dt, lang)| seen.insert((v.clone(), dt.clone(), lang.clone())));
     values
 }
 

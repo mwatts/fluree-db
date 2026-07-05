@@ -284,8 +284,7 @@ pub async fn get_vended_credentials(
     // Serving gate: the ledger's f:serveBlocks posture governs raw access.
     // NOTE: unlike per-request block serving, a minted grant stays valid
     // until it expires — posture changes take effect at grant expiry.
-    let serving =
-        crate::routes::serving::effective_serving(&state.fluree, &effective_ledger).await?;
+    let serving = state.effective_serving_cached(&effective_ledger).await?;
     if !serving.blocks {
         return Err(ServerError::not_found("Ledger not found"));
     }
@@ -409,7 +408,7 @@ pub async fn get_ns_record(
     // Advertise the serving tiers this server offers for the ledger.
     // Best-effort: a ledger that fails to load can't resolve its posture,
     // and the record lookup itself should still succeed.
-    let serving = match crate::routes::serving::effective_serving(&state.fluree, &ledger_id).await {
+    let serving = match state.effective_serving_cached(&ledger_id).await {
         Ok(s) => Some(s.advertised()),
         Err(e) => {
             tracing::warn!(ledger_id, error = %e, "serving posture unresolved; omitting from NS record");
@@ -716,8 +715,7 @@ pub async fn get_object_by_cid(
 
     // 3c. Serving gate: the ledger's f:serveBlocks posture must allow raw
     //     content serving.
-    let serving =
-        crate::routes::serving::effective_serving(&state.fluree, &effective_ledger).await?;
+    let serving = state.effective_serving_cached(&effective_ledger).await?;
     if !serving.blocks {
         return Err(ServerError::not_found("Object not found"));
     }

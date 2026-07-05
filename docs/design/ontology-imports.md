@@ -36,7 +36,7 @@ GRAPH <urn:fluree:myapp:main#config> {
     f:reasoningDefaults <urn:myapp:config:reasoning> .
 
   <urn:myapp:config:reasoning>
-    f:reasoningModes ( "rdfs" "owl2-rl" ) ;
+    f:reasoningModes ( "rdfs" "owl2rl" ) ;
     f:schemaSource <urn:myapp:config:schema-ref> ;
     f:followOwlImports true ;
     f:ontologyImportMap <urn:myapp:config:bfo-binding> .

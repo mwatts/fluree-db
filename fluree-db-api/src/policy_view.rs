@@ -28,6 +28,7 @@
 use crate::dataset::GovernanceOptions;
 use crate::error::Result;
 use crate::policy_builder;
+use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::{LedgerSnapshot, OverlayProvider};
 use fluree_db_ledger::{HistoricalLedgerView, LedgerState};
 use fluree_db_novelty::Novelty;
@@ -353,16 +354,11 @@ pub async fn build_transact_policy_context(
     to_t: i64,
     opts: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>> {
-    let resolved =
-        match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
-            Ok(Some(c)) => Some(crate::config_resolver::resolve_effective_config(&c, None)),
-            Ok(None) => None,
-            Err(e) => {
-                return Err(crate::error::ApiError::config(format!(
-                    "Failed to load ledger config while resolving transaction policy: {e}"
-                )));
-            }
-        };
+    let raw_config =
+        resolve_ledger_config_cached(fluree, snapshot, overlay, novelty_for_stats, to_t).await?;
+    let resolved = raw_config
+        .as_deref()
+        .map(|c| crate::config_resolver::resolve_effective_config(c, None));
 
     let effective_opts = match &resolved {
         Some(r) => crate::config_resolver::merge_policy_opts(r, opts, None),
@@ -416,7 +412,11 @@ pub async fn build_transact_policy_context(
             novelty_for_stats,
             to_t,
             &effective_opts,
-            &[0], // identity-mode uses [0]; unused under cross-ledger
+            // Graph set for the identity subject-existence probe that binds
+            // ?$identity (rule selection is the cross-ledger wire, not these
+            // graphs). Under cross-ledger policy, identity records must live
+            // in D's default graph — the probe searches [0] only.
+            &[0],
             restrictions,
             cross_ledger_schema.clone(),
         )
@@ -424,11 +424,17 @@ pub async fn build_transact_policy_context(
         return Ok(Some(policy_ctx));
     }
 
+    // Resolve (and validate) the same-ledger selector first, matching the read
+    // path's fail-closed-on-unknown-selector contract (fluree_ext.rs resolves
+    // unconditionally). Applying the no-inputs shortcut before this would let an
+    // invalid config `f:policySource` silently run as root on writes while reads
+    // fail closed — the read/write divergence this path exists to eliminate.
+    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot)?;
+
     if !effective_opts.has_any_policy_inputs() {
         return Ok(None);
     }
 
-    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot)?;
     let policy_ctx = policy_builder::build_policy_context_from_opts_with_schema(
         snapshot,
         overlay,
@@ -440,6 +446,72 @@ pub async fn build_transact_policy_context(
     )
     .await?;
     Ok(Some(policy_ctx))
+}
+
+/// Resolve the raw ledger config for the write path, memoized per-ledger by the
+/// novelty config-write marker (`Novelty::config_write_t`).
+///
+/// Reading the config graph on every write — including writes that carry no
+/// policy inputs — is feature-necessary (you must read config to learn
+/// `f:policySource` / config policy defaults), but for a configured ledger under
+/// sustained writes it re-resolves state that has not changed. The marker
+/// advances iff a commit touches the config graph, so a configured-but-static
+/// ledger resolves config once per config change instead of once per write (and
+/// once per stage/commit retry — retries triggered by unrelated data conflicts
+/// leave the marker untouched and hit the cache).
+///
+/// Fail-safe by construction: the cache is consulted only at head, with a
+/// readable marker and a loaded handle. Any deviation — time-travel (`to_t`
+/// below head), a non-`Novelty` overlay, or no loaded handle — resolves fresh
+/// against the passed snapshot/overlay. A cache miss or a marker reset (e.g.
+/// after reindex) costs an extra resolve, never a stale (fail-open) read.
+async fn resolve_ledger_config_cached(
+    fluree: &crate::Fluree,
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+) -> Result<Option<Arc<LedgerConfig>>> {
+    // The invalidation marker and head detection both come from the current
+    // novelty overlay. Prefer the explicit stats handle; fall back to the
+    // overlay when it is itself a `Novelty`.
+    let novelty = novelty_for_stats.or_else(|| overlay.as_any().downcast_ref::<Novelty>());
+
+    // Only cacheable at head (`to_t` == ledger head) with a readable marker.
+    let cache_key = novelty.and_then(|nov| {
+        let head_t = snapshot.t.max(nov.t);
+        (to_t == head_t).then_some(nov.config_write_t)
+    });
+
+    if let Some(key) = cache_key {
+        if let Some(mgr) = fluree.ledger_manager() {
+            if let Some(handle) = mgr.get_loaded_handle(&snapshot.ledger_id).await {
+                if let Some(hit) = handle.config_cache_get(key).await {
+                    return Ok(hit);
+                }
+                let resolved = resolve_ledger_config_raw(snapshot, overlay, to_t).await?;
+                handle.config_cache_put(key, resolved.clone()).await;
+                return Ok(resolved);
+            }
+        }
+    }
+
+    resolve_ledger_config_raw(snapshot, overlay, to_t).await
+}
+
+/// Uncached resolve, `Arc`-wrapping the result and mapping the error into the
+/// config-failure shape `build_transact_policy_context` reports.
+async fn resolve_ledger_config_raw(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<Arc<LedgerConfig>>> {
+    match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
+        Ok(opt) => Ok(opt.map(Arc::new)),
+        Err(e) => Err(crate::error::ApiError::config(format!(
+            "Failed to load ledger config while resolving transaction policy: {e}"
+        ))),
+    }
 }
 
 /// Wrap a ledger with identity-based policy via `f:policyClass` lookup.

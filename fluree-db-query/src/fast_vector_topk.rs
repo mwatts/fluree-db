@@ -104,6 +104,14 @@ pub fn detect_vector_topk(query: &Query) -> Option<VectorTopKSpec> {
         _ => return None,
     };
 
+    // A bare LIMIT with no ORDER BY means "any k rows"; the generic pipeline
+    // returns them in scan order, so imposing top-k-by-score here would change
+    // which rows come back. Only serve LIMIT alongside DESC(?score) — otherwise
+    // decline so the shape routes to the pipeline unchanged.
+    if query.limit.is_some() && order_var.is_none() {
+        return None;
+    }
+
     // Walk WHERE: exactly one triple, one dotProduct bind, ≤1 threshold
     // filter, ≤1 single-row VALUES supplying the target var.
     let mut triple: Option<(VarId, Ref, VarId)> = None;
@@ -292,7 +300,12 @@ impl Fold {
         match need {
             Some(n) => Fold::TopK {
                 need: n,
-                heap: BinaryHeap::with_capacity(n + 1),
+                // Cap the eager reservation: `n` is a user literal (limit +
+                // offset), so a large-but-legal LIMIT would otherwise reserve an
+                // oversized heap per partition. The heap grows if genuinely
+                // needed, and `push` caps it at `need`. `saturating_add` also
+                // avoids the `n + 1` overflow debug-panic at pathological limits.
+                heap: BinaryHeap::with_capacity(n.saturating_add(1).min(4096)),
             },
             None => Fold::All(Vec::new()),
         }
@@ -511,21 +524,31 @@ pub fn vector_topk_operator(
             };
 
             let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
-            let to_t = ctx.to_t;
-            let epoch = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0);
+            let scan = VectorScan {
+                ctx,
+                store,
+                g_id,
+                p_id,
+                scorer: &scorer,
+                need,
+            };
 
             // ── Scan lanes ─────────────────────────────────────────────
-            let rows: Option<Vec<(u64, f64)>> = if total_rows >= PARALLEL_MIN_ROWS {
-                scan_partitioned(ctx, store, g_id, p_id, &ops, &scorer, need, to_t, epoch)?
+            // Partitioned lane first (large predicates); its outcome decides
+            // whether we fall back to the serial lane or defer straight to the
+            // pipeline. A genuine bail must NOT re-scan serially.
+            let partitioned: Option<Vec<(u64, f64)>> = if total_rows >= PARALLEL_MIN_ROWS {
+                match scan_partitioned(&scan, &ops)? {
+                    PartitionScan::Rows(r) => Some(r),
+                    PartitionScan::Bailed => return Ok(None),
+                    PartitionScan::TooFewPartitions => None,
+                }
             } else {
                 None
             };
-            let rows = match rows {
+            let rows = match partitioned {
                 Some(r) => r,
-                None => match scan_serial(ctx, store, g_id, &pred_sid, p_id, &scorer, need)? {
+                None => match scan_serial(&scan, &pred_sid)? {
                     Some(r) => r,
                     None => return Ok(None),
                 },
@@ -586,15 +609,15 @@ pub fn vector_topk_operator(
 }
 
 /// Serial lane: whole-predicate overlay-merging cursor.
-fn scan_serial(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    pred_sid: &Sid,
-    p_id: u32,
-    scorer: &Scorer<'_>,
-    need: Option<usize>,
-) -> Result<Option<Vec<(u64, f64)>>> {
+fn scan_serial(scan: &VectorScan, pred_sid: &Sid) -> Result<Option<Vec<(u64, f64)>>> {
+    let &VectorScan {
+        ctx,
+        store,
+        g_id,
+        p_id,
+        scorer,
+        need,
+    } = scan;
     let Some(mut cursor) = build_overlay_cursor_for_predicate(
         ctx,
         store,
@@ -624,28 +647,59 @@ fn scan_serial(
     Ok(Some(fold.into_rows()))
 }
 
-/// Parallel lane: subject-range partitions at leaf boundaries, each with a
-/// bounded overlay cursor and its subject-sliced overlay ops, folded on the
-/// global rayon pool. Returns `Ok(None)` to fall back to the serial lane
-/// (too few partitions) — the caller then tries `scan_serial`.
-#[allow(clippy::too_many_arguments)]
-fn scan_partitioned(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
+/// Outcome of the partitioned scan lane. Distinguishes "not enough partitions,
+/// fall back to the serial lane" from "a partition genuinely bailed, defer
+/// straight to the pipeline" — the caller must not re-scan serially on a bail
+/// (it would hit the same bail row and waste a full pass).
+enum PartitionScan {
+    /// Too few CPUs / partitions to parallelize — try the serial lane.
+    TooFewPartitions,
+    /// A partition hit a `Bail` condition — defer to the generic pipeline.
+    Bailed,
+    /// Scored rows.
+    Rows(Vec<(u64, f64)>),
+}
+
+/// Shared context for one vector top-k scan of predicate `p_id` in graph
+/// `g_id`: where to read (`store`/`ctx`), how to score (`scorer`), and the
+/// top-k bound (`need`). Both the partitioned and serial lanes take this so the
+/// lane functions only carry their lane-specific extras.
+struct VectorScan<'a> {
+    ctx: &'a ExecutionContext<'a>,
+    store: &'a Arc<BinaryIndexStore>,
     g_id: GraphId,
     p_id: u32,
-    ops: &crate::fast_path_common::SharedOverlayOps,
-    scorer: &Scorer<'_>,
+    scorer: &'a Scorer<'a>,
     need: Option<usize>,
-    to_t: i64,
-    epoch: u64,
-) -> Result<Option<Vec<(u64, f64)>>> {
+}
+
+/// Parallel lane: subject-range partitions at leaf boundaries, each with a
+/// bounded overlay cursor and its subject-sliced overlay ops, folded on the
+/// global rayon pool. Returns [`PartitionScan::TooFewPartitions`] to fall back
+/// to the serial lane, or [`PartitionScan::Bailed`] to defer to the pipeline.
+fn scan_partitioned(
+    scan: &VectorScan,
+    ops: &crate::fast_path_common::SharedOverlayOps,
+) -> Result<PartitionScan> {
+    let &VectorScan {
+        ctx,
+        store,
+        g_id,
+        p_id,
+        scorer,
+        need,
+    } = scan;
+    let to_t = ctx.to_t;
+    let epoch = ctx
+        .overlay
+        .map(fluree_db_core::OverlayProvider::epoch)
+        .unwrap_or(0);
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     let k = ncpu.min(MAX_PARTITIONS);
     if k < 2 {
-        return Ok(None);
+        return Ok(PartitionScan::TooFewPartitions);
     }
     // Candidate subject boundaries: leaf first-subjects when there are
     // enough leaves; else refine to leaflet first-subjects (opens the few
@@ -671,7 +725,7 @@ fn scan_partitioned(
         bounds
     };
     if candidates.len() < 2 {
-        return Ok(None);
+        return Ok(PartitionScan::TooFewPartitions);
     }
     let mut bounds: Vec<u64> = vec![0];
     for j in 1..k {
@@ -682,7 +736,7 @@ fn scan_partitioned(
     }
     bounds.push(u64::MAX);
     if bounds.len() < 3 {
-        return Ok(None);
+        return Ok(PartitionScan::TooFewPartitions);
     }
     let ranges: Vec<(u64, u64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
 
@@ -732,8 +786,8 @@ fn scan_partitioned(
                     merged.push(s, score);
                 }
             }
-            None => return Ok(None), // a partition hit a bail condition
+            None => return Ok(PartitionScan::Bailed), // a partition hit a bail condition
         }
     }
-    Ok(Some(merged.into_rows()))
+    Ok(PartitionScan::Rows(merged.into_rows()))
 }

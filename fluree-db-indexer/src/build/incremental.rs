@@ -333,7 +333,7 @@ async fn run_update_branch(
         let content_store = content_store.as_ref();
         let tracker = &tracker;
         let cache_dir = &cache_dir;
-        let warm_cache = warm_cache.as_deref();
+        let warm_cache = warm_cache.as_ref();
         async move {
             let mut totals = LeafUploadCounts::default();
             while let Some(blob) = rx.recv().await {
@@ -3776,7 +3776,7 @@ async fn upload_one_leaf_blob(
     upload_budget: &Semaphore,
     cache_dir: &std::path::Path,
     blob: NewLeafBlob,
-    warm_cache: Option<&LeafletCache>,
+    warm_cache: Option<&Arc<LeafletCache>>,
 ) -> Result<LeafUploadCounts> {
     let _permit = upload_budget
         .acquire()
@@ -3798,8 +3798,22 @@ async fn upload_one_leaf_blob(
     // Warm-on-write (co-located only): seed the shared read cache with the
     // leaflets we just wrote, from bytes already in hand, so the query server's
     // immediate read of this new-CID leaf hits the cache instead of cold decode.
+    //
+    // The zstd decode runs on a blocking thread, not this async uploader task —
+    // in the co-located deployment the same runtime serves queries, and a churn
+    // build must not stall a query worker on decompression. Warming is
+    // best-effort and fire-and-forget: a read that races a not-yet-finished warm
+    // just cold-decodes as before, and the remaining build steps (branch + root
+    // write, head swap) almost always outlast the decode, so the immediate
+    // post-swap read still hits. `leaf_bytes` is at its last use here, so it
+    // moves into the task rather than being copied.
     if let Some(cache) = warm_cache {
-        warm_leaf_into_cache(cache, &info.leaf_cid, &info.leaf_bytes);
+        let cache = Arc::clone(cache);
+        let leaf_cid = info.leaf_cid.clone();
+        let leaf_bytes = info.leaf_bytes;
+        tokio::task::spawn_blocking(move || {
+            warm_leaf_into_cache(&cache, &leaf_cid, &leaf_bytes);
+        });
     }
 
     if let Some(sc_bytes) = info.sidecar_bytes.as_deref() {
@@ -3814,7 +3828,8 @@ async fn upload_one_leaf_blob(
         counts.sidecar_bytes = sc_bytes.len() as u64;
         counts.sidecar_count = 1;
     }
-    // `info` (and its leaf_bytes/sidecar_bytes) drops here, freeing the buffers.
+    // `info`'s sidecar buffer drops here; `leaf_bytes` was moved into the warm
+    // task above (or already dropped when no warm cache is configured).
     Ok(counts)
 }
 

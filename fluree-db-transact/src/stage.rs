@@ -2475,10 +2475,11 @@ async fn validate_staged_nodes(
         }
     }
 
-    // Check conformance
-    let conforms = all_results
-        .iter()
-        .all(|r| r.severity != fluree_db_shacl::Severity::Violation);
+    // Spec semantics: `sh:conforms` is true iff there are NO results, matching
+    // `ShaclEngine::validate_staged` so `ValidationReport.conforms` means the
+    // same thing across crates. Enforcement gates here key off
+    // `violation_count()` (warnings/info don't reject), not `conforms`.
+    let conforms = all_results.is_empty();
 
     Ok(ValidationReport {
         conforms,

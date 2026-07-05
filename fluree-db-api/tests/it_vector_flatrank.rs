@@ -1681,3 +1681,104 @@ async fn vector_topk_fast_path_parity() {
         .collect();
     assert_rows(&got_fb, &want, "fallback (?vec projected)");
 }
+
+/// A non-vector literal physically stored on the vector predicate passes
+/// fast-path *detection* (the canonical `{?x, ?score}` shape), then trips the
+/// runtime `Scorer::score → Err(Bail)` mid-scan. The whole fast path must defer
+/// to the generic pipeline and return the pipeline's exact rows — never a
+/// partial/garbage result.
+#[tokio::test]
+async fn vector_topk_fast_path_runtime_bail_defers_to_pipeline() {
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/vector-topk-runtime-bail:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    // Real vectors plus one non-vector string on the SAME predicate.
+    let real: [(&str, [f64; 2]); 4] = [
+        ("ex:a", [0.9, 0.1]),
+        ("ex:b", [0.5, 0.5]),
+        ("ex:c", [0.1, 0.9]),
+        ("ex:d", [0.8, 0.2]),
+    ];
+    let mut graph: Vec<serde_json::Value> = real
+        .iter()
+        .map(|(id, v)| {
+            json!({
+                "@id": id,
+                "ex:vec": {"@value": [v[0], v[1]], "@type": "https://ns.flur.ee/db#embeddingVector"}
+            })
+        })
+        .collect();
+    graph.push(json!({"@id": "ex:bad", "ex:vec": "Not a Vector"}));
+
+    let ledger = fluree
+        .insert(ledger0, &json!({"@context": ctx, "@graph": graph}))
+        .await
+        .expect("seed")
+        .ledger;
+    let _ = ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload indexed");
+
+    let target = [0.7_f64, 0.3_f64];
+    let query = json!({
+        "@context": ctx,
+        "select": ["?x", "?score"],
+        "values": [["?t"], [{"@value": [target[0], target[1]], "@type": "https://ns.flur.ee/db#embeddingVector"}]],
+        "where": [
+            {"@id": "?x", "ex:vec": "?vec"},
+            ["bind", "?score", ["dotProduct", "?vec", "?t"]],
+            ["filter", "(> ?score 0)"]
+        ],
+        "orderBy": [["desc", "?score"]],
+        "limit": 3
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("runtime-bail query");
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    let got: Vec<(String, f64)> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let r = r.as_array().unwrap();
+            (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())
+        })
+        .collect();
+
+    // Scalar ground truth over the real vectors only (f32-quantized at ingest;
+    // the target stays full precision). The non-vector subject contributes
+    // nothing, so it must be absent from the deferred pipeline's output.
+    let q = |x: f64| (x as f32) as f64;
+    let mut want: Vec<(String, f64)> = real
+        .iter()
+        .map(|(id, v)| (id.to_string(), q(v[0]) * target[0] + q(v[1]) * target[1]))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    want.sort_by(|a, b| b.1.total_cmp(&a.1));
+    want.truncate(3);
+
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "runtime bail must defer, not emit partial: got {got:?}"
+    );
+    for (i, ((gid, gs), (wid, ws))) in got.iter().zip(&want).enumerate() {
+        assert_eq!(gid, wid, "rank {i} id: got {got:?} want {want:?}");
+        assert!(
+            (gs - ws).abs() <= 1e-9 * ws.abs().max(1.0),
+            "rank {i} score {gs} != {ws}"
+        );
+    }
+    assert!(
+        !got.iter().any(|(id, _)| id == "ex:bad"),
+        "non-vector subject must not appear: {got:?}"
+    );
+}

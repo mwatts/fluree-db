@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
 use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
@@ -143,9 +144,26 @@ impl Clone for LedgerHandle {
     }
 }
 
+/// Cached resolved ledger config, keyed by the novelty config-write marker
+/// (`Novelty::config_write_t`). The marker advances iff a commit writes the
+/// config graph, so a matching key guarantees the cached config is current —
+/// and a mismatch (including the downward reset after a reindex) forces a
+/// re-resolve rather than a stale read. See `policy_view::resolve_ledger_config_cached`.
+#[derive(Default)]
+struct ConfigCacheEntry {
+    /// The `config_write_t` this entry was resolved at; `None` until first populated.
+    key: Option<i64>,
+    /// Resolved config at `key`. `None` (with `key = Some(_)`) memoizes the
+    /// "ledger declares no config" result so unconfigured ledgers skip the scan.
+    config: Option<Arc<LedgerConfig>>,
+}
+
 /// Lock ordering invariant: always acquire `state` before `binary_store`.
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
+///
+/// `config_cache` is independent of `state` (guarded by its own lock, never
+/// held across the `state` lock), so it participates in no ordering constraint.
 struct LedgerHandleInner {
     /// Guards all access to the ledger state. A `RwLock` so concurrent reads
     /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
@@ -175,6 +193,9 @@ struct LedgerHandleInner {
     /// latency-sensitive transactor can disable it. Never fires on the commit
     /// path (commits use `LedgerWriteGuard`, not `snapshot`).
     tier_width: AtomicUsize,
+    /// Resolved-config cache, invalidated by the novelty config-write marker.
+    /// Independent of `state` (see the lock-ordering note above).
+    config_cache: RwLock<ConfigCacheEntry>,
 }
 
 impl LedgerHandle {
@@ -191,8 +212,27 @@ impl LedgerHandle {
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
                 tier_width: AtomicUsize::new(fluree_db_novelty::DEFAULT_TIER_WIDTH),
+                config_cache: RwLock::new(ConfigCacheEntry::default()),
             }),
         }
+    }
+
+    /// Fetch the cached resolved config if it was resolved at `key` (the
+    /// current `Novelty::config_write_t`). Returns `Some(cfg_opt)` on a hit
+    /// (`cfg_opt` is `None` when the ledger declares no config), or `None` on a
+    /// miss. Cheap: a single shared lock on the config cache, never the state.
+    pub(crate) async fn config_cache_get(&self, key: i64) -> Option<Option<Arc<LedgerConfig>>> {
+        let entry = self.inner.config_cache.read().await;
+        (entry.key == Some(key)).then(|| entry.config.clone())
+    }
+
+    /// Store the resolved config under its config-write marker. A later config
+    /// write advances the marker, so the next read misses and re-resolves — the
+    /// cache is a fail-safe fast path that can never serve stale config.
+    pub(crate) async fn config_cache_put(&self, key: i64, config: Option<Arc<LedgerConfig>>) {
+        let mut entry = self.inner.config_cache.write().await;
+        entry.key = Some(key);
+        entry.config = config;
     }
 
     /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
@@ -2839,5 +2879,48 @@ mod tests {
         // Status code should be preserved (404, not 500)
         assert_eq!(extracted.status_code(), 404);
         assert!(extracted.to_string().contains("ledger bar"));
+    }
+
+    /// The resolved-config cache is a fail-safe fast path: a value is served
+    /// only on an exact config-write-marker match. A newer marker (config
+    /// changed) misses and forces a re-resolve — it never serves stale config.
+    /// A memoized "no config" result is a hit (unconfigured ledgers skip the
+    /// scan), and a `put` at a new marker supersedes the prior entry.
+    #[tokio::test]
+    async fn config_cache_marker_gated_and_fail_safe() {
+        let handle = make_test_handle("cfg:main");
+
+        // Empty cache: every marker misses.
+        assert!(
+            handle.config_cache_get(0).await.is_none(),
+            "empty cache misses"
+        );
+
+        // Store a resolved config at marker 7.
+        let cfg = Arc::new(LedgerConfig::default());
+        handle.config_cache_put(7, Some(Arc::clone(&cfg))).await;
+        assert!(
+            matches!(handle.config_cache_get(7).await, Some(Some(_))),
+            "exact marker hits and returns the stored config"
+        );
+
+        // A config write advances the marker → the old entry no longer matches,
+        // so the read misses and the caller re-resolves (never a stale read).
+        assert!(
+            handle.config_cache_get(8).await.is_none(),
+            "advanced marker invalidates the cached config"
+        );
+
+        // "No config at this marker" is a genuine hit, not a miss.
+        handle.config_cache_put(9, None).await;
+        assert!(
+            matches!(handle.config_cache_get(9).await, Some(None)),
+            "memoized no-config result is a hit"
+        );
+        // The overwrite dropped the marker-7 entry.
+        assert!(
+            handle.config_cache_get(7).await.is_none(),
+            "put supersedes the prior marker entry"
+        );
     }
 }
