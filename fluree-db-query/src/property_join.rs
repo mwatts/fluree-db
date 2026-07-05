@@ -203,15 +203,22 @@ impl Hash for SubjectKey {
 }
 
 impl PropertyJoinOperator {
+    /// Rank a predicate as the leading (subject-set-seeding) scan.
+    ///
+    /// All fully-bound objects share the best score; ties resolve to the
+    /// lowest index, and predicate order follows the planner's
+    /// selectivity-reordered pattern order. This is what lets a specific
+    /// bound value (`{id: 4112}`, ~1 row) drive ahead of its `rdf:type`
+    /// class pattern (|class| rows) — while a genuinely rare class, which
+    /// the planner orders first, still wins the tie.
     fn driver_score(
         predicate: &PropertyJoinPredicate,
         object_bounds: &HashMap<VarId, ObjectBounds>,
     ) -> u8 {
         match &predicate.object {
-            PropertyJoinObject::Bound(_) if predicate.pred_ref.is_rdf_type() => 0,
-            PropertyJoinObject::Bound(_) => 1,
-            PropertyJoinObject::Var(obj_var) if object_bounds.contains_key(obj_var) => 2,
-            PropertyJoinObject::Var(_) => 3,
+            PropertyJoinObject::Bound(_) => 0,
+            PropertyJoinObject::Var(obj_var) if object_bounds.contains_key(obj_var) => 1,
+            PropertyJoinObject::Var(_) => 2,
         }
     }
 
@@ -1306,6 +1313,50 @@ mod tests {
 
         let driver = PropertyJoinOperator::select_driver_predicate(&op.predicates, &bounds);
         assert_eq!(driver, Some(0));
+    }
+
+    #[test]
+    fn test_property_join_driver_follows_planner_order_for_bound_objects() {
+        // Post-reorder pattern order is [value-bound, rdf:type]: the specific
+        // bound value must drive, not the class pattern (PERF-1: a
+        // `(:User {id: $id})` star label-scanned because rdf:type outranked
+        // the ~1-row id seek).
+        let rdf_type = || Ref::Iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into());
+        let patterns = vec![
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "id")),
+                Term::Value(fluree_db_core::value::FlakeValue::Long(4112)),
+            ),
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                rdf_type(),
+                Term::Sid(Sid::new(100, "User")),
+            ),
+        ];
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let driver = PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new());
+        assert_eq!(driver, Some(0), "specific bound value should drive");
+
+        // When the planner orders the class first (rare class more selective
+        // than the bound value), the tie-break preserves that choice.
+        let patterns = vec![
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                rdf_type(),
+                Term::Sid(Sid::new(100, "RareClass")),
+            ),
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "status")),
+                Term::Value(fluree_db_core::value::FlakeValue::String("active".into())),
+            ),
+        ];
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let driver = PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new());
+        assert_eq!(driver, Some(0), "planner-first class should keep driving");
     }
 
     #[test]
