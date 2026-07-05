@@ -758,27 +758,32 @@ impl LedgerState {
             )));
         }
 
-        // Guard: event time must be monotonically non-decreasing along the
-        // chain. `datetime_to_t` (`@iso:` resolution) relies on this ordering;
-        // a violation would silently mis-resolve wall-clock time travel.
-        // Soft guard: only enforced when both sides are known — legacy commits
-        // without parseable times fall through rather than wedging the ledger.
+        // Event time should be monotonically non-decreasing along the chain, so
+        // `@iso:`/`@recorded:` resolution stays exact. This is the *replay* path
+        // (incremental catch-up over already-durable commits): the build path
+        // (`resolve_commit_times`) rejects a *new* commit that violates this, but
+        // here the history is immutable and may predate the invariant (a pre-PR
+        // ledger with an NTP step-back or a raft leadership handoff between
+        // skewed clocks). Wedging catch-up can't fix history it can't change, so
+        // warn and continue — resolution across such a point may be approximate.
+        // (The full-reload path has no guard either; this keeps them consistent.)
         let commit_temporal = HeadTemporal::from_commit(&commit);
         if let (Some(prev), Some(new)) = (self.head_temporal, commit_temporal) {
             if new.event_time_ms < prev.event_time_ms {
-                return Err(LedgerError::InvalidData(format!(
-                    "Cannot apply commit at t={commit_t}: event time {} is earlier than \
-                     the current head's event time {} (event time must be monotonically \
-                     non-decreasing)",
-                    new.event_time_ms, prev.event_time_ms
-                )));
+                tracing::warn!(
+                    commit_t,
+                    new_event_time_ms = new.event_time_ms,
+                    prev_event_time_ms = prev.event_time_ms,
+                    "applying commit whose event time predates the head; wall-clock \
+                     (@iso:/@recorded:) resolution may be approximate across this point"
+                );
             }
             if prev.dual_stamp() && !new.dual_stamp() {
-                return Err(LedgerError::InvalidData(format!(
-                    "Cannot apply commit at t={commit_t}: ledger is in dual-stamp mode \
-                     (head commit carries db:receivedAt) but this commit does not; \
-                     @recorded: resolution requires every post-flip commit to dual-stamp"
-                )));
+                tracing::warn!(
+                    commit_t,
+                    "applying a post-flip commit without db:receivedAt; @recorded: \
+                     resolution may be approximate across this point"
+                );
             }
         }
 
@@ -1481,6 +1486,29 @@ mod tests {
         assert!(err.to_string().contains("missing content ID"));
         // State should not have changed
         assert_eq!(state.t(), 0);
+    }
+
+    #[test]
+    fn test_apply_single_commit_tolerates_backwards_event_time() {
+        // Replay/catch-up over already-durable commits must not wedge on a
+        // non-monotonic event time (clock skew / pre-invariant history). The
+        // build path rejects new violations; this path warns and continues.
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        let c1 = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"))
+            .with_time("2026-01-02T00:00:00Z");
+        state.apply_single_commit(c1, "test:main").unwrap();
+
+        // c2's event time steps backwards relative to c1 — must still apply.
+        let c2 = Commit::new(2, vec![make_flake(11, 1, 200, 2)])
+            .with_id(make_test_commit_id("commit:2"))
+            .with_time("2026-01-01T00:00:00Z");
+        state
+            .apply_single_commit(c2, "test:main")
+            .expect("replay must tolerate a backwards event time");
+        assert_eq!(state.t(), 2);
     }
 
     #[test]
