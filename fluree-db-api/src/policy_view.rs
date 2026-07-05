@@ -395,7 +395,11 @@ pub async fn build_transact_policy_context(
             novelty_for_stats,
             to_t,
             &effective_opts,
-            &[0], // identity-mode uses [0]; unused under cross-ledger
+            // Graph set for the identity subject-existence probe that binds
+            // ?$identity (rule selection is the cross-ledger wire, not these
+            // graphs). Under cross-ledger policy, identity records must live
+            // in D's default graph — the probe searches [0] only.
+            &[0],
             restrictions,
         )
         .await?;

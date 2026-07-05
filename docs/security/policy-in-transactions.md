@@ -95,6 +95,8 @@ The ledger's `#config` graph governs writes the same way it governs reads:
 
 This applies uniformly across the server transact routes (local and Raft consensus), push replication, credentialed transactions, and the CLI's local mode with policy flags.
 
+> **Trusted-admin exception.** Config-driven write enforcement is applied at the consensus commit boundary. Direct in-process library writes — the embedded `Fluree::insert_turtle` / `insert_turtle_with_opts` methods, and `fluree insert`/`upsert`/`update` in local mode invoked without policy flags — are a **trusted-admin path**: they stage under root and do **not** resolve config-declared `f:policySource` / `f:modify` defaults. An embedded integrator that needs config policy enforced on writes must go through the server transact routes (or supply an explicit `PolicyContext`). This is deliberate: a process with direct storage access is already inside the trust boundary.
+
 ## Targeting patterns
 
 ### Whitelist a property to a role

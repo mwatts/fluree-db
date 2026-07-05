@@ -226,6 +226,13 @@ under a cross-ledger `f:policySource`:
   `?$identity`: `f:query` rules referencing it match nothing, so
   `f:required` rules deny — the same contract as same-ledger
   identity-mode's unknown-identity case.
+- **Identity records must live in D's default graph.** The
+  subject-existence probe that decides whether to bind `?$identity`
+  searches D's default graph only. An identity whose subject node
+  is written into a *named* graph is treated as absent (unbound
+  `?$identity`), so `f:required` rules deny even for a legitimate
+  owner. Keep identity/user records in the default graph, or bind
+  `?$identity` explicitly via `opts.policy_values`.
 
 One merge subtlety: an identity counts as a request policy input,
 so under the default `f:overrideControl` (`f:OverrideAll`) the
