@@ -2164,7 +2164,8 @@ pub async fn stage_with_shacl(
     // Validate staged flakes against shapes (per graph). `None` for
     // `enabled_graphs` means "validate every graph with staged flakes" —
     // this legacy path doesn't consult per-graph config.
-    let report = validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None).await?;
+    let report =
+        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
 
     if !report.conforms {
         return Err(TransactError::ShaclViolation(format_shacl_report(&report)));
@@ -2227,17 +2228,33 @@ pub async fn validate_view_with_shacl(
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
+    membership_g_ids: &[GraphId],
+    cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
 ) -> Result<ShaclValidationOutcome> {
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     if shacl_cache.is_empty() {
         return Ok(ShaclValidationOutcome::default());
     }
 
-    let engine = ShaclEngine::new(shacl_cache.clone());
+    // `membership_g_ids` (the `f:shapesSource` graph[s]) are unioned into
+    // `sh:class` value-membership resolution so a shared value-set vocabulary
+    // can live alongside the shapes rather than in each data graph.
+    // `cross_ledger_db` is a live handle into a model ledger holding the
+    // controlled vocabulary (cross-ledger `f:shapesSource`), consulted on
+    // demand for `sh:class` membership.
+    let engine =
+        ShaclEngine::new(shacl_cache.clone()).with_membership_graphs(membership_g_ids.to_vec());
     let enabled_graphs: Option<HashSet<GraphId>> =
         per_graph_policy.map(|m| m.keys().copied().collect());
-    let report =
-        validate_staged_nodes(view, &engine, graph_sids, tracker, enabled_graphs.as_ref()).await?;
+    let report = validate_staged_nodes(
+        view,
+        &engine,
+        graph_sids,
+        tracker,
+        enabled_graphs.as_ref(),
+        cross_ledger,
+    )
+    .await?;
 
     // Split violations by the graph's configured mode. `graph_id` on each
     // result was tagged during the per-graph loop in validate_staged_nodes.
@@ -2269,8 +2286,11 @@ pub async fn validate_view_with_shacl(
 /// Validate staged nodes against SHACL shapes, per graph.
 ///
 /// Groups staged subjects by their graph and validates each group with a
-/// `GraphDbRef` targeting the correct `g_id`. Shape compilation stays at
-/// g_id=0 (shapes are schema-level definitions in the default graph).
+/// `GraphDbRef` targeting the correct `g_id`. Shape *compilation* graph is
+/// chosen upstream by `f:shapesSource` (see `apply_shacl_policy_to_staged_view`)
+/// — this loop only drives per-graph *validation*. `sh:class` value membership
+/// additionally consults the engine's `membership_g_ids` (the `f:shapesSource`
+/// vocabulary graph[s]) unioned with each focus node's own data graph.
 ///
 /// When `graph_sids` is `None` (e.g., commit-transfer path where the txn
 /// context is unavailable), falls back to validating all subjects against
@@ -2282,6 +2302,7 @@ async fn validate_staged_nodes(
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
+    cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
 ) -> Result<ValidationReport> {
     use fluree_vocab::namespaces::RDF;
     use fluree_vocab::rdf_names;
@@ -2389,7 +2410,9 @@ async fn validate_staged_nodes(
             // inside `validate_node` via post-state range queries — see the
             // SubjectsOf/ObjectsOf handling there for why hints can't be
             // reliably built from staged flakes alone.
-            let report = engine.validate_node(db, subject, &node_types).await?;
+            let report = engine
+                .validate_node(db, subject, &node_types, cross_ledger)
+                .await?;
             // Tag each result with the graph it was validated under so the
             // caller can route warn vs reject per-graph (see
             // `ShaclValidationOutcome`).

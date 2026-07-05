@@ -20,7 +20,53 @@ use fluree_db_core::{
 };
 use fluree_vocab::namespaces::RDF;
 use fluree_vocab::rdf_names;
-use std::collections::HashSet;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
+
+/// Per-transaction memo for `sh:class` value-membership verdicts.
+///
+/// Keyed by `(value node, expected class, focus data graph)`. The engine that
+/// drives transaction validation is built fresh per transaction and shared
+/// across every focus node, so this map is scoped to exactly one validation
+/// pass and never leaks a verdict across transactions or staged states. The
+/// focus data graph is part of the key because membership is resolved against
+/// the *union* of the focus data graph and the vocabulary graphs — the same
+/// value can legitimately resolve differently when referenced from a different
+/// data graph.
+type ClassMembershipCache = Mutex<HashMap<(Sid, Sid, GraphId), bool>>;
+
+/// Threaded context for resolving `sh:class` value membership: the extra
+/// vocabulary graphs to union into the `rdf:type` / `rdfs:subClassOf` lookup
+/// (the `f:shapesSource` graph[s]) plus the per-transaction memo. `Copy`
+/// because it is just two borrows passed down the validation call tree.
+/// A live cross-ledger membership source for `sh:class`: a handle into the
+/// model ledger M holding the controlled vocabulary, plus the data ledger's
+/// namespace map (code → IRI prefix, including this transaction's staged
+/// allocations) needed to translate D-term Sids into M's term space.
+#[derive(Clone, Copy)]
+pub struct CrossLedgerMembership<'a> {
+    /// `GraphDbRef` into M's value-set graph at the resolved `t`.
+    pub model_db: GraphDbRef<'a>,
+    /// D's namespace codes → IRI prefixes (base + this transaction's staged
+    /// allocations). Used to decode a D-term Sid to its full IRI before
+    /// re-encoding it against M (whose split mode may differ), because the
+    /// staged base snapshot alone can't decode namespaces introduced this txn.
+    pub data_ns_map: &'a HashMap<u16, String>,
+}
+
+#[derive(Clone, Copy)]
+struct ClassMembershipCtx<'a> {
+    /// Graphs beyond the focus node's own data graph to consult for membership.
+    /// Empty = legacy behaviour (focus data graph for `rdf:type`, schema graph
+    /// 0 for `subClassOf`).
+    membership_g_ids: &'a [GraphId],
+    /// Per-transaction memo shared across all focus nodes in one pass.
+    cache: &'a ClassMembershipCache,
+    /// Cross-ledger value-set source (model ledger M holding the controlled
+    /// vocabulary), when `f:shapesSource` is cross-ledger. Consulted on demand
+    /// for `sh:class` membership after the local lookup misses.
+    cross_ledger: Option<CrossLedgerMembership<'a>>,
+}
 
 /// SHACL validation engine
 ///
@@ -33,6 +79,13 @@ pub struct ShaclEngine {
     cache: ShaclCache,
     /// Schema hierarchy for RDFS reasoning (optional)
     hierarchy: Option<SchemaHierarchy>,
+    /// Extra graphs consulted when resolving `sh:class` value membership —
+    /// typically the `f:shapesSource` graph(s), so a shared value-set
+    /// vocabulary can live alongside the shapes. The focus node's own data
+    /// graph is always consulted in addition to these.
+    membership_g_ids: Vec<GraphId>,
+    /// Per-transaction memo of resolved `sh:class` membership verdicts.
+    class_cache: ClassMembershipCache,
 }
 
 impl ShaclEngine {
@@ -43,6 +96,8 @@ impl ShaclEngine {
         Self {
             cache,
             hierarchy: None,
+            membership_g_ids: Vec::new(),
+            class_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -54,6 +109,8 @@ impl ShaclEngine {
         Self {
             cache,
             hierarchy: Some(hierarchy),
+            membership_g_ids: Vec::new(),
+            class_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -96,7 +153,22 @@ impl ShaclEngine {
         let hierarchy = dbs.first().and_then(|d| d.snapshot.schema_hierarchy());
         let cache = ShaclCache::new(key, shapes, hierarchy.as_ref());
 
-        Ok(Self { cache, hierarchy })
+        Ok(Self {
+            cache,
+            hierarchy,
+            membership_g_ids: Vec::new(),
+            class_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Set the additional graphs consulted when resolving `sh:class` value
+    /// membership (typically the `f:shapesSource` graph ids). The focus node's
+    /// own data graph is always consulted in addition to these, so a shared
+    /// value-set vocabulary can live in the shapes graph while the referencing
+    /// data lives in a different graph.
+    pub fn with_membership_graphs(mut self, g_ids: Vec<GraphId>) -> Self {
+        self.membership_g_ids = g_ids;
+        self
     }
 
     /// Build an engine by compiling shapes from a database (no overlay)
@@ -139,6 +211,7 @@ impl ShaclEngine {
         db: GraphDbRef<'_>,
         focus_node: &Sid,
         node_types: &[Sid],
+        cross_ledger: Option<CrossLedgerMembership<'_>>,
     ) -> Result<ValidationReport> {
         let mut results = Vec::new();
 
@@ -195,13 +268,21 @@ impl ShaclEngine {
         // Collect all shapes for logical constraint resolution
         let all_shapes: Vec<&CompiledShape> = self.cache.all_shapes().iter().collect();
 
-        // Validate against each shape
+        // Validate against each shape. `class_ctx` carries the `f:shapesSource`
+        // vocabulary graphs (for cross-graph `sh:class` value-sets) and the
+        // per-transaction membership memo down to `validate_class_constraint`.
+        let class_ctx = ClassMembershipCtx {
+            membership_g_ids: &self.membership_g_ids,
+            cache: &self.class_cache,
+            cross_ledger,
+        };
         for shape in applicable_shapes {
             if shape.deactivated {
                 continue;
             }
 
-            let shape_results = validate_shape(db, focus_node, shape, &all_shapes).await?;
+            let shape_results =
+                validate_shape(db, focus_node, shape, &all_shapes, Some(class_ctx)).await?;
             results.extend(shape_results);
         }
 
@@ -219,7 +300,7 @@ impl ShaclEngine {
         node_types: &[Sid],
     ) -> Result<ValidationReport> {
         let db = GraphDbRef::new(snapshot, g_id, &NoOverlay, snapshot.t);
-        self.validate_node(db, focus_node, node_types).await
+        self.validate_node(db, focus_node, node_types, None).await
     }
 
     /// Validate all focus nodes targeted by shapes
@@ -229,6 +310,13 @@ impl ShaclEngine {
         // Collect all shapes for logical constraint resolution
         let all_shapes: Vec<&CompiledShape> = self.cache.all_shapes().iter().collect();
 
+        let class_ctx = ClassMembershipCtx {
+            membership_g_ids: &self.membership_g_ids,
+            cache: &self.class_cache,
+            // Full-db validation (`validate_all`) has no cross-ledger model
+            // context; `sh:class` uses the local lookup only.
+            cross_ledger: None,
+        };
         for shape in self.cache.all_shapes() {
             if shape.deactivated {
                 continue;
@@ -238,7 +326,8 @@ impl ShaclEngine {
             let focus_nodes = get_focus_nodes(db, shape, self.hierarchy.as_ref()).await?;
 
             for focus_node in focus_nodes {
-                let results = validate_shape(db, &focus_node, shape, &all_shapes).await?;
+                let results =
+                    validate_shape(db, &focus_node, shape, &all_shapes, Some(class_ctx)).await?;
                 all_results.extend(results);
             }
         }
@@ -351,7 +440,7 @@ impl ShaclEngine {
                 .collect();
 
             // Validate this node against applicable shapes
-            let report = self.validate_node(db, subject, &node_types).await?;
+            let report = self.validate_node(db, subject, &node_types, None).await?;
             all_results.extend(report.results);
         }
 
@@ -494,6 +583,7 @@ fn validate_shape<'a>(
     focus_node: &'a Sid,
     shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -502,7 +592,8 @@ fn validate_shape<'a>(
         // Validate property shapes
         for prop_shape in &shape.property_shapes {
             let prop_results =
-                validate_property_shape(db, focus_node, prop_shape, shape, all_shapes).await?;
+                validate_property_shape(db, focus_node, prop_shape, shape, all_shapes, class_ctx)
+                    .await?;
             results.extend(prop_results);
         }
 
@@ -769,7 +860,11 @@ fn validate_nested_shape<'a>(
             && nested.value_constraints.is_empty()
         {
             if let Some(ref_shape) = all_shapes.iter().find(|s| s.id == nested.id) {
-                return validate_shape(db, focus_node, ref_shape, all_shapes).await;
+                // `sh:class` reached via a referenced/nested shape keeps the
+                // legacy data-graph lookup (no `f:shapesSource` vocabulary union
+                // and no shared memo) — the value-set feature targets top-level
+                // property shapes.
+                return validate_shape(db, focus_node, ref_shape, all_shapes, None).await;
             }
             // Shape not found and no inline constraints — treat as unresolved.
             // Return a violation to prevent sh:or from being trivially true.
@@ -880,6 +975,7 @@ async fn validate_property_shape<'a>(
     prop_shape: &PropertyShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
 
@@ -935,7 +1031,7 @@ async fn validate_property_shape<'a>(
             }
             Constraint::Class(expected_class) => {
                 let class_violations =
-                    validate_class_constraint(db, &values, expected_class).await?;
+                    validate_class_constraint(db, &values, expected_class, class_ctx).await?;
                 for violation in class_violations {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
@@ -1428,24 +1524,36 @@ fn validate_pair_constraint(
 /// Validate `sh:class` for a set of property values.
 ///
 /// For each value (which must be a `Ref` — a literal can never be an instance
-/// of a class), look up `rdf:type` flakes and check conformance via:
-/// 1. Direct match: value's type == `expected_class`
-/// 2. Indexed-schema hierarchy: type is a descendant of `expected_class` per
-///    the `SchemaHierarchy` cached on the snapshot (fast, but only reflects
-///    already-indexed subclass relations)
-/// 3. Live subclass walk: BFS upward over `rdfs:subClassOf` via `db.range()`,
-///    which sees novelty-added relations that aren't yet in the hierarchy
+/// of a class), resolve whether it is (transitively) an instance of
+/// `expected_class`. Membership is looked up across the **union** of the focus
+/// node's own data graph and any `f:shapesSource` vocabulary graphs threaded in
+/// via `class_ctx`, so a shared value-set (e.g. a list of US states defined in
+/// the shapes graph) is discoverable even when the referencing records live in
+/// a different graph. Resolution uses, in order:
+/// 1. Direct / indexed-hierarchy match against the `SchemaHierarchy`.
+/// 2. Live `rdfs:subClassOf` walk (schema graph 0 unioned with the vocabulary
+///    graphs) for novelty-added or vocabulary-local relations.
 ///
-/// A value with no conforming `rdf:type` is a violation.
+/// When `class_ctx` is present its per-transaction memo collapses repeated
+/// `(value, class, focus graph)` checks to a single lookup. A value with no
+/// conforming `rdf:type` is a violation.
 async fn validate_class_constraint(
     db: GraphDbRef<'_>,
     values: &[FlakeValue],
     expected_class: &Sid,
+    class_ctx: Option<ClassMembershipCtx<'_>>,
 ) -> Result<Vec<ConstraintViolation>> {
     let mut out = Vec::new();
     if values.is_empty() {
         return Ok(out);
     }
+
+    // Extra vocabulary graphs (f:shapesSource) unioned into the membership
+    // lookup. Empty when no context is threaded (e.g. `sh:class` reached via a
+    // referenced shape), which preserves the historical data-graph-only lookup.
+    let membership_g_ids: &[GraphId] = class_ctx.map(|c| c.membership_g_ids).unwrap_or(&[]);
+    // Cross-ledger value-set source, if any.
+    let cross_ledger: Option<CrossLedgerMembership<'_>> = class_ctx.and_then(|c| c.cross_ledger);
 
     // Fast-path acceptable set: expected_class + its descendants per the
     // indexed-schema hierarchy. Misses novelty-added subclass relations;
@@ -1459,7 +1567,6 @@ async fn validate_class_constraint(
         }
     }
 
-    let rdf_type = Sid::new(RDF, rdf_names::TYPE);
     for value in values {
         let value_ref = match value {
             FlakeValue::Ref(r) => r,
@@ -1476,35 +1583,34 @@ async fn validate_class_constraint(
             }
         };
 
-        let type_flakes = db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::subject_predicate(value_ref.clone(), rdf_type.clone()),
-            )
-            .await?;
+        // Per-transaction memo keyed on (value, class, focus data graph). The
+        // guard is dropped before any `.await` so the validation future stays
+        // `Send`. Cache hits also skip the range scan (and its fuel charge), so
+        // per-transaction fuel depends on intra-transaction value repetition.
+        let cache_key = (value_ref.clone(), expected_class.clone(), db.g_id);
+        let cached: Option<bool> = class_ctx.and_then(|c| {
+            let guard = c.cache.lock();
+            guard.get(&cache_key).copied()
+        });
 
-        let value_types: Vec<Sid> = type_flakes
-            .iter()
-            .filter_map(|f| match &f.o {
-                FlakeValue::Ref(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-
-        // Fast path: any indexed-hierarchy match.
-        let mut conforms = value_types.iter().any(|t| hierarchy_accepted.contains(t));
-
-        // Slow path: walk the live `rdfs:subClassOf` graph (covers novelty-added
-        // subclass relations that haven't made it into the hierarchy yet).
-        if !conforms {
-            for t in &value_types {
-                if is_subclass_of(db, t, expected_class).await? {
-                    conforms = true;
-                    break;
+        let conforms = match cached {
+            Some(hit) => hit,
+            None => {
+                let computed = value_conforms_to_class(
+                    db,
+                    membership_g_ids,
+                    cross_ledger,
+                    value_ref,
+                    &hierarchy_accepted,
+                    expected_class,
+                )
+                .await?;
+                if let Some(c) = class_ctx {
+                    c.cache.lock().insert(cache_key, computed);
                 }
+                computed
             }
-        }
+        };
 
         if !conforms {
             out.push(ConstraintViolation {
@@ -1521,47 +1627,199 @@ async fn validate_class_constraint(
     Ok(out)
 }
 
-/// Rescope a `GraphDbRef` to the default (schema) graph while preserving
-/// every other field — tracker, runtime_small_dicts, eager, overlay,
-/// snapshot, and t.
+/// Resolve whether `value_ref` is (transitively) an instance of
+/// `expected_class`, consulting the focus node's data graph unioned with
+/// `membership_g_ids` (the `f:shapesSource` vocabulary graph[s]). When a
+/// cross-ledger model handle is present, it is consulted on demand only after
+/// the local lookup misses (so locally-typed values never touch the model
+/// ledger).
+async fn value_conforms_to_class(
+    db: GraphDbRef<'_>,
+    membership_g_ids: &[GraphId],
+    cross_ledger: Option<CrossLedgerMembership<'_>>,
+    value_ref: &Sid,
+    hierarchy_accepted: &HashSet<Sid>,
+    expected_class: &Sid,
+) -> Result<bool> {
+    let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+
+    // Graphs to consult for the value's `rdf:type`: the focus data graph plus
+    // the configured vocabulary graphs, de-duplicated.
+    let mut lookup_g_ids: Vec<GraphId> = vec![db.g_id];
+    for &g in membership_g_ids {
+        if !lookup_g_ids.contains(&g) {
+            lookup_g_ids.push(g);
+        }
+    }
+
+    let mut value_types: Vec<Sid> = Vec::new();
+    for &g in &lookup_g_ids {
+        let gdb = rescope_to_graph(db, g);
+        let type_flakes = gdb
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject_predicate(value_ref.clone(), rdf_type.clone()),
+            )
+            .await?;
+        for f in &type_flakes {
+            if let FlakeValue::Ref(t) = &f.o {
+                if !value_types.contains(t) {
+                    value_types.push(t.clone());
+                }
+            }
+        }
+    }
+
+    // Fast path: any indexed-hierarchy match.
+    if value_types.iter().any(|t| hierarchy_accepted.contains(t)) {
+        return Ok(true);
+    }
+
+    // Slow path: walk the live `rdfs:subClassOf` graph (schema graph 0 unioned
+    // with the vocabulary graphs) for novelty-added / vocabulary-local relations.
+    for t in &value_types {
+        if is_subclass_of(db, membership_g_ids, t, expected_class).await? {
+            return Ok(true);
+        }
+    }
+
+    // Cross-ledger fallback: the controlled vocabulary lives in a model ledger.
+    // Only reached when the value isn't typed locally.
+    if let Some(cl) = cross_ledger {
+        return value_conforms_cross_ledger(cl, value_ref, expected_class).await;
+    }
+
+    Ok(false)
+}
+
+/// Decode a data-ledger Sid to its IRI using an explicit namespace-code map.
 ///
-/// **Do not replace this with `GraphDbRef::new(db.snapshot, 0, db.overlay, db.t)`.**
-/// That constructor resets `tracker` (and `runtime_small_dicts`, `eager`) to
-/// their defaults, which silently disables fuel accounting on any schema
-/// walks a tracked validation is running. The copy-and-mutate-`g_id` pattern
-/// below leans on `GraphDbRef: Copy` to carry every field through unchanged.
-fn rescope_to_schema_graph(db: GraphDbRef<'_>) -> GraphDbRef<'_> {
-    let mut schema_db = db;
-    schema_db.g_id = 0;
-    schema_db
+/// Mirrors `LedgerSnapshot::decode_sid` but reads from a supplied map so that
+/// namespaces this transaction *staged* (absent from the base snapshot) still
+/// decode. `EMPTY` / `OVERFLOW` codes carry the full IRI as the name.
+fn decode_sid_with_ns_map(ns_map: &HashMap<u16, String>, sid: &Sid) -> Option<String> {
+    use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+    if sid.namespace_code == EMPTY || sid.namespace_code == OVERFLOW {
+        return Some(sid.name.to_string());
+    }
+    ns_map
+        .get(&sid.namespace_code)
+        .map(|prefix| format!("{}{}", prefix, sid.name))
+}
+
+/// Resolve `sh:class` membership against a cross-ledger model ledger `M`.
+///
+/// `value_ref` / `expected_class` are Sids in the data ledger D's term space,
+/// so they are decoded to IRIs against D's (staged) namespace map and
+/// re-encoded against M — which re-splits with its own mode, so differing
+/// namespace-split modes between the ledgers are handled correctly. Well-known
+/// vocab predicates (`rdf:type`, `rdfs:subClassOf`) share global namespace
+/// codes across ledgers, so only the user IRIs need translation. If M has never
+/// seen the value or class IRI, it cannot be a member there.
+async fn value_conforms_cross_ledger(
+    cl: CrossLedgerMembership<'_>,
+    value_ref: &Sid,
+    expected_class: &Sid,
+) -> Result<bool> {
+    let m_db = cl.model_db;
+    // D term -> IRI (via D's staged ns map) -> M term. A missing decode/encode
+    // means the value/class is simply not known to M -> not a member there.
+    let (Some(value_iri), Some(class_iri)) = (
+        decode_sid_with_ns_map(cl.data_ns_map, value_ref),
+        decode_sid_with_ns_map(cl.data_ns_map, expected_class),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(m_value), Some(m_class)) = (
+        m_db.snapshot.encode_iri_strict(&value_iri),
+        m_db.snapshot.encode_iri_strict(&class_iri),
+    ) else {
+        return Ok(false);
+    };
+
+    let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+    let type_flakes = m_db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject_predicate(m_value, rdf_type),
+        )
+        .await?;
+    let m_types: Vec<Sid> = type_flakes
+        .iter()
+        .filter_map(|f| match &f.o {
+            FlakeValue::Ref(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if m_types.contains(&m_class) {
+        return Ok(true);
+    }
+
+    // Subclass reasoning within M: walk `subClassOf` over M's value-set graph
+    // unioned with M's schema graph (g_id=0).
+    for t in &m_types {
+        if is_subclass_of(m_db, &[m_db.g_id], t, &m_class).await? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Rescope a `GraphDbRef` to a specific graph while preserving every other
+/// field — tracker, runtime_small_dicts, eager, overlay, snapshot, and t.
+///
+/// **Do not replace this with `GraphDbRef::new(..)`.** That constructor resets
+/// `tracker` (and `runtime_small_dicts`, `eager`) to their defaults, silently
+/// disabling fuel accounting on any walk a tracked validation is running. The
+/// copy-and-mutate-`g_id` pattern leans on `GraphDbRef: Copy` to carry every
+/// field through unchanged.
+fn rescope_to_graph(db: GraphDbRef<'_>, g_id: GraphId) -> GraphDbRef<'_> {
+    let mut scoped = db;
+    scoped.g_id = g_id;
+    scoped
 }
 
 /// BFS upward from `start` over `rdfs:subClassOf`, returning true if `target`
 /// is reachable.
 ///
-/// The walk is scoped to the **default graph** (`g_id = 0`), not the caller's
-/// graph. Rationale: `rdfs:subClassOf` is schema-level data — the indexed
-/// `SchemaHierarchy` is built exclusively from the default graph, and this
-/// fallback walk must match that semantic. Otherwise a subject being validated
-/// in graph `G` would not see a subclass edge asserted in the schema graph.
+/// The walk consults the **schema graph** (`g_id = 0`) unioned with any
+/// `membership_g_ids` (the `f:shapesSource` vocabulary graph[s]). Rationale:
+/// `rdfs:subClassOf` is schema-level data — the indexed `SchemaHierarchy` is
+/// built from the default graph, and this fallback must match that semantic,
+/// while a value-set vocabulary configured via `f:shapesSource` may define a
+/// small class hierarchy in its own graph that must also be honoured.
 ///
-/// Uses `db.range()` via a rebuilt `GraphDbRef` so novelty-added subclass
+/// Uses `db.range()` via rescoped `GraphDbRef`s so novelty-added subclass
 /// relations are visible — the indexed `SchemaHierarchy` can lag behind.
 ///
 /// Returns `Ok(true)` immediately when `start == target` (every class is a
 /// subclass of itself for the purposes of `sh:class`). Cycle-guarded via a
 /// `visited` set, since `rdfs:subClassOf` graphs in user data can be malformed.
-async fn is_subclass_of(db: GraphDbRef<'_>, start: &Sid, target: &Sid) -> Result<bool> {
+async fn is_subclass_of(
+    db: GraphDbRef<'_>,
+    membership_g_ids: &[GraphId],
+    start: &Sid,
+    target: &Sid,
+) -> Result<bool> {
     use std::collections::VecDeque;
 
     if start == target {
         return Ok(true);
     }
 
-    // Schema relations live in g_id=0. Use `rescope_to_schema_graph` so the
-    // caller's tracker and other per-validation context survive — see the
-    // function's docstring for why `GraphDbRef::new(..)` must NOT be used.
-    let schema_db = rescope_to_schema_graph(db);
+    // Graphs holding subClassOf edges: the schema graph plus the vocabulary
+    // graphs, de-duplicated. Rescoping preserves the caller's tracker — see
+    // `rescope_to_graph` for why `GraphDbRef::new(..)` must NOT be used.
+    let mut walk_g_ids: Vec<GraphId> = vec![0];
+    for &g in membership_g_ids {
+        if !walk_g_ids.contains(&g) {
+            walk_g_ids.push(g);
+        }
+    }
 
     let sub_class_of = Sid::new(fluree_vocab::namespaces::RDFS, "subClassOf");
     let mut visited: HashSet<Sid> = HashSet::new();
@@ -1570,20 +1828,23 @@ async fn is_subclass_of(db: GraphDbRef<'_>, start: &Sid, target: &Sid) -> Result
     queue.push_back(start.clone());
 
     while let Some(current) = queue.pop_front() {
-        let flakes = schema_db
-            .range(
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::subject_predicate(current, sub_class_of.clone()),
-            )
-            .await?;
-        for f in flakes {
-            if let FlakeValue::Ref(parent) = &f.o {
-                if parent == target {
-                    return Ok(true);
-                }
-                if visited.insert(parent.clone()) {
-                    queue.push_back(parent.clone());
+        for &g in &walk_g_ids {
+            let scoped = rescope_to_graph(db, g);
+            let flakes = scoped
+                .range(
+                    IndexType::Spot,
+                    RangeTest::Eq,
+                    RangeMatch::subject_predicate(current.clone(), sub_class_of.clone()),
+                )
+                .await?;
+            for f in flakes {
+                if let FlakeValue::Ref(parent) = &f.o {
+                    if parent == target {
+                        return Ok(true);
+                    }
+                    if visited.insert(parent.clone()) {
+                        queue.push_back(parent.clone());
+                    }
                 }
             }
         }
@@ -1656,13 +1917,13 @@ mod tests {
     use crate::cache::ShaclCacheKey;
     use fluree_db_core::GraphDbRef;
 
-    /// Regression: `rescope_to_schema_graph` — used by the `sh:class` fallback
-    /// subclass walk — must preserve the caller's tracker (and other
-    /// per-validation context). A naive rebuild via `GraphDbRef::new(..)`
+    /// Regression: `rescope_to_graph` — used by the `sh:class` value-membership
+    /// and fallback subclass walks — must preserve the caller's tracker (and
+    /// other per-validation context). A naive rebuild via `GraphDbRef::new(..)`
     /// would silently drop `tracker`, disabling fuel accounting on tracked
     /// validations. This pins the invariant.
     #[test]
-    fn rescope_to_schema_graph_preserves_tracker_and_other_fields() {
+    fn rescope_to_graph_preserves_tracker_and_other_fields() {
         use fluree_db_core::tracking::TrackingOptions;
         use fluree_db_core::{LedgerSnapshot, NoOverlay, Tracker};
 
@@ -1685,7 +1946,7 @@ mod tests {
         );
         assert!(db.eager, "precondition: caller's db is eager");
 
-        let schema_db = super::rescope_to_schema_graph(db);
+        let schema_db = super::rescope_to_graph(db, 0);
 
         assert_eq!(schema_db.g_id, 0, "schema walk must run in default graph");
         assert!(
