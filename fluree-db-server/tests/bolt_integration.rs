@@ -535,7 +535,12 @@ async fn bolt5_returns_node_structures() {
     };
     assert_eq!(props.get_str("name"), Some("Alice"));
     assert_eq!(props.get_int("age"), Some(30));
-    assert_eq!(props.get_str("knows"), Some("http://example.org/bob"));
+    // Ref-valued predicates are relationships, not node properties (Neo4j
+    // parity): they surface via bound edge/path vars, never inlined here.
+    assert!(
+        props.get("knows").is_none(),
+        "edges must not inline into nodes"
+    );
     let Some(Value::Structure(birthday)) = props.get("birthday") else {
         panic!(
             "birthday must be a Date structure, got {:?}",

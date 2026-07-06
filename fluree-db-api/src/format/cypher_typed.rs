@@ -502,6 +502,15 @@ impl<'a> NodeHydrator<'a> {
                 }
                 continue;
             }
+            // Ref-valued predicates are relationships, not node properties —
+            // a Neo4j Node carries scalars only; edges surface by binding a
+            // relationship or path var. Inlining them also made node emit
+            // scale with out-degree: every target ref forces a dict/arena
+            // IRI materialization, where literal objects are already inline
+            // in the leaflet.
+            if matches!(flake.o, FlakeValue::Ref(_)) {
+                continue;
+            }
             let Some(key) = self.key_name(&flake.p)? else {
                 continue;
             };
@@ -536,7 +545,10 @@ impl<'a> NodeHydrator<'a> {
         let mut props: Vec<(String, CypherCell)> = Vec::new();
         let flakes = self.subject_flakes(sid).await?;
         for flake in flakes.iter() {
-            if !flake.op || Some(&flake.p) == self.rdf_type.as_ref() {
+            if !flake.op
+                || Some(&flake.p) == self.rdf_type.as_ref()
+                || matches!(flake.o, FlakeValue::Ref(_))
+            {
                 continue;
             }
             let Some(key) = self.key_name(&flake.p)? else {

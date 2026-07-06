@@ -1153,15 +1153,16 @@ mem:fact-01kwvtdzzsfecc56zgjs23ckwq a mem:Fact ;
     mem:rationale "Future Bolt tx work (Raft support, policy) must preserve the atomic single-ref-advance publish and the base-precondition; N sequential ref advances would expose intermediate states." .
 
 mem:fact-01kww286deybnkjrnyxn4w55fe a mem:Fact ;
-    mem:content "Bolt hydration perf (BOLT-1b, bench-confirmed): serial per-node SPOT fetches made data-heavy Bolt results 1.5-7x slower than HTTP (neighbours_2_with_data 1.07→7.58ms @ 188 rows). Fixed: typed_table prefetch collects all hydration subjects (nodes/reifiers/path nodes), sorts by subject for leaflet locality, fetches with buffer_unordered(16) into a shared flake cache. KEY: HTTP cypher-json never hydrates (bare RETURN n = IRI string), so HTTP numbers on *_with_data benchgraph queries under-deliver vs vendors — Bolt-after-fix vs vendors is the honest comparison. JSON-LD select-map [\"*\"] hydration is ALSO sequential per subject; same prefetch pattern can back-port at depth 0." ;
+    mem:content "Bolt node hydration (BOLT-1b) needed THREE fixes, bench-taught: (1) prefetch collector must materialize EncodedSid — bare node vars off the binary scan are encoded, and is_encoded()-skip silently emptied the prefetch (first fix changed nothing on the bench); (2) the per-subject SPOT fetches are CPU-bound (~18us each: cursor+leaflet decode+dict), so buffer_unordered was concurrency-not-parallelism — prefetch now tokio::spawns chunked tasks over a cloned GraphDb; (3) predicate-key/class-label decodes are memoized per result. Probe: 200 rich nodes RETURN n typed table 4.0→2.1ms (examples/bolt_node_emit_probe.rs reports encoded-condition + phase timings). Remaining floor = per-subject fetch CPU; next lever is an engine-level batched sorted leaflet sweep." ;
     mem:tag "benchmark" ;
     mem:tag "bolt" ;
     mem:tag "cypher" ;
     mem:tag "hydration" ;
     mem:tag "performance" ;
     mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/examples/bolt_node_emit_probe.rs" ;
     mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
-    mem:artifactRef "fluree-db-api/src/format/hydration.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/materialize.rs" ;
     mem:branch "feature/bolt" ;
     mem:createdAt "2026-07-06T15:55:17.806942+00:00"^^xsd:dateTime ;
     mem:rationale "Converge on hydration.rs fetch_subject_properties (policy-aware) when Bolt auth lands; the engine-level batched gather (property_join-style) is the long-term fix if hydration still shows hot." .

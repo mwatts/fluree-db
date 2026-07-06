@@ -44,7 +44,7 @@ async fn main() {
                 "ex:cmpl": (i % 100),
                 "ex:eyes": format!("color{}", i % 5),
                 "ex:hair": format!("hair{}", i % 7),
-                "ex:knows": {"@id": format!("ex:u{}", (i + 1) % users)}
+                "ex:knows": (1..=10).map(|k| json!({"@id": format!("ex:u{}", (i + k * 7) % users)})).collect::<Vec<_>>()
             })
         })
         .collect();

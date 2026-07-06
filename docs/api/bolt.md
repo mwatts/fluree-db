@@ -33,8 +33,10 @@ conversion with the Cypher JSON transport:
   hash of it (an opaque handle — use `element_id` for identity). Labels
   follow the `labels()` rule (`rdf:type` local names; the `db:Node`
   existence marker is hidden). Properties are fetched per node at result
-  time; multi-valued predicates become lists, ref-valued properties are
-  IRI strings.
+  time; multi-valued literal predicates become lists. Ref-valued
+  predicates are **relationships, not node properties** (Neo4j parity):
+  they never inline into the node's property map — bind a relationship
+  or path variable to read them.
 - **Relationships**: endpoints, type (predicate local name), and
   annotation properties when the edge is reified; a reified edge's
   `element_id` is the reifier IRI, otherwise a stable synthetic id.
