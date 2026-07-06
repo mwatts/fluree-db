@@ -321,7 +321,10 @@ impl IndexPublisher for RaftNameService {
             Ok(resp) => map_advance_index_response(resp.data),
             // A stepped-down leader's straggling publish call. The
             // new leader will run its own build; nothing for us to
-            // do except not propagate the error.
+            // do except not propagate the error. This swallow is
+            // specific to the background indexer's re-run story —
+            // the one-shot `publish_index_allow_equal` below
+            // surfaces the same condition as an error instead.
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
             // ChangeMembershipError can't surface here — this
             // command isn't a membership change. Treat as
@@ -349,13 +352,29 @@ impl AdminPublisher for RaftNameService {
         let cmd = build_rewrite_index_command(ledger_id, index_t, index_id)?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => map_advance_index_response(resp.data),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
+            // Unlike `publish_index`, no swallow here: this trait's
+            // callers are one-shot admin operations (import's final
+            // publish, the CLI index command) with no re-run story —
+            // returning Ok would report success with no index head
+            // published. Not-leader at submission and step-down
+            // mid-propose arrive as the same error, so the outcome
+            // is unresolved: the caller retries against the current
+            // leader.
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
+                Err(NameServiceError::propose_unresolved(
+                    "RewriteIndexHead forwarded to leader (this node is not the leader, or \
+                     stepped down mid-propose); retry against the current leader"
+                        .to_string(),
+                ))
+            }
             Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
                 Err(NameServiceError::storage(format!(
                     "unexpected ChangeMembershipError on RewriteIndexHead: {e}"
                 )))
             }
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+            // A fatal raft error can strike after the entry was
+            // appended; it may still replicate and commit.
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::propose_unresolved(format!(
                 "raft fatal during RewriteIndexHead: {f}"
             ))),
         }
@@ -2901,6 +2920,32 @@ mod tests {
                 source_branch: prior_source,
                 branches: prior_branches,
             },
+        );
+    }
+
+    /// The stub raft is never initialized, so it has no leader and
+    /// `client_write` returns `ForwardToLeader` — exactly the
+    /// condition whose handling deliberately differs between the
+    /// two index publishers. The background indexer's `publish_index`
+    /// swallows it (the new leader runs its own build); the one-shot
+    /// admin `publish_index_allow_equal` must surface it, or import
+    /// and the CLI report success with no index head published.
+    #[tokio::test]
+    async fn publish_index_swallows_not_leader() {
+        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        assert!(ns.publish_index("test/db:main", 1, &cid(1)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn publish_index_allow_equal_surfaces_not_leader() {
+        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let err = ns
+            .publish_index_allow_equal("test/db:main", 1, &cid(1))
+            .await
+            .expect_err("not-leader admin publish must not report success");
+        assert!(
+            matches!(err, NameServiceError::ProposeUnresolved(_)),
+            "expected ProposeUnresolved, got {err:?}"
         );
     }
 
