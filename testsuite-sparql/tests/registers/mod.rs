@@ -418,15 +418,10 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-where/manifest#dawg-delete-where-06",
 ];
 
-// All four block on one Turtle lexer bug: a blank-node label
-// immediately followed by '.' (`_:o6.`) fails to lex — audit §4.2.5.
-pub const SPARQL11_JSON_RES: &[&str] = &[
-    // data load: Turtle/TriG parse error (4)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/json-res/manifest#jsonres01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/json-res/manifest#jsonres02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/json-res/manifest#jsonres03",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/json-res/manifest#jsonres04",
-];
+// Empty: jsonres01-04 went green once the Turtle lexer treated a trailing
+// '.' after a blank-node label (`_:o6.`) as the statement terminator
+// (#1444, roadmap PR-L1).
+pub const SPARQL11_JSON_RES: &[&str] = &[];
 
 // csv03 expects canonical xsd:double lexical form (1.0E6) in CSV output.
 pub const SPARQL11_CSV_TSV: &[&str] = &[
@@ -435,10 +430,12 @@ pub const SPARQL11_CSV_TSV: &[&str] = &[
 ];
 
 // Requires RDFS/OWL/RIF entailment regimes — a deliberate non-goal
-// (audit §4.4). The 20 simple-entailment-answerable tests that pass
-// today stay enforced; revisit this register if reasoning support lands.
+// (audit §4.4). The 21 simple-entailment-answerable tests that pass
+// today stay enforced (owlds02 joined them once the bnode-dot lexer fix
+// let its data load — #1444); revisit this register if reasoning support
+// lands.
 pub const SPARQL11_ENTAILMENT: &[&str] = &[
-    // result mismatch (44)
+    // result mismatch (45)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#bind07",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#lang",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q1",
@@ -479,6 +476,9 @@ pub const SPARQL11_ENTAILMENT: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#simple7",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#simple8",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-02",
+    // sparqldl-03's data now loads (bnode-dot lexer fix, #1444) but the
+    // expected solution requires OWL entailment: 1 expected, 0 found.
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-03",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-10",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-11",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-12",
@@ -488,9 +488,6 @@ pub const SPARQL11_ENTAILMENT: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-07",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-08",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-09",
-    // data load: Turtle/TriG parse error (2)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#owlds02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#sparqldl-03",
 ];
 
 pub const SPARQL12_GROUPING: &[&str] = &[
