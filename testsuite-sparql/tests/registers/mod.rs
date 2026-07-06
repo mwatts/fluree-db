@@ -37,8 +37,10 @@ pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
 
 // Dominated by the missing UPDATE graph-management grammar
 // (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD, SILENT variants) — audit §4.2.1.
+// NOTE: every test here is double-registered (also inside SPARQL11_UPDATE);
+// a fix PR must delete BOTH register lines per test.
 pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
-    // parser rejects valid input (27)
+    // parser rejects valid input: graph-management grammar (23) — PR-U3
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_1",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_10",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_11",
@@ -55,21 +57,27 @@ pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_21",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_22",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_3",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_36",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_37",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_38",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_39",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_4",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_40",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_5",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_6",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_7",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_8",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_9",
-    // parser accepts invalid input (missing validation) (4)
+    // parser rejects valid input: validator rejects GRAPH inside DELETE WHERE
+    // (update class D, NOT graph-management grammar) (1) — PR-U1
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_36",
+    // parser rejects valid input: empty / prologue-only request must be a
+    // valid no-op (update class C, NOT graph-management grammar) (3) — PR-U2
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_38",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_39",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_40",
+    // parser accepts invalid input (missing validation) (3) — PR-U1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_50",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_51",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_52",
+    // parser accepts invalid input: cross-operation blank-node label reuse in
+    // a multi-op `;` request (update class B validation) (1) — PR-U2
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_54",
 ];
 
@@ -126,29 +134,42 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg10",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg11",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg12",
-    // result mismatch (3)
+    // graph cluster: COUNT over an (empty) named graph — needs enumerable
+    // empty named graphs; gated on decision D-6, expected to remain
+    // registered after PR-G1 (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
+    // expression/aggregate cluster (2) — PR-X2: agg-err-01 = aggregate must
+    // poison (unbind) on non-numeric group members; agg02 = COUNT(?var)
+    // re-typed as xsd:int — fix site UNCONFIRMED (it is NOT the
+    // group_aggregate finalize; probe before fixing)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-err-01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg02",
-    // query execution error (1)
+    // expression/aggregate cluster: COUNT(DISTINCT *) needs a
+    // rows-distinct IR aggregate (1) — PR-X2
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-count-rows-distinct",
 ];
 
 pub const SPARQL11_BINDINGS: &[&str] = &[
-    // result mismatch (1)
+    // graph cluster: requires enumerable empty named graphs; stays
+    // registered after PR-G1, gated on decision D-6 (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph",
 ];
 
 pub const SPARQL11_CONSTRUCT: &[&str] = &[
-    // dataset: FROM/FROM NAMED unsupported on single-ledger GraphDb (1)
+    // dataset: FROM/FROM NAMED unsupported on single-ledger GraphDb (1) — PR-G2
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/construct/manifest#constructwhere04",
-    // query execution error (1)
+    // parse-time rejection of RDF collection syntax in the CONSTRUCT
+    // template (NOT a query-execution error); once PR-1 lands collections it
+    // becomes the CONSTRUCT-template blank-node instantiation gap — W-2
+    // serialization cluster; stays registered through PR-1 (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/construct/manifest#constructlist",
 ];
 
 pub const SPARQL11_EXISTS: &[&str] = &[
-    // result mismatch (2)
+    // result mismatch (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/exists/manifest#exists-graph-variable",
+    // graph cluster: BASE-relative graph IRI resolution + EXISTS
+    // active-graph inheritance (1) — PR-BASE + PR-G1 (conditional)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/exists/manifest#exists03",
 ];
 
@@ -174,10 +195,10 @@ pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[
 ];
 
 pub const SPARQL11_SUBQUERY: &[&str] = &[
-    // result mismatch (2)
-    // (subquery12 was greened by main's sub-SELECT set-operand fix, PR #1436
-    // — its "mismatch" was a bare-{SELECT} misparse executing through error
-    // recovery)
+    // graph cluster (2) — PR-G1: subquery02 = GRAPH ?g correlation into the
+    // subquery; subquery04 = default graph leaks into a GRAPH-scoped subquery
+    // (subquery12 — CONSTRUCT ↔ sub-SELECT alias visibility — was greened by
+    // main's sub-SELECT set-operand fix, PR #1436)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery02",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery04",
 ];
@@ -186,18 +207,27 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
 // binding typed as literal — audit §4.2.
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (113)
+    // result mismatch (110); subgroup ownership per
+    // docs/audit/burn-down/ROADMAP.md §6.1
+    //
+    // W-1 algebra cluster: nested-group FILTER sees enclosing-scope
+    // variables; nested-OPTIONAL / join variable-scope semantics (5)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
+    // PR-BASE: relative-IRI/BASE resolution in query output (2)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#base-prefix-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#base-prefix-5",
+    // PR-1 parser cluster P1: RDF collection ( … ) patterns — the collection
+    // triples are silently dropped today because the API swallows the parse
+    // diagnostics (4)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
+    // W-2 serialization cluster: string-escape serialization (2)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-1",
@@ -214,6 +244,7 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-flt",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-int",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-str",
+    // W-2 serialization cluster: reification output in CONSTRUCT (2)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
@@ -236,6 +267,8 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-2-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
+    // joint PR-G1 (GRAPH-variable semantics) + PR-X2 (D5 value equality);
+    // the second lander removes these (3)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
@@ -269,6 +302,8 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-10",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-11",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-12",
+    // W-1 algebra cluster: FILTER-scope / nested-OPTIONAL semantics;
+    // optional-complex-2 is additionally gated on PR-G1 (GRAPH ?x) (4)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional-filter/manifest#dawg-optional-filter-005-not-simplified",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
@@ -310,13 +345,17 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-10b",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-11",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-12b",
-    // query execution error (1)
+    // query execution error: PR-BASE (relative-IRI/BASE resolution at lower
+    // time); its lexer half lands in PR-1 (1)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#base-prefix-1",
 ];
 
 // Clusters: graph-management ops missing from the UPDATE grammar,
-// GRAPH blocks in DELETE WHERE, USING semantics, INSERT into
-// not-yet-existing named graph — audit §4.2.1.
+// GRAPH blocks in DELETE WHERE, USING + GRAPH scoping, and multi-operation
+// `;` requests silently executing only their first operation (#1438) —
+// audit §4.2.1, burn-down update-completeness.md. The syntax-update-1 tests
+// are double-registered (see SPARQL11_SYNTAX_UPDATE_1); fix PRs must delete
+// both register lines per test.
 pub const SPARQL11_UPDATE: &[&str] = &[
     // update grammar: graph-management op not parsed (41)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add01",
@@ -360,7 +399,7 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#load-silent",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#move-silent",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#move-to-default-silent",
-    // parser rejects valid input (27)
+    // parser rejects valid input: graph-management grammar (23) — PR-U3
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_1",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_10",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_11",
@@ -377,18 +416,22 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_21",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_22",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_3",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_36",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_37",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_38",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_39",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_4",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_40",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_5",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_6",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_7",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_8",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_9",
-    // parser accepts invalid input (missing validation) (12)
+    // parser rejects valid input: validator rejects GRAPH inside DELETE WHERE
+    // (update class D, NOT graph-management grammar) (1) — PR-U1
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_36",
+    // parser rejects valid input: empty / prologue-only request must be a
+    // valid no-op (update class C, NOT graph-management grammar) (3) — PR-U2
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_38",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_39",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_40",
+    // parser accepts invalid input (missing validation) (11) — PR-U1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-insert/manifest#dawg-delete-insert-03",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-insert/manifest#dawg-delete-insert-03b",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-insert/manifest#dawg-delete-insert-05",
@@ -400,13 +443,22 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_50",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_51",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_52",
+    // parser accepts invalid input: cross-operation blank-node label reuse in
+    // a multi-op `;` request (update class B validation) (1) — PR-U2
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_54",
-    // update eval: resulting graph-store state differs (7)
+    // update eval: multi-operation `;` request executes only its first
+    // operation (class B truncation, #1438) — NOT "INSERT into a
+    // not-yet-existing named graph loses triples" and NOT "combined
+    // DELETE/INSERT WHERE skips the deletes"; each single operation works
+    // (5) — PR-U2 (+PR-U3 for the graph-management ops the same-bnode
+    // requests also contain)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-05a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-data-same-bnode",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-where-same-bnode",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-where-same-bnode2",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-insert/manifest#dawg-delete-insert-01c",
+    // update eval: USING + explicit GRAPH over-deletes from the default
+    // graph (class F scoping) (2) — PR-U6, sequenced after PR-G1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-02a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-06a",
     // engine: GRAPH blocks in DELETE WHERE unsupported (3)
@@ -425,7 +477,7 @@ pub const SPARQL11_JSON_RES: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/json-res/manifest#jsonres04",
 ];
 
-// csv03 expects canonical xsd:double lexical form (1.0E6) in CSV output.
+// csv03 expects canonical xsd:double lexical form (1.0E6) in CSV output — PR-L2.
 pub const SPARQL11_CSV_TSV: &[&str] = &[
     // result mismatch (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/csv-tsv-res/manifest#csv03",
@@ -605,9 +657,12 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
 ];
 
 // Blocked on Turtle-star data loading and engine triple-term support —
-// audit §4.3 / Phase D.
+// audit §4.3 / Phase D. Re-baseline this whole register after Turtle-star
+// ingest (PR-W15) lands: the residual blockers are wave-2 query syntax /
+// triple-term functions / CONSTRUCT projection / result serialization,
+// scoped by the Option-1 first-class-triple-term epic (ROADMAP §2).
 pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: Turtle/TriG parse error (40)
+    // data load: Turtle-star data won't parse (13)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-4",
@@ -621,9 +676,12 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
+    // data load: additionally blocked on TriG GRAPH-block parsing,
+    // orthogonal to star (D-8) (3)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
+    // data load: Turtle-star data won't parse (22)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
@@ -645,8 +703,12 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
+    // data load: additionally blocked on TriG GRAPH-block parsing,
+    // orthogonal to star (D-8) (2)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
+    // harness: the expected-result TriG-star graph fails to parse — the
+    // `{| |}` INSERT DATA itself already executes (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
     // query execution error (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
@@ -674,10 +736,12 @@ pub const SPARQL12_LANG_BASEDIR: &[&str] = &[
 ];
 
 pub const SPARQL12_RDF11: &[&str] = &[
-    // query execution error (2)
+    // DATATYPE() rejects constant (non-variable) arguments — the same D2
+    // defect as the expression cluster; PR-X1 removes both clusters'
+    // entries in one fix (2)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#langstring-datatype",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-datatype",
-    // result mismatch (1)
+    // result mismatch (1) — PR-X2
     "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-same",
 ];
 
@@ -687,7 +751,9 @@ pub const SPARQL12_SYNTAX: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#nested-aggregate-functions",
 ];
 
-// VERSION declaration support — audit §4.3.
+// VERSION itself already lexes and parses; these three fail on the bare
+// `<< >>` reifier patterns in their query bodies (wave-2 triple-term
+// syntax) — PR-W2A, not a VERSION-declaration gap.
 pub const SPARQL12_VERSION: &[&str] = &[
     // parser rejects valid input (3)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-01",
@@ -695,14 +761,20 @@ pub const SPARQL12_VERSION: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-05",
 ];
 
-// Path cardinality / duplicate semantics — sequence-path results differ in
-// multiplicity (`p1/p2` path counting vs `*`/`+` distinct nodes) — plus the
-// zero-variable `SELECT *` projection over a both-bound path (pp36).
-// Audit §4.2.7 (hot-operator semantics; fix must preserve `*`/`+` fast path).
+// Hot-operator territory; any fix must preserve the `*`/`+` fast path
+// (audit §4.2.7, burn-down residual-eval.md §3.2).
 pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
+    // zero-length-path closure misses parts of the node universe (terms
+    // appearing only off the path predicate, and literal nodes) — NOT a
+    // multiplicity bug — PR-PP
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp16",
+    // graph cluster, NOT path cardinality: pp34 = constant GRAPH IRI misses
+    // the registry on base-expansion (exact-key lookup); pp35 = GRAPH ?g
+    // binds the graph name as a plain literal — PR-BASE + PR-G1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp34",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
+    // empty-schema `Batch::new` len-collapse inside PropertyPathOperator
+    // (zero-variable SELECT * over a both-bound path) — NOT projection — PR-PP
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp36",
 ];
 
