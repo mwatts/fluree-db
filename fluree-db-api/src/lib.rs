@@ -3505,17 +3505,11 @@ impl Fluree {
         // uses; a Some plan needs a caller-known skolem id so the created
         // Sids are reconstructible post-commit.
         let return_plan = {
-            let out = fluree_db_cypher::parse_cypher(cypher);
-            match out.ast {
-                Some(mut ast) if !out.has_errors() => {
-                    let empty = fluree_db_cypher::ParamMap::new();
-                    fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-                        .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-                    crate::cypher_write::plan_write_return(&ast)
-                        .map_err(|e| ApiError::cypher(e, Vec::new()))?
-                }
+            match crate::query::helpers::substituted_cypher_ast(cypher, params) {
+                Ok(ast) => crate::cypher_write::plan_write_return(&ast)
+                    .map_err(|e| ApiError::cypher(e, Vec::new()))?,
                 // Parse errors surface with full diagnostics below.
-                _ => None,
+                Err(_) => None,
             }
         };
         let skolem_txn_id = return_plan
@@ -3576,22 +3570,7 @@ impl Fluree {
         snapshot: &fluree_db_core::LedgerSnapshot,
         skolem_txn_id: Option<String>,
     ) -> Result<crate::cypher_write::WritePlan> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
 
         // Validate a trailing RETURN up front (lowering ignores it): the v1
         // surface is bare created-entity variables, and it never combines with
@@ -3861,27 +3840,7 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<fluree_db_transact::ir::Txn> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-
-        // Substitute `$param` references before lowering. Always run (empty
-        // map when no params were supplied) so an unfilled `$param` reports a
-        // clear missing-parameter error.
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
         self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await
     }

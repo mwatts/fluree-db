@@ -112,6 +112,54 @@ pub(crate) fn parse_cypher_to_ir(
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
 ) -> Result<(VarRegistry, Query)> {
+    let ast = substituted_cypher_ast(cypher, params)?;
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context)
+}
+
+/// Statements longer than this are parsed but never cached: unique bulk
+/// payloads (inline CREATE data) would evict the short, hot statements the
+/// cache exists for, and entry count — not bytes — bounds the LRU.
+const MAX_CACHED_STATEMENT_LEN: usize = 8 * 1024;
+
+/// Process-wide parsed-AST LRU, keyed on statement text.
+///
+/// The cached value is the **pre-substitution** AST: text-only key, ledger
+/// independent, immutable. Callers clone the `Arc`'d AST and run
+/// `substitute_params` on the clone, so per-request cost under a hit is
+/// clone + substitute instead of a full parse. Capacity comes from
+/// `FLUREE_CYPHER_AST_CACHE` (entries, default 512; `0` disables), read once.
+#[allow(clippy::type_complexity)]
+fn cypher_ast_cache(
+) -> Option<&'static parking_lot::Mutex<lru::LruCache<Box<str>, Arc<fluree_db_cypher::CypherAst>>>>
+{
+    use std::num::NonZeroUsize;
+    use std::sync::OnceLock;
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Option<parking_lot::Mutex<lru::LruCache<Box<str>, Arc<fluree_db_cypher::CypherAst>>>>,
+    > = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let capacity = std::env::var("FLUREE_CYPHER_AST_CACHE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512);
+            NonZeroUsize::new(capacity).map(|c| parking_lot::Mutex::new(lru::LruCache::new(c)))
+        })
+        .as_ref()
+}
+
+/// Parse Cypher source through the process-wide AST cache.
+///
+/// Only successful parses are cached; parse failures re-parse on every call
+/// so diagnostics stay exact. Returns the shared pre-substitution AST — do
+/// not mutate through the `Arc`; clone first (see [`substituted_cypher_ast`]).
+pub(crate) fn parse_cypher_ast_cached(cypher: &str) -> Result<Arc<fluree_db_cypher::CypherAst>> {
+    if let Some(cache) = cypher_ast_cache() {
+        if let Some(hit) = cache.lock().get(cypher) {
+            return Ok(Arc::clone(hit));
+        }
+    }
     let out = fluree_db_cypher::parse_cypher(cypher);
     if out.has_errors() {
         let msg = out
@@ -122,19 +170,33 @@ pub(crate) fn parse_cypher_to_ir(
             .join("; ");
         return Err(ApiError::cypher(msg, out.diagnostics));
     }
-    let mut ast = out
-        .ast
-        .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+    let ast = Arc::new(
+        out.ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?,
+    );
+    if cypher.len() <= MAX_CACHED_STATEMENT_LEN {
+        if let Some(cache) = cypher_ast_cache() {
+            cache.lock().put(cypher.into(), Arc::clone(&ast));
+        }
+    }
+    Ok(ast)
+}
 
-    // Substitute `$param` references before lowering, so the lowering path
-    // only ever sees concrete literals. Always run (empty map when no params
-    // were supplied) so a `$param` with no value reports a clear missing-
-    // parameter error rather than reaching the lowering as an unsupported node.
+/// Parse (via the AST cache) and return a param-substituted AST clone.
+///
+/// Substitution always runs (empty map when no params were supplied) so a
+/// `$param` with no value reports a clear missing-parameter error rather
+/// than reaching the lowering as an unsupported node.
+pub(crate) fn substituted_cypher_ast(
+    cypher: &str,
+    params: Option<&fluree_db_cypher::ParamMap>,
+) -> Result<fluree_db_cypher::CypherAst> {
+    let ast = parse_cypher_ast_cached(cypher)?;
+    let mut ast = (*ast).clone();
     let empty = fluree_db_cypher::ParamMap::new();
     fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
         .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-
-    lower_cypher_ast_to_ir(&ast, snapshot, default_context)
+    Ok(ast)
 }
 
 /// Lower an already-parsed, param-substituted Cypher read AST to the shared
@@ -414,5 +476,57 @@ pub(crate) fn extract_sparql_dataset_spec(
             DatasetSpec::from_sparql_clause(clause).map_err(|e| ApiError::query(e.to_string()))
         }
         None => Ok(DatasetSpec::default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cypher_ast_cache_returns_shared_ast() {
+        let text = "MATCH (n:CacheHitTest) RETURN n";
+        let first = parse_cypher_ast_cached(text).expect("parse");
+        let second = parse_cypher_ast_cached(text).expect("parse");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same statement text must hit the cache"
+        );
+    }
+
+    #[test]
+    fn cypher_ast_cache_skips_oversized_statements() {
+        let filler = "x".repeat(MAX_CACHED_STATEMENT_LEN);
+        let text = format!("MATCH (n:Big) WHERE n.name <> \"{filler}\" RETURN n");
+        let first = parse_cypher_ast_cached(&text).expect("parse");
+        let second = parse_cypher_ast_cached(&text).expect("parse");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "oversized statements must not be cached"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cypher_parse_errors_are_not_cached() {
+        let text = "MATCH (n:Broken RETURN";
+        assert!(parse_cypher_ast_cached(text).is_err());
+        assert!(parse_cypher_ast_cached(text).is_err());
+    }
+
+    #[test]
+    fn substitution_clones_and_leaves_cached_ast_pristine() {
+        let text = "MATCH (n:SubstTest {id: $id}) RETURN n";
+        let mut params_a = fluree_db_cypher::ParamMap::new();
+        params_a.insert("id".into(), serde_json::json!(1));
+        let mut params_b = fluree_db_cypher::ParamMap::new();
+        params_b.insert("id".into(), serde_json::json!(2));
+
+        let a = substituted_cypher_ast(text, Some(&params_a)).expect("subst a");
+        let b = substituted_cypher_ast(text, Some(&params_b)).expect("subst b");
+        assert_ne!(a, b, "different params must produce different ASTs");
+
+        // Missing param still errors through the cached path.
+        assert!(substituted_cypher_ast(text, None).is_err());
     }
 }

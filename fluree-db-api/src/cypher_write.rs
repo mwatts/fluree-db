@@ -641,17 +641,9 @@ pub fn plan_write_return_source(
     cypher: &str,
     params: Option<&fluree_db_cypher::ParamMap>,
 ) -> Result<Option<CypherWriteReturnPlan>, crate::error::ApiError> {
-    let out = fluree_db_cypher::parse_cypher(cypher);
-    if out.has_errors() {
-        return Ok(None);
-    }
-    let Some(mut ast) = out.ast else {
+    let Ok(ast) = crate::query::helpers::substituted_cypher_ast(cypher, params) else {
         return Ok(None);
     };
-    let empty = fluree_db_cypher::ParamMap::new();
-    if fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty)).is_err() {
-        return Ok(None);
-    }
     plan_write_return(&ast).map_err(|e| crate::error::ApiError::cypher(e, Vec::new()))
 }
 
