@@ -6739,3 +6739,58 @@ async fn cypher_explain_reports_sid_encoded_plan() {
         "id not SID-encoded: {explain}"
     );
 }
+
+#[tokio::test]
+async fn cypher_with_where_property_equality_folds_to_seek() {
+    // `WITH n WHERE n.id = k` lowers the accessor to OPTIONAL + FILTER; the
+    // optional-filter fold must turn it into a required triple (seek) without
+    // changing rows — including multi-valued properties and absent properties.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:with-where-fold");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:id": 7, "ex:age": [25, 30]},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:id": 8},
+                    {"@id": "ex:c", "@type": "ex:Person"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let rows = |r: fluree_db_api::QueryResult| r.row_count();
+
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WITH n WHERE n.id = 7 RETURN n")
+        .await
+        .expect("with-where eq");
+    assert_eq!(rows(r), 1);
+
+    // Absent property: no rows (c has no id) — the fold preserves this.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WITH n WHERE n.id = 99 RETURN n")
+        .await
+        .expect("no match");
+    assert_eq!(rows(r), 0);
+
+    // Multi-valued property through a range comparison: one row per passing
+    // value.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age > 26 RETURN n, n.age")
+        .await
+        .expect("range");
+    assert_eq!(rows(r), 1);
+
+    // IS NULL keeps its OPTIONAL (bound-check is not error-rejecting):
+    // only c lacks id.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.id IS NULL RETURN n")
+        .await
+        .expect("is null");
+    assert_eq!(rows(r), 1);
+}

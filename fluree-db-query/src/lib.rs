@@ -72,6 +72,7 @@ pub(crate) mod object_binding;
 pub mod offset;
 pub mod operator;
 pub mod optional;
+pub(crate) mod optional_filter_fold;
 pub mod parse;
 pub mod plan_node;
 pub mod planner;

@@ -2185,6 +2185,26 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
+    // same-group filter into required triples (well-formed left-join
+    // simplification), so equality/range pushdown and selectivity estimation
+    // see them. Canonical source: Cypher property accessors under a WHERE
+    // (`MATCH (n:User) WITH n WHERE n.id = $id` — a label scan without this).
+    // Runs first so the later folds and the planner operate on the
+    // simplified shape.
+    if crate::optional_filter_fold::has_optional_filter_candidate(query) {
+        let mut simplified = query.clone();
+        crate::optional_filter_fold::fold_optional_filters(&mut simplified);
+        return build_operator_tree_folds(&simplified, stats, planning);
+    }
+    build_operator_tree_folds(query, stats, planning)
+}
+
+fn build_operator_tree_folds(
+    query: &Query,
+    stats: Option<Arc<StatsView>>,
+    planning: &PlanningContext,
+) -> Result<BoxedOperator> {
     // Fold `FILTER(?x = ?y)` equijoins into variable unification before planning,
     // so the rewrite feeds the stats-driven reorder, count planner, and index
     // fast paths (rather than running as a cross-product + filter). Only clone
