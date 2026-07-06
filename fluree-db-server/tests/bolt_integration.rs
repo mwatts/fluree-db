@@ -857,3 +857,55 @@ async fn bolt_tx_statement_failure_poisons_and_reset_recovers() {
         "poisoned tx must not commit"
     );
 }
+
+/// Same node-structure contract as `bolt5_returns_node_structures`, but on
+/// an **indexed** ledger: bindings come off the binary scan as `EncodedSid`
+/// and hydration takes the batched sorted-crawl lane (overlay-free gate).
+/// Guards the lane's correctness — labels, scalar properties, temporal
+/// structures, and the no-adjacency rule must match the novelty path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_indexed_node_structures_via_batched_crawl() {
+    let (_tmp, state, addr) = bolt_server(LEDGER).await;
+    state
+        .fluree
+        .reindex(LEDGER, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+    client
+        .run(
+            r#"MATCH (n:Person {name: "Alice"}) RETURN n"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    assert_eq!(records.len(), 1);
+    let node = as_structure(&records[0][0]);
+    assert_eq!(node.signature, SIG_NODE);
+    assert_eq!(
+        node.fields[1],
+        Value::List(vec![Value::String("Person".into())])
+    );
+    let Value::Map(props) = &node.fields[2] else {
+        panic!("properties map")
+    };
+    assert_eq!(props.get_str("name"), Some("Alice"));
+    assert_eq!(props.get_int("age"), Some(30));
+    assert!(props.get("knows").is_none(), "edges must not inline");
+    let Some(Value::Structure(birthday)) = props.get("birthday") else {
+        panic!(
+            "birthday must be a Date structure, got {:?}",
+            props.get("birthday")
+        )
+    };
+    assert_eq!(birthday.signature, SIG_DATE);
+    assert_eq!(birthday.fields, vec![Value::Integer(7631)]);
+    assert_eq!(
+        node.fields[3],
+        Value::String("http://example.org/alice".into())
+    );
+}

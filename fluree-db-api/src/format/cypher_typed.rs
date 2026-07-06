@@ -134,15 +134,13 @@ pub(crate) async fn typed_table(
         .map(|&v| result.vars.name(v).to_string())
         .collect();
 
-    let mut hydrator = NodeHydrator::new(view, compactor);
+    let mut hydrator = NodeHydrator::new(view, compactor, result.binary_graph.as_ref());
 
     // Prefetch pass: the engine has already produced the subject list, so
-    // the per-node property fetches are independent point reads — issue
-    // them with bounded concurrency in subject order (leaflet locality)
-    // instead of one awaited SPOT scan per node during the row walk.
-    // Encoded bindings are skipped here (they materialize lazily and fall
-    // back to the on-demand fetch, which is cache-correct either way).
-    let mut wanted: Vec<Sid> = Vec::new();
+    // the remaining work is a bulk read, not N point probes. Subjects that
+    // arrive as `EncodedSid` carry their raw s_id, which the overlay-free
+    // batched lane consumes directly.
+    let mut wanted: Vec<WantedSubject> = Vec::new();
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
             for &var_id in &col_vars {
@@ -171,6 +169,14 @@ pub(crate) async fn typed_table(
     Ok((columns, rows))
 }
 
+/// One subject the prefetch pass will hydrate. The raw `s_id` is carried
+/// when the binding had one (`EncodedSid`) — it selects the batched
+/// sorted-crawl lane, which never needs the dictionary again.
+struct WantedSubject {
+    sid: Sid,
+    s_id: Option<u64>,
+}
+
 /// Collect every subject this binding will hydrate when rendered: node
 /// refs, relationship reifiers (annotation properties), and path nodes.
 /// Mirrors the dispatch in [`binding_cell`]. Encoded subject refs
@@ -180,24 +186,41 @@ pub(crate) async fn typed_table(
 fn collect_subject_sids(
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
     binding: &Binding,
-    out: &mut Vec<Sid>,
+    out: &mut Vec<WantedSubject>,
 ) -> Result<()> {
     if binding.is_encoded() {
-        if binding.is_encoded_sid() {
+        if let Some(s_id) = binding.encoded_s_id() {
             let materialized = super::materialize::materialize_with_graph(gv, binding)?;
-            collect_subject_sids(gv, &materialized, out)?;
+            if let Binding::Sid { sid, .. } = materialized {
+                out.push(WantedSubject {
+                    sid,
+                    s_id: Some(s_id),
+                });
+            }
         }
         return Ok(());
     }
     match binding {
-        Binding::Sid { sid, .. } => out.push(sid.clone()),
-        Binding::IriMatch { primary_sid, .. } => out.push(primary_sid.clone()),
+        Binding::Sid { sid, .. } => out.push(WantedSubject {
+            sid: sid.clone(),
+            s_id: None,
+        }),
+        Binding::IriMatch { primary_sid, .. } => out.push(WantedSubject {
+            sid: primary_sid.clone(),
+            s_id: None,
+        }),
         Binding::Rel(rel) => {
             if let Some(reifier) = &rel.reifier {
-                out.push(reifier.clone());
+                out.push(WantedSubject {
+                    sid: reifier.clone(),
+                    s_id: None,
+                });
             }
         }
-        Binding::Path { nodes, .. } => out.extend(nodes.iter().cloned()),
+        Binding::Path { nodes, .. } => out.extend(nodes.iter().map(|sid| WantedSubject {
+            sid: sid.clone(),
+            s_id: None,
+        })),
         Binding::List(values) | Binding::Grouped(values) => {
             for v in values {
                 collect_subject_sids(gv, v, out)?;
@@ -221,8 +244,17 @@ pub(crate) async fn hydrate_nodes(
     compactor: &IriCompactor,
     sids: &[Sid],
 ) -> Result<Vec<CypherNode>> {
-    let mut hydrator = NodeHydrator::new(view, compactor);
-    hydrator.prefetch(sids.to_vec()).await?;
+    let mut hydrator = NodeHydrator::new(view, compactor, None);
+    hydrator
+        .prefetch(
+            sids.iter()
+                .map(|sid| WantedSubject {
+                    sid: sid.clone(),
+                    s_id: None,
+                })
+                .collect(),
+        )
+        .await?;
     let mut nodes = Vec::with_capacity(sids.len());
     for sid in sids {
         nodes.push(hydrator.node(sid).await?);
@@ -340,6 +372,9 @@ fn time_cell(t: &fluree_db_core::temporal::Time) -> CypherTemporal {
 struct NodeHydrator<'a> {
     view: &'a GraphDb,
     compactor: &'a IriCompactor,
+    /// Binary graph of the result, when it has one — carries the store the
+    /// batched sorted-crawl lane reads.
+    gv: Option<&'a fluree_db_binary_index::BinaryGraphView>,
     rdf_type: Option<Sid>,
     node_marker: Option<Sid>,
     cache: HashMap<Sid, CypherNode>,
@@ -352,22 +387,31 @@ struct NodeHydrator<'a> {
     key_names: HashMap<Sid, Option<Arc<str>>>,
     /// Class Sid → Cypher label (None = the hidden `db:Node` marker).
     label_names: HashMap<Sid, Option<Arc<str>>>,
+    /// p_id → Cypher property key for the batched lane (None = system
+    /// predicate, hidden).
+    key_names_by_pid: HashMap<u32, Option<Arc<str>>>,
 }
 
 /// Concurrent subject fetches in flight during [`NodeHydrator::prefetch`].
 const PREFETCH_CONCURRENCY: usize = 16;
 
 impl<'a> NodeHydrator<'a> {
-    fn new(view: &'a GraphDb, compactor: &'a IriCompactor) -> Self {
+    fn new(
+        view: &'a GraphDb,
+        compactor: &'a IriCompactor,
+        gv: Option<&'a fluree_db_binary_index::BinaryGraphView>,
+    ) -> Self {
         Self {
             view,
             compactor,
+            gv,
             rdf_type: view.snapshot.encode_iri(fluree_vocab::rdf::TYPE),
             node_marker: view.snapshot.encode_iri(fluree_vocab::fluree::NODE),
             cache: HashMap::new(),
             flake_cache: HashMap::new(),
             key_names: HashMap::new(),
             label_names: HashMap::new(),
+            key_names_by_pid: HashMap::new(),
         }
     }
 
@@ -401,19 +445,158 @@ impl<'a> NodeHydrator<'a> {
         Ok(name)
     }
 
-    /// Bulk-fetch the flakes of every not-yet-cached subject.
+    /// Bulk-fetch every not-yet-cached subject the table will render.
     ///
-    /// The fetches are CPU-bound in-memory work (cursor setup, leaflet
-    /// decode, dict resolves — ~tens of µs each), so cooperative
-    /// concurrency alone doesn't help: the chunks are spawned as tasks to
-    /// run on parallel workers, each walking its share of the
-    /// subject-sorted list in order.
-    async fn prefetch(&mut self, mut sids: Vec<Sid>) -> Result<()> {
+    /// Two lanes:
+    /// - **Batched sorted crawl** — subjects that arrived with a raw `s_id`
+    ///   (`EncodedSid` off the binary scan), when the overlay is certainly
+    ///   empty: one gap-aware sorted SPOT sweep
+    ///   ([`batched_lookup_subject_properties`]) decodes each touched
+    ///   leaflet once and never re-enters the dictionary for ref-valued
+    ///   rows (relationships are skipped by `o_type` before any decode).
+    /// - **Per-subject fallback** — everything else (no s_id, or live
+    ///   novelty): CPU-bound point reads spawned as chunked tasks across
+    ///   runtime workers, in subject order.
+    async fn prefetch(&mut self, wanted: Vec<WantedSubject>) -> Result<()> {
+        let mut batched: Vec<(u64, Sid)> = Vec::new();
+        let mut fallback: Vec<Sid> = Vec::new();
+        let batch_lane_open = self.gv.is_some() && self.view.overlay.is_effectively_empty();
+        let mut seen: std::collections::HashSet<Sid> = std::collections::HashSet::new();
+        for subject in wanted {
+            if self.cache.contains_key(&subject.sid)
+                || self.flake_cache.contains_key(&subject.sid)
+                || !seen.insert(subject.sid.clone())
+            {
+                continue;
+            }
+            match subject.s_id {
+                Some(s_id) if batch_lane_open => batched.push((s_id, subject.sid)),
+                _ => fallback.push(subject.sid),
+            }
+        }
+
+        if !batched.is_empty() {
+            self.crawl_batched(batched)?;
+        }
+        self.prefetch_fallback(fallback).await
+    }
+
+    /// The batched lane: sorted SPOT sweep over raw s_ids, building nodes
+    /// straight from `(p_id, o_type, o_key)` rows. Overlay-free only — the
+    /// caller gates on `OverlayProvider::is_effectively_empty`.
+    fn crawl_batched(&mut self, mut subjects: Vec<(u64, Sid)>) -> Result<()> {
+        let gv = self.gv.expect("batch lane gated on gv");
+        let store = gv.clone_store();
+        let g_id = gv.g_id();
+        subjects.sort_unstable_by_key(|(s_id, _)| *s_id);
+        let s_ids: Vec<u64> = subjects.iter().map(|(s_id, _)| *s_id).collect();
+
+        let mut rows_by_subject =
+            fluree_db_binary_index::read::batched_lookup::batched_lookup_subject_properties(
+                &store,
+                g_id,
+                &s_ids,
+                self.view.t,
+            )
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!("batched subject crawl failed: {e}"))
+            })?;
+
+        for (s_id, sid) in subjects {
+            let rows = rows_by_subject.remove(&s_id).unwrap_or_default();
+            let node = self.node_from_rows(&sid, &rows, store.as_ref(), g_id)?;
+            self.cache.insert(sid, node);
+        }
+        Ok(())
+    }
+
+    /// Build a node from batched-crawl rows. Ref-valued rows are skipped by
+    /// `o_type` **before** decoding — that skip (no dict/arena touch per
+    /// edge target) is the point of the batched lane.
+    fn node_from_rows(
+        &mut self,
+        sid: &Sid,
+        rows: &[(u32, u16, u64)],
+        store: &fluree_db_binary_index::BinaryIndexStore,
+        g_id: u16,
+    ) -> Result<CypherNode> {
+        let iri = self.compactor.decode_sid(sid)?;
+        let rdf_type_p_id = self
+            .rdf_type
+            .as_ref()
+            .and_then(|sid| store.sid_to_p_id(sid));
+        let mut labels = Vec::new();
+        let mut props: Vec<(String, Vec<CypherCell>)> = Vec::new();
+        for &(p_id, o_type, o_key) in rows {
+            if Some(p_id) == rdf_type_p_id {
+                let decoded = store
+                    .decode_value_v3(o_type, o_key, p_id, g_id)
+                    .map_err(|e| FormatError::InvalidBinding(format!("decode class ref: {e}")))?;
+                if let FlakeValue::Ref(class_sid) = decoded {
+                    if let Some(label) = self.label_name(&class_sid)? {
+                        labels.push(label.to_string());
+                    }
+                }
+                continue;
+            }
+            if fluree_db_core::o_type::OType::from_u16(o_type).is_node_ref() {
+                continue;
+            }
+            let Some(key) = self.key_name_by_pid(p_id, store)? else {
+                continue;
+            };
+            let decoded = store
+                .decode_value_v3(o_type, o_key, p_id, g_id)
+                .map_err(|e| FormatError::InvalidBinding(format!("decode property: {e}")))?;
+            let cell = self.flake_value_cell(&decoded)?;
+            match props.iter_mut().find(|(k, _)| *k == key.as_ref()) {
+                Some((_, cells)) => cells.push(cell),
+                None => props.push((key.to_string(), vec![cell])),
+            }
+        }
+        Ok(CypherNode {
+            iri,
+            labels,
+            properties: props
+                .into_iter()
+                .map(|(k, mut cells)| {
+                    let cell = if cells.len() == 1 {
+                        cells.pop().expect("one cell")
+                    } else {
+                        CypherCell::List(cells)
+                    };
+                    (k, cell)
+                })
+                .collect(),
+        })
+    }
+
+    /// Memoized p_id → property key (`None` hides system predicates).
+    fn key_name_by_pid(
+        &mut self,
+        p_id: u32,
+        store: &fluree_db_binary_index::BinaryIndexStore,
+    ) -> Result<Option<Arc<str>>> {
+        if let Some(hit) = self.key_names_by_pid.get(&p_id) {
+            return Ok(hit.clone());
+        }
+        let name = match store.resolve_predicate_iri(p_id) {
+            Some(iri) if iri.starts_with(FLUREE_SYSTEM_NS) => None,
+            Some(iri) => Some(Arc::from(cypher_name_from_iri(iri).as_str())),
+            None => None,
+        };
+        self.key_names_by_pid.insert(p_id, name.clone());
+        Ok(name)
+    }
+
+    /// The fallback lane: per-subject point reads, spawned as chunked
+    /// tasks (CPU-bound work — cursor setup, leaflet decode, dict
+    /// resolves — needs parallel workers, not cooperative concurrency).
+    async fn prefetch_fallback(&mut self, mut sids: Vec<Sid>) -> Result<()> {
         sids.sort_unstable_by(|a, b| {
             (a.namespace_code, a.name.as_ref()).cmp(&(b.namespace_code, b.name.as_ref()))
         });
         sids.dedup();
-        sids.retain(|sid| !self.flake_cache.contains_key(sid));
         if sids.is_empty() {
             return Ok(());
         }
@@ -458,7 +641,6 @@ impl<'a> NodeHydrator<'a> {
         }
         Ok(())
     }
-
     /// A subject's flakes, from the prefetch cache when warm; the fallback
     /// single fetch covers subjects the prefetch pass couldn't see
     /// (encoded bindings that materialized during the row walk).
@@ -694,7 +876,7 @@ mod tests {
         collect_subject_sids(None, &nested, &mut out).unwrap();
         collect_subject_sids(None, &path, &mut out).unwrap();
 
-        let names: Vec<&str> = out.iter().map(|s| s.name.as_ref()).collect();
+        let names: Vec<&str> = out.iter().map(|s| s.sid.name.as_ref()).collect();
         assert_eq!(names, vec!["ann1", "n1", "n2", "p1", "p2"]);
     }
 }

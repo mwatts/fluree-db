@@ -79,6 +79,42 @@ async fn main() {
         rows.len()
     );
 
+    // Correctness spot-check on the hydrated output (exercises the batched
+    // crawl lane on this indexed, overlay-free ledger).
+    use fluree_db_api::format::cypher_typed::CypherCell;
+    let node = rows
+        .iter()
+        .flat_map(|r| r.iter())
+        .find_map(|c| match c {
+            CypherCell::Node(n) if n.iri == "http://example.org/u0" => Some(n),
+            _ => None,
+        })
+        .expect("u0 in result");
+    assert_eq!(node.labels, vec!["User"], "labels");
+    let prop = |k: &str| {
+        node.properties
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v)
+    };
+    assert_eq!(
+        prop("name"),
+        Some(&CypherCell::Value(serde_json::json!("user0")))
+    );
+    assert_eq!(prop("age"), Some(&CypherCell::Value(serde_json::json!(18))));
+    assert_eq!(
+        prop("region"),
+        Some(&CypherCell::Value(serde_json::json!("region0")))
+    );
+    assert!(prop("knows").is_none(), "edges must not inline");
+    assert_eq!(
+        node.properties.len(),
+        8,
+        "8 scalar props, no refs: {:?}",
+        node.properties
+    );
+    eprintln!("hydrated content verified (labels, scalars, no adjacency)");
+
     // Flat table (what HTTP emits — no hydration), typed table (Bolt).
     for (name, typed) in [("flat  ", false), ("typed ", true)] {
         let mut total = 0f64;

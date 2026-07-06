@@ -1109,7 +1109,7 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
 mem:fact-01kwvpa1cdekas5700mv919nte a mem:Fact ;
-    mem:content "Bolt v1 landed on feature/bolt: pure codec crate fluree-db-bolt (PackStream/chunking/handshake 4.4+5.0-5.4/session machine, zero Fluree deps) + server feature `bolt` (default off, --bolt-listen-addr/--bolt-default-db). Session is action-based: on_request returns Turn::Execute(RunRequest), server glue executes then calls run_succeeded/run_failed — keeps the state machine sync/pure. Reads use QueryResult::to_cypher_table (pre-cypherify RDF-faithful cells factored out of format/cypher.rs) then cell_to_bolt: xsd:decimal→Float, temporal→ISO strings, nodes→IRI strings (v1). Writes reuse pub(crate) submit_via_consensus/wait_for_committed_state. Listener refuses to start under data_auth_mode=required." ;
+    mem:content "Bolt v1 landed on feature/bolt: pure codec crate fluree-db-bolt (PackStream/chunking/handshake 4.4+5.0-5.4/session machine, zero Fluree deps) + server feature `bolt` (default on, binds only when --bolt-listen-addr set; --bolt-default-db). Session is action-based: on_request returns Turn::Execute(RunRequest), server glue executes then calls run_succeeded/run_failed — keeps the state machine sync/pure. Reads use QueryResult::to_cypher_table (pre-cypherify RDF-faithful cells factored out of format/cypher.rs) then cell_to_bolt: xsd:decimal→Float, temporal→ISO strings, nodes→IRI strings (v1). Writes reuse pub(crate) submit_via_consensus/wait_for_committed_state. Auth landed later on feature/bolt-auth (see bolt auth memory) — the old refuse-to-start-under-required-auth guard is GONE, replaced by per-session enforcement." ;
     mem:tag "bolt" ;
     mem:tag "cypher" ;
     mem:tag "packstream" ;
@@ -1179,6 +1179,37 @@ mem:fact-01kww2pyrz2rdf3tzgc72dhe4p a mem:Fact ;
     mem:branch "feature/bolt" ;
     mem:createdAt "2026-07-06T16:03:21.503160+00:00"^^xsd:dateTime ;
     mem:rationale "Anyone extending hydration caching to dataset mode must key by (ledger_alias, Sid); anyone changing policy contexts mid-request would invalidate the post-policy cache assumption." .
+
+mem:fact-01kww61t7fnmpf936xj5aecp7v a mem:Fact ;
+    mem:content "Bolt auth (feature/bolt-auth): HELLO(≤5.0)/LOGON(5.1+) auth maps → Turn::Authenticate; glue verifies via the hoisted verify_data_principal (the ONE transport-agnostic token→DataPrincipal pipeline, also used by HTTP MaybeDataBearer). Session keeps an `authenticated` flag so RESET after failed LOGON returns to Authentication, not Ready; HELLO-auth failure closes (no pre-5.1 re-auth). Per-STATEMENT re-checks: token exp (no skew → TokenExpired; login validate allows 60s skew, so exp-within-skew tokens logon but can't run) and ledger read/write scopes (denial = DatabaseNotFound, existence-hiding like HTTP 404). basic scheme = token-in-password carrier; principal field ignored." ;
+    mem:tag "auth" ;
+    mem:tag "bolt" ;
+    mem:tag "security" ;
+    mem:tag "session" ;
+    mem:tag "tokens" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-bolt/src/session.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:artifactRef "fluree-db-server/src/extract/data_bearer.rs" ;
+    mem:artifactRef "fluree-db-server/tests/bolt_auth_integration.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T17:01:43.023441+00:00"^^xsd:dateTime ;
+    mem:rationale "Any transport adding token auth must reuse verify_data_principal, and the RESET/authenticated-flag interaction is a subtle state-machine trap." .
+
+mem:fact-01kww61y9crayg5pqd2ghnawt5 a mem:Fact ;
+    mem:content "Bolt policy enforcement: identity-only GovernanceOptions from the session drives wrap_policy on both read paths (autocommit + in-txn view) mirroring execute_cypher_ledger; CypherTransaction carries governance pinned at BEGIN — each staged statement builds build_transact_policy_context against the txn's PRIVATE state (earlier statements policy-visible) and policy-wraps the MERGE probe. to_cypher_typed_table no longer fails closed under view policy: NodeHydrator filters each raw-SPOT subject fetch through the view's QueryPolicyEnforcer (bulk class-cache populate, then filter_flakes_for_graph; fully-filtered subjects cache as empty). No policy knobs over Bolt by design — identity's in-ledger bindings only." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "hydration" ;
+    mem:tag "policy" ;
+    mem:tag "transactions" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_txn.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T17:01:47.180471+00:00"^^xsd:dateTime ;
+    mem:rationale "The hydrator is the pattern for any format-time raw-SPOT read under policy; the txn governance pinning and probe wrap must be preserved by future Bolt/txn work." .
 
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
