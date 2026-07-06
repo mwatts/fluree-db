@@ -1108,6 +1108,32 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
+mem:decision-01kwwmmezehttr76cjq1kdtfqf a mem:Decision ;
+    mem:content "Bolt/Cypher node-emit strings are Arc<str> end-to-end: CypherNode/Relationship/Path fields, the hydrator memos, AND the bolt codec's Value::String + MapValue keys — names alloc once per distinct name per result, never per use (87→73ms on the 20k-node probe). IriCompactor::decode_sid_shared returns the Sid's own name (refcount bump, no alloc) for EMPTY/OVERFLOW/empty-prefix namespaces — the ready-made hot path for the planned move of default Cypher identifiers to namespace 0 (no IRI prefix instead of http://example.org/). Note: the dict already stores split (ns_code, suffix), so NS-0's win is decode-side only." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "namespace-0" ;
+    mem:tag "node-emit" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/iri.rs" ;
+    mem:artifactRef "fluree-db-bolt/src/value.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T21:16:34.158183+00:00"^^xsd:dateTime ;
+    mem:rationale "User decided Cypher's default namespace will move to code 0; the Arc<str> plumbing captures the allocation win for any namespace today and makes NS-0 decode zero-cost when it lands. Don't reintroduce String copies at the PackStream boundary — that re-buys every allocation." .
+
+mem:decision-01kwwmsb3939gkgcss4nnpetwa a mem:Decision ;
+    mem:content "Cypher identifiers (labels, property keys, rel types) default to namespace code 0 — bare names, no IRI prefix — on BOTH read and write paths; RDF compat is opt-in via ledger default context @vocab (set_default_context) or GraphDb::with_default_context. Implemented 2026-07-06 on feature/bolt (see ns-0 lowering fact for mechanics). elementId/node identity = the stored name (full IRI only in @vocab mode)." ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "namespace-0" ;
+    mem:scope mem:repo ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T21:19:14.025388+00:00"^^xsd:dateTime ;
+    mem:rationale "User decision 2026-07-06: NS 0 makes more sense as the Cypher default than http://example.org/. Supersedes the old default-vocab behavior." .
+
 mem:fact-01kwvpa1cdekas5700mv919nte a mem:Fact ;
     mem:content "Bolt v1 landed on feature/bolt: pure codec crate fluree-db-bolt (PackStream/chunking/handshake 4.4+5.0-5.4/session machine, zero Fluree deps) + server feature `bolt` (default on, binds only when --bolt-listen-addr set; --bolt-default-db). Session is action-based: on_request returns Turn::Execute(RunRequest), server glue executes then calls run_succeeded/run_failed — keeps the state machine sync/pure. Reads use QueryResult::to_cypher_table (pre-cypherify RDF-faithful cells factored out of format/cypher.rs) then cell_to_bolt: xsd:decimal→Float, temporal→ISO strings, nodes→IRI strings (v1). Writes reuse pub(crate) submit_via_consensus/wait_for_committed_state. Auth landed later on feature/bolt-auth (see bolt auth memory) — the old refuse-to-start-under-required-auth guard is GONE, replaced by per-session enforcement." ;
     mem:tag "bolt" ;
@@ -1242,6 +1268,19 @@ mem:fact-01kwwf09dhmhae0cq0xxjj293m a mem:Fact ;
     mem:branch "feature/bolt" ;
     mem:createdAt "2026-07-06T19:38:10.225712+00:00"^^xsd:dateTime ;
     mem:rationale "shortest_path_merges_novelty_over_index pins delta semantics; bounded_qualifying/exact_length modes still use per-node neighbors(), property-path traversals unconverted — the expander is the shared primitive for both." .
+
+mem:fact-01kwwpw1xptfx0aspa02chhrvx a mem:Fact ;
+    mem:content "NS-0 Cypher default LANDED: LoweringContext.vocab + CypherLowerOpts.vocab are Option<String>, None default; extract_cypher_iri_mapping only returns Some when ledger context has @vocab. iri_ref/iri_term: strict-encode fail + vocab None + name has no ':' → Sid(EMPTY, name); scheme-ful strings keep Ref::Iri fallback (NoEncoder/rdf:type must not collapse into NS-0). Write side needs no special-casing: sid_for_iri canonical_splits bare names to the pre-registered \"\" prefix (code 0). GOTCHAS: policy identity resolution uses STRICT encode → bare token identities never match (use DIDs/full IRIs); encode_iri_strict rejects EMPTY by design; bare JSON-LD @id/@type/keys with no vocab also land in NS-0, so both surfaces converge on bare names." ;
+    mem:tag "cypher" ;
+    mem:tag "lowering" ;
+    mem:tag "namespace-0" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/context.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_cypher_update.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T21:55:40.086415+00:00"^^xsd:dateTime .
 
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
