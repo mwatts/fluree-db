@@ -698,15 +698,15 @@ pub const SPARQL12_VERSION: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-05",
 ];
 
-// Path cardinality / duplicate semantics — sequence-path results differ in
-// multiplicity (`p1/p2` path counting vs `*`/`+` distinct nodes) — plus the
-// zero-variable `SELECT *` projection over a both-bound path (pp36).
-// Audit §4.2.7 (hot-operator semantics; fix must preserve `*`/`+` fast path).
+// Not path-cardinality defects: pp34/pp35 are graph-cluster tests mis-filed
+// under property-path (`GRAPH <ng-01.ttl> { ?s :p1* ?t }` — constant GRAPH IRI
+// base-expansion vs exact-key registry miss, and `?g` bound as a literal).
+// Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
+// already produces the expected `[a,b,b]` bag once the GRAPH block matches
+// (residual-eval.md §2.2).
 pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp16",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp34",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp36",
 ];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
