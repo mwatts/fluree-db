@@ -2238,6 +2238,7 @@ mod tests {
             ledger_id: "test/db:main".into(),
             commit_id: cid(1),
             commit_t: 1,
+            released_envelope: None,
         });
         assert!(r.is_ok());
     }

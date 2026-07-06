@@ -402,6 +402,23 @@ fn drain_releases(response: &mut Response) -> Vec<(String, ContentId)> {
         | Response::Retracted {
             released_envelopes, ..
         } => std::mem::take(released_envelopes),
+        // A keyless queue entry's envelope isn't held by any
+        // idempotency record, so `apply_head` / `apply_poison`
+        // release it as the entry retires.
+        Response::HeadApplied {
+            ledger_id,
+            released_envelope,
+            ..
+        }
+        | Response::Poisoned {
+            ledger_id,
+            released_envelope,
+            ..
+        } => released_envelope
+            .take()
+            .map(|cid| (ledger_id.clone(), cid))
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -731,6 +748,45 @@ mod tests {
 
     fn cid(seed: u8) -> ContentId {
         ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    /// `drain_releases` must forward a keyless entry's envelope
+    /// (paired with the response's ledger_id) so the per-node
+    /// release task frees it, and forward nothing when the entry
+    /// kept its envelope for later idempotency eviction.
+    #[test]
+    fn drain_releases_forwards_keyless_apply_envelopes() {
+        let mut applied = Response::HeadApplied {
+            ledger_id: "test/db:main".into(),
+            commit_id: cid(1),
+            commit_t: 1,
+            released_envelope: Some(cid(9)),
+        };
+        assert_eq!(
+            drain_releases(&mut applied),
+            vec![("test/db:main".to_string(), cid(9))]
+        );
+
+        let mut keyed = Response::HeadApplied {
+            ledger_id: "test/db:main".into(),
+            commit_id: cid(1),
+            commit_t: 1,
+            released_envelope: None,
+        };
+        assert!(drain_releases(&mut keyed).is_empty());
+
+        let mut poisoned = Response::Poisoned {
+            ledger_id: "test/db:main".into(),
+            queue_id: 7,
+            reason: crate::raft::state_machine::PoisonReason::BodyMalformed {
+                error: "x".into(),
+            },
+            released_envelope: Some(cid(3)),
+        };
+        assert_eq!(
+            drain_releases(&mut poisoned),
+            vec![("test/db:main".to_string(), cid(3))]
+        );
     }
 
     fn log_id(term: u64, index: u64) -> LogId<NodeId> {

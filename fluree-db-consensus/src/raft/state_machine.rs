@@ -1207,10 +1207,17 @@ pub enum Response {
     },
     /// [`Command::ApplyHead`] popped the queue front and advanced
     /// the branch head.
+    ///
+    /// `released_envelope` carries the popped entry's `request_cid`
+    /// when the entry had no idempotency key — nothing else records
+    /// it, so the wrapper releases the envelope blob now. A keyed
+    /// entry's envelope is instead held by its idempotency
+    /// [`ApplyRecord`] and released at eviction, so this is `None`.
     HeadApplied {
         ledger_id: String,
         commit_id: ContentId,
         commit_t: i64,
+        released_envelope: Option<ContentId>,
     },
     /// [`Command::ApplyHead`] or [`Command::PoisonQueueEntry`]
     /// found the queue front didn't match `queue_id`. State
@@ -1222,10 +1229,16 @@ pub enum Response {
     },
     /// [`Command::PoisonQueueEntry`] popped the front and
     /// recorded the failure.
+    ///
+    /// `released_envelope` follows the same rule as
+    /// [`Self::HeadApplied`]: `Some(request_cid)` for a keyless
+    /// entry (released now), `None` for a keyed entry (held by its
+    /// [`PoisonRecord`] until eviction).
     Poisoned {
         ledger_id: String,
         queue_id: u64,
         reason: PoisonReason,
+        released_envelope: Option<ContentId>,
     },
     /// [`Command::EvictIdempotency`] removed `removed` entries.
     /// `released_envelopes` carries `(ledger_id, request_cid)` pairs
@@ -2431,27 +2444,36 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
         }
     }
 
-    if let Some(key) = entry.idempotency {
-        state.idempotency.insert(
-            key,
-            ApplyOutcome::Applied(ApplyRecord {
-                request_cid: entry.request_cid,
-                body_cid: entry.body_cid,
-                body_kind: entry.body_kind,
-                recorded_at_millis: applied_at_millis,
-                head: commit_id.clone(),
-                t: commit_t,
-                recorded_index: log_index,
-                tally,
-                flake_count,
-            }),
-        );
-    }
+    // Keyed entry: the idempotency record retains `request_cid` and
+    // its eviction releases the envelope later. Keyless entry:
+    // nothing will ever record it, so hand it to the wrapper for
+    // release now — otherwise the envelope blob leaks in CAS.
+    let released_envelope = match entry.idempotency {
+        Some(key) => {
+            state.idempotency.insert(
+                key,
+                ApplyOutcome::Applied(ApplyRecord {
+                    request_cid: entry.request_cid,
+                    body_cid: entry.body_cid,
+                    body_kind: entry.body_kind,
+                    recorded_at_millis: applied_at_millis,
+                    head: commit_id.clone(),
+                    t: commit_t,
+                    recorded_index: log_index,
+                    tally,
+                    flake_count,
+                }),
+            );
+            None
+        }
+        None => Some(entry.request_cid),
+    };
 
     Response::HeadApplied {
         ledger_id: full_ledger_id,
         commit_id,
         commit_t,
+        released_envelope,
     }
 }
 
@@ -2475,23 +2497,31 @@ fn apply_poison_queue_entry(
         Err(resp) => return *resp,
     };
 
-    if let Some(key) = entry.idempotency {
-        state.idempotency.insert(
-            key,
-            ApplyOutcome::Failed(PoisonRecord {
-                request_cid: entry.request_cid,
-                body_cid: entry.body_cid,
-                reason: reason.clone(),
-                recorded_index: log_index,
-                recorded_at_millis: applied_at_millis,
-            }),
-        );
-    }
+    // Keyless entries release their envelope now; keyed entries
+    // hold it in the `PoisonRecord` until eviction. See
+    // `apply_head`.
+    let released_envelope = match entry.idempotency {
+        Some(key) => {
+            state.idempotency.insert(
+                key,
+                ApplyOutcome::Failed(PoisonRecord {
+                    request_cid: entry.request_cid,
+                    body_cid: entry.body_cid,
+                    reason: reason.clone(),
+                    recorded_index: log_index,
+                    recorded_at_millis: applied_at_millis,
+                }),
+            );
+            None
+        }
+        None => Some(entry.request_cid),
+    };
 
     Response::Poisoned {
         ledger_id: full_ledger_id,
         queue_id,
         reason,
+        released_envelope,
     }
 }
 
@@ -3949,10 +3979,14 @@ mod tests {
                 ledger_id,
                 commit_id,
                 commit_t,
+                released_envelope,
             } => {
                 assert_eq!(ledger_id, "test/db:main");
                 assert_eq!(commit_id, cid(42));
                 assert_eq!(commit_t, 10);
+                // Keyed entry: the envelope is retained by the
+                // idempotency record, released at eviction — not now.
+                assert_eq!(released_envelope, None);
             }
             other => panic!("expected HeadApplied, got {other:?}"),
         }
@@ -4245,6 +4279,7 @@ mod tests {
                 ledger_id,
                 queue_id: qid,
                 reason: PoisonReason::BodyMalformed { error },
+                ..
             } => {
                 assert_eq!(ledger_id, "test/db:main");
                 assert_eq!(qid, queue_id);
@@ -4281,11 +4316,20 @@ mod tests {
             other => panic!("not Enqueued: {other:?}"),
         };
 
-        apply(
+        let resp = apply(
             &mut state,
             poison_cmd("test/db", "main", queue_id, body_malformed("nope")),
             3,
         );
+
+        // No idempotency record will ever hold this envelope, so the
+        // poison releases it now — otherwise the blob leaks in CAS.
+        match resp {
+            Response::Poisoned {
+                released_envelope, ..
+            } => assert_eq!(released_envelope, Some(cid(7))),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
 
         let ref_key = RefKey::new("test/db", "main");
         assert!(state
@@ -4294,6 +4338,35 @@ mod tests {
             .map(VecDeque::is_empty)
             .unwrap_or(true));
         // No idempotency key means nothing recorded — the cache stays empty.
+        assert!(state.idempotency.is_empty());
+    }
+
+    #[test]
+    fn apply_head_without_idempotency_releases_envelope() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", queue_id, cid(42), 10),
+            3,
+        );
+
+        // Keyless success path: the envelope has no idempotency
+        // record to retire it, so it's released as the entry
+        // applies. Its `request_cid` == the enqueue body seed.
+        match resp {
+            Response::HeadApplied {
+                released_envelope, ..
+            } => assert_eq!(released_envelope, Some(cid(7))),
+            other => panic!("expected HeadApplied, got {other:?}"),
+        }
+        // And nothing was cached, so nothing else references it.
         assert!(state.idempotency.is_empty());
     }
 
