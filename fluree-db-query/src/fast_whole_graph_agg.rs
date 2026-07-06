@@ -115,8 +115,15 @@ enum FoldKind {
     /// projected column in projection order.
     Scalars(Vec<AggTask>),
     /// `GROUP BY ?prop` + `COUNT(*)`: one row per distinct property value
-    /// plus a null group. Column positions index into `schema`.
-    Histogram { prop_col: usize, count_col: usize },
+    /// plus a null group. Column positions index into `schema`. An optional
+    /// filter over the group key drops whole groups: every row in a group
+    /// shares the key value, so per-group evaluation (including on the
+    /// null group's `Unbound`) is exactly the pipeline's per-row filter.
+    Histogram {
+        prop_col: usize,
+        count_col: usize,
+        filter: Option<Expression>,
+    },
 }
 
 /// Detected plan: anchor, accessor predicate (if any), fold kind, and the
@@ -176,19 +183,44 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
         }
         Some((tp.p.clone(), prop_var))
     };
-    let (accessor, prop_alias) = match rest {
-        [] => (None, None),
-        [Pattern::Optional(inner)] => (Some(parse_accessor(inner)?), None),
+    let parse_alias = |acc: &(Ref, VarId), var: &VarId, expr: &Expression| -> Option<VarId> {
+        if *expr != Expression::Var(acc.1) || *var == acc.1 || *var == subject_var {
+            return None;
+        }
+        Some(*var)
+    };
+    let (accessor, prop_alias, key_filter) = match rest {
+        [] => (None, None, None),
+        [Pattern::Optional(inner)] => (Some(parse_accessor(inner)?), None, None),
         [Pattern::Optional(inner), Pattern::Bind { var, expr }] => {
             let acc = parse_accessor(inner)?;
-            if *expr != Expression::Var(acc.1) || *var == acc.1 || *var == subject_var {
-                return None;
-            }
-            (Some(acc), Some(*var))
+            let alias = parse_alias(&acc, var, expr)?;
+            (Some(acc), Some(alias), None)
+        }
+        [Pattern::Optional(inner), Pattern::Filter(f)] => {
+            let acc = parse_accessor(inner)?;
+            (Some(acc), None, Some(f.clone()))
+        }
+        [Pattern::Optional(inner), Pattern::Filter(f), Pattern::Bind { var, expr }] => {
+            let acc = parse_accessor(inner)?;
+            let alias = parse_alias(&acc, var, expr)?;
+            (Some(acc), Some(alias), Some(f.clone()))
         }
         _ => return None,
     };
     let prop_var = accessor.as_ref().map(|(_, v)| *v);
+    // A filter is admitted only when it reads nothing but the accessor value
+    // (whole-group-uniform) and is synchronously evaluable.
+    if let Some(f) = &key_filter {
+        let refs = f.referenced_vars();
+        if refs.is_empty()
+            || refs.iter().any(|v| Some(*v) != prop_var)
+            || crate::filter::contains_exists(f)
+            || crate::eval::metadata_resolve::contains_metadata_read(f)
+        {
+            return None;
+        }
+    }
     let select_vars = query.output.projected_vars()?;
 
     let kind = match &query.grouping {
@@ -198,6 +230,11 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
             having: None,
         }) => {
             if !binds.is_empty() || select_vars.len() != aggregates.len() {
+                return None;
+            }
+            if key_filter.is_some() {
+                // Scalar folds read predicate totals; a value filter would
+                // change them. (Histograms filter per group instead.)
                 return None;
             }
             let mut tasks = Vec::with_capacity(select_vars.len());
@@ -237,9 +274,19 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
             if prop_col == count_col {
                 return None;
             }
+            // The batch schema carries the group-key var; rewrite the filter
+            // to reference it when the key is the projection alias (identity
+            // bind — same value).
+            let filter = key_filter.map(|mut f| {
+                if key != prop_var {
+                    f.substitute_var(prop_var, key);
+                }
+                f
+            });
             FoldKind::Histogram {
                 prop_col,
                 count_col,
+                filter,
             }
         }
         _ => return None,
@@ -410,12 +457,21 @@ pub(crate) fn whole_graph_scalar_aggs_operator(
                 FoldKind::Histogram {
                     prop_col,
                     count_col,
+                    filter,
                 } => {
                     let Some(a) = accessor.as_ref() else {
                         return Ok(None);
                     };
-                    let Some(b) =
-                        compute_histogram(ctx, store, a, subjects, &schema, *prop_col, *count_col)?
+                    let Some(b) = compute_histogram(
+                        ctx,
+                        store,
+                        a,
+                        subjects,
+                        &schema,
+                        *prop_col,
+                        *count_col,
+                        filter.as_ref(),
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -451,6 +507,7 @@ fn class_stats<'a>(
 /// (values are contiguous in POST order) plus one null-group row for
 /// subjects without the property. Declines on very wide histograms and on
 /// stores the group-count walk cannot serve.
+#[allow(clippy::too_many_arguments)]
 fn compute_histogram(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -459,6 +516,7 @@ fn compute_histogram(
     schema: &Arc<[VarId]>,
     prop_col: usize,
     count_col: usize,
+    filter: Option<&Expression>,
 ) -> Result<Option<Batch>> {
     // Bound the output (one batch) and guarantee the top-K walk keeps every
     // group: the directory-level distinct-object count must fit the cap.
@@ -523,7 +581,19 @@ fn compute_histogram(
     cols[count_col] = col_count;
     let batch = Batch::new(schema.clone(), cols)
         .map_err(|e| QueryError::execution(format!("histogram batch: {e}")))?;
-    Ok(Some(batch))
+
+    // A group-key filter drops whole groups; evaluating it per group row
+    // (including the null group's Unbound key) is exactly the pipeline's
+    // per-row semantics, because every row of a group carries the same key.
+    let Some(filter) = filter else {
+        return Ok(Some(batch));
+    };
+    let prepared = crate::eval::PreparedBoolExpression::new(filter.clone());
+    match crate::filter::filter_batch(&batch, &prepared, schema, ctx)? {
+        Some(filtered) => Ok(Some(filtered)),
+        // Every group rejected: a legitimately empty result, not a decline.
+        None => Ok(Some(crate::fast_path_common::empty_batch(schema.clone())?)),
+    }
 }
 
 struct AccessorCounts {

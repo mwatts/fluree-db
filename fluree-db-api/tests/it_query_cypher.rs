@@ -7005,3 +7005,91 @@ async fn cypher_class_anchored_fold_declines_without_containment() {
         assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(30), "{cj}");
     }
 }
+
+/// Filtered histogram: the WHERE predicate references only the group key, so
+/// the fold evaluates it once per group (null group included) — identical to
+/// the pipeline's per-row filtering.
+#[tokio::test]
+async fn cypher_class_anchored_filtered_histogram_matches_pipeline() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:class-agg-filtered";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": [15, 30]},
+                    {"@id": "ex:bob",   "@type": "ex:Person"},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 30},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let rows_of = |cj: &JsonValue| -> Vec<(JsonValue, JsonValue)> {
+        let mut rows: Vec<(JsonValue, JsonValue)> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| (r["row"][0].clone(), r["row"][1].clone()))
+            .collect();
+        rows.sort_by_key(|(k, _)| k.to_string());
+        rows
+    };
+
+    for db in [&novelty_db, &indexed_db] {
+        // Range filter: groups >= 18 only, no null group (unbound rejected).
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) WHERE n.age >= 18 RETURN n.age, COUNT(*)",
+            )
+            .await
+            .expect("filtered histogram")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(
+            rows_of(&cj),
+            vec![(json!(30), json!(2)), (json!(40), json!(1))],
+            "{cj}"
+        );
+
+        // Filter that rejects every group: empty result, not an error.
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) WHERE n.age > 100 RETURN n.age, COUNT(*)",
+            )
+            .await
+            .expect("all rejected")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(
+            cj["results"][0]["data"].as_array().expect("rows").len(),
+            0,
+            "{cj}"
+        );
+
+        // IS NULL keeps ONLY the null group (bound-check passes Unbound).
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) WHERE n.age IS NULL RETURN n.age, COUNT(*)",
+            )
+            .await
+            .expect("null group only")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(rows_of(&cj), vec![(json!(null), json!(1))], "{cj}");
+    }
+}
