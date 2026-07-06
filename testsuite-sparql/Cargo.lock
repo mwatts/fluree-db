@@ -700,7 +700,6 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "rustc-hash",
- "ryu",
  "serde",
  "serde_json",
  "sysinfo",

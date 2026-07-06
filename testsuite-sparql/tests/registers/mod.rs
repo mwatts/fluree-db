@@ -428,11 +428,9 @@ pub const SPARQL11_JSON_RES: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/json-res/manifest#jsonres04",
 ];
 
-// csv03 expects canonical xsd:double lexical form (1.0E6) in CSV output.
-pub const SPARQL11_CSV_TSV: &[&str] = &[
-    // result mismatch (1)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/csv-tsv-res/manifest#csv03",
-];
+// Fully green: csv03 was fixed by emitting the canonical xsd:double
+// lexical form (1.0E6) from every RDF-lexical serializer (issue #1445).
+pub const SPARQL11_CSV_TSV: &[&str] = &[];
 
 // Requires RDFS/OWL/RIF entailment regimes — a deliberate non-goal
 // (audit §4.4). The 20 simple-entailment-answerable tests that pass

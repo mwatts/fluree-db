@@ -2494,7 +2494,6 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "rustc-hash",
- "ryu",
  "serde",
  "serde_json",
  "sysinfo",

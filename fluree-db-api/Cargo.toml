@@ -89,9 +89,9 @@ xxhash-rust.workspace = true
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
-# Fast integer/float formatting for TSV output (zero-alloc)
+# Fast integer formatting for TSV output (zero-alloc); doubles use the
+# canonical xsd:double writer from fluree-graph-ir
 itoa.workspace = true
-ryu.workspace = true
 # CSV bulk import (neo4j-admin header convention → JSON-LD front-end)
 csv = "1.4"
 # Percent-encode CSV cell values into safe IRI segments
