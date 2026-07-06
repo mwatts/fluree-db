@@ -1142,7 +1142,7 @@ struct LeadGroupPartial {
 /// `lead_len` is the number of leading key bytes that define the grouping:
 /// - SPOT distinct subjects: 8 bytes (s_id)
 /// - OPST distinct objects: 10 bytes (o_type + o_key)
-fn count_distinct_lead_groups(
+pub(crate) fn count_distinct_lead_groups(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,

@@ -192,7 +192,7 @@ pub fn predicate_scalar_agg_operator(
 }
 
 /// The folded result of a scalar aggregate, before batch construction.
-enum AggOutput {
+pub(crate) enum AggOutput {
     /// `xsd:integer` value (SUM, COUNT-DISTINCT, and the empty-group identity 0
     /// for AVG).
     Integer(i64),
@@ -201,6 +201,14 @@ enum AggOutput {
 }
 
 impl AggOutput {
+    /// The result as a bare binding (for folds that assemble multi-column rows).
+    pub(crate) fn into_binding(self) -> Binding {
+        match self {
+            AggOutput::Integer(v) => Binding::lit(FlakeValue::Long(v), Sid::xsd_integer()),
+            AggOutput::Binding(b) => b,
+        }
+    }
+
     fn into_batch(self, out_var: VarId) -> Result<Batch> {
         match self {
             AggOutput::Integer(v) => build_i64_singleton_batch(out_var, v, "scalar-agg"),
@@ -352,7 +360,7 @@ fn empty_result(kind: ScalarAggKind) -> AggOutput {
 /// Shared POST-leaflet scan driver. Returns `Ok(None)` when a variant hits a
 /// runtime-unsupported leaflet (mixed/non-matching datatypes) and the caller
 /// must fall back to the planned pipeline.
-fn scan_predicate_scalar_agg(
+pub(crate) fn scan_predicate_scalar_agg(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &Ref,

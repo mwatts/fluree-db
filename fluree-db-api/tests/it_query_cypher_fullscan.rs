@@ -8,7 +8,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, graphdb_from_ledger};
+use support::{genesis_ledger, graphdb_from_ledger, rebuild_and_publish_index};
 
 #[tokio::test]
 async fn cypher_bare_match_full_scan_opt_in() {
@@ -65,4 +65,164 @@ async fn cypher_bare_match_full_scan_opt_in() {
     // avg yields xsd:decimal, which cypher-json renders as a string to
     // preserve precision.
     assert_eq!(row[2], json!("62"), "avg: {cj}");
+}
+
+/// Run one Cypher query against both views and return the two cypher-json rows.
+async fn row_on_both(
+    fluree: &fluree_db_api::Fluree,
+    novelty_db: &fluree_db_api::GraphDb,
+    indexed_db: &fluree_db_api::GraphDb,
+    cypher: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let mut rows = Vec::new();
+    for db in [novelty_db, indexed_db] {
+        let cj = fluree
+            .query_cypher(db, cypher)
+            .await
+            .expect("query")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        rows.push(cj["results"][0]["data"][0]["row"].clone());
+    }
+    let indexed = rows.pop().unwrap();
+    let novelty = rows.pop().unwrap();
+    (novelty, indexed)
+}
+
+/// Whole-graph aggregates on an indexed ledger take the directory-fold fast
+/// path (`fast_whole_graph_agg`); the same queries on the novelty-only view
+/// run the general pipeline. Both must agree — including the row-multiplying
+/// left-join semantics of a multi-valued property.
+#[tokio::test]
+async fn cypher_indexed_whole_graph_aggregates_match_pipeline() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:full-scan-indexed";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    // alice has TWO ages: the accessor left-join gives her two
+                    // rows, so count(n) = 5 over 4 subjects while
+                    // count(n.age) = 4 values.
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": [25, 30]},
+                    {"@id": "ex:bob",   "@type": "ex:Person"},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 40},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    // count(n) / count(n.prop) / count(DISTINCT n) — exact integer folds.
+    let (novelty, indexed) = row_on_both(
+        &fluree,
+        &novelty_db,
+        &indexed_db,
+        "MATCH (n) RETURN count(n) AS c, count(n.age) AS ca, count(DISTINCT n) AS cd",
+    )
+    .await;
+    assert_eq!(novelty, json!([5, 4, 4]), "pipeline row");
+    assert_eq!(indexed, json!([5, 4, 4]), "fold row");
+
+    // min/max fold from POST boundary keys; avg from the predicate-scoped
+    // scan. avg = (25+30+40+40)/4 = 33.75. The general pipeline renders the
+    // decimal as a string while the fold (like the existing SPARQL AVG fast
+    // path) yields a double — compare numerically.
+    let (novelty, indexed) = row_on_both(
+        &fluree,
+        &novelty_db,
+        &indexed_db,
+        "MATCH (n) RETURN min(n.age) AS mn, max(n.age) AS mx, avg(n.age) AS av",
+    )
+    .await;
+    for (label, row) in [("pipeline", &novelty), ("fold", &indexed)] {
+        assert_eq!(row[0], json!(25), "{label} min: {row}");
+        assert_eq!(row[1], json!(40), "{label} max: {row}");
+        let avg = row[2]
+            .as_f64()
+            .or_else(|| row[2].as_str().and_then(|s| s.parse().ok()))
+            .expect("numeric avg");
+        assert!((avg - 33.75).abs() < 1e-9, "{label} avg: {row}");
+    }
+
+    // sum through the same fold.
+    let (novelty, indexed) = row_on_both(
+        &fluree,
+        &novelty_db,
+        &indexed_db,
+        "MATCH (n) RETURN sum(n.age) AS s",
+    )
+    .await;
+    assert_eq!(novelty, json!([135]), "pipeline sum");
+    assert_eq!(indexed, json!([135]), "fold sum");
+
+    // count(n) with no accessor = distinct subjects.
+    let (novelty, indexed) = row_on_both(
+        &fluree,
+        &novelty_db,
+        &indexed_db,
+        "MATCH (n) RETURN count(n) AS c",
+    )
+    .await;
+    assert_eq!(novelty, json!([4]), "pipeline count");
+    assert_eq!(indexed, json!([4]), "fold count");
+}
+
+/// `f:reifies*` facts are hidden from the `?n ?p ?o` pipeline but present in
+/// the SPOT directories, so their presence must make the fold decline to the
+/// fallback — results stay identical to the novelty view either way.
+#[tokio::test]
+async fn cypher_indexed_whole_graph_count_declines_on_edge_annotations() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:full-scan-annotated";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:knows": {
+                            "@id": "ex:bob",
+                            "@annotation": {"ex:since": 2020}
+                        }
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let (novelty, indexed) = row_on_both(
+        &fluree,
+        &novelty_db,
+        &indexed_db,
+        "MATCH (n) RETURN count(n) AS c",
+    )
+    .await;
+    assert_eq!(
+        novelty, indexed,
+        "annotated graph: fold must defer to the pipeline"
+    );
 }

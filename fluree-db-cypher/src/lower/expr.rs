@@ -501,13 +501,29 @@ pub(crate) fn resolve_property_accessor<E: IriEncoder>(
     let prop_var_name = format!("?#__prop_{}_{}", target_var.name, key);
     let prop_var = ctx.intern_var(&prop_var_name);
 
-    aux.push(Pattern::Optional(vec![Pattern::Triple(
-        TriplePattern::new(
-            Ref::Var(target_id),
-            Ref::Iri(pred_iri.into()),
-            Term::Var(prop_var),
-        ),
-    )]));
+    // Dedup within the current clause's aux list only (`min(n.age),
+    // max(n.age)` must share one accessor — a repeated Optional over the
+    // same var re-joins the property per occurrence). Cross-scope re-emits
+    // (the WITH-boundary case above) land in a fresh `aux`, so this
+    // clause-local scan never suppresses them.
+    let already_emitted = aux.iter().any(|p| match p {
+        Pattern::Optional(inner) => match inner.as_slice() {
+            [Pattern::Triple(tp)] => {
+                tp.s.as_var() == Some(target_id) && tp.o.as_var() == Some(prop_var)
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    if !already_emitted {
+        aux.push(Pattern::Optional(vec![Pattern::Triple(
+            TriplePattern::new(
+                Ref::Var(target_id),
+                Ref::Iri(pred_iri.into()),
+                Term::Var(prop_var),
+            ),
+        )]));
+    }
     Ok(prop_var)
 }
 

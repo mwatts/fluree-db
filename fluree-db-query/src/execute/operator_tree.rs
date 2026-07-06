@@ -36,6 +36,9 @@ use crate::fast_string_prefix_count_all::{
 };
 use crate::fast_sum_strlen_group_concat::sum_strlen_group_concat_operator;
 use crate::fast_union_star_count_all::{UnionCountMode, UnionStarCountAllOperator};
+use crate::fast_whole_graph_agg::{
+    detect_whole_graph_scalar_aggs, whole_graph_scalar_aggs_operator,
+};
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
@@ -2309,6 +2312,20 @@ fn build_operator_tree_inner(
                 pred,
                 mode,
                 out_var,
+                Some(fallback),
+            )));
+        }
+    }
+
+    // Fast-path: whole-graph scalar aggregates over a distinct-subject
+    // subquery, the Cypher `MATCH (n) RETURN count(n), count(n.age), …`
+    // lowering. Multi-aggregate: each output column folds from index
+    // directories / a predicate-scoped scan. See `fast_whole_graph_agg`.
+    if enable_fused_fast_paths {
+        if let Some(plan) = detect_whole_graph_scalar_aggs(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(whole_graph_scalar_aggs_operator(
+                plan,
                 Some(fallback),
             )));
         }
