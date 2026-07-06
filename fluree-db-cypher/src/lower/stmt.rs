@@ -228,6 +228,42 @@ fn lower_single_branch<E: IriEncoder>(
     q: &crate::ast::Query,
     outer_scope: &[VarId],
 ) -> Result<SingleBranch> {
+    // Anonymous-hop chains may fuse to a frontier-BFS path only when walk
+    // multiplicity is unobservable: DISTINCT output, no aggregates anywhere
+    // in the projection or ORDER BY, and no clause that could observe or
+    // aggregate per-walk rows (WITH / CALL). See
+    // `LoweringContext::fuse_reachability_chains`.
+    let saved_fusion = ctx.fuse_reachability_chains;
+    ctx.fuse_reachability_chains = q.return_clause.distinct
+        && !q
+            .return_clause
+            .items
+            .iter()
+            .any(|item| expr_has_aggregate(&item.expr))
+        && !q
+            .return_clause
+            .order_by
+            .iter()
+            .any(|o| expr_has_aggregate(&o.expr))
+        && q.clauses.iter().all(|c| {
+            matches!(
+                c,
+                ReadClause::Match(_)
+                    | ReadClause::OptionalMatch(_)
+                    | ReadClause::Unwind(_)
+                    | ReadClause::InlineRows { .. }
+            )
+        });
+    let result = lower_single_branch_inner(ctx, q, outer_scope);
+    ctx.fuse_reachability_chains = saved_fusion;
+    result
+}
+
+fn lower_single_branch_inner<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    q: &crate::ast::Query,
+    outer_scope: &[VarId],
+) -> Result<SingleBranch> {
     let mut patterns: Vec<Pattern> = Vec::new();
     // Variables visible from an ENCLOSING scope (a CALL body sees its imports);
     // empty at the top level. A `WITH` narrows scope to its projection, so once

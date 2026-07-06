@@ -75,7 +75,36 @@ fn lower_part<E: IriEncoder>(
     }
 
     let mut prev = part.head.clone();
-    for (rel, next) in &part.tail {
+    let mut i = 0;
+    while i < part.tail.len() {
+        // Reachability fusion: a run of ≥2 anonymous untyped outgoing hops
+        // (`-->()-->()-->x`) collapses to one exact-depth wildcard path —
+        // frontier BFS with per-level dedup instead of per-walk join rows.
+        // Gated statement-wide (`fuse_reachability_chains`: DISTINCT output,
+        // no aggregates, interior nodes unreferenced by construction).
+        if ctx.fuse_reachability_chains && part.path_var.is_none() {
+            let run = fusible_run_len(&part.tail[i..]);
+            if run >= 2 {
+                let end_node = &part.tail[i + run - 1].1;
+                lower_node(ctx, end_node, out)?;
+                let s_ref = lookup_node_ref(ctx, &prev);
+                let o_ref = lookup_node_ref(ctx, end_node);
+                out.push(Pattern::PropertyPath(
+                    fluree_db_query::ir::PropertyPathPattern::new_wildcard(
+                        s_ref,
+                        fluree_db_query::ir::PathModifier::OneOrMore,
+                        Some(run as u32),
+                        Some(run as u32),
+                        o_ref,
+                    ),
+                ));
+                prev = end_node.clone();
+                i += run;
+                continue;
+            }
+        }
+
+        let (rel, next) = &part.tail[i];
         lower_node(ctx, next, out)?;
         let pv = if single_var_length {
             part.path_var.as_ref()
@@ -84,8 +113,36 @@ fn lower_part<E: IriEncoder>(
         };
         lower_rel(ctx, &prev, rel, next, out, pv)?;
         prev = next.clone();
+        i += 1;
     }
     Ok(())
+}
+
+/// Length of the maximal fusible hop run at the start of `tail`: consecutive
+/// plain anonymous untyped outgoing hops (no rel var/props/types/length)
+/// whose *interior* nodes are fully anonymous (`()` — no var, label, or
+/// props). The run's final node may be anything (it is lowered normally as
+/// the path endpoint).
+fn fusible_run_len(tail: &[(RelPattern, NodePattern)]) -> usize {
+    let mut run = 0;
+    for (idx, (rel, node)) in tail.iter().enumerate() {
+        let rel_fusible = rel.length.is_none()
+            && rel.types.is_empty()
+            && rel.var.is_none()
+            && rel.props.is_none()
+            && rel.direction == Direction::Outgoing;
+        if !rel_fusible {
+            break;
+        }
+        run = idx + 1;
+        // The node just reached is interior only if another hop follows; an
+        // interior node must be fully anonymous to stay unobservable.
+        let is_anonymous = node.var.is_none() && node.labels.is_empty() && node.props.is_none();
+        if !is_anonymous {
+            break;
+        }
+    }
+    run
 }
 
 /// Lower `p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` into a

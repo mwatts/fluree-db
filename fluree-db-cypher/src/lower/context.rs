@@ -44,6 +44,16 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// scan is rarely what a production query intends; benchmarks and ad-hoc
     /// exploration opt in (server flag `FLUREE_CYPHER_ALLOW_FULL_SCAN`).
     pub allow_full_scan: bool,
+    /// Whether chains of anonymous untyped hops (`-->()-->()-->(n)`) may
+    /// lower to a single exact-depth wildcard path (frontier BFS with
+    /// per-level dedup) instead of per-hop triple joins. Join chains produce
+    /// one row per *walk*; the path operator one row per *endpoint* — the
+    /// two agree only when the statement's output is `DISTINCT`, aggregates
+    /// nothing, and never references the interior nodes. The statement
+    /// lowering sets this after checking those conditions
+    /// ([`super::stmt`]); default off (write-path MATCH lowering and CALL
+    /// bodies never enable it).
+    pub(super) fuse_reachability_chains: bool,
 }
 
 impl<'a, E: IriEncoder> LoweringContext<'a, E> {
@@ -57,6 +67,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             scopes: Vec::new(),
             annotation_dependent: std::collections::HashSet::new(),
             allow_full_scan: false,
+            fuse_reachability_chains: false,
         }
     }
 

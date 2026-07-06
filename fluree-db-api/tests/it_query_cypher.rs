@@ -6794,3 +6794,87 @@ async fn cypher_with_where_property_equality_folds_to_seek() {
         .expect("is null");
     assert_eq!(rows(r), 1);
 }
+
+#[tokio::test]
+async fn cypher_anonymous_hop_chain_fuses_to_reachability_under_distinct() {
+    // Diamond + tail: a→b1→c, a→b2→c, c→d. Two 2-hop walks reach c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:chain-fusion");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:User", "ex:id": 1,
+                     "ex:knows": [{"@id": "ex:b1"}, {"@id": "ex:b2"}]},
+                    {"@id": "ex:b1", "@type": "ex:User", "ex:knows": {"@id": "ex:c"}},
+                    {"@id": "ex:b2", "@type": "ex:User", "ex:knows": {"@id": "ex:c"}},
+                    {"@id": "ex:c", "@type": "ex:User", "ex:id": 3,
+                     "ex:knows": {"@id": "ex:d"}},
+                    {"@id": "ex:d", "@type": "ex:User", "ex:id": 4},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // DISTINCT endpoints via 2 anonymous hops: just c (one row despite two
+    // walks) — the fused frontier-BFS form must agree with join semantics
+    // after dedup.
+    let r = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->()-->(n:User) RETURN DISTINCT n.id",
+        )
+        .await
+        .expect("fused distinct");
+    assert_eq!(r.row_count(), 1);
+
+    // WITHOUT DISTINCT the chain must keep one row per walk (2 rows) — the
+    // fusion is gated off.
+    let r = fluree
+        .query_cypher(&db, "MATCH (s:User {id: 1})-->()-->(n:User) RETURN n.id")
+        .await
+        .expect("walk multiplicity");
+    assert_eq!(r.row_count(), 2, "non-DISTINCT keeps per-walk rows");
+
+    // Aggregates observe walk multiplicity: count(*) = 2 even with DISTINCT
+    // elsewhere — gated off.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->()-->(n:User) RETURN count(*) AS c",
+        )
+        .await
+        .expect("count walks")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(2), "{cj}");
+
+    // A named intermediate node is observable — not fused; DISTINCT (m, n)
+    // pairs: (b1,c) and (b2,c).
+    let r = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->(m)-->(n:User) RETURN DISTINCT m, n",
+        )
+        .await
+        .expect("named middle");
+    assert_eq!(r.row_count(), 2);
+
+    // 3-hop chain: only d.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->()-->()-->(n:User) RETURN DISTINCT n.id",
+        )
+        .await
+        .expect("3-hop")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(4), "{cj}");
+}
