@@ -224,7 +224,11 @@ async fn sparql_subselect_in_optional_binds_projection() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_setop(&fluree, "setop:optional").await;
 
-    // Uncorrelated COUNT of companies (=2), broadcast to each of the 3 people.
+    // The sub-SELECT shares no variable with the outer query, so it is an
+    // UNCORRELATED aggregate: it evaluates once (COUNT of companies = 2) and that
+    // single row broadcasts to each of the 3 people. This is correct SPARQL
+    // semantics and the point of the test — do not "fix" it into a per-person
+    // correlated count.
     let q = r"
         PREFIX ex: <http://example.org/>
         SELECT ?n ?cnt WHERE {

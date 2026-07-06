@@ -52,6 +52,12 @@ impl super::Parser<'_> {
         // sub-SELECT after itself consuming a nested '{'; the leading SELECT was
         // therefore treated as an unexpected token and the projection was dropped.
         // `parse_subquery` consumes through the matching closing '}'.
+        //
+        // Do NOT re-add a per-caller `KwSelect` check that bypasses this: any new
+        // group-opening construct inherits sub-SELECT support for free by calling
+        // this function after consuming its own `{`. A local check at a call site
+        // would silently reintroduce the dropped-UNION / dropped-projection bug
+        // (#1435 / azure-chat #42, #43).
         if self.stream.check_keyword(TokenKind::KwSelect) {
             return self.parse_subquery(start).or_else(|| {
                 // Malformed sub-SELECT: skip to the matching '}' so its tokens
