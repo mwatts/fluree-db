@@ -247,6 +247,16 @@ impl QueryResult {
         format::format_results(self, &self.context, snapshot, &config)
     }
 
+    /// The Cypher tabular result (columns + rows) with RDF-faithful cell
+    /// values — the pre-flattening form of [`Self::to_cypher_json`]. Value-
+    /// typed transports (Bolt) map datatypes from these cells directly.
+    pub fn to_cypher_table(
+        &self,
+        snapshot: &LedgerSnapshot,
+    ) -> format::Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
+        format::format_cypher_table(self, &self.context, snapshot)
+    }
+
     /// Format as AgentJson (LLM/agent-optimized envelope)
     ///
     /// Returns an envelope with schema header, compact object rows, and pagination metadata.

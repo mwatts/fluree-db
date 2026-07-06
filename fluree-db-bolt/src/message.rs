@@ -32,19 +32,39 @@ pub const FAILURE: u8 = 0x7F;
 /// A decoded client request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
-    Hello { extra: MapValue },
-    Logon { auth: MapValue },
+    Hello {
+        extra: MapValue,
+    },
+    Logon {
+        auth: MapValue,
+    },
     Logoff,
     Goodbye,
     Reset,
-    Run { query: String, parameters: MapValue, extra: MapValue },
-    Begin { extra: MapValue },
+    Run {
+        query: String,
+        parameters: MapValue,
+        extra: MapValue,
+    },
+    Begin {
+        extra: MapValue,
+    },
     Commit,
     Rollback,
-    Discard { extra: MapValue },
-    Pull { extra: MapValue },
-    Route { routing: MapValue, bookmarks: Vec<Value>, extra: Value },
-    Telemetry { api: i64 },
+    Discard {
+        extra: MapValue,
+    },
+    Pull {
+        extra: MapValue,
+    },
+    Route {
+        routing: MapValue,
+        bookmarks: Vec<Value>,
+        extra: Value,
+    },
+    Telemetry {
+        api: i64,
+    },
 }
 
 impl Request {
@@ -66,12 +86,18 @@ impl Request {
         ) -> Result<MapValue, DecodeError> {
             match fields.next() {
                 Some(Value::Map(m)) => Ok(m),
-                other => Err(DecodeError::new(format!("{what}: expected map, got {other:?}"))),
+                other => Err(DecodeError::new(format!(
+                    "{what}: expected map, got {other:?}"
+                ))),
             }
         }
         match signature {
-            HELLO => Ok(Request::Hello { extra: next_map(&mut fields, "HELLO extra")? }),
-            LOGON => Ok(Request::Logon { auth: next_map(&mut fields, "LOGON auth")? }),
+            HELLO => Ok(Request::Hello {
+                extra: next_map(&mut fields, "HELLO extra")?,
+            }),
+            LOGON => Ok(Request::Logon {
+                auth: next_map(&mut fields, "LOGON auth")?,
+            }),
             LOGOFF => Ok(Request::Logoff),
             GOODBYE => Ok(Request::Goodbye),
             RESET => Ok(Request::Reset),
@@ -95,13 +121,23 @@ impl Request {
                         )))
                     }
                 };
-                Ok(Request::Run { query, parameters, extra })
+                Ok(Request::Run {
+                    query,
+                    parameters,
+                    extra,
+                })
             }
-            BEGIN => Ok(Request::Begin { extra: next_map(&mut fields, "BEGIN extra")? }),
+            BEGIN => Ok(Request::Begin {
+                extra: next_map(&mut fields, "BEGIN extra")?,
+            }),
             COMMIT => Ok(Request::Commit),
             ROLLBACK => Ok(Request::Rollback),
-            DISCARD => Ok(Request::Discard { extra: next_map(&mut fields, "DISCARD extra")? }),
-            PULL => Ok(Request::Pull { extra: next_map(&mut fields, "PULL extra")? }),
+            DISCARD => Ok(Request::Discard {
+                extra: next_map(&mut fields, "DISCARD extra")?,
+            }),
+            PULL => Ok(Request::Pull {
+                extra: next_map(&mut fields, "PULL extra")?,
+            }),
             ROUTE => {
                 let routing = next_map(&mut fields, "ROUTE routing")?;
                 let bookmarks = match fields.next() {
@@ -114,7 +150,11 @@ impl Request {
                 };
                 // 4.3 carries a db string; 4.4+ an extra map. Pass through.
                 let extra = fields.next().unwrap_or(Value::Null);
-                Ok(Request::Route { routing, bookmarks, extra })
+                Ok(Request::Route {
+                    routing,
+                    bookmarks,
+                    extra,
+                })
             }
             TELEMETRY => {
                 let api = match fields.next() {
@@ -127,7 +167,9 @@ impl Request {
                 };
                 Ok(Request::Telemetry { api })
             }
-            other => Err(DecodeError::new(format!("unknown message signature 0x{other:02X}"))),
+            other => Err(DecodeError::new(format!(
+                "unknown message signature 0x{other:02X}"
+            ))),
         }
     }
 }
@@ -151,7 +193,10 @@ impl Response {
     }
 
     pub fn failure(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Response::Failure { code: code.into(), message: message.into() }
+        Response::Failure {
+            code: code.into(),
+            message: message.into(),
+        }
     }
 
     /// Encode to a message payload (before chunking).
@@ -165,12 +210,18 @@ impl Response {
                 signature: RECORD,
                 fields: vec![Value::List(values.clone())],
             },
-            Response::Ignored => Structure { signature: IGNORED, fields: vec![] },
+            Response::Ignored => Structure {
+                signature: IGNORED,
+                fields: vec![],
+            },
             Response::Failure { code, message } => {
                 let mut meta = MapValue::new();
                 meta.insert("code", code.as_str());
                 meta.insert("message", message.as_str());
-                Structure { signature: FAILURE, fields: vec![Value::Map(meta)] }
+                Structure {
+                    signature: FAILURE,
+                    fields: vec![Value::Map(meta)],
+                }
             }
         };
         packstream::encode_to_vec(&Value::Structure(structure))
@@ -270,10 +321,17 @@ mod tests {
     fn failure_encodes_code_and_message() {
         let failure = Response::failure("Neo.ClientError.Statement.SyntaxError", "boom");
         let decoded = packstream::decode_exact(&failure.encode()).unwrap();
-        let Value::Structure(s) = decoded else { panic!("not a structure") };
+        let Value::Structure(s) = decoded else {
+            panic!("not a structure")
+        };
         assert_eq!(s.signature, FAILURE);
-        let Value::Map(meta) = &s.fields[0] else { panic!("no metadata map") };
-        assert_eq!(meta.get_str("code"), Some("Neo.ClientError.Statement.SyntaxError"));
+        let Value::Map(meta) = &s.fields[0] else {
+            panic!("no metadata map")
+        };
+        assert_eq!(
+            meta.get_str("code"),
+            Some("Neo.ClientError.Statement.SyntaxError")
+        );
         assert_eq!(meta.get_str("message"), Some("boom"));
     }
 

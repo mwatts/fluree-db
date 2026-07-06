@@ -107,7 +107,10 @@ mod tests {
         let payload = b"\xb1\x01\xa0".to_vec(); // HELLO {}
         let mut wire = Vec::new();
         write_message(&payload, &mut wire);
-        assert_eq!(wire, [&[0x00, 0x03][..], &payload[..], &[0x00, 0x00][..]].concat());
+        assert_eq!(
+            wire,
+            [&[0x00, 0x03][..], &payload[..], &[0x00, 0x00][..]].concat()
+        );
 
         let mut asm = ChunkAssembler::new();
         asm.push(&wire).unwrap();
@@ -134,7 +137,10 @@ mod tests {
         write_message(b"two", &mut wire);
         let mut asm = ChunkAssembler::new();
         asm.push(&wire).unwrap();
-        assert_eq!(assemble_all(&mut asm), vec![b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(
+            assemble_all(&mut asm),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
     }
 
     #[test]

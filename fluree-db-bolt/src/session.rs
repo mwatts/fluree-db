@@ -90,7 +90,12 @@ const CODE_TX_UNSUPPORTED: &str = "Neo.ClientError.Statement.TypeError";
 
 impl Session {
     pub fn new(config: SessionConfig) -> Self {
-        Self { config, state: State::AwaitingHello, stream: None, hello_db: None }
+        Self {
+            config,
+            state: State::AwaitingHello,
+            stream: None,
+            hello_db: None,
+        }
     }
 
     pub fn version(&self) -> BoltVersion {
@@ -119,10 +124,7 @@ impl Session {
     fn on_reset(&mut self) -> Turn {
         if self.state == State::AwaitingHello {
             // RESET before HELLO is a protocol violation.
-            return Turn::Close(vec![Response::failure(
-                CODE_INVALID,
-                "RESET before HELLO",
-            )]);
+            return Turn::Close(vec![Response::failure(CODE_INVALID, "RESET before HELLO")]);
         }
         self.stream = None;
         self.state = if self.state == State::Authentication {
@@ -171,13 +173,21 @@ impl Session {
 
     fn on_ready(&mut self, request: Request) -> Turn {
         match request {
-            Request::Run { query, parameters, extra } => {
+            Request::Run {
+                query,
+                parameters,
+                extra,
+            } => {
                 let db = extra
                     .get_str("db")
                     .map(str::to_string)
                     .or_else(|| self.hello_db.clone())
                     .or_else(|| self.config.default_db.clone());
-                Turn::Execute(RunRequest { query, parameters, db })
+                Turn::Execute(RunRequest {
+                    query,
+                    parameters,
+                    db,
+                })
             }
             Request::Begin { .. } => self.fail(Response::failure(
                 CODE_TX_UNSUPPORTED,
@@ -229,7 +239,13 @@ impl Session {
         let mut meta = MapValue::new();
         meta.insert(
             "fields",
-            Value::List(stream.fields.iter().map(|f| Value::from(f.as_str())).collect()),
+            Value::List(
+                stream
+                    .fields
+                    .iter()
+                    .map(|f| Value::from(f.as_str()))
+                    .collect(),
+            ),
         );
         meta.insert("t_first", t_first_ms);
         meta.insert("qid", 0i64);
@@ -242,14 +258,21 @@ impl Session {
     pub fn run_failed(&mut self, code: impl Into<String>, message: impl Into<String>) -> Response {
         self.state = State::Failed;
         self.stream = None;
-        Response::Failure { code: code.into(), message: message.into() }
+        Response::Failure {
+            code: code.into(),
+            message: message.into(),
+        }
     }
 
     fn serve_pull(&mut self, n: i64) -> Vec<Response> {
         let Some(stream) = self.stream.as_mut() else {
             return vec![Response::failure(CODE_INVALID, "no result stream")];
         };
-        let take = if n < 0 { stream.rows.len() } else { (n as usize).min(stream.rows.len()) };
+        let take = if n < 0 {
+            stream.rows.len()
+        } else {
+            (n as usize).min(stream.rows.len())
+        };
         let mut replies: Vec<Response> = Vec::with_capacity(take + 1);
         for _ in 0..take {
             let row = stream.rows.pop_front().expect("row count checked");
@@ -273,7 +296,11 @@ impl Session {
         let Some(stream) = self.stream.as_mut() else {
             return Response::failure(CODE_INVALID, "no result stream");
         };
-        let drop_n = if n < 0 { stream.rows.len() } else { (n as usize).min(stream.rows.len()) };
+        let drop_n = if n < 0 {
+            stream.rows.len()
+        } else {
+            (n as usize).min(stream.rows.len())
+        };
         stream.rows.drain(..drop_n);
         if stream.rows.is_empty() {
             let mut summary = std::mem::take(&mut stream.summary);
@@ -310,7 +337,10 @@ impl Session {
             .unwrap_or_default();
         let server_entry = |role: &str| {
             let mut entry = MapValue::new();
-            entry.insert("addresses", Value::List(vec![Value::from(address.as_str())]));
+            entry.insert(
+                "addresses",
+                Value::List(vec![Value::from(address.as_str())]),
+            );
             entry.insert("role", role);
             Value::Map(entry)
         };
@@ -319,7 +349,11 @@ impl Session {
         rt.insert("db", db);
         rt.insert(
             "servers",
-            Value::List(vec![server_entry("WRITE"), server_entry("READ"), server_entry("ROUTE")]),
+            Value::List(vec![
+                server_entry("WRITE"),
+                server_entry("READ"),
+                server_entry("ROUTE"),
+            ]),
         );
         let mut meta = MapValue::new();
         meta.insert("rt", rt);
@@ -366,7 +400,9 @@ mod tests {
     fn ready_session_54() -> Session {
         let mut s = Session::new(config(BoltVersion::V5_4));
         s.on_request(hello(MapValue::new()));
-        s.on_request(Request::Logon { auth: MapValue::new() });
+        s.on_request(Request::Logon {
+            auth: MapValue::new(),
+        });
         assert!(s.is_ready());
         s
     }
@@ -399,12 +435,18 @@ mod tests {
     fn bolt5_hello_requires_logon() {
         let mut s = Session::new(config(BoltVersion::V5_4));
         let turn = s.on_request(hello(MapValue::new()));
-        let Turn::Reply(replies) = turn else { panic!("expected reply") };
-        let Response::Success(meta) = &replies[0] else { panic!("expected success") };
+        let Turn::Reply(replies) = turn else {
+            panic!("expected reply")
+        };
+        let Response::Success(meta) = &replies[0] else {
+            panic!("expected success")
+        };
         assert!(meta.get_str("server").unwrap().starts_with("Neo4j/"));
         assert!(!s.is_ready(), "5.4 needs LOGON before READY");
 
-        let turn = s.on_request(Request::Logon { auth: MapValue::new() });
+        let turn = s.on_request(Request::Logon {
+            auth: MapValue::new(),
+        });
         assert_eq!(turn, Turn::Reply(vec![Response::success_empty()]));
         assert!(s.is_ready());
     }
@@ -425,15 +467,21 @@ mod tests {
         assert_eq!(run.db.as_deref(), Some("test:main"));
 
         let success = s.run_succeeded(three_row_stream(), 1);
-        let Response::Success(meta) = &success else { panic!() };
+        let Response::Success(meta) = &success else {
+            panic!()
+        };
         assert_eq!(
             meta.get("fields"),
             Some(&Value::List(vec![Value::from("x")]))
         );
 
-        let Turn::Reply(replies) = s.on_request(pull(-1)) else { panic!() };
+        let Turn::Reply(replies) = s.on_request(pull(-1)) else {
+            panic!()
+        };
         assert_eq!(replies.len(), 4); // 3 records + summary
-        let Response::Success(summary) = replies.last().unwrap() else { panic!() };
+        let Response::Success(summary) = replies.last().unwrap() else {
+            panic!()
+        };
         assert_eq!(summary.get_str("type"), Some("r"));
         assert_eq!(summary.get("has_more"), Some(&Value::Boolean(false)));
     }
@@ -444,14 +492,22 @@ mod tests {
         s.on_request(run_req("q"));
         s.run_succeeded(three_row_stream(), 0);
 
-        let Turn::Reply(first) = s.on_request(pull(2)) else { panic!() };
+        let Turn::Reply(first) = s.on_request(pull(2)) else {
+            panic!()
+        };
         assert_eq!(first.len(), 3); // 2 records + has_more success
-        let Response::Success(meta) = first.last().unwrap() else { panic!() };
+        let Response::Success(meta) = first.last().unwrap() else {
+            panic!()
+        };
         assert_eq!(meta.get("has_more"), Some(&Value::Boolean(true)));
 
-        let Turn::Reply(rest) = s.on_request(pull(2)) else { panic!() };
+        let Turn::Reply(rest) = s.on_request(pull(2)) else {
+            panic!()
+        };
         assert_eq!(rest.len(), 2); // 1 record + final summary
-        let Response::Success(summary) = rest.last().unwrap() else { panic!() };
+        let Response::Success(summary) = rest.last().unwrap() else {
+            panic!()
+        };
         assert_eq!(summary.get("has_more"), Some(&Value::Boolean(false)));
     }
 
@@ -462,8 +518,12 @@ mod tests {
         s.run_succeeded(three_row_stream(), 0);
         let mut extra = MapValue::new();
         extra.insert("n", -1i64);
-        let Turn::Reply(replies) = s.on_request(Request::Discard { extra }) else { panic!() };
-        let Response::Success(summary) = &replies[0] else { panic!() };
+        let Turn::Reply(replies) = s.on_request(Request::Discard { extra }) else {
+            panic!()
+        };
+        let Response::Success(summary) = &replies[0] else {
+            panic!()
+        };
         assert_eq!(summary.get_str("type"), Some("r"));
         // Next RUN is accepted again.
         assert!(matches!(s.on_request(run_req("q2")), Turn::Execute(_)));
@@ -472,10 +532,14 @@ mod tests {
     #[test]
     fn begin_fails_clearly_and_reset_recovers() {
         let mut s = ready_session_54();
-        let Turn::Reply(replies) = s.on_request(Request::Begin { extra: MapValue::new() }) else {
+        let Turn::Reply(replies) = s.on_request(Request::Begin {
+            extra: MapValue::new(),
+        }) else {
             panic!()
         };
-        let Response::Failure { code, message } = &replies[0] else { panic!() };
+        let Response::Failure { code, message } = &replies[0] else {
+            panic!()
+        };
         assert_eq!(code, "Neo.ClientError.Statement.TypeError");
         assert!(message.contains("not supported"));
 
@@ -508,7 +572,9 @@ mod tests {
         s.run_succeeded(three_row_stream(), 0);
         s.on_request(Request::Reset);
         // Stream gone: PULL now fails (READY state).
-        let Turn::Reply(replies) = s.on_request(pull(-1)) else { panic!() };
+        let Turn::Reply(replies) = s.on_request(pull(-1)) else {
+            panic!()
+        };
         assert!(matches!(replies[0], Response::Failure { .. }));
     }
 
@@ -519,7 +585,9 @@ mod tests {
         hello_extra.insert("db", "hello:db");
         s.on_request(hello(hello_extra));
 
-        let Turn::Execute(run) = s.on_request(run_req("q")) else { panic!() };
+        let Turn::Execute(run) = s.on_request(run_req("q")) else {
+            panic!()
+        };
         assert_eq!(run.db.as_deref(), Some("hello:db"));
 
         let mut run_extra = MapValue::new();
@@ -566,7 +634,9 @@ mod tests {
         cfg.advertised_address = Some("db.example.com:7687".into());
         let mut s = Session::new(cfg);
         s.on_request(hello(MapValue::new()));
-        s.on_request(Request::Logon { auth: MapValue::new() });
+        s.on_request(Request::Logon {
+            auth: MapValue::new(),
+        });
         let Turn::Reply(replies) = s.on_request(Request::Route {
             routing: MapValue::new(),
             bookmarks: vec![],
@@ -574,10 +644,16 @@ mod tests {
         }) else {
             panic!()
         };
-        let Response::Success(meta) = &replies[0] else { panic!() };
-        let Some(Value::Map(rt)) = meta.get("rt") else { panic!("no rt") };
+        let Response::Success(meta) = &replies[0] else {
+            panic!()
+        };
+        let Some(Value::Map(rt)) = meta.get("rt") else {
+            panic!("no rt")
+        };
         assert_eq!(rt.get_int("ttl"), Some(300));
-        let Some(Value::List(servers)) = rt.get("servers") else { panic!() };
+        let Some(Value::List(servers)) = rt.get("servers") else {
+            panic!()
+        };
         assert_eq!(servers.len(), 3);
     }
 }

@@ -1,7 +1,29 @@
 # Bolt protocol adapter — implementation hand-off
 
-Status: proposed (not started). This document captures the design,
-code anchor points, and performance expectations worked out during the
+Status: **v1 implemented** (branch `feature/bolt`, 2026-07). Steps 1 and 2
+of the sequencing below landed:
+
+- **Parsed-AST cache** — process-wide LRU in `fluree-db-api`
+  (`FLUREE_CYPHER_AST_CACHE`, default 512 entries); all five parse sites
+  route through `query/helpers.rs::parse_cypher_ast_cached`. The
+  parse/lower split profiler is `fluree-db-api/examples/cypher_phase_profile.rs`.
+- **`fluree-db-bolt` crate** — pure codec: PackStream, chunking,
+  handshake (4.4 + 5.0–5.4), typed messages, autocommit session state
+  machine. No Fluree deps; byte-fixture unit tests.
+- **Server wiring** — `fluree-db-server` feature `bolt` (default off):
+  `--bolt-listen-addr` / `--bolt-default-db` (+ `[server.bolt]` TOML),
+  listener + per-connection tasks in `fluree-db-server/src/bolt.rs`, reads
+  via `query_cypher_with_params` + `QueryResult::to_cypher_table` (the
+  pre-flattening shared converter factored from cypher-json), writes via
+  the consensus submit path with write-RETURN support. End-to-end tests:
+  `fluree-db-server/tests/bolt_integration.rs`; official-driver smoke:
+  `tests/bolt_driver_smoke.py`.
+- Step 3 (driver-matrix polish, temporal/graph PackStream structures,
+  auth, explicit transactions) remains open — see the support matrix's
+  Bolt section for the current transport semantics.
+
+The remainder of this document is the original design hand-off, kept for
+the anchor points and performance expectations worked out during the
 benchgraph/Pokec optimization effort (branch `fix/cypher-benchgraph-gaps`,
 2026-07). Read alongside [Cypher (concept)](../query/cypher.md) and the
 [openCypher support matrix](../reference/cypher-support-matrix.md).

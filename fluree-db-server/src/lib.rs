@@ -25,6 +25,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "bolt")]
+pub mod bolt;
 pub mod config;
 pub mod config_file;
 pub mod error;
@@ -300,6 +302,33 @@ impl FlureeServer {
             })
         });
 
+        // Bolt protocol listener (Neo4j drivers). v1 runs open — refuse to
+        // start rather than silently bypassing a required data-plane auth.
+        #[cfg(feature = "bolt")]
+        let bolt_task = match self.state.config.bolt_listen_addr {
+            Some(bolt_addr) => {
+                if self.state.config.data_auth_mode == crate::config::DataAuthMode::Required {
+                    return Err(std::io::Error::other(
+                        "bolt_listen_addr is set but data_auth_mode=required: the Bolt \
+                         listener is unauthenticated in v1 and would bypass data auth",
+                    ));
+                }
+                Some(
+                    bolt::spawn_listener(Arc::clone(&self.state), bolt_addr)
+                        .await?
+                        .1,
+                )
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "bolt"))]
+        if self.state.config.bolt_listen_addr.is_some() {
+            tracing::warn!(
+                "bolt_listen_addr is set but this binary was built without the `bolt` \
+                 feature; the Bolt listener will not start"
+            );
+        }
+
         // Warm ledger caches + forward-dict pages in the BACKGROUND, after the
         // listener is bound, so the server accepts requests immediately rather
         // than blocking startup until every (potentially large) ledger loads.
@@ -322,6 +351,10 @@ impl FlureeServer {
 
         // Cancel background tasks on shutdown
         warm_task.abort();
+        #[cfg(feature = "bolt")]
+        if let Some(task) = bolt_task {
+            task.abort();
+        }
         if let Some(task) = subscription_task {
             task.abort();
         }

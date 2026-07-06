@@ -127,6 +127,20 @@ pub type Result<T> = std::result::Result<T, FormatError>;
 /// # Returns
 ///
 /// A `serde_json::Value` containing the formatted results
+/// The Cypher tabular result (columns + rows) with **RDF-faithful** cell
+/// values — `{"@value":…,"@type":…}` literals and `{"@id":…}` refs survive,
+/// unlike the flattened Cypher-JSON envelope. Transports with richer type
+/// systems (Bolt/PackStream) consume this so each maps datatypes once,
+/// sharing the per-binding conversion with the JSON formatter.
+pub fn format_cypher_table(
+    result: &QueryResult,
+    context: &ParsedContext,
+    snapshot: &LedgerSnapshot,
+) -> Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+    cypher::table(result, &compactor)
+}
+
 pub fn format_results(
     result: &QueryResult,
     context: &ParsedContext,

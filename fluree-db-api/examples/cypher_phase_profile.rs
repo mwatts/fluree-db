@@ -117,15 +117,6 @@ fn build_dataset(users: usize, edges_per_user: usize) -> JsonValue {
     })
 }
 
-#[derive(Default, Clone)]
-struct PhaseUs {
-    parse: f64,
-    clone: f64,
-    subst: f64,
-    lower: f64,
-    e2e: f64,
-}
-
 fn time_us<R>(iters: usize, warmup: usize, mut f: impl FnMut() -> R) -> f64 {
     for _ in 0..warmup {
         std::hint::black_box(f());
@@ -163,22 +154,20 @@ async fn main() {
         "statement", "parse_us", "clone_us", "subst_us", "lower_us", "e2e_us", "plan+exec_us"
     );
     for stmt in statements() {
-        let mut p = PhaseUs::default();
-
-        p.parse = time_us(iters, warmup, || parse_cypher(stmt.text));
+        let parse_us = time_us(iters, warmup, || parse_cypher(stmt.text));
 
         let ast = parse_cypher(stmt.text).ast.expect("ast");
-        p.clone = time_us(iters, warmup, || ast.clone());
+        let clone_us = time_us(iters, warmup, || ast.clone());
 
-        p.subst = time_us(iters, warmup, || {
+        let subst_us = time_us(iters, warmup, || {
             let mut c = ast.clone();
             substitute_params(&mut c, &stmt.params).expect("subst");
             c
-        }) - p.clone;
+        }) - clone_us;
 
         let mut substituted = ast.clone();
         substitute_params(&mut substituted, &stmt.params).expect("subst");
-        p.lower = time_us(iters, warmup, || {
+        let lower_us = time_us(iters, warmup, || {
             let mut vars = VarRegistry::new();
             let mut ctx =
                 LoweringContext::new(&*db.snapshot, &mut vars).with_vocab("http://example.org/");
@@ -186,7 +175,6 @@ async fn main() {
         });
 
         // Full round trip, sequential requests (single client).
-        let e2e_start = Instant::now();
         let e2e_iters = iters.min(200);
         for _ in 0..warmup.min(20) {
             fluree
@@ -203,13 +191,12 @@ async fn main() {
                     .expect("query"),
             );
         }
-        p.e2e = t0.elapsed().as_secs_f64() * 1e6 / e2e_iters as f64;
-        let _ = e2e_start;
+        let e2e_us = t0.elapsed().as_secs_f64() * 1e6 / e2e_iters as f64;
 
-        let plan_exec = p.e2e - p.parse - p.subst - p.lower;
+        let plan_exec = e2e_us - parse_us - subst_us - lower_us;
         println!(
             "{:<16} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>12.1}",
-            stmt.name, p.parse, p.clone, p.subst, p.lower, p.e2e, plan_exec
+            stmt.name, parse_us, clone_us, subst_us, lower_us, e2e_us, plan_exec
         );
     }
 

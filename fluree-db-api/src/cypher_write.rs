@@ -652,3 +652,15 @@ pub fn plan_write_return_source(
 pub fn fresh_skolem_txn_id() -> String {
     fluree_db_transact::generate_txn_id()
 }
+
+/// Whether a Cypher statement is a write (contains updating clauses).
+/// Transports that carry reads and writes on one verb — Bolt `RUN` —
+/// dispatch on this. Parses through the process-wide AST cache; parse
+/// errors surface with full diagnostics.
+pub fn cypher_statement_is_write(cypher: &str) -> crate::Result<bool> {
+    let ast = crate::query::helpers::parse_cypher_ast_cached(cypher)?;
+    Ok(matches!(
+        ast.statement,
+        fluree_db_cypher::ast::Statement::Update(_)
+    ))
+}

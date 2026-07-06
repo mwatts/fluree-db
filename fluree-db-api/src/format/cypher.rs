@@ -38,6 +38,29 @@ pub fn format(
     compactor: &IriCompactor,
     _config: &super::config::FormatterConfig,
 ) -> Result<JsonValue> {
+    let (columns, rows) = table(result, compactor)?;
+    let columns: Vec<JsonValue> = columns.into_iter().map(JsonValue::String).collect();
+    let data: Vec<JsonValue> = rows
+        .into_iter()
+        .map(|row| {
+            let meta = vec![JsonValue::Null; row.len()];
+            let row: Vec<JsonValue> = row.into_iter().map(cypherify).collect();
+            json!({ "row": row, "meta": meta })
+        })
+        .collect();
+    Ok(json!({ "results": [ { "columns": columns, "data": data } ] }))
+}
+
+/// The Cypher tabular result before scalar flattening: column names plus
+/// per-cell **RDF-faithful** JSON values (`{"@value":…,"@type":…}` literals,
+/// `{"@id":…}` refs). Value-typed transports — Bolt/PackStream — consume this
+/// so datatype decisions (decimal, temporal) are made once per transport
+/// instead of re-derived from flattened JSON. The JSON envelope above is the
+/// same table with [`cypherify`] applied per cell.
+pub fn table(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+) -> Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
     // Column order. An explicit projection (RETURN list) names exactly the
     // user's columns — emit them verbatim, mirroring the JSON-LD array
     // formatter. Only the wildcard path falls back to the batch schema, where
@@ -55,30 +78,29 @@ pub fn format(
             .collect(),
     };
 
-    let columns: Vec<JsonValue> = col_vars
+    let columns: Vec<String> = col_vars
         .iter()
-        .map(|&v| JsonValue::String(result.vars.name(v).to_string()))
+        .map(|&v| result.vars.name(v).to_string())
         .collect();
 
-    let mut data = Vec::new();
+    let mut rows = Vec::new();
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
             let mut row = Vec::with_capacity(col_vars.len());
             for &var_id in &col_vars {
                 let cell = match batch.get(row_idx, var_id) {
-                    Some(b) if !matches!(b, Binding::Unbound | Binding::Poisoned) => cypherify(
-                        super::jsonld::format_binding_with_result(result, b, compactor)?,
-                    ),
+                    Some(b) if !matches!(b, Binding::Unbound | Binding::Poisoned) => {
+                        super::jsonld::format_binding_with_result(result, b, compactor)?
+                    }
                     _ => JsonValue::Null,
                 };
                 row.push(cell);
             }
-            let meta = vec![JsonValue::Null; row.len()];
-            data.push(json!({ "row": row, "meta": meta }));
+            rows.push(row);
         }
     }
 
-    Ok(json!({ "results": [ { "columns": columns, "data": data } ] }))
+    Ok((columns, rows))
 }
 
 /// Flatten an RDF-faithful JSON-LD value to a Cypher native scalar: a

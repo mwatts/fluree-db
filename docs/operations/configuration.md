@@ -187,6 +187,34 @@ Address and port to bind to:
 fluree-server --listen-addr 0.0.0.0:9090
 ```
 
+### Bolt Protocol Listener
+
+Servers built with the `bolt` feature can additionally speak the Bolt
+protocol (Neo4j drivers) against the openCypher surface. Unset = disabled.
+See the [Bolt adapter design](../design/bolt-adapter.md) and the
+[Cypher support matrix](../reference/cypher-support-matrix.md#bolt-protocol-neo4j-drivers)
+for scope and value-mapping notes.
+
+| Flag                | Env Var                   | Default    |
+| ------------------- | ------------------------- | ---------- |
+| `--bolt-listen-addr`| `FLUREE_BOLT_LISTEN_ADDR` | (disabled) |
+| `--bolt-default-db` | `FLUREE_BOLT_DEFAULT_DB`  | (none)     |
+
+`--bolt-default-db` names the ledger served to sessions that select no
+database; drivers can select one per session (`database=` / `db`). The v1
+listener is unauthenticated and refuses to start when
+`data_auth_mode=required`.
+
+```bash
+fluree-server --bolt-listen-addr 0.0.0.0:7687 --bolt-default-db mydb:main
+```
+
+```toml
+[server.bolt]
+listen_addr = "0.0.0.0:7687"
+default_db = "mydb:main"
+```
+
 ### Storage Path
 
 Path for file-based storage. If not specified, defaults to `.fluree/storage` relative to the working directory (the same location used by `fluree init`):

@@ -141,14 +141,7 @@ fn encode_str(s: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-fn encode_collection_header(
-    tiny: u8,
-    m8: u8,
-    m16: u8,
-    m32: u8,
-    len: usize,
-    out: &mut Vec<u8>,
-) {
+fn encode_collection_header(tiny: u8, m8: u8, m16: u8, m32: u8, len: usize, out: &mut Vec<u8>) {
     match len {
         n if n <= 15 => out.push(tiny | n as u8),
         n if n <= 0xFF => {
@@ -209,11 +202,15 @@ impl<'a> Decoder<'a> {
             INT8 => Ok(Value::Integer(self.take_u8()? as i8 as i64)),
             INT16 => {
                 let b = self.take(2)?;
-                Ok(Value::Integer(i16::from_be_bytes(b.try_into().unwrap()) as i64))
+                Ok(Value::Integer(
+                    i16::from_be_bytes(b.try_into().unwrap()) as i64
+                ))
             }
             INT32 => {
                 let b = self.take(4)?;
-                Ok(Value::Integer(i32::from_be_bytes(b.try_into().unwrap()) as i64))
+                Ok(Value::Integer(
+                    i32::from_be_bytes(b.try_into().unwrap()) as i64
+                ))
             }
             INT64 => {
                 let b = self.take(8)?;
@@ -247,7 +244,9 @@ impl<'a> Decoder<'a> {
                 }
                 Ok(Value::Structure(Structure { signature, fields }))
             }
-            m => Err(DecodeError::new(format!("unknown packstream marker 0x{m:02X}"))),
+            m => Err(DecodeError::new(format!(
+                "unknown packstream marker 0x{m:02X}"
+            ))),
         }
     }
 
@@ -265,15 +264,17 @@ impl<'a> Decoder<'a> {
             }
         };
         if len > MAX_DECODE_LEN {
-            return Err(DecodeError::new(format!("length {len} exceeds decode limit")));
+            return Err(DecodeError::new(format!(
+                "length {len} exceeds decode limit"
+            )));
         }
         Ok(len)
     }
 
     fn decode_string(&mut self, len: usize) -> Result<Value, DecodeError> {
         let bytes = self.take(len)?;
-        let s = std::str::from_utf8(bytes)
-            .map_err(|_| DecodeError::new("invalid utf-8 in string"))?;
+        let s =
+            std::str::from_utf8(bytes).map_err(|_| DecodeError::new("invalid utf-8 in string"))?;
         Ok(Value::String(s.to_string()))
     }
 
@@ -365,7 +366,10 @@ mod tests {
         assert_eq!(encode_to_vec(&Value::Integer(-17)), [0xC8, 0xEF]);
         assert_eq!(encode_to_vec(&Value::Integer(-128)), [0xC8, 0x80]);
         assert_eq!(encode_to_vec(&Value::Integer(128)), [0xC9, 0x00, 0x80]);
-        assert_eq!(encode_to_vec(&Value::Integer(-32769)), [0xCA, 0xFF, 0xFF, 0x7F, 0xFF]);
+        assert_eq!(
+            encode_to_vec(&Value::Integer(-32769)),
+            [0xCA, 0xFF, 0xFF, 0x7F, 0xFF]
+        );
         assert_eq!(
             encode_to_vec(&Value::Integer(2_147_483_648)),
             [0xCB, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00]

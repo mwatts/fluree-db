@@ -128,6 +128,25 @@ These shape everything below; read them first.
 | `xsd:float` string-backed numeric coercion | ✅ | In SUM/AVG, comparisons, math. |
 | List / map ordering in `ORDER BY` | ⏳ | `ORDER BY <list/map>` rejected (defensive total order internally). |
 
+## Bolt protocol (Neo4j drivers)
+
+Servers built with the `bolt` feature accept official Neo4j drivers
+(`bolt://` scheme) against the openCypher surface — versions 4.4 and
+5.0–5.4, autocommit only. See [Bolt adapter design](../design/bolt-adapter.md)
+and [configuration](../operations/configuration.md). Transport-specific
+semantics:
+
+| Aspect | Status | Notes |
+|--------|:------:|-------|
+| Autocommit `RUN` (read + write), params, reactive `PULL`/`DISCARD` | ✅ | Same execution paths as the HTTP routes. |
+| Explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ⏳ | Clear `FAILURE` (never silent wrong behavior); needs session-pinned staged state reconciled with consensus locking. |
+| `db` selection | ✅ | Driver `database=` (HELLO defaults or per-RUN) → ledger id; fallback `--bolt-default-db`. |
+| `xsd:decimal` values | ⟂ | Bolt/PackStream has no decimal type: rendered as **Float** (Neo4j parity, precision loss). The JSON transport keeps exact lexical strings. Integer `/` produces decimals, so this shows on ordinary division. |
+| Temporal values (`xsd:date` / `dateTime`) | ⏳ | ISO-8601 **strings** in v1, not Bolt Date/DateTime structures. |
+| Node / relationship / path values (`RETURN n`) | ⟂ | Same value shapes as Cypher-JSON: IRI string / `{start,type,end}` map / node-IRI list — not Bolt `Node`/`Relationship`/`Path` structures yet. |
+| Auth | ⏳ | v1 runs open (`none` scheme accepted); the listener refuses to start when `data_auth_mode=required`. |
+| `ROUTE` / cluster routing | ⏳ | Use the `bolt://` (direct) scheme; `neo4j://` routing answers a failure unless an advertised address is configured. |
+
 ## Maintaining this matrix
 
 This is a hand-maintained matrix, not yet a TCK-driven report. When a Cypher

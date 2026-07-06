@@ -3081,6 +3081,7 @@ dependencies = [
  "ed25519-dalek",
  "fluree-db-api",
  "fluree-db-binary-index",
+ "fluree-db-bolt",
  "fluree-db-connection",
  "fluree-db-consensus",
  "fluree-db-core",
