@@ -15,11 +15,15 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use fluree_db_api::format::cypher_typed::{
+    CypherCell, CypherNode, CypherPath, CypherRelationship, CypherTemporal,
+};
 use fluree_db_bolt::chunk::{write_message, ChunkAssembler};
 use fluree_db_bolt::handshake::{negotiate, HandshakeOutcome, HANDSHAKE_LEN, REJECT};
 use fluree_db_bolt::message::{Request, Response};
 use fluree_db_bolt::session::{ResultStream, RunRequest, Session, SessionConfig, Turn};
-use fluree_db_bolt::value::{MapValue, Value};
+use fluree_db_bolt::value::{sig, MapValue, Structure, Value};
+use fluree_db_bolt::BoltVersion;
 use serde_json::Value as JsonValue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -136,7 +140,8 @@ async fn handle_connection(
                     break;
                 }
                 Turn::Execute(run) => {
-                    let reply = execute_run(&state, &mut session, run).await;
+                    let version = session.version();
+                    let reply = execute_run(&state, &mut session, run, version).await;
                     write_message(&reply.encode(), &mut out_buf);
                 }
             }
@@ -174,9 +179,14 @@ impl RunFailure {
     }
 }
 
-async fn execute_run(state: &AppState, session: &mut Session, run: RunRequest) -> Response {
+async fn execute_run(
+    state: &AppState,
+    session: &mut Session,
+    run: RunRequest,
+    version: BoltVersion,
+) -> Response {
     let started = Instant::now();
-    match try_execute_run(state, &run).await {
+    match try_execute_run(state, &run, version).await {
         Ok(stream) => session.run_succeeded(stream, started.elapsed().as_millis() as i64),
         Err(f) => {
             debug!(code = f.code, error = %f.message, "bolt RUN failed");
@@ -185,7 +195,11 @@ async fn execute_run(state: &AppState, session: &mut Session, run: RunRequest) -
     }
 }
 
-async fn try_execute_run(state: &AppState, run: &RunRequest) -> Result<ResultStream, RunFailure> {
+async fn try_execute_run(
+    state: &AppState,
+    run: &RunRequest,
+    version: BoltVersion,
+) -> Result<ResultStream, RunFailure> {
     let Some(ledger_id) = run.db.as_deref() else {
         return Err(RunFailure::new(
             CODE_DB_NOT_FOUND,
@@ -199,7 +213,7 @@ async fn try_execute_run(state: &AppState, run: &RunRequest) -> Result<ResultStr
     if is_write {
         execute_write(state, ledger_id, &run.query, params).await
     } else {
-        execute_read(state, ledger_id, &run.query, params).await
+        execute_read(state, ledger_id, &run.query, params, version).await
     }
 }
 
@@ -208,6 +222,7 @@ async fn execute_read(
     ledger_id: &str,
     query: &str,
     params: Option<fluree_db_api::CypherParamMap>,
+    version: BoltVersion,
 ) -> Result<ResultStream, RunFailure> {
     let view = state
         .fluree
@@ -220,7 +235,8 @@ async fn execute_read(
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     let (columns, rows) = result
-        .to_cypher_table(&view.snapshot)
+        .to_cypher_typed_table(&view)
+        .await
         .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
 
     let mut summary = MapValue::new();
@@ -231,7 +247,11 @@ async fn execute_read(
         fields: columns,
         rows: rows
             .into_iter()
-            .map(|row| row.into_iter().map(cell_to_bolt).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(|c| typed_cell_to_bolt(c, version))
+                    .collect()
+            })
             .collect(),
         summary,
     })
@@ -448,6 +468,212 @@ fn typed_literal_to_bolt(value: JsonValue, datatype_local: &str) -> Value {
     }
 }
 
+/// A stable 64-bit id for Bolt's numeric `id` fields, derived from the
+/// durable identity (the IRI) via FNV-1a. Numeric ids only need to be
+/// opaque, stable handles — `element_id` (the IRI itself) is the durable
+/// identity, as documented in the support matrix.
+fn stable_id(identity: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in identity.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash as i64
+}
+
+/// One typed result cell (`QueryResult::to_cypher_typed_table`) →
+/// PackStream. Graph values become Bolt structures (element-id fields on
+/// 5.x only); temporal values become Date/Time/DateTime structures (the
+/// 4.4 legacy DateTime encodes local-adjusted seconds); `xsd:decimal`
+/// degrades to Float (Neo4j parity, documented precision loss).
+fn typed_cell_to_bolt(cell: CypherCell, version: BoltVersion) -> Value {
+    match cell {
+        CypherCell::Value(json) => cell_to_bolt(json),
+        CypherCell::Decimal(s) => s
+            .parse::<f64>()
+            .map(Value::Float)
+            .unwrap_or_else(|_| Value::String(s)),
+        CypherCell::BigInt(s) => match (s.parse::<i64>(), s.parse::<f64>()) {
+            (Ok(i), _) => Value::Integer(i),
+            (Err(_), Ok(f)) => Value::Float(f),
+            _ => Value::String(s),
+        },
+        CypherCell::Temporal(t) => temporal_structure(t, version),
+        CypherCell::List(cells) => Value::List(
+            cells
+                .into_iter()
+                .map(|c| typed_cell_to_bolt(c, version))
+                .collect(),
+        ),
+        CypherCell::Map(entries) => Value::Map(
+            entries
+                .into_iter()
+                .map(|(k, c)| (k, typed_cell_to_bolt(c, version)))
+                .collect(),
+        ),
+        CypherCell::Node(node) => node_structure(*node, version),
+        CypherCell::Relationship(rel) => relationship_structure(*rel, version),
+        CypherCell::Path(path) => path_structure(*path, version),
+    }
+}
+
+fn properties_map(properties: Vec<(String, CypherCell)>, version: BoltVersion) -> Value {
+    Value::Map(
+        properties
+            .into_iter()
+            .map(|(k, c)| (k, typed_cell_to_bolt(c, version)))
+            .collect(),
+    )
+}
+
+fn node_structure(node: CypherNode, version: BoltVersion) -> Value {
+    let mut fields = vec![
+        Value::Integer(stable_id(&node.iri)),
+        Value::List(node.labels.into_iter().map(Value::String).collect()),
+        properties_map(node.properties, version),
+    ];
+    if version.has_element_ids() {
+        fields.push(Value::String(node.iri));
+    }
+    Value::Structure(Structure {
+        signature: sig::NODE,
+        fields,
+    })
+}
+
+/// The relationship's numeric id: the reifier IRI when the edge is
+/// reified (durable), else a synthesized hash of (start, type, end) —
+/// stable within a result set, which is all pre-5.x drivers need.
+fn relationship_id(rel: &CypherRelationship) -> (i64, String) {
+    match &rel.reifier_iri {
+        Some(iri) => (stable_id(iri), iri.clone()),
+        None => {
+            let synthetic = format!("{}|{}|{}", rel.start_iri, rel.type_name, rel.end_iri);
+            (stable_id(&synthetic), synthetic)
+        }
+    }
+}
+
+fn relationship_structure(rel: CypherRelationship, version: BoltVersion) -> Value {
+    let (id, element_id) = relationship_id(&rel);
+    let mut fields = vec![
+        Value::Integer(id),
+        Value::Integer(stable_id(&rel.start_iri)),
+        Value::Integer(stable_id(&rel.end_iri)),
+        Value::String(rel.type_name.clone()),
+        properties_map(rel.properties, version),
+    ];
+    if version.has_element_ids() {
+        fields.push(Value::String(element_id));
+        fields.push(Value::String(rel.start_iri));
+        fields.push(Value::String(rel.end_iri));
+    }
+    Value::Structure(Structure {
+        signature: sig::RELATIONSHIP,
+        fields,
+    })
+}
+
+fn unbound_relationship_structure(rel: CypherRelationship, version: BoltVersion) -> Value {
+    let (id, element_id) = relationship_id(&rel);
+    let mut fields = vec![
+        Value::Integer(id),
+        Value::String(rel.type_name.clone()),
+        properties_map(rel.properties, version),
+    ];
+    if version.has_element_ids() {
+        fields.push(Value::String(element_id));
+    }
+    Value::Structure(Structure {
+        signature: sig::UNBOUND_RELATIONSHIP,
+        fields,
+    })
+}
+
+fn path_structure(path: CypherPath, version: BoltVersion) -> Value {
+    let nodes = path
+        .nodes
+        .into_iter()
+        .map(|n| node_structure(n, version))
+        .collect();
+    let rels = path
+        .rels
+        .into_iter()
+        .map(|r| unbound_relationship_structure(r, version))
+        .collect();
+    let indices = path.indices.into_iter().map(Value::Integer).collect();
+    Value::Structure(Structure {
+        signature: sig::PATH,
+        fields: vec![Value::List(nodes), Value::List(rels), Value::List(indices)],
+    })
+}
+
+fn temporal_structure(temporal: CypherTemporal, version: BoltVersion) -> Value {
+    match temporal {
+        CypherTemporal::Date { days, .. } => Value::Structure(Structure {
+            signature: sig::DATE,
+            fields: vec![Value::Integer(days)],
+        }),
+        CypherTemporal::DateTime {
+            epoch_seconds,
+            nanos,
+            tz_offset_seconds: Some(offset),
+            ..
+        } => {
+            // 5.x: UTC epoch seconds + offset. 4.4 (no `utc` patch
+            // negotiated): the legacy struct bakes the offset into the
+            // seconds field ("local epoch seconds").
+            if version.has_element_ids() {
+                Value::Structure(Structure {
+                    signature: sig::DATE_TIME,
+                    fields: vec![
+                        Value::Integer(epoch_seconds),
+                        Value::Integer(nanos as i64),
+                        Value::Integer(offset as i64),
+                    ],
+                })
+            } else {
+                Value::Structure(Structure {
+                    signature: sig::DATE_TIME_LEGACY,
+                    fields: vec![
+                        Value::Integer(epoch_seconds + offset as i64),
+                        Value::Integer(nanos as i64),
+                        Value::Integer(offset as i64),
+                    ],
+                })
+            }
+        }
+        CypherTemporal::DateTime {
+            epoch_seconds,
+            nanos,
+            tz_offset_seconds: None,
+            ..
+        } => Value::Structure(Structure {
+            signature: sig::LOCAL_DATE_TIME,
+            fields: vec![Value::Integer(epoch_seconds), Value::Integer(nanos as i64)],
+        }),
+        CypherTemporal::Time {
+            nanos_since_midnight,
+            tz_offset_seconds: Some(offset),
+            ..
+        } => Value::Structure(Structure {
+            signature: sig::TIME,
+            fields: vec![
+                Value::Integer(nanos_since_midnight),
+                Value::Integer(offset as i64),
+            ],
+        }),
+        CypherTemporal::Time {
+            nanos_since_midnight,
+            tz_offset_seconds: None,
+            ..
+        } => Value::Structure(Structure {
+            signature: sig::LOCAL_TIME,
+            fields: vec![Value::Integer(nanos_since_midnight)],
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +757,113 @@ mod tests {
             }),
         );
         assert!(params_to_json(&params).is_err());
+    }
+
+    #[test]
+    fn node_structure_field_count_by_version() {
+        let node = CypherNode {
+            iri: "http://example.org/u1".into(),
+            labels: vec!["Person".into()],
+            properties: vec![("name".into(), CypherCell::Value(json!("Ana")))],
+        };
+        let Value::Structure(v5) = node_structure(node.clone(), BoltVersion::V5_4) else {
+            panic!()
+        };
+        assert_eq!(v5.signature, sig::NODE);
+        assert_eq!(v5.fields.len(), 4, "5.x nodes carry element_id");
+        assert_eq!(v5.fields[3], Value::String("http://example.org/u1".into()));
+
+        let Value::Structure(v44) = node_structure(node, BoltVersion::V4_4) else {
+            panic!()
+        };
+        assert_eq!(v44.fields.len(), 3, "4.4 nodes have no element_id");
+        let Value::Map(props) = &v44.fields[2] else {
+            panic!("properties map")
+        };
+        assert_eq!(props.get_str("name"), Some("Ana"));
+    }
+
+    #[test]
+    fn relationship_structure_shape() {
+        let rel = CypherRelationship {
+            start_iri: "http://example.org/a".into(),
+            end_iri: "http://example.org/b".into(),
+            type_name: "knows".into(),
+            reifier_iri: None,
+            properties: vec![],
+        };
+        let Value::Structure(v5) = relationship_structure(rel.clone(), BoltVersion::V5_4) else {
+            panic!()
+        };
+        assert_eq!(v5.signature, sig::RELATIONSHIP);
+        assert_eq!(v5.fields.len(), 8);
+        assert_eq!(v5.fields[3], Value::String("knows".into()));
+
+        let Value::Structure(v44) = relationship_structure(rel, BoltVersion::V4_4) else {
+            panic!()
+        };
+        assert_eq!(v44.fields.len(), 5);
+    }
+
+    #[test]
+    fn temporal_structures_by_version() {
+        let date = CypherTemporal::Date {
+            days: 7631,
+            iso: "1990-11-23".into(),
+        };
+        let Value::Structure(d) = temporal_structure(date, BoltVersion::V5_4) else {
+            panic!()
+        };
+        assert_eq!(
+            (d.signature, &d.fields[..]),
+            (sig::DATE, &[Value::Integer(7631)][..])
+        );
+
+        // 2024-01-15T10:30:00+05:00 => utc epoch 1705289400, offset 18000.
+        let dt = CypherTemporal::DateTime {
+            epoch_seconds: 1_705_289_400,
+            nanos: 0,
+            tz_offset_seconds: Some(18_000),
+            iso: String::new(),
+        };
+        let Value::Structure(modern) = temporal_structure(dt.clone(), BoltVersion::V5_4) else {
+            panic!()
+        };
+        assert_eq!(modern.signature, sig::DATE_TIME);
+        assert_eq!(modern.fields[0], Value::Integer(1_705_289_400));
+
+        let Value::Structure(legacy) = temporal_structure(dt, BoltVersion::V4_4) else {
+            panic!()
+        };
+        assert_eq!(legacy.signature, sig::DATE_TIME_LEGACY);
+        assert_eq!(
+            legacy.fields[0],
+            Value::Integer(1_705_289_400 + 18_000),
+            "legacy DateTime bakes the offset into the seconds"
+        );
+
+        let naive = CypherTemporal::DateTime {
+            epoch_seconds: 100,
+            nanos: 5,
+            tz_offset_seconds: None,
+            iso: String::new(),
+        };
+        let Value::Structure(local) = temporal_structure(naive, BoltVersion::V5_4) else {
+            panic!()
+        };
+        assert_eq!(local.signature, sig::LOCAL_DATE_TIME);
+    }
+
+    #[test]
+    fn decimal_cell_degrades_to_float() {
+        assert_eq!(
+            typed_cell_to_bolt(CypherCell::Decimal("2.5".into()), BoltVersion::V5_4),
+            Value::Float(2.5)
+        );
+        assert_eq!(
+            typed_cell_to_bolt(CypherCell::BigInt("12".into()), BoltVersion::V5_4),
+            Value::Integer(12)
+        );
     }
 
     #[test]

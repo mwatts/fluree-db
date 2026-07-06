@@ -73,9 +73,11 @@ async fn bolt_server(ledger: &str) -> (TempDir, Arc<AppState>, std::net::SocketA
         &state,
         ledger,
         json!({
-            "@context": {"ex": "http://example.org/"},
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
             "@graph": [
-                {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 30},
+                {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 30,
+                 "ex:birthday": {"@value": "1990-11-23", "@type": "xsd:date"},
+                 "ex:knows": {"@id": "ex:bob"}},
                 {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob", "ex:age": 45}
             ]
         }),
@@ -439,4 +441,136 @@ async fn bolt_rejects_unknown_version() {
     // Propose Bolt 3.0 only — unsupported.
     let (_client, chosen) = BoltClient::connect(addr, [0, 0, 0, 3]).await;
     assert_eq!(chosen, [0, 0, 0, 0], "no-overlap handshake answers zeros");
+}
+
+/// Bolt structure signatures the typed tests assert on.
+const SIG_NODE: u8 = 0x4E;
+const SIG_RELATIONSHIP: u8 = 0x52;
+const SIG_DATE: u8 = 0x44;
+
+fn as_structure(value: &Value) -> &Structure {
+    match value {
+        Value::Structure(s) => s,
+        other => panic!("expected structure, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt5_returns_node_structures() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    client
+        .run(
+            r#"MATCH (n:Person {name: "Alice"}) RETURN n"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    assert_eq!(records.len(), 1);
+    let node = as_structure(&records[0][0]);
+    assert_eq!(node.signature, SIG_NODE);
+    assert_eq!(
+        node.fields.len(),
+        4,
+        "5.x node: id, labels, properties, element_id"
+    );
+    assert!(matches!(node.fields[0], Value::Integer(_)));
+    assert_eq!(
+        node.fields[1],
+        Value::List(vec![Value::String("Person".into())])
+    );
+    let Value::Map(props) = &node.fields[2] else {
+        panic!("properties map")
+    };
+    assert_eq!(props.get_str("name"), Some("Alice"));
+    assert_eq!(props.get_int("age"), Some(30));
+    assert_eq!(props.get_str("knows"), Some("http://example.org/bob"));
+    let Some(Value::Structure(birthday)) = props.get("birthday") else {
+        panic!(
+            "birthday must be a Date structure, got {:?}",
+            props.get("birthday")
+        )
+    };
+    assert_eq!(birthday.signature, SIG_DATE);
+    assert_eq!(
+        node.fields[3],
+        Value::String("http://example.org/alice".into()),
+        "element_id is the full IRI"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt44_node_has_no_element_id() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 4]).await;
+    client.ready(false).await;
+
+    client
+        .run(
+            r#"MATCH (n:Person {name: "Bob"}) RETURN n"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    let node = as_structure(&records[0][0]);
+    assert_eq!(node.fields.len(), 3, "4.4 node: id, labels, properties");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_returns_date_structure() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    client
+        .run(
+            r#"MATCH (n:Person {name: "Alice"}) RETURN n.birthday AS b"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    let date = as_structure(&records[0][0]);
+    assert_eq!(date.signature, SIG_DATE);
+    // 1990-11-23 is 7631 days after 1970-01-01.
+    assert_eq!(date.fields, vec![Value::Integer(7631)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_returns_relationship_structure() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    client
+        .run(
+            r#"MATCH (a:Person {name: "Alice"})-[e:knows]->(b) RETURN e"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    assert_eq!(records.len(), 1);
+    let rel = as_structure(&records[0][0]);
+    assert_eq!(rel.signature, SIG_RELATIONSHIP);
+    assert_eq!(rel.fields.len(), 8, "5.x relationship carries element ids");
+    assert_eq!(rel.fields[3], Value::String("knows".into()));
+    assert_eq!(
+        rel.fields[6],
+        Value::String("http://example.org/alice".into()),
+        "start_element_id"
+    );
+    assert_eq!(
+        rel.fields[7],
+        Value::String("http://example.org/bob".into()),
+        "end_element_id"
+    );
 }

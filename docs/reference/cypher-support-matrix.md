@@ -142,8 +142,9 @@ semantics:
 | Explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ⏳ | Clear `FAILURE` (never silent wrong behavior); needs session-pinned staged state reconciled with consensus locking. |
 | `db` selection | ✅ | Driver `database=` (HELLO defaults or per-RUN) → ledger id; fallback `--bolt-default-db`. |
 | `xsd:decimal` values | ⟂ | Bolt/PackStream has no decimal type: rendered as **Float** (Neo4j parity, precision loss). The JSON transport keeps exact lexical strings. Integer `/` produces decimals, so this shows on ordinary division. |
-| Temporal values (`xsd:date` / `dateTime`) | ⏳ | ISO-8601 **strings** in v1, not Bolt Date/DateTime structures. |
-| Node / relationship / path values (`RETURN n`) | ⟂ | Same value shapes as Cypher-JSON: IRI string / `{start,type,end}` map / node-IRI list — not Bolt `Node`/`Relationship`/`Path` structures yet. |
+| Temporal values (`xsd:date` / `dateTime` / `time`) | ✅ | Bolt `Date` / `DateTime` / `Time` structures (4.4 gets the legacy local-seconds `DateTime`; lexical forms without a timezone map to the Local variants). |
+| Node values (`RETURN n`) | ✅ | Bolt `Node` structures: `element_id` = full IRI (durable identity), numeric `id` = stable hash of the IRI (opaque handle), labels via the `labels()` rule (`db:Node` marker hidden), properties fetched per node at format time (multi-valued predicates become lists; ref-valued properties are IRI strings). Reads run open (no view policy) — typed results error under policy rather than bypass it. |
+| Relationship / path values | ✅ | Bolt `Relationship` (endpoints + type + annotation properties when reified; synthesized stable `id` otherwise) and `Path` structures (unique node/rel lists + walk indices). |
 | Auth | ⏳ | v1 runs open (`none` scheme accepted); the listener refuses to start when `data_auth_mode=required`. |
 | `ROUTE` / cluster routing | ⏳ | Use the `bolt://` (direct) scheme; `neo4j://` routing answers a failure unless an advertised address is configured. |
 

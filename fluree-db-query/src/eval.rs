@@ -40,6 +40,8 @@ mod value;
 mod vector;
 pub mod vector_math;
 
+pub use metadata::cypher_name_from_iri;
+
 pub(crate) use helpers::build_regex_with_flags;
 pub use helpers::PreparedBoolExpression;
 pub use value::{ArithmeticError, ComparableValue, ComparisonError, NullValueError};

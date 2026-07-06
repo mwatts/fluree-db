@@ -61,23 +61,7 @@ pub fn table(
     result: &QueryResult,
     compactor: &IriCompactor,
 ) -> Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
-    // Column order. An explicit projection (RETURN list) names exactly the
-    // user's columns — emit them verbatim, mirroring the JSON-LD array
-    // formatter. Only the wildcard path falls back to the batch schema, where
-    // synthetic helper vars must be filtered out.
-    let projected = (!result.output.is_wildcard()).then(|| result.output.projected_vars_or_empty());
-    let col_vars: Vec<VarId> = match &projected {
-        Some(vars) => vars.clone(),
-        None => result
-            .batches
-            .first()
-            .map_or(&[][..], |b| b.schema())
-            .iter()
-            .copied()
-            .filter(|&v| !super::is_internal_var_name(result.vars.name(v)))
-            .collect(),
-    };
-
+    let col_vars = column_vars(result);
     let columns: Vec<String> = col_vars
         .iter()
         .map(|&v| result.vars.name(v).to_string())
@@ -101,6 +85,25 @@ pub fn table(
     }
 
     Ok((columns, rows))
+}
+
+/// Column order for the Cypher tabular formats. An explicit projection
+/// (RETURN list) names exactly the user's columns — emit them verbatim,
+/// mirroring the JSON-LD array formatter. Only the wildcard path falls back
+/// to the batch schema, where synthetic helper vars must be filtered out.
+pub(crate) fn column_vars(result: &QueryResult) -> Vec<VarId> {
+    let projected = (!result.output.is_wildcard()).then(|| result.output.projected_vars_or_empty());
+    match projected {
+        Some(vars) => vars,
+        None => result
+            .batches
+            .first()
+            .map_or(&[][..], |b| b.schema())
+            .iter()
+            .copied()
+            .filter(|&v| !super::is_internal_var_name(result.vars.name(v)))
+            .collect(),
+    }
 }
 
 /// Flatten an RDF-faithful JSON-LD value to a Cypher native scalar: a

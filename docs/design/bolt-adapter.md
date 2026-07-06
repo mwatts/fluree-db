@@ -27,9 +27,16 @@ of the sequencing below landed:
   the consensus submit path with write-RETURN support. End-to-end tests:
   `fluree-db-server/tests/bolt_integration.rs`; official-driver smoke:
   `tests/bolt_driver_smoke.py`.
-- Step 3 (driver-matrix polish, temporal/graph PackStream structures,
-  auth, explicit transactions) remains open — see the support matrix's
-  Bolt section for the current transport semantics.
+- **Graph + temporal structures** (step-3 tail, landed): `RETURN n` yields
+  Bolt `Node` structures (labels + per-node property hydration at format
+  time via `QueryResult::to_cypher_typed_table` / `format::cypher_typed`),
+  relationship and path values map to `Relationship`/`Path` structures,
+  and temporal literals map to `Date`/`DateTime`/`Time` (4.4 legacy
+  variants handled). Typed results refuse to run under a view policy —
+  format-time hydration reads raw SPOT state.
+- Remaining step-3 tail: auth schemes, driver-matrix polish, explicit
+  transactions — see the support matrix's Bolt section for current
+  transport semantics.
 
 The remainder of this document is the original design hand-off, kept for
 the anchor points and performance expectations worked out during the
