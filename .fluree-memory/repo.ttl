@@ -1227,6 +1227,22 @@ mem:fact-01kwwddyea3x6nyqmysg11vqvf a mem:Fact ;
     mem:createdAt "2026-07-06T19:10:40.586531+00:00"^^xsd:dateTime ;
     mem:rationale "Future annotation writes must keep the gate honest (stats/overlay reflect new f:reifies facts before queries run) or bound edge vars silently drop annotation bindings; bolt_reified_edge_gate_reopens_for_novelty_annotations pins this." .
 
+mem:fact-01kwwf09dhmhae0cq0xxjj293m a mem:Fact ;
+    mem:content "shortestPath rebuilt on level-batched frontier (frontier.rs): FrontierExpander expands whole BFS levels via batched_lookup_{predicate_refs (typed fwd), subject_properties (wildcard fwd), inbound_refs (bwd)}; novelty applied as OverlayEdgeDelta from ONE netted overlay walk cached on (content_version,g_id,pred,to_t) — asserts extend, retractions mask base rows (merge-correct, no closeable gate). State keyed PathNode{Base(u64)|Novel(Sid)}; Sids materialize only for emitted paths. Both traversal caps unified behind FLUREE_PATH_MAX_VISITED (default 1M, was 10k/100k) — unblocks expansion_4. Probe 1.52→0.54ms tiny graph; win scales. property_path forward_step still per-node — wire the same expander next." ;
+    mem:tag "cypher" ;
+    mem:tag "frontier" ;
+    mem:tag "novelty" ;
+    mem:tag "performance" ;
+    mem:tag "shortest-path" ;
+    mem:tag "traversal" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/frontier.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_path.rs" ;
+    mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T19:38:10.225712+00:00"^^xsd:dateTime ;
+    mem:rationale "shortest_path_merges_novelty_over_index pins delta semantics; bounded_qualifying/exact_length modes still use per-node neighbors(), property-path traversals unconverted — the expander is the shared primitive for both." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
