@@ -291,6 +291,16 @@ tiny); `where_plan.rs` (PR-X1 D1 vs W-1); `graph.rs` (PR-G1 vs residual A1-A4
 
 ## 4. Decision list for the team
 
+> **STATUS (2026-07-06): ADOPTED AS RECOMMENDED.** AJ approved proceeding with
+> the recommendation column for all of D-1 through D-12. **Standing
+> requirement:** any PR that actions one of these decisions must state in its
+> PR description that a decision point existed, enumerate the valid options
+> that were considered (including the ones not taken), and explain why the
+> adopted option was chosen — linking back to this table and the owning
+> cluster doc. Silent adoption of a decision inside an implementation PR is
+> not acceptable; reviewers should be able to re-litigate the choice from the
+> PR description alone.
+
 | # | Decision | Options | Audits' recommendation (verified) | Register entries gated |
 |---|---|---|---|---|
 | **D-1** | Triple-term syntax: accept-then-defer vs documented divergence | Option 4 accept (parse, lower=`not_implemented`) / Option 3 reject-on-principle / (Option 2 desugar is dominated — drop) | **Option 4** (`sparql12-wave2-triple-terms.md` §4); book Option 1 as a separate epic scored by EVAL_TRIPLE_TERMS | 27 (W2BC) now; 39 eval via the epic |
@@ -480,3 +490,7 @@ UPDATE/transact row (`it_transact_update.rs`, `it_named_graphs.rs`) — PR-U1.
    `grp_graphsource` as applicable); PRs touching pinned extensions update the
    pinning tests named in §2; PRs with investigation items (agg02, subquery12,
    D5b) include the probe result in the PR description before the fix commit.
+6. **Decision transparency (AJ, 2026-07-06):** if the PR actions any D-1…D-12
+   decision, the PR description must present the decision point, all options
+   considered, and the rationale for the adopted option (link §4). See the §4
+   status note.
