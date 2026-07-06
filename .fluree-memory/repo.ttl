@@ -1137,6 +1137,21 @@ mem:fact-01kwvpa4y42ve0930eqqf0kz47 a mem:Fact ;
     mem:branch "feature/bolt" ;
     mem:createdAt "2026-07-06T12:26:38.916498+00:00"^^xsd:dateTime .
 
+mem:fact-01kwvtdzzsfecc56zgjs23ckwq a mem:Fact ;
+    mem:content "Bolt explicit transactions (feature/bolt): optimistic one-commit-per-statement model in api cypher_txn.rs. BEGIN pins the cached head; each write stages against the txn's private LedgerState then pure build_commit + finalize_state (nothing published; read-your-writes via GraphDb::from_ledger_state). COMMIT: lock_for_write, verify head t+commit_id == base, put_with_id all pending blobs, ONE compare_and_set_ref to the final commit (atomic visibility; chain keeps provenance), then finalize_commit. Base moved → TransactError::CommitConflict → Neo.TransientError.* so drivers auto-retry managed tx fns. Single-node only — glue rejects BEGIN under raft/peer. Session: TxReady/TxStreaming, qid streams, Turn::Begin/Commit/Rollback/Reset." ;
+    mem:tag "bolt" ;
+    mem:tag "commit" ;
+    mem:tag "cypher" ;
+    mem:tag "optimistic-concurrency" ;
+    mem:tag "transactions" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_txn.rs" ;
+    mem:artifactRef "fluree-db-bolt/src/session.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T13:38:39.225260+00:00"^^xsd:dateTime ;
+    mem:rationale "Future Bolt tx work (Raft support, policy) must preserve the atomic single-ref-advance publish and the base-precondition; N sequential ref advances would expose intermediate states." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
