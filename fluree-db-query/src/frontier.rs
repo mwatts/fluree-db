@@ -147,51 +147,69 @@ impl FrontierExpander {
         }
     }
 
-    /// Expand one frontier level. Returns `(parent, neighbor)` pairs;
-    /// `forward` follows edges source→target, else target→source.
-    pub(crate) fn expand(
+    /// Expand one frontier level, streaming `(parent, neighbor)` edges to
+    /// `on_edge`. The frontier is processed in fixed slices so peak memory
+    /// is `O(slice × out-degree)` — independent of the visited cap — while
+    /// each slice still gets the batched-sweep economics (the underlying
+    /// lookups chunk at 1000 subjects per cursor anyway). `on_edge`
+    /// returning `Break` stops the expansion early (e.g. a bidirectional
+    /// meet); the function reports whether it ran to completion.
+    pub(crate) fn expand_with(
         &self,
         ctx: &ExecutionContext<'_>,
         frontier: &[PathNode],
         forward: bool,
-    ) -> Result<Vec<(PathNode, PathNode)>> {
+        on_edge: &mut dyn FnMut(PathNode, PathNode) -> std::ops::ControlFlow<()>,
+    ) -> Result<bool> {
+        use std::ops::ControlFlow;
+        /// Frontier nodes per batched call: bounds the transient edge
+        /// buffer at `SLICE × out-degree` (~15 MB at degree 30).
+        const SLICE: usize = 8_192;
+
         ctx.tracker.consume_fuel(frontier.len() as u64)?;
-        let mut pairs: Vec<(PathNode, PathNode)> = Vec::new();
-
-        if let Some(store) = &self.store {
-            let base_ids: Vec<u64> = frontier
-                .iter()
-                .filter_map(|n| match n {
-                    PathNode::Base(id) => Some(*id),
-                    PathNode::Novel(_) => None,
-                })
-                .collect();
-            if !base_ids.is_empty() {
-                if forward {
-                    self.expand_base_forward(store, &base_ids, &mut pairs)?;
-                } else {
-                    self.expand_base_backward(store, &base_ids, &mut pairs)?;
-                }
-            }
-        }
-
-        // Overlay-asserted edges, for every frontier node (persisted or
-        // novelty-only).
         let adds = if forward {
             &self.delta.fwd_add
         } else {
             &self.delta.bwd_add
         };
-        if !adds.is_empty() {
-            for node in frontier {
-                if let Some(neighbors) = adds.get(node) {
-                    for neighbor in neighbors {
-                        pairs.push((node.clone(), neighbor.clone()));
+
+        for slice in frontier.chunks(SLICE) {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            let mut pairs: Vec<(PathNode, PathNode)> = Vec::new();
+            if let Some(store) = &self.store {
+                let base_ids: Vec<u64> = slice
+                    .iter()
+                    .filter_map(|n| match n {
+                        PathNode::Base(id) => Some(*id),
+                        PathNode::Novel(_) => None,
+                    })
+                    .collect();
+                if !base_ids.is_empty() {
+                    if forward {
+                        self.expand_base_forward(store, &base_ids, &mut pairs)?;
+                    } else {
+                        self.expand_base_backward(store, &base_ids, &mut pairs)?;
                     }
                 }
             }
+            // Overlay-asserted edges, for every slice node (persisted or
+            // novelty-only).
+            if !adds.is_empty() {
+                for node in slice {
+                    if let Some(neighbors) = adds.get(node) {
+                        for neighbor in neighbors {
+                            pairs.push((node.clone(), neighbor.clone()));
+                        }
+                    }
+                }
+            }
+            for (parent, neighbor) in pairs {
+                if let ControlFlow::Break(()) = on_edge(parent, neighbor) {
+                    return Ok(false);
+                }
+            }
         }
-        Ok(pairs)
+        Ok(true)
     }
 
     fn expand_base_forward(
