@@ -22,6 +22,11 @@ use sparql_handlers::register_sparql_tests;
 /// Tests listed in `ignored_tests` are expected to fail and won't cause
 /// the overall suite to fail. Every other test must pass.
 ///
+/// The skip register is policed in both directions: a test in
+/// `ignored_tests` that *passes* fails the suite as a stale skip entry.
+/// This keeps the register an accurate ledger of remaining gaps — entries
+/// must be removed in the same change that fixes the underlying feature.
+///
 /// If the `W3C_REPORT_JSON` environment variable is set, a machine-readable
 /// JSON report is written to that path. Use `--test-threads=1` when generating
 /// reports to avoid concurrent writes to the same file.
@@ -43,8 +48,17 @@ pub fn check_testsuite(manifest_url: &str, ignored_tests: &[&str]) -> Result<()>
         let status;
         match &result.outcome {
             Ok(()) => {
-                pass_count += 1;
-                status = "pass";
+                if ignored_tests.contains(&result.test.as_str()) {
+                    failures.push(format!(
+                        "{}: unexpectedly PASSED but is in the skip register — \
+                         remove its entry (stale skip entries hide regressions)",
+                        result.test
+                    ));
+                    status = "unexpected-pass";
+                } else {
+                    pass_count += 1;
+                    status = "pass";
+                }
             }
             Err(error) => {
                 if ignored_tests.contains(&result.test.as_str()) {

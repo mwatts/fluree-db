@@ -1,22 +1,31 @@
-//! `QueryEvaluationTest` handler: create an in-memory Fluree ledger, load
-//! test data, execute a SPARQL query, and compare against expected results.
+//! `QueryEvaluationTest` / `UpdateEvaluationTest` handlers: create an
+//! in-memory Fluree ledger, load test data (default + named graphs), execute
+//! a SPARQL query or update, and compare against expected results.
 
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use fluree_db_api::{format, FlureeBuilder, FormatterConfig, GraphDb, ParsedContext, QueryOutput};
+use fluree_db_api::{
+    format, Fluree, FlureeBuilder, FormatterConfig, GraphDb, LedgerState, ParsedContext,
+    QueryOutput,
+};
 
 use crate::files::read_file_to_string;
 use crate::manifest::Test;
 use crate::rdfxml;
 use crate::result_comparison::{are_results_isomorphic, format_results_diff};
 use crate::result_format::{
-    fluree_construct_to_sparql_results, fluree_json_to_sparql_results, parse_expected_results,
+    fluree_construct_to_sparql_results, fluree_json_to_sparql_results, parse_expected_graph,
+    parse_expected_results, project_to_csv_space, RdfTerm, SparqlResults, Triple,
 };
 use crate::subprocess::{run_in_subprocess, TestDescriptor};
 
 /// Max time for a single query evaluation test (data load + query + compare).
 const EVAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ledger alias used for every W3C test (each test runs in its own
+/// subprocess with a fresh in-memory Fluree, so the alias never collides).
+const TEST_LEDGER: &str = "w3c:test";
 
 /// Handler for `mf:QueryEvaluationTest`.
 ///
@@ -54,6 +63,239 @@ pub fn evaluate_query_evaluation_test(test: &Test) -> Result<()> {
     Ok(())
 }
 
+/// Handler for `mf:UpdateEvaluationTest`.
+///
+/// Same subprocess isolation as query evaluation. Loads the initial graph
+/// store state (`ut:data` / `ut:graphData`), applies the SPARQL UPDATE
+/// (`ut:request`), and compares the resulting graph store state against the
+/// expected state (`ut:data` / `ut:graphData` on `mf:result`).
+pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
+    let test_id = test.id.clone();
+    let request_url = test
+        .update_request
+        .clone()
+        .context("UpdateEvaluationTest missing ut:request (update file URL)")?;
+
+    let descriptor = TestDescriptor::UpdateEval {
+        test_id,
+        request_url,
+        data_url: test.data.clone(),
+        graph_data: test.graph_data.clone(),
+        result_data_url: test.result_data.clone(),
+        result_graph_data: test.result_graph_data.clone(),
+    };
+
+    let result = run_in_subprocess(&descriptor, EVAL_TIMEOUT)?;
+
+    if !result.passed {
+        let error_msg = result.error.unwrap_or_else(|| "Unknown error".to_string());
+        bail!("{error_msg}");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Graph store setup (shared by query-eval and update-eval)
+// ---------------------------------------------------------------------------
+
+/// Create the test ledger and load initial state: default graph data plus
+/// named graphs. Returns the resulting ledger state.
+///
+/// Named graphs are loaded as TriG `GRAPH <name> { ... }` blocks through the
+/// alias-based transact builder (`upsert_turtle`), which routes through
+/// `parse_trig_phase1`. Each file's `@prefix`/`@base` directives are hoisted
+/// above the GRAPH block (TriG directives are document-scoped), and each
+/// graph loads in its own transaction so prefix declarations can't collide
+/// across files.
+async fn setup_graph_store(
+    fluree: &Fluree,
+    data_url: Option<&str>,
+    graph_data: &[(String, String)],
+) -> Result<LedgerState> {
+    let ledger = fluree
+        .create_ledger(TEST_LEDGER)
+        .await
+        .context("Failed to create test ledger")?;
+
+    // Default graph data (.ttl or .rdf).
+    // For .ttl: prepend @base so relative IRIs resolve correctly.
+    // For .rdf: convert RDF/XML to N-Triples (absolute IRIs) first.
+    // Some W3C tests (e.g., empty.ttl) have valid syntax but no triples —
+    // Fluree rejects these as empty transactions, so we skip gracefully.
+    let mut current = ledger;
+    if let Some(data_url) = data_url {
+        let raw = read_file_to_string(data_url)
+            .with_context(|| format!("Reading test data: {data_url}"))?;
+        if !raw.trim().is_empty() {
+            let turtle = prepare_for_insert(&raw, data_url)?;
+            match fluree.insert_turtle(current.clone(), &turtle).await {
+                Ok(result) => current = result.ledger,
+                Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
+                Err(e) => return Err(e).with_context(|| format!("Loading test data: {data_url}")),
+            }
+        }
+    }
+
+    // Named graph data as TriG GRAPH blocks.
+    for (graph_name, graph_url) in graph_data {
+        let raw = read_file_to_string(graph_url)
+            .with_context(|| format!("Reading named graph data: {graph_url}"))?;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let content = prepare_for_insert(&raw, graph_url)?;
+        let (directives, body) = split_turtle_directives(&content);
+        if body.trim().is_empty() {
+            continue;
+        }
+        let trig = format!("{directives}GRAPH <{graph_name}> {{\n{body}}}\n");
+        // upsert_turtle (not insert_turtle): the builder's insert_turtle
+        // fast path bypasses TriG GRAPH-block extraction.
+        match fluree
+            .graph(TEST_LEDGER)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+        {
+            Ok(_) => {
+                current = fetch_state(fluree).await?;
+            }
+            Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Loading named graph data: {graph_url} as <{graph_name}>")
+                })
+            }
+        }
+    }
+
+    Ok(current)
+}
+
+/// Fetch the latest committed state of the test ledger by alias.
+async fn fetch_state(fluree: &Fluree) -> Result<LedgerState> {
+    let handle = fluree
+        .ledger_cached(TEST_LEDGER)
+        .await
+        .context("Fetching test ledger state")?;
+    Ok(handle.snapshot().await.to_ledger_state())
+}
+
+/// Split a Turtle document into (directives, body).
+///
+/// TriG requires directives at document scope, so when wrapping a Turtle
+/// file's content in a `GRAPH { }` block its `@prefix`/`@base` lines must be
+/// hoisted out. W3C test data declares directives one per line.
+fn split_turtle_directives(content: &str) -> (String, String) {
+    let mut directives = String::new();
+    let mut body = String::new();
+    for line in content.lines() {
+        let t = line.trim_start();
+        let lower = t.to_ascii_lowercase();
+        if lower.starts_with("@prefix")
+            || lower.starts_with("@base")
+            || lower.starts_with("prefix ")
+            || lower.starts_with("prefix\t")
+            || lower.starts_with("base ")
+            || lower.starts_with("base\t")
+        {
+            directives.push_str(line);
+            directives.push('\n');
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    (directives, body)
+}
+
+// ---------------------------------------------------------------------------
+// Graph readback (used by update-eval comparison)
+// ---------------------------------------------------------------------------
+
+/// Read all triples of one graph (default graph when `graph` is `None`)
+/// through the public SPARQL query surface.
+async fn read_graph_triples(
+    fluree: &Fluree,
+    ledger: &LedgerState,
+    graph: Option<&str>,
+) -> Result<Vec<Triple>> {
+    let db = GraphDb::from_ledger_state(ledger);
+    let sparql = match graph {
+        Some(g) => format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}"),
+        None => "SELECT ?s ?p ?o WHERE { ?s ?p ?o }".to_string(),
+    };
+    let query_result = fluree
+        .query(&db, &sparql)
+        .await
+        .with_context(|| format!("Reading back graph {graph:?}"))?;
+
+    let empty_context = ParsedContext::new();
+    let config = FormatterConfig::sparql_json();
+    let json = format::format_results(&query_result, &empty_context, &ledger.snapshot, &config)
+        .map_err(|e| anyhow::anyhow!("Formatting readback results: {e}"))?;
+    let results = fluree_json_to_sparql_results(&json)
+        .context("Converting readback results to SparqlResults")?;
+
+    let SparqlResults::Solutions { solutions, .. } = results else {
+        bail!("Graph readback returned non-SELECT results");
+    };
+
+    let mut triples = Vec::with_capacity(solutions.len());
+    for sol in solutions {
+        let (Some(s), Some(p), Some(o)) = (sol.get("s"), sol.get("p"), sol.get("o")) else {
+            continue; // partial row — cannot happen for a bare SPO scan
+        };
+        triples.push(Triple {
+            subject: s.clone(),
+            predicate: p.clone(),
+            object: o.clone(),
+        });
+    }
+    // An RDF graph is a set; the SPO scan should already be duplicate-free,
+    // but normalize anyway so comparison semantics don't depend on it.
+    dedup_triples(&mut triples);
+    Ok(triples)
+}
+
+fn dedup_triples(triples: &mut Vec<Triple>) {
+    let mut seen = std::collections::HashSet::new();
+    triples.retain(|t| seen.insert(format!("{t:?}")));
+}
+
+/// Enumerate the names of all non-empty named graphs.
+async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<String>> {
+    let db = GraphDb::from_ledger_state(ledger);
+    let sparql = "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }";
+    let query_result = fluree
+        .query(&db, sparql)
+        .await
+        .context("Enumerating named graphs")?;
+
+    let empty_context = ParsedContext::new();
+    let config = FormatterConfig::sparql_json();
+    let json = format::format_results(&query_result, &empty_context, &ledger.snapshot, &config)
+        .map_err(|e| anyhow::anyhow!("Formatting graph enumeration: {e}"))?;
+    let results = fluree_json_to_sparql_results(&json)?;
+
+    let SparqlResults::Solutions { solutions, .. } = results else {
+        bail!("Graph enumeration returned non-SELECT results");
+    };
+    Ok(solutions
+        .into_iter()
+        .filter_map(|sol| match sol.get("g") {
+            Some(RdfTerm::Iri(iri)) => Some(iri.clone()),
+            _ => None,
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Query evaluation (inner, runs inside the subprocess)
+// ---------------------------------------------------------------------------
+
 /// Inner async function that does the actual test work.
 ///
 /// Public for use by the `run-w3c-test` subprocess binary.
@@ -64,68 +306,11 @@ pub async fn run_eval_test(
     result_url: &str,
     graph_data: &[(String, String)],
 ) -> Result<()> {
-    // 1. Create in-memory Fluree + ledger
+    // 1. Create in-memory Fluree + ledger, load default + named graph data
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = fluree
-        .create_ledger("w3c:test")
-        .await
-        .context("Failed to create test ledger")?;
+    let ledger = setup_graph_store(&fluree, data_url, graph_data).await?;
 
-    // 2. Load default graph data (.ttl or .rdf) if provided.
-    //    For .ttl: prepend @base so relative IRIs resolve correctly.
-    //    For .rdf: convert RDF/XML to N-Triples (absolute IRIs) first.
-    //    Some W3C tests (e.g., empty.ttl) have valid syntax but no triples —
-    //    Fluree rejects these as empty transactions, so we skip gracefully.
-    let ledger = if let Some(data_url) = data_url {
-        let raw = read_file_to_string(data_url)
-            .with_context(|| format!("Reading test data: {data_url}"))?;
-        if raw.trim().is_empty() {
-            ledger
-        } else {
-            let turtle = prepare_for_insert(&raw, data_url)?;
-            match fluree.insert_turtle(ledger.clone(), &turtle).await {
-                Ok(result) => result.ledger,
-                Err(e) if is_empty_transaction(&e) => {
-                    // Turtle had only prefixes / no triples — skip gracefully
-                    ledger
-                }
-                Err(e) => return Err(e).with_context(|| format!("Loading test data: {data_url}")),
-            }
-        }
-    } else {
-        ledger
-    };
-
-    // 3. Load named graph data if present.
-    //    Fluree's Turtle parser does not support TriG GRAPH blocks, so we load
-    //    each named graph's data as a separate insert into the default graph.
-    //    This means SPARQL GRAPH queries won't find data in the correct named
-    //    graph — tests relying on named graph separation will fail. This is a
-    //    known limitation until TriG or per-graph loading is supported.
-    let ledger = if graph_data.is_empty() {
-        ledger
-    } else {
-        let mut current_ledger = ledger;
-        for (_graph_name, graph_url) in graph_data {
-            let raw = read_file_to_string(graph_url)
-                .with_context(|| format!("Reading named graph data: {graph_url}"))?;
-            if !raw.trim().is_empty() {
-                let turtle = prepare_for_insert(&raw, graph_url)?;
-                match fluree.insert_turtle(current_ledger.clone(), &turtle).await {
-                    Ok(result) => current_ledger = result.ledger,
-                    Err(e) if is_empty_transaction(&e) => { /* no triples — skip */ }
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("Loading named graph data: {graph_url} for test {test_id}")
-                        })
-                    }
-                }
-            }
-        }
-        current_ledger
-    };
-
-    // 4. Read + execute the SPARQL query
+    // 2. Read + execute the SPARQL query
     let sparql = read_file_to_string(query_url)
         .with_context(|| format!("Reading query file: {query_url}"))?;
 
@@ -135,10 +320,10 @@ pub async fn run_eval_test(
         .await
         .with_context(|| format!("Executing SPARQL query for test {test_id}"))?;
 
-    // 5. Parse expected results
+    // 3. Parse expected results
     let expected = parse_expected_results(result_url)?;
 
-    // 6. Detect CONSTRUCT vs SELECT/ASK from the parsed query's select mode.
+    // 4. Detect CONSTRUCT vs SELECT/ASK from the parsed query's select mode.
     //    Previous heuristic checked file extension (.ttl/.rdf), but many SPARQL
     //    1.0 SELECT tests use .ttl result files encoded in the DAWG Result Set
     //    vocabulary — not CONSTRUCT graphs. See issue #44.
@@ -162,7 +347,15 @@ pub async fn run_eval_test(
             .context("Converting Fluree results to SparqlResults")?
     };
 
-    // 7. Compare
+    // CSV expected results are lossy (no term kinds / datatypes); project the
+    // actual results into the same value space before comparing.
+    let actual = if result_url.ends_with(".csv") {
+        project_to_csv_space(actual)
+    } else {
+        actual
+    };
+
+    // 5. Compare
     if !are_results_isomorphic(&expected, &actual) {
         let diff = format_results_diff(&expected, &actual);
         bail!(
@@ -174,6 +367,120 @@ pub async fn run_eval_test(
         );
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Update evaluation (inner, runs inside the subprocess)
+// ---------------------------------------------------------------------------
+
+/// Inner async function for `mf:UpdateEvaluationTest`.
+///
+/// Public for use by the `run-w3c-test` subprocess binary.
+pub async fn run_update_eval_test(
+    test_id: &str,
+    request_url: &str,
+    data_url: Option<&str>,
+    graph_data: &[(String, String)],
+    result_data_url: Option<&str>,
+    result_graph_data: &[(String, String)],
+) -> Result<()> {
+    // 1. Initial graph store state
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_graph_store(&fluree, data_url, graph_data).await?;
+
+    // 2. Apply the update request
+    let sparql = read_file_to_string(request_url)
+        .with_context(|| format!("Reading update request: {request_url}"))?;
+    match fluree
+        .graph(TEST_LEDGER)
+        .transact()
+        .sparql_update(&sparql)
+        .commit()
+        .await
+    {
+        Ok(_) => {}
+        // An update whose WHERE clause matches nothing (or whose data is
+        // already present/absent) is a valid no-op per SPARQL Update.
+        Err(e) if is_empty_transaction(&e) => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("Applying update for test {test_id}"));
+        }
+    }
+
+    let ledger = fetch_state(&fluree).await?;
+
+    // 3. Compare default graph state
+    let expected_default = match result_data_url {
+        Some(url) => parse_expected_graph(url)?,
+        None => Vec::new(),
+    };
+    let actual_default = read_graph_triples(&fluree, &ledger, None).await?;
+    compare_graph(
+        test_id,
+        "default graph",
+        expected_default,
+        actual_default,
+        result_data_url,
+    )?;
+
+    // 4. Compare each expected named graph
+    for (graph_name, expected_url) in result_graph_data {
+        let expected = parse_expected_graph(expected_url)?;
+        let actual = read_graph_triples(&fluree, &ledger, Some(graph_name)).await?;
+        compare_graph(
+            test_id,
+            &format!("named graph <{graph_name}>"),
+            expected,
+            actual,
+            Some(expected_url),
+        )?;
+    }
+
+    // 5. No unexpected non-empty named graphs.
+    //
+    // Note: this compares *non-empty* graphs only. Fluree does not track
+    // empty named graphs as first-class graph-store entries, so tests that
+    // distinguish CLEAR (graph remains, empty) from DROP (graph removed)
+    // cannot observe that difference here.
+    let expected_names: std::collections::HashSet<&str> = result_graph_data
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let actual_names = list_named_graphs(&fluree, &ledger).await?;
+    for name in &actual_names {
+        if !expected_names.contains(name.as_str()) {
+            bail!(
+                "Unexpected non-empty named graph after update.\n\
+                 Test: {test_id}\n\
+                 Graph: <{name}>\n\
+                 Expected named graphs: {expected_names:?}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Compare one graph's expected vs actual triples isomorphically.
+fn compare_graph(
+    test_id: &str,
+    which: &str,
+    expected: Vec<Triple>,
+    actual: Vec<Triple>,
+    expected_url: Option<&str>,
+) -> Result<()> {
+    let expected = SparqlResults::Graph(expected);
+    let actual = SparqlResults::Graph(actual);
+    if !are_results_isomorphic(&expected, &actual) {
+        let diff = format_results_diff(&expected, &actual);
+        bail!(
+            "Graph state after update not isomorphic ({which}).\n\
+             Test: {test_id}\n\
+             Expected: {expected_url:?}\n\n\
+             {diff}"
+        );
+    }
     Ok(())
 }
 

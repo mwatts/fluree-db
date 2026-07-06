@@ -1,0 +1,341 @@
+# W3C SPARQL Testsuite — Audit & 100% Coverage Plan (2026-07)
+
+**Status:** audit complete; Phases A (harness completeness) and E (CI
+enforcement) are implemented on branch `test/sparql-testsuite-full-coverage`.
+`cargo test` in `testsuite-sparql/` runs all 36 suites green (~15 s wall,
+parallel): 1,420 tests — 815 passing, 538 registered engine/feature gaps, 67
+registered not-applicable — with the register enforced in both directions in
+CI. Phases B/C/D burn the registers down from here.
+**Baseline:** commit `15e2a4b95` (origin/main), rdf-tests submodule `efccbc6b8` (`sparql-mixed-rdf-version-tests-228-gefccbc6`).
+
+## 1. Executive summary
+
+The `testsuite-sparql` harness is architecturally sound and honors its design
+contract (~4.2k lines of Rust drive ~1,420 W3C test cases discovered from
+manifests; zero hand-written test cases). But **CI enforces none of it**: the
+GitHub Actions job runs only `fmt`, `clippy`, and `cargo test --no-run`. The
+Makefile/docs claim plain `cargo test` is "CI-safe"; it is not — the default
+(non-ignored) suite currently fails **85 syntax tests**, which is presumably
+why the CI run step was never enabled.
+
+Ground truth across every registered manifest plus the unregistered SPARQL 1.2
+suite: **~1,420 tests, 595 failures**. The failures cluster into a small number
+of root causes, and a large fraction are **harness gaps, not engine gaps** —
+the engine has since grown capabilities (SPARQL UPDATE execution, TriG/named
+graphs, connection-level datasets) that the harness never adopted.
+
+Definition of done ("100% green light coverage"):
+
+1. **Every** manifest in the submodule is registered and executed in CI —
+   nothing is silently un-run.
+2. Every test either passes or sits in an explicit, per-test, commented,
+   reviewed skip register (the same `ignored_tests` mechanism that exists
+   today, kept accurate by CI).
+3. CI fails on any unexpected failure **and any unexpected pass** (stale skip
+   entries are errors), so the register shrinks monotonically as engine gaps
+   close.
+4. Engine fixes land under the repo's perf-safety discipline (§6): no hot-path
+   regressions to buy correctness.
+
+## 2. Current state
+
+### 2.1 Harness (contract: intact)
+
+```
+testsuite-sparql/            (excluded from workspace; own Cargo.lock)
+├── src/manifest.rs          manifest.ttl → Test iterator (uses Fluree's own Turtle parser)
+├── src/evaluator.rs         test-type IRI → handler dispatch
+├── src/sparql_handlers.rs   handler registration
+├── src/query_handler.rs     QueryEvaluationTest: ledger + load + query + compare
+├── src/subprocess.rs        per-test subprocess isolation (5 s syntax / 10 s eval timeouts)
+├── src/result_format.rs     .srx/.srj/.ttl(DAWG)/CONSTRUCT-graph parsing
+├── src/result_comparison.rs isomorphic comparison incl. bnode mapping
+├── src/report.rs            JSON report (W3C_REPORT_JSON)
+└── tests/w3c_sparql.rs      registry: 28 test fns = manifest URL + skip list
+```
+
+This is the Oxigraph-style pattern and it has held: adding a whole new suite is
+a ~10-line test fn. The refactor risk the team worried about ("too much custom
+code") has **not** materialized; the fixes below are additive handlers, not a
+rewrite.
+
+### 2.2 What CI enforces today
+
+`.github/workflows/ci.yml` job `testsuite-sparql`: fmt + clippy + `cargo test
+--no-run`. **No test executes in CI.** There is no durable adherence to any
+pass rate today.
+
+### 2.3 Registry state
+
+- Syntax suites + property-path run by default; 12 eval categories, 1.0 eval,
+  update, json-res, csv-tsv, service, protocol, service-description,
+  http-rdf-update, entailment are all `#[ignore]`d.
+- `sparql11_property_path` is the model citizen: green with a curated,
+  feature-grouped 18-test skip list. **13 of those 18 now pass** (stale — the
+  features landed); only `pp06 pp16 pp34 pp35 pp36` still fail.
+- The whole `rdf-tests/sparql/sparql12/` tree (SPARQL 1.2 / RDF-star,
+  254 tests) is **unregistered**.
+
+## 3. Ground truth (2026-07-06 baseline, this branch)
+
+| Suite | Total | Pass | Fail | Notes |
+|---|---|---|---|---|
+| 1.1 syntax-query | 94 | 81 | 13 | 7 pos-rejected, 6 neg-accepted |
+| 1.1 syntax-update-1 | 54 | 23 | 31 | graph-mgmt ops missing from parser |
+| 1.1 syntax-update-2 | 1 | 1 | 0 | |
+| 1.0 syntax | 199 | 158 | 41 | 17 pos (lists/forms/qname), 24 neg |
+| 1.1 syntax-fed | 3 | 3 | 0 | |
+| 1.1 aggregates | 46 | 37 | 9 | 5 neg-accepted (GROUP BY projection validation) |
+| 1.1 bind / cast / negation | 10/6/12 | all | 0 | 100% |
+| 1.1 bindings | 11 | 10 | 1 | `graph` (named-graph) |
+| 1.1 construct | 7 | 5 | 2 | constructwhere04, constructlist |
+| 1.1 exists | 6 | 4 | 2 | exists03, exists-graph-variable |
+| 1.1 functions | 75 | 69 | 6 | strlang03-rdf11, concat02, bnode01, in01, notin01, iri01 |
+| 1.1 grouping | 6 | 4 | 2 | group06/07 neg-accepted |
+| 1.1 project-expression | 7 | 6 | 1 | projexp05 |
+| 1.1 property-path | 33 | 28 | 5* | *in skip list; 13 skip entries stale |
+| 1.1 subquery | 14 | 11 | 3 | subquery02/04/12 |
+| 1.0 eval | 282 | 154 | 128 | see §4 clusters |
+| 1.1 update (syntax+eval) | 157 | 24 | 133 | 94 eval "not implemented" + 39 syntax |
+| 1.1 json-res | 4 | 0 | 4 | Turtle lexer: `_:o6.` (bnode label + dot) |
+| 1.1 csv-tsv-res | 6 | 0 | 6 | comparison not implemented |
+| 1.1 service | 7 | 0 | 7* | *skip-listed: needs endpoints |
+| 1.1 protocol / GSP / svc-desc | 34/19/3 | 0 | all* | *skip-listed: not applicable (HTTP) |
+| 1.1 entailment | 70 | 20 | 50 | needs RDFS/OWL regimes (out of scope) |
+| **1.2 (unregistered probe)** | 254 | 91 | 163 | see §4.3 |
+
+**Totals: ~1,420 registered+probe tests, 595 failing today.**
+
+## 4. Failure taxonomy → root causes
+
+### 4.1 Harness/registration gaps (no engine risk; largest, cheapest wins)
+
+| Gap | Failing tests affected | Fix |
+|---|---|---|
+| UPDATE evaluation handler is a `bail!` stub, but the API now supports UPDATE (`GraphTransactBuilder::sparql_update`, issues #509/#1288 closed) | 94 (+3 in 1.2) | Implement `UpdateEvaluationTest`: build ledger from `ut:data`/`ut:graphData`, apply update, compare result graph(s) vs `ut:result` (isomorphic, per-graph) |
+| Named-graph data loaded into the **default** graph (comment says "until TriG is supported" — TriG landed, #1278/#1279 closed) | ~14 (1.0 graph) + 1 bindings + several 1.0 dataset/1.1 exists | Load `qt:graphData` as real named graphs (wrap each file in `GRAPH <name> { }` TriG or use the named-graph insert API) |
+| `FROM`/`FROM NAMED` rejected on single-ledger `GraphDb` | 12 (1.0 dataset) + part of graph | Design decision §5.3: within-ledger dataset construction (preferred) or harness-level graph→ledger mapping via `query_connection_sparql` |
+| CSV/TSV result comparison stub | 6 | Implement CSV/TSV encoders/comparison (formatters may already exist in `fluree-db-api::format`) |
+| SPARQL 1.2 suites unregistered | 254 | Register per-category fns like every other suite |
+| `mf:PositiveUpdateSyntaxTest`/`mf:NegativeUpdateSyntaxTest` (1.2 non-`11` type IRIs) unhandled | 20 | Two `evaluator.register` lines |
+| Labeled `qt:graphData` blank nodes silently dropped (`manifest.rs::get_graph_data` calls `term_to_string` on a blank node → `None`; never reads `qt:graph`) | latent (drops test data) | Read `qt:graph` off the blank node |
+| Property-path skip list stale (13/18 now pass) | 0 (hides regressions) | Prune to `pp06 pp16 pp34 pp35 pp36`; CI's unexpected-pass check prevents recurrence |
+| Combined suites (`sparql11_query_w3c_testsuite`, `sparql11_all`) duplicate per-category runs | n/a | Exclude from CI matrix (keep for local use) |
+
+### 4.2 Engine gaps (perf-safety analysis required, §6)
+
+Ordered roughly by breadth of impact:
+
+1. **UPDATE grammar: graph-management ops absent.** `UpdateOperation` has only
+   `InsertData/DeleteData/DeleteWhere/Modify`. Missing: `LOAD`, `CLEAR`,
+   `CREATE`, `DROP`, `COPY`, `MOVE`, `ADD` (+ `SILENT`), and whatever `Modify`
+   lacks (`WITH`/`USING` coverage TBD). Explains 27+27 positive-syntax
+   rejections (1.1 update suites) and blocks a slice of update-eval. Parser
+   work is off hot path entirely; execution maps to existing transact/ledger
+   ops.
+2. **Value/type semantics cluster (~76 in 1.0 eval + ~6 1.1 functions).**
+   `type-promotion` (22), `open-world` (11), `expr-builtin` (14), `expr-ops`
+   (7), `expr-equals` (7), `boolean-effective-value` (7), `cast` (7) + 1.1
+   functions (6). Root causes: XSD derived-type promotion in comparisons,
+   open-world equality for unknown datatypes, assorted builtin edge semantics.
+   **Hot-path sensitive** — this is FILTER evaluation.
+3. **Negative-syntax validation (56).** Parser accepts invalid queries:
+   aggregate/GROUP BY projection scope (agg08-12, group06/07), plus 24 in 1.0
+   and 6 in 1.1. Validation passes run at parse time only — off query hot
+   path by construction.
+4. **Positive-syntax parser gaps (24 in 1.0/1.1 query).** Collections `(...)`
+   in patterns (syntax-lists-*), blank-node property list forms
+   (syntax-forms), `syntax-qname-05`, `syntax-order-07`, test_21/23/35a/36a/
+   63/64, `test_pp_coll`.
+5. **Turtle lexer: bnode label followed by `.` without whitespace** (`_:o6.`)
+   fails to lex — blocks all 4 json-res tests' data load and any user data of
+   this shape. PN_LOCAL/label termination rule; perf-neutral char-class fix,
+   but lexing is import-hot → bench guardrail (`insert_formats`,
+   `import_bulk`).
+6. **SPARQL parser: `BASE` + relative `PREFIX` IRI resolution**
+   (`base-prefix-1`: "expected IRI after prefix namespace") — several 1.0
+   `basic` failures.
+7. **Property-path multiplicity semantics** (pp06, pp16, pp34-36): sequence
+   paths must preserve solution multiplicity while `*`/`+` are
+   distinct-node; plus pp36 zero-var projection. Deep operator semantics in a
+   hot operator — needs the §6 pattern (common shapes keep current code path).
+8. **RDF-star / SPARQL 1.2** — see §4.3.
+9. Misc: `agg-count-rows-distinct` execution error, constructwhere04/
+   constructlist execution errors, subquery02/04/12, exists03/
+   exists-graph-variable, xsd:long-vs-integer VALUES issue (#1319, open).
+
+### 4.3 SPARQL 1.2 probe breakdown (254 tests, 91 pass today)
+
+| Sub-suite | Pass | Fail | Dominant cause |
+|---|---|---|---|
+| syntax-triple-terms-positive | 19 | 94 | parser lacks `<<( )>>`/triple-term syntax |
+| syntax-triple-terms-negative | 63 | 2 | pass "for free" (parser rejects everything star) |
+| eval-triple-terms | 0 | 41 | Turtle-star data won't load + engine support |
+| lang-basedir | 1 | 10 | base-direction literals (`@en--ltr`) |
+| codepoint-escapes | 2 | 6 | `\u`/codepoint escape handling |
+| version | 6 | 3 | `VERSION` declaration |
+| rdf11 / expression / grouping / syntax | 0/0/0/0 | 3/1/1/2 | mixed |
+
+RDF-star engine support state (empirical, from harness probes):
+
+- The SPARQL parser has no triple-term syntax: 84 of the positive-syntax
+  tests fail at parse; the 26 that pass are the non-star cases. The negative
+  suite passes almost entirely "for free" (a parser without the syntax
+  rejects everything).
+- Turtle-star data files fail to load (`fluree-graph-turtle` has no `<< >>`
+  support), which alone blocks all 41 eval-triple-terms tests.
+- No evidence of a triple-term/quoted-triple representation in
+  `fluree-graph-ir` or the query engine — Phase D is parser + IR + storage
+  term-kind work, sized accordingly (design review required before
+  committing; term-kind changes touch index encodings, which are
+  perf-critical).
+- Independent mini-features in the 1.2 suite: `VERSION` declaration (3),
+  base-direction literals `@en--ltr` (10), codepoint escapes (6) — these are
+  parser-local and cheap relative to triple terms.
+
+### 4.4 Legitimately not-applicable (durable skip register with rationale)
+
+- protocol (34), http-rdf-update/GSP (19), service-description (3): require
+  HTTP client/server conformance testing; not a database-engine property.
+  Already skip-listed with rationale. Keep; re-home if a server-level
+  conformance harness ever exists.
+- service (7): requires live external SPARQL endpoints. Future option: mock
+  endpoint in-process; until then skip-listed.
+- entailment (50 of 70): requires RDFS/OWL/RIF entailment regimes — a
+  deliberate non-goal. **But 20 pass today** (simple-entailment-answerable);
+  pin those green so regressions surface, skip-list the rest with rationale.
+
+## 5. Target architecture decisions
+
+### 5.1 CI enforcement design
+
+Replace the compile-only step with a real run:
+
+- `cargo test` (default set) must be green → becomes the gate. Everything
+  reachable is registered **non-ignored** with explicit per-test skip lists.
+- The `#[ignore]` attribute remains only for: combined/duplicate suites and
+  suites whose runtime or infra needs make them local-only (none expected).
+- Add **unexpected-pass detection** to `check_testsuite`: a test in
+  `ignored_tests` that *passes* fails the suite with "stale skip entry —
+  remove it". This is what keeps the register honest (it already rotted once:
+  13/18 property-path entries).
+- Keep per-test subprocess isolation (existing) so one hang cannot eat the job;
+  job-level timeout as backstop.
+- Nightly (not per-PR) full JSON report artifact for trend visibility.
+
+### 5.2 Skip-register policy (unchanged from docs, now enforced)
+
+Every entry: test IRI + comment (root cause, spec link, tracking issue) —
+grouped by feature exactly like `sparql11_property_path` does today. CI
+enforces both directions. Target end-state register after this effort:
+protocol/GSP/service-desc/service/entailment (§4.4) + enumerated engine-gap
+tests from §4.2 that don't land in the first wave, each tied to a GitHub
+issue.
+
+### 5.3 Dataset (`FROM`/`FROM NAMED`) strategy — needs a design call
+
+W3C dataset tests select graphs from the test document set. Options:
+
+- **(a) Within-ledger datasets** (semantic match): allow dataset clauses on a
+  single ledger to restrict/compose from its named graphs. #1279's fix
+  suggests partial infrastructure. Engine change — needs planner review.
+- **(b) Harness maps graph URLs → ledgers** and uses
+  `query_connection_sparql`: zero engine change, but ledger aliases must
+  admit arbitrary IRIs and semantics must match (default-graph union etc.).
+
+Decision deferred to implementation of the dataset category; everything else
+is independent of it.
+
+## 6. Perf-safety discipline (non-negotiable)
+
+Repo priority is speed first, memory second. Correctness fixes must follow the
+established off-hot-path pattern (cf. sibling-OPTIONAL fast path retained while
+general OPTIONAL semantics were fixed; fulltext context setup skipped unless
+the query uses `fulltext(...)`):
+
+1. **Classify** every engine fix as parse-time, prepare-time, or per-row.
+   Parse/prepare-time fixes (validation passes, grammar, update ops, promotion
+   *table construction*) are inherently safe — do them there whenever
+   possible.
+2. **Per-row changes must preserve the common-type fast path.** e.g. type
+   promotion: keep the existing same-type / integer-integer / string-string
+   comparisons byte-identical; route only *mixed derived-numeric* and
+   *unknown-datatype* comparisons through a new slow path selected at
+   prepare time (per-predicate/per-expression, not per-row branching where
+   avoidable).
+3. **Property-path multiplicity**: preserve current traversal for `*`/`+`
+   (distinct semantics are correct there); sequence-path counting only where
+   the plan shape requires it, chosen at plan time.
+4. **Bench guardrails per PR**: `query_hot_bsbm`, `query_hot_bsbm_bi` (filter/
+   join hot paths), `insert_formats` + `import_bulk` (Turtle lexer), within
+   `regression-budget.json` budgets; nightly bench workflow is the backstop.
+5. Harness-only changes (Phase A) carry zero engine risk by definition.
+
+## 7. Phased implementation plan
+
+**Phase A — harness completeness (no engine changes):**
+A1 fix `get_graph_data` labeled-graph bug; A2 named-graph loading via TriG;
+A3 UPDATE-eval handler over `sparql_update`; A4 register 1.2 suites +
+non-`11` update-syntax types; A5 CSV/TSV comparison; A6 prune property-path
+skip list; A7 unexpected-pass detection; A8 entailment: pin 20 green, skip
+rest with rationale. Re-baseline after A — expected: update-eval failures
+collapse to real engine gaps; graph/bindings/exists partially green;
+1.2 counts become accurate.
+
+**Phase B — off-hot-path engine fixes:**
+B1 UPDATE grammar graph-mgmt ops (+ exec mapping); B2 negative-syntax
+validation passes; B3 positive-syntax parser gaps (lists/forms/qname/order);
+B4 Turtle lexer bnode-dot fix (bench-guarded); B5 BASE/PREFIX resolution fix.
+
+**Phase C — semantics fixes (bench-guarded, §6 pattern):**
+C1 type-promotion + open-world equality + expr builtins cluster;
+C2 remaining eval mismatches (functions/subquery/exists/construct/aggregates);
+C3 property-path multiplicity; C4 dataset strategy (§5.3) + graph category.
+
+**Phase D — RDF-star/1.2** (scope set by the sub-audit): parser syntax first
+(syntax suites green), then Turtle-star loading, then engine term support for
+eval-triple-terms; lang-basedir/version/codepoint-escapes as independent
+mini-features.
+
+**Phase E — CI switch-on:** replace `--no-run` with the real run + both-way
+enforcement; docs update (`sparql-compliance.md`, Makefile "CI-safe" claim);
+nightly report artifact.
+
+Sequencing: A → E can land immediately after A (CI enforces the accurate
+baseline with explicit registers); B/C/D burn the register down in follow-up
+PRs, each shrinking skip lists in the same change that fixes the engine.
+
+## 8. Implementation status (updated 2026-07-06)
+
+**Done (this branch):**
+- Phase A complete: labeled `ut:graphData` parsing fixed; named graphs load
+  as real named graphs (TriG via transact builder); `UpdateEvaluationTest`
+  implemented end-to-end over the public `sparql_update` surface (24→67
+  passing); CSV/TSV result comparison (0→5 of 6); SPARQL 1.2 suites
+  registered per-category; non-`11` update-syntax test types handled;
+  property-path register pruned (14 stale entries removed, `pp06`
+  additionally flagged by the new stale-skip detection);
+  unexpected-pass policing added to `check_testsuite`.
+- Phase E complete: CI job now runs the full suite (was compile-only);
+  Makefile/docs rewritten to match the registers model
+  (`tests/registers/mod.rs`).
+
+**New engine findings from Phase A runs (added to registers):**
+- `GRAPH ?g` exposes the default graph as a graph named by the ledger alias,
+  and binds `?g` as a *plain literal* rather than an IRI — breaks most
+  `sparql10/graph` tests even though named-graph data now loads correctly.
+- `GRAPH` blocks inside `DELETE WHERE` are rejected at lowering
+  ("not yet supported").
+- `INSERT` into a not-yet-existing named graph silently loses the triples
+  (basic-update `insert-05a`, `insert-*-same-bnode*`).
+- `USING` clause semantics incomplete (`dawg-delete-using-*`).
+- Combined `DELETE`/`INSERT` `WHERE` applies inserts without the deletes
+  (`dawg-delete-insert-01c`).
+- CSV output does not use canonical `xsd:double` lexical form (`csv03`).
+
+**Open items:**
+- [ ] Phase B/C/D engine fixes per §4.2/§4.3 (each PR must shrink the
+      registers it addresses; bench guardrails per §6).
+- [ ] Decide §5.3 dataset strategy when Phase C4 starts.
+- [ ] File tracking issues per §4.2 cluster (audit A2-style batch).
+- [ ] Deep code-level RDF-star audit before Phase D design.
