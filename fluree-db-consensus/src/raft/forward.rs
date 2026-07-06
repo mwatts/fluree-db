@@ -224,7 +224,8 @@ fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    host.parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// Returns true for hosts that should never be a legitimate cluster
@@ -239,6 +240,12 @@ fn is_ssrf_host(host: &str, allow_loopback: bool) -> bool {
     let Ok(ip) = host.parse::<IpAddr>() else {
         return false;
     };
+    // Canonicalize first: an IPv4-mapped IPv6 literal like
+    // `::ffff:169.254.169.254` routes to the mapped IPv4 address
+    // (here, the cloud metadata service), but its raw v6 form
+    // passes every check below — `to_canonical` collapses it to the
+    // v4 form so the v4 rules apply.
+    let ip = ip.to_canonical();
     if ip.is_unspecified() {
         return true;
     }
@@ -653,6 +660,22 @@ mod tests {
         // interface, same effective risk as loopback.
         assert!(!is_valid_leader_url("http://0.0.0.0:8080", false));
         assert!(!is_valid_leader_url("http://[::]:8080", false));
+
+        // IPv4-mapped IPv6 — the kernel routes these to the mapped
+        // IPv4 address, so they must be judged by the v4 rules, not
+        // pass through as opaque v6 literals.
+        assert!(!is_valid_leader_url(
+            "http://[::ffff:169.254.169.254]/",
+            false
+        ));
+        assert!(!is_valid_leader_url("http://[::ffff:127.0.0.1]:8080", false));
+        assert!(!is_valid_leader_url("http://[::ffff:0.0.0.0]:8080", false));
+        // And still rejected even in the single-host posture, where
+        // only genuine loopback is meant to be allowed.
+        assert!(!is_valid_leader_url(
+            "http://[::ffff:169.254.169.254]/",
+            true
+        ));
     }
 
     #[test]
