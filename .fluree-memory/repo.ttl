@@ -1228,7 +1228,7 @@ mem:fact-01kwwddyea3x6nyqmysg11vqvf a mem:Fact ;
     mem:rationale "Future annotation writes must keep the gate honest (stats/overlay reflect new f:reifies facts before queries run) or bound edge vars silently drop annotation bindings; bolt_reified_edge_gate_reopens_for_novelty_annotations pins this." .
 
 mem:fact-01kwwf09dhmhae0cq0xxjj293m a mem:Fact ;
-    mem:content "shortestPath rebuilt on level-batched frontier (frontier.rs): FrontierExpander expands whole BFS levels via batched_lookup_{predicate_refs (typed fwd), subject_properties (wildcard fwd), inbound_refs (bwd)}; novelty applied as OverlayEdgeDelta from ONE netted overlay walk cached on (content_version,g_id,pred,to_t) — asserts extend, retractions mask base rows (merge-correct, no closeable gate). State keyed PathNode{Base(u64)|Novel(Sid)}; Sids materialize only for emitted paths. Both traversal caps unified behind FLUREE_PATH_MAX_VISITED (default 1M, was 10k/100k) — unblocks expansion_4. Probe 1.52→0.54ms tiny graph; win scales. property_path forward_step still per-node — wire the same expander next." ;
+    mem:content "shortestPath batched-frontier rebuild was REVERTED (77088689e) after bench proof: level-batched expansion regressed pokec medium 4.77→23ms because shortestPath is an EARLY-TERMINATING search — a bidirectional meet touches ~hundreds of nodes, and any level-batched read fetches ahead of the meet. Batched levels fit EXHAUSTIVE traversals only (expansion_4 reachability, hydration); per-node point reads fit early-exit searches. The toy probe misled twice: clustered ids (no scan amplification) and an unreachable pair (accidentally exhaustive). KEPT: FLUREE_PATH_MAX_VISITED cap unification (expansion_4 completes at medium, ties Memgraph 931/938ms, rows exact); gap-aware chunk_subjects (gap>64 splits — scattered sets become point-seeks); per-chunk membership filter fixing boundary-row duplication in all three batched lookups (latent: leaflet spillover + global set = rows collected twice)." ;
     mem:tag "cypher" ;
     mem:tag "frontier" ;
     mem:tag "novelty" ;
@@ -1236,7 +1236,7 @@ mem:fact-01kwwf09dhmhae0cq0xxjj293m a mem:Fact ;
     mem:tag "shortest-path" ;
     mem:tag "traversal" ;
     mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-query/src/frontier.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/batched_lookup.rs" ;
     mem:artifactRef "fluree-db-query/src/property_path.rs" ;
     mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
     mem:branch "feature/bolt" ;
