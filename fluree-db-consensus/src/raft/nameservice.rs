@@ -52,7 +52,7 @@ use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, StashGuard};
 use crate::raft::state_machine::{
     Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, NameServiceState, NewBranch,
     NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefKey, ResetHeadSnapshot,
-    Response as SmResponse, StagedHead,
+    Response as SmResponse, StagedHead, StoredConfig, StoredStatus,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -1788,13 +1788,12 @@ impl StatusLookup for RaftNameService {
         if !branch_registered {
             return Ok(None);
         }
-        Ok(Some(
-            state
-                .status
-                .get(&canonical)
-                .cloned()
-                .unwrap_or_else(StatusValue::initial),
-        ))
+        let stored = state
+            .status
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(StoredStatus::initial);
+        Ok(Some(StatusValue::from(&stored)))
     }
 }
 
@@ -1810,16 +1809,21 @@ impl StatusPublisher for RaftNameService {
         // address the same replicated entry. The state machine keys
         // on the command's string verbatim — canonicalizing inside
         // apply would make mixed-version nodes replay the same log
-        // entry to different keys.
+        // entry to different keys. Values convert to the
+        // postcard-safe `StoredStatus` form here for the same
+        // reason: the apply compares and stores the command's bytes
+        // verbatim.
         let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = SmCommand::PushStatus {
             ledger_id: format_ledger_id(&name, &branch),
-            expected: expected.cloned(),
-            new: new.clone(),
+            expected: expected.map(StoredStatus::from),
+            new: StoredStatus::from(new),
         };
         match self.submit_lifecycle(cmd).await? {
             SmResponse::StatusUpdated => Ok(StatusCasResult::Updated),
-            SmResponse::StatusConflict { actual } => Ok(StatusCasResult::Conflict { actual }),
+            SmResponse::StatusConflict { actual } => Ok(StatusCasResult::Conflict {
+                actual: actual.as_ref().map(StatusValue::from),
+            }),
             other => Err(NameServiceError::storage(format!(
                 "unexpected Response variant for PushStatus: {other:?}"
             ))),
@@ -1841,13 +1845,12 @@ impl ConfigLookup for RaftNameService {
         if !branch_registered {
             return Ok(None);
         }
-        Ok(Some(
-            state
-                .config
-                .get(&canonical)
-                .cloned()
-                .unwrap_or_else(ConfigValue::unborn),
-        ))
+        let stored = state
+            .config
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(StoredConfig::unborn);
+        Ok(Some(ConfigValue::from(&stored)))
     }
 }
 
@@ -1863,12 +1866,14 @@ impl ConfigPublisher for RaftNameService {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let cmd = SmCommand::PushConfig(Box::new(ConfigUpdate {
             ledger_id: format_ledger_id(&name, &branch),
-            expected: expected.cloned(),
-            new: new.clone(),
+            expected: expected.map(StoredConfig::from),
+            new: StoredConfig::from(new),
         }));
         match self.submit_lifecycle(cmd).await? {
             SmResponse::ConfigUpdated => Ok(ConfigCasResult::Updated),
-            SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict { actual }),
+            SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict {
+                actual: actual.as_ref().map(ConfigValue::from),
+            }),
             other => Err(NameServiceError::storage(format!(
                 "unexpected Response variant for PushConfig: {other:?}"
             ))),
@@ -2935,8 +2940,8 @@ mod tests {
             &state,
             Command::PushStatus {
                 ledger_id: "test/db:main".into(),
-                expected: Some(StatusValue::initial()),
-                new: pushed_status.clone(),
+                expected: Some(StoredStatus::initial()),
+                new: StoredStatus::from(&pushed_status),
             },
             2,
         )
@@ -2948,8 +2953,8 @@ mod tests {
             &state,
             Command::PushConfig(Box::new(ConfigUpdate {
                 ledger_id: "test/db:main".into(),
-                expected: Some(ConfigValue::unborn()),
-                new: pushed_config.clone(),
+                expected: Some(StoredConfig::unborn()),
+                new: StoredConfig::from(&pushed_config),
             })),
             3,
         )

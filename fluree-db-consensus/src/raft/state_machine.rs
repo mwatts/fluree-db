@@ -22,10 +22,11 @@ use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_nameservice::{
-    ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue, StatusValue,
+    ConfigPayload, ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue,
+    StatusPayload, StatusValue,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -475,13 +476,13 @@ pub struct NameServiceState {
     /// read path falls back to [`StatusValue::initial`] when the
     /// branch is registered but no record lives here.
     #[serde(default)]
-    pub status: HashMap<String, StatusValue>,
+    pub status: HashMap<String, StoredStatus>,
     /// Per-`alias:branch` configuration pushed via
     /// [`fluree_db_nameservice::ConfigPublisher::push_config`]. The
     /// read path falls back to [`ConfigValue::unborn`] when the
     /// branch is registered but no record lives here.
     #[serde(default)]
-    pub config: HashMap<String, ConfigValue>,
+    pub config: HashMap<String, StoredConfig>,
     /// Non-ledger graph source records (BM25, Vector, Geo, R2RML,
     /// Iceberg) keyed by `name:branch`. Mutated through the three
     /// [`fluree_db_nameservice::GraphSourcePublisher`] commands:
@@ -612,22 +613,23 @@ pub enum Command {
     /// contract: returns [`Response::StatusConflict`] when `expected`
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
-    /// [`StatusValue::initial`] when no record is present for a
-    /// registered branch.
+    /// [`StoredStatus::initial`] when no record is present for a
+    /// registered branch. Values travel in the postcard-safe
+    /// [`StoredStatus`] form; proposers convert (see
+    /// `RaftNameService::push_status`).
     PushStatus {
         ledger_id: String,
-        expected: Option<StatusValue>,
-        new: StatusValue,
+        expected: Option<StoredStatus>,
+        new: StoredStatus,
     },
     /// CAS push for one branch's configuration. Mirrors the
     /// [`fluree_db_nameservice::ConfigPublisher::push_config`]
     /// contract: returns [`Response::ConfigConflict`] when `expected`
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
-    /// [`ConfigValue::unborn`] when no record is present for a
-    /// registered branch. The args are boxed because
-    /// [`ConfigValue`]'s `ConfigPayload` carries an `extra` map
-    /// whose size dominates the enum otherwise.
+    /// [`StoredConfig::unborn`] when no record is present for a
+    /// registered branch. The args are boxed because the payload
+    /// text can dominate the enum's size otherwise.
     PushConfig(Box<ConfigUpdate>),
     /// Upsert a graph source's config-side fields (source type,
     /// config blob, dependencies). On an existing record the index
@@ -695,12 +697,215 @@ pub enum Command {
     SetWorkerEligibility(WorkerEligibility),
 }
 
+/// Postcard-safe JSON value tree with deterministic encoding:
+/// objects are `BTreeMap`s, so equal values have equal structure —
+/// and equal postcard bytes — at every depth, with no text
+/// canonicalization anywhere. Mirrors the JSON data model because
+/// `serde_json::Value` itself can't ride the raft log:
+/// `Value`'s `Deserialize` requires a self-describing format, which
+/// postcard is not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CanonicalValue {
+    Null,
+    Bool(bool),
+    /// JSON integers keep their `i64`/`u64` split so the full
+    /// `u64` range round-trips exactly.
+    Int(i64),
+    UInt(u64),
+    /// Finite by construction: JSON cannot represent NaN or ∞
+    /// (`serde_json` maps them to null), so trees built by
+    /// [`Self::from_json`] never contain them and structural
+    /// equality has no NaN hole.
+    Float(f64),
+    String(String),
+    Array(Vec<CanonicalValue>),
+    Object(BTreeMap<String, CanonicalValue>),
+}
+
+impl From<&serde_json::Value> for CanonicalValue {
+    fn from(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Self::Int(i)
+                } else if let Some(u) = n.as_u64() {
+                    Self::UInt(u)
+                } else {
+                    // `as_f64` is Some for every remaining Number.
+                    Self::Float(n.as_f64().unwrap_or_default())
+                }
+            }
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Array(items) => {
+                Self::Array(items.iter().map(Self::from).collect())
+            }
+            serde_json::Value::Object(map) => Self::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from(v)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<&CanonicalValue> for serde_json::Value {
+    fn from(value: &CanonicalValue) -> Self {
+        match value {
+            CanonicalValue::Null => Self::Null,
+            CanonicalValue::Bool(b) => Self::Bool(*b),
+            CanonicalValue::Int(i) => Self::from(*i),
+            CanonicalValue::UInt(u) => Self::from(*u),
+            CanonicalValue::Float(f) => Self::from(*f),
+            CanonicalValue::String(s) => Self::String(s.clone()),
+            CanonicalValue::Array(items) => Self::Array(items.iter().map(Self::from).collect()),
+            CanonicalValue::Object(map) => Self::Object(
+                map.iter().map(|(k, v)| (k.clone(), Self::from(v))).collect(),
+            ),
+        }
+    }
+}
+
+/// Convert an HTTP-shaped extras map into the stored tree form.
+fn extra_from_json(extra: &HashMap<String, serde_json::Value>) -> BTreeMap<String, CanonicalValue> {
+    extra
+        .iter()
+        .map(|(k, v)| (k.clone(), CanonicalValue::from(v)))
+        .collect()
+}
+
+/// Convert a stored extras tree back to the HTTP-shaped map.
+fn extra_to_json(extra: &BTreeMap<String, CanonicalValue>) -> HashMap<String, serde_json::Value> {
+    extra
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(v)))
+        .collect()
+}
+
+/// Postcard-safe form of [`StatusValue`] carried in
+/// [`Command::PushStatus`] and held in [`NameServiceState::status`].
+///
+/// `StatusPayload` is HTTP-shaped — `#[serde(flatten)]` over an
+/// arbitrary metadata map — which postcard's known-length format
+/// cannot encode, so neither the raft log nor state snapshots can
+/// carry it directly. The typed fields are mirrored here (the
+/// exhaustive destructuring in [`Self::from_value`] turns any
+/// HTTP-schema field change into a compile error at the conversion)
+/// and the open metadata map becomes a [`CanonicalValue`] tree, so
+/// the CAS comparison in `apply_push_status` is structural — no
+/// serialization in the equality path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredStatus {
+    pub v: i64,
+    pub state: String,
+    pub extra: BTreeMap<String, CanonicalValue>,
+}
+
+impl From<&StatusValue> for StoredStatus {
+    fn from(value: &StatusValue) -> Self {
+        // Exhaustive destructuring: a field added to the HTTP types
+        // fails compilation here until it's mapped into the stored
+        // form (or explicitly dropped).
+        let StatusValue { v, payload } = value;
+        let StatusPayload { state, extra } = payload;
+        Self {
+            v: *v,
+            state: state.clone(),
+            extra: extra_from_json(extra),
+        }
+    }
+}
+
+impl From<&StoredStatus> for StatusValue {
+    fn from(stored: &StoredStatus) -> Self {
+        Self::new(
+            stored.v,
+            StatusPayload {
+                state: stored.state.clone(),
+                extra: extra_to_json(&stored.extra),
+            },
+        )
+    }
+}
+
+impl StoredStatus {
+    /// Stored form of [`StatusValue::initial`] — the fallback the
+    /// apply path compares an initial CAS push against.
+    pub fn initial() -> Self {
+        Self::from(&StatusValue::initial())
+    }
+}
+
+/// Postcard-safe form of [`ConfigValue`] — same rationale and
+/// structure as [`StoredStatus`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredConfig {
+    pub v: i64,
+    pub payload: Option<StoredConfigPayload>,
+}
+
+/// Mirror of [`ConfigPayload`]'s typed fields plus the stored form
+/// of its open metadata map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredConfigPayload {
+    pub default_context: Option<ContentId>,
+    pub config_id: Option<ContentId>,
+    pub extra: BTreeMap<String, CanonicalValue>,
+}
+
+impl From<&ConfigValue> for StoredConfig {
+    fn from(value: &ConfigValue) -> Self {
+        // Exhaustive destructuring — see `From<&StatusValue>`.
+        let ConfigValue { v, payload } = value;
+        Self {
+            v: *v,
+            payload: payload.as_ref().map(|p| {
+                let ConfigPayload {
+                    default_context,
+                    config_id,
+                    extra,
+                } = p;
+                StoredConfigPayload {
+                    default_context: default_context.clone(),
+                    config_id: config_id.clone(),
+                    extra: extra_from_json(extra),
+                }
+            }),
+        }
+    }
+}
+
+impl From<&StoredConfig> for ConfigValue {
+    fn from(stored: &StoredConfig) -> Self {
+        Self::new(
+            stored.v,
+            stored.payload.as_ref().map(|p| ConfigPayload {
+                default_context: p.default_context.clone(),
+                config_id: p.config_id.clone(),
+                extra: extra_to_json(&p.extra),
+            }),
+        )
+    }
+}
+
+impl StoredConfig {
+    /// Stored form of [`ConfigValue::unborn`] — the fallback the
+    /// apply path compares an initial CAS push against.
+    pub fn unborn() -> Self {
+        Self {
+            v: 0,
+            payload: None,
+        }
+    }
+}
+
 /// Payload for [`Command::PushConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdate {
     pub ledger_id: String,
-    pub expected: Option<ConfigValue>,
-    pub new: ConfigValue,
+    pub expected: Option<StoredConfig>,
+    pub new: StoredConfig,
 }
 
 /// Payload for [`Command::EnqueueCommand`].
@@ -881,12 +1086,12 @@ pub enum Response {
     /// `new.v` failed the monotonic guard. `actual` carries the
     /// current value when the branch is known; `None` when the
     /// ledger or branch isn't registered.
-    StatusConflict { actual: Option<StatusValue> },
+    StatusConflict { actual: Option<StoredStatus> },
     /// [`Command::PushConfig`] succeeded.
     ConfigUpdated,
     /// [`Command::PushConfig`] refused — see [`Self::StatusConflict`]
     /// for the analogous semantics.
-    ConfigConflict { actual: Option<ConfigValue> },
+    ConfigConflict { actual: Option<StoredConfig> },
     /// [`Command::PublishGraphSource`] upserted the record.
     GraphSourcePublished,
     /// [`Command::PublishGraphSourceIndex`] advanced the index
@@ -1803,8 +2008,8 @@ fn apply_compare_and_set_ref(
 fn apply_push_status(
     state: &mut NameServiceState,
     ledger_id: String,
-    expected: Option<StatusValue>,
-    new: StatusValue,
+    expected: Option<StoredStatus>,
+    new: StoredStatus,
 ) -> Response {
     let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
         return Response::StatusConflict { actual: None };
@@ -1823,14 +2028,17 @@ fn apply_push_status(
     // would make mixed-version nodes replay the same log entry to
     // different keys.
     //
-    // Absent record reads as `StatusValue::initial`; the apply uses
+    // Absent record reads as `StoredStatus::initial`; the apply uses
     // the same fallback so an initial CAS push from
-    // `expected = initial` lands on a fresh branch.
+    // `expected = initial` lands on a fresh branch. The equality
+    // below is structural (`CanonicalValue` trees with sorted
+    // maps), so logically equal payloads compare equal regardless
+    // of construction order.
     let current = state
         .status
         .get(&ledger_id)
         .cloned()
-        .unwrap_or_else(StatusValue::initial);
+        .unwrap_or_else(StoredStatus::initial);
 
     if expected.as_ref() != Some(&current) {
         return Response::StatusConflict {
@@ -1864,16 +2072,17 @@ fn apply_push_config(state: &mut NameServiceState, args: ConfigUpdate) -> Respon
     }
 
     // Keyed by the command's `ledger_id` verbatim — same
-    // canonicalize-at-the-proposer contract as `apply_push_status`.
+    // canonicalize-at-the-proposer contract and structural
+    // equality as `apply_push_status`.
     //
-    // Absent record reads as `ConfigValue::unborn`; the apply uses
+    // Absent record reads as `StoredConfig::unborn`; the apply uses
     // the same fallback so an initial CAS push from
     // `expected = unborn` lands on a fresh branch.
     let current = state
         .config
         .get(&ledger_id)
         .cloned()
-        .unwrap_or_else(ConfigValue::unborn);
+        .unwrap_or_else(StoredConfig::unborn);
 
     if expected.as_ref() != Some(&current) {
         return Response::ConfigConflict {
@@ -4526,20 +4735,141 @@ mod tests {
     // PushStatus
     // ====================================================================
 
-    fn status(v: i64, state_str: &str) -> StatusValue {
-        StatusValue::new(v, fluree_db_nameservice::StatusPayload::new(state_str))
+    fn status(v: i64, state_str: &str) -> StoredStatus {
+        StoredStatus::from(&StatusValue::new(
+            v,
+            fluree_db_nameservice::StatusPayload::new(state_str),
+        ))
     }
 
     fn push_status_cmd(
         ledger_id: &str,
-        expected: Option<StatusValue>,
-        new: StatusValue,
+        expected: Option<StoredStatus>,
+        new: StoredStatus,
     ) -> Command {
         Command::PushStatus {
             ledger_id: ledger_id.into(),
             expected,
             new,
         }
+    }
+
+    /// The CAS in `apply_push_status` is structural equality on
+    /// `CanonicalValue` trees, and the replicated bytes are postcard
+    /// over `BTreeMap`s — both must be independent of the insertion
+    /// order of the HTTP-shaped `HashMap` the payload arrived in.
+    #[test]
+    fn stored_forms_are_insertion_order_independent() {
+        use fluree_db_nameservice::StatusPayload;
+
+        let mut ab = StatusPayload::new("ready");
+        ab.extra
+            .insert("alpha".into(), serde_json::json!({"y": 2, "x": 1}));
+        ab.extra.insert("beta".into(), serde_json::json!(true));
+
+        let mut ba = StatusPayload::new("ready");
+        ba.extra.insert("beta".into(), serde_json::json!(true));
+        ba.extra
+            .insert("alpha".into(), serde_json::json!({"x": 1, "y": 2}));
+
+        let stored_ab = StoredStatus::from(&StatusValue::new(1, ab));
+        let stored_ba = StoredStatus::from(&StatusValue::new(1, ba));
+        assert_eq!(
+            stored_ab, stored_ba,
+            "same logical payload must convert to structurally equal trees"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&stored_ab).unwrap(),
+            postcard::to_allocvec(&stored_ba).unwrap(),
+            "and to identical replicated bytes"
+        );
+    }
+
+    /// Stored forms round-trip losslessly to the HTTP-shaped types —
+    /// flattened extra metadata, nested structure, and the full JSON
+    /// number range included — and survive the postcard encoding the
+    /// raft log and snapshots apply (the original bug: the
+    /// HTTP-shaped types could not be postcard-encoded at all, and
+    /// the log-write failure surfaced as a raft fatal).
+    #[test]
+    fn stored_status_and_config_round_trip() {
+        use fluree_db_nameservice::StatusPayload;
+
+        let mut payload = StatusPayload::new("indexing");
+        payload
+            .extra
+            .insert("progress".into(), serde_json::json!(0.5));
+        payload
+            .extra
+            .insert("count".into(), serde_json::json!(-7_i64));
+        payload
+            .extra
+            .insert("big".into(), serde_json::json!(u64::MAX));
+        payload.extra.insert(
+            "nested".into(),
+            serde_json::json!({"errors": [null, "disk full"], "retries": 3}),
+        );
+        let value = StatusValue::new(3, payload);
+        let stored = StoredStatus::from(&value);
+        assert_eq!(StatusValue::from(&stored), value);
+        let bytes = postcard::to_allocvec(&stored).expect("stored status postcard-encodes");
+        let decoded: StoredStatus = postcard::from_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded, stored);
+        assert_eq!(StatusValue::from(&StoredStatus::initial()), StatusValue::initial());
+
+        let config_value = ConfigValue::new(
+            2,
+            Some(fluree_db_nameservice::ConfigPayload {
+                default_context: Some(cid(4)),
+                config_id: None,
+                extra: Default::default(),
+            }),
+        );
+        let stored = StoredConfig::from(&config_value);
+        assert_eq!(ConfigValue::from(&stored), config_value);
+        let bytes = postcard::to_allocvec(&stored).expect("stored config postcard-encodes");
+        let decoded: StoredConfig = postcard::from_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded, stored);
+        assert_eq!(ConfigValue::from(&StoredConfig::unborn()), ConfigValue::unborn());
+        assert_eq!(
+            StoredConfig::from(&ConfigValue::unborn()),
+            StoredConfig::unborn(),
+            "the apply fallback must equal a proposer-converted unborn"
+        );
+    }
+
+    /// Populated status/config state must survive the postcard
+    /// snapshot cycle — the second half of the original bug (the
+    /// HTTP-shaped types inside `NameServiceState` broke every
+    /// snapshot build once an entry existed).
+    #[test]
+    fn populated_status_config_state_snapshots_round_trip() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+        let resp = apply(
+            &mut state,
+            push_status_cmd(
+                "test/db:main",
+                Some(StoredStatus::initial()),
+                status(2, "indexing"),
+            ),
+            1,
+        );
+        assert_eq!(resp, Response::StatusUpdated);
+        let resp = apply(
+            &mut state,
+            push_config_cmd(
+                "test/db:main",
+                Some(StoredConfig::unborn()),
+                config(1, Some(cid(9))),
+            ),
+            2,
+        );
+        assert_eq!(resp, Response::ConfigUpdated);
+
+        let bytes = state.to_snapshot().expect("populated state snapshots");
+        let restored = NameServiceState::from_snapshot(&bytes).expect("snapshot restores");
+        assert_eq!(restored, state);
     }
 
     #[test]
@@ -4623,19 +4953,19 @@ mod tests {
     // PushConfig
     // ====================================================================
 
-    fn config(v: i64, default_context: Option<ContentId>) -> ConfigValue {
+    fn config(v: i64, default_context: Option<ContentId>) -> StoredConfig {
         let payload = default_context.map(|cid| fluree_db_nameservice::ConfigPayload {
             default_context: Some(cid),
             config_id: None,
             extra: Default::default(),
         });
-        ConfigValue::new(v, payload)
+        StoredConfig::from(&ConfigValue::new(v, payload))
     }
 
     fn push_config_cmd(
         ledger_id: &str,
-        expected: Option<ConfigValue>,
-        new: ConfigValue,
+        expected: Option<StoredConfig>,
+        new: StoredConfig,
     ) -> Command {
         Command::PushConfig(Box::new(ConfigUpdate {
             ledger_id: ledger_id.into(),
@@ -4653,7 +4983,7 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
+                Some(StoredConfig::unborn()),
                 config(1, Some(cid(42))),
             ),
             1,
@@ -4673,7 +5003,7 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
+                Some(StoredConfig::unborn()),
                 config(1, Some(cid(42))),
             ),
             1,
@@ -4684,7 +5014,7 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
+                Some(StoredConfig::unborn()),
                 config(2, Some(cid(43))),
             ),
             2,
@@ -4707,8 +5037,8 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
-                ConfigValue::unborn(),
+                Some(StoredConfig::unborn()),
+                StoredConfig::unborn(),
             ),
             1,
         );
