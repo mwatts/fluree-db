@@ -162,11 +162,10 @@ impl RaftIntegration {
             client: http_client,
             config: network_config,
         } = transport;
-        let forwarder = Arc::new(LeaderForwarder::new(
-            Arc::clone(&raft),
-            id,
-            http_client.clone(),
-        ));
+        let forwarder = Arc::new(
+            LeaderForwarder::new(Arc::clone(&raft), id, http_client.clone())
+                .with_max_body_bytes(network_config.forward_max_body_bytes),
+        );
         let nameservice = Arc::new(
             RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
                 .with_staged_receipts(Arc::clone(&staged_receipts))

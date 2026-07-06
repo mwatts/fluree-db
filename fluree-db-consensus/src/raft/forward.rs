@@ -31,6 +31,7 @@
 //! reachable for forwarding on every other node — no restart.
 
 use crate::http::is_hop_by_hop;
+use crate::raft::network::NetworkConfig;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
@@ -41,15 +42,6 @@ use openraft::Raft;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Upper bound on the request body the follower will buffer before
-/// forwarding it to the leader. A follower that's still in catch-up
-/// shouldn't be coerced into allocating arbitrary memory by a hostile
-/// caller — anything beyond this returns 413 Payload Too Large. 64
-/// MiB comfortably covers the bulk-import paths Fluree exposes today;
-/// callers running larger imports should split the payload or address
-/// the leader directly.
-const MAX_FORWARDED_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Total per-request timeout for a forwarded call to the leader,
 /// from connect through response body read. Without this, a leader
@@ -88,11 +80,29 @@ pub struct LeaderForwarder {
     raft: Arc<Raft<TypeConfig>>,
     id: NodeId,
     client: reqwest::Client,
+    /// Upper bound on the request body buffered before relaying —
+    /// a follower shouldn't be coerced into allocating arbitrary
+    /// memory by a hostile caller. Bodies beyond the cap are
+    /// refused with 413 Payload Too Large before any relay. See
+    /// [`NetworkConfig::forward_max_body_bytes`] for how to size it.
+    max_body_bytes: usize,
 }
 
 impl LeaderForwarder {
     pub fn new(raft: Arc<Raft<TypeConfig>>, id: NodeId, client: reqwest::Client) -> Self {
-        Self { raft, id, client }
+        Self {
+            raft,
+            id,
+            client,
+            max_body_bytes: NetworkConfig::default().forward_max_body_bytes,
+        }
+    }
+
+    /// Cap the request body buffered before relaying (see
+    /// [`NetworkConfig::forward_max_body_bytes`]).
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
     }
 
     /// Decide whether this node should serve the request locally or
@@ -295,9 +305,15 @@ pub async fn forward_to_leader(
                 )
                     .into_response();
             }
-            forward_request(&forwarder.client, &leader_url, request, hops + 1)
-                .await
-                .unwrap_or_else(IntoResponse::into_response)
+            forward_request(
+                &forwarder.client,
+                &leader_url,
+                request,
+                hops + 1,
+                forwarder.max_body_bytes,
+            )
+            .await
+            .unwrap_or_else(IntoResponse::into_response)
         }
         ForwardDecision::UnknownLeader(id) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -338,6 +354,8 @@ fn incoming_hop_count(headers: &HeaderMap) -> u32 {
 enum ForwardError {
     #[error("reading request body to forward: {0}")]
     ReadBody(axum::Error),
+    #[error("request body exceeds the {limit}-byte forward limit")]
+    BodyTooLarge { limit: usize },
     #[error("sending forwarded request to leader: {0}")]
     Send(reqwest::Error),
     #[error("forwarded request to leader timed out after {seconds}s", seconds = FORWARD_REQUEST_TIMEOUT.as_secs())]
@@ -357,6 +375,10 @@ impl IntoResponse for ForwardError {
             // reqwest's per-request deadline.
             ForwardError::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ForwardError::ReadResponse(ref e) if e.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
+            // The client's fault, not the leader's — a 5xx here
+            // would read as infrastructure failure and invite
+            // retries of a request that can never succeed.
+            ForwardError::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             _ => StatusCode::BAD_GATEWAY,
         };
         (status, self.to_string()).into_response()
@@ -381,6 +403,7 @@ async fn forward_request(
     leader_base_url: &str,
     req: Request,
     outgoing_hops: u32,
+    max_body_bytes: usize,
 ) -> Result<Response, ForwardError> {
     let (parts, body) = req.into_parts();
     let original_uri = parts.extensions.get::<OriginalUri>().map(|o| &o.0);
@@ -394,9 +417,9 @@ async fn forward_request(
         path_and_query
     );
 
-    let body_bytes = axum::body::to_bytes(body, MAX_FORWARDED_BODY_BYTES)
+    let body_bytes = axum::body::to_bytes(body, max_body_bytes)
         .await
-        .map_err(ForwardError::ReadBody)?;
+        .map_err(|e| classify_body_read_error(e, max_body_bytes))?;
 
     let mut headers = strip_hop_by_hop(parts.headers);
     // Stamp the outgoing hop count so the next forwarder can bail
@@ -451,6 +474,22 @@ async fn response_from_upstream(upstream: reqwest::Response) -> Result<Response,
         }
     }
     Ok(resp)
+}
+
+/// Distinguish the body-length cap tripping from a genuine read
+/// failure: the cap is the client's fault (413), a failed read is
+/// the connection's (502). `axum::body::to_bytes` reports both as
+/// `axum::Error`, with the cap identifiable by a
+/// `LengthLimitError` in the source chain.
+fn classify_body_read_error(err: axum::Error, limit: usize) -> ForwardError {
+    let mut source = std::error::Error::source(&err);
+    while let Some(current) = source {
+        if current.is::<http_body_util::LengthLimitError>() {
+            return ForwardError::BodyTooLarge { limit };
+        }
+        source = current.source();
+    }
+    ForwardError::ReadBody(err)
 }
 
 /// Drop hop-by-hop headers (see [`crate::http::is_hop_by_hop`])
@@ -511,6 +550,37 @@ mod tests {
     fn timeout_error_maps_to_gateway_timeout() {
         let resp = ForwardError::Timeout.into_response();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// The body-cap tripping is the client's fault and must read as
+    /// 413, not a 502 that looks like infrastructure failure and
+    /// invites retries of a request that can never succeed.
+    #[tokio::test]
+    async fn oversized_body_classifies_as_payload_too_large() {
+        let err = axum::body::to_bytes(Body::from(vec![0u8; 64]), 16)
+            .await
+            .expect_err("body exceeds cap");
+        let classified = classify_body_read_error(err, 16);
+        assert!(
+            matches!(classified, ForwardError::BodyTooLarge { limit: 16 }),
+            "expected BodyTooLarge, got {classified:?}"
+        );
+        let resp = classified.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn non_limit_body_errors_stay_read_body() {
+        let err = axum::Error::new(std::io::Error::other("connection reset"));
+        let classified = classify_body_read_error(err, 16);
+        assert!(
+            matches!(classified, ForwardError::ReadBody(_)),
+            "expected ReadBody, got {classified:?}"
+        );
+        assert_eq!(
+            classified.into_response().status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[test]

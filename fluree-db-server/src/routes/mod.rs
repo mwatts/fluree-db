@@ -281,6 +281,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Add state
     let mut router = router.with_state(state.clone());
 
+    // Enforce the configured request-body cap on every public
+    // route. Without this layer, body-consuming extractors fall
+    // back to axum's 2 MiB default and `--body-limit` is a no-op.
+    router = router.layer(axum::extract::DefaultBodyLimit::max(
+        state.config.body_limit,
+    ));
+
     // Add CORS if enabled
     if state.config.cors_enabled {
         router = router.layer(

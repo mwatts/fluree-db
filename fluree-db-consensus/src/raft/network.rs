@@ -114,6 +114,14 @@ pub struct NetworkConfig {
     /// at most). Tiny compared to the receipt path, but still
     /// pinned to a deliberate cap for parity with the sibling RPCs.
     pub apply_queue_poison_max_body_bytes: usize,
+    /// Maximum request body a follower buffers before relaying a
+    /// client request to the leader ([`crate::raft::forward`]).
+    /// Bodies beyond the cap are refused with 413 before any relay.
+    /// Deployments should align this with the public routes' body
+    /// limit — a larger value has the follower buffering bodies the
+    /// leader will refuse anyway, a smaller one rejects follower-side
+    /// what the leader would accept.
+    pub forward_max_body_bytes: usize,
 }
 
 impl Default for NetworkConfig {
@@ -128,6 +136,7 @@ impl Default for NetworkConfig {
             install_snapshot_max_body_bytes: 1024 * 1024 * 1024,
             apply_staged_commit_max_body_bytes: 16 * 1024 * 1024,
             apply_queue_poison_max_body_bytes: 1024 * 1024,
+            forward_max_body_bytes: 64 * 1024 * 1024,
         }
     }
 }

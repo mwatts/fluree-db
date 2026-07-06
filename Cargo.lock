@@ -2638,6 +2638,7 @@ dependencies = [
  "fluree-db-transact",
  "futures",
  "hex",
+ "http-body-util",
  "moka",
  "openraft",
  "postcard",
