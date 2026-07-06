@@ -19,7 +19,8 @@ of the sequencing below landed:
 - **`fluree-db-bolt` crate** — pure codec: PackStream, chunking,
   handshake (4.4 + 5.0–5.4), typed messages, autocommit session state
   machine. No Fluree deps; byte-fixture unit tests.
-- **Server wiring** — `fluree-db-server` feature `bolt` (default off):
+- **Server wiring** — `fluree-db-server` feature `bolt` (default **on**;
+  the listener binds only when `bolt_listen_addr` is configured):
   `--bolt-listen-addr` / `--bolt-default-db` (+ `[server.bolt]` TOML),
   listener + per-connection tasks in `fluree-db-server/src/bolt.rs`, reads
   via `query_cypher_with_params` + `QueryResult::to_cypher_table` (the

@@ -189,8 +189,10 @@ fluree-server --listen-addr 0.0.0.0:9090
 
 ### Bolt Protocol Listener
 
-Servers built with the `bolt` feature can additionally speak the Bolt
-protocol (Neo4j drivers) against the openCypher surface. Unset = disabled.
+The server can additionally speak the Bolt protocol (Neo4j drivers)
+against the openCypher surface. The listener binds only when an address
+is configured — unset = disabled. (The `bolt` build feature is on by
+default; minimal builds may exclude it.)
 See the [Bolt adapter design](../design/bolt-adapter.md) and the
 [Cypher support matrix](../reference/cypher-support-matrix.md#bolt-protocol-neo4j-drivers)
 for scope and value-mapping notes.

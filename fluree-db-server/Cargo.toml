@@ -22,7 +22,7 @@ name = "fluree_db_server"
 path = "src/lib.rs"
 
 [features]
-default = ["native", "credential", "iceberg", "shacl"]
+default = ["native", "credential", "iceberg", "shacl", "bolt"]
 native = ["fluree-db-api/native"]
 # AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
 aws = ["fluree-db-api/aws"]
@@ -53,7 +53,9 @@ otel = [
 # cluster-admin routers on a separate private listener.
 raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
 # Bolt protocol listener (Neo4j drivers speak to the openCypher surface).
-# See docs/design/bolt-adapter.md. Off by default while v1 stabilizes.
+# Default on — the listener only binds when bolt_listen_addr is configured,
+# so runtime config is the real gate; exclude the feature only for minimal
+# builds. See docs/design/bolt-adapter.md.
 bolt = ["dep:fluree-db-bolt"]
 
 [dependencies]
