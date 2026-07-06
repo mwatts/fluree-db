@@ -18,7 +18,10 @@
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
 
@@ -133,6 +136,25 @@ pub(crate) async fn typed_table(
         .collect();
 
     let mut hydrator = NodeHydrator::new(view, compactor);
+
+    // Prefetch pass: the engine has already produced the subject list, so
+    // the per-node property fetches are independent point reads — issue
+    // them with bounded concurrency in subject order (leaflet locality)
+    // instead of one awaited SPOT scan per node during the row walk.
+    // Encoded bindings are skipped here (they materialize lazily and fall
+    // back to the on-demand fetch, which is cache-correct either way).
+    let mut wanted: Vec<Sid> = Vec::new();
+    for batch in &result.batches {
+        for row_idx in 0..batch.len() {
+            for &var_id in &col_vars {
+                if let Some(b) = batch.get(row_idx, var_id) {
+                    collect_subject_sids(b, &mut wanted);
+                }
+            }
+        }
+    }
+    hydrator.prefetch(wanted).await?;
+
     let mut rows = Vec::new();
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
@@ -148,6 +170,36 @@ pub(crate) async fn typed_table(
         }
     }
     Ok((columns, rows))
+}
+
+/// Collect every subject this binding will hydrate when rendered: node
+/// refs, relationship reifiers (annotation properties), and path nodes.
+/// Mirrors the dispatch in [`binding_cell`]; encoded bindings are skipped.
+fn collect_subject_sids(binding: &Binding, out: &mut Vec<Sid>) {
+    if binding.is_encoded() {
+        return;
+    }
+    match binding {
+        Binding::Sid { sid, .. } => out.push(sid.clone()),
+        Binding::IriMatch { primary_sid, .. } => out.push(primary_sid.clone()),
+        Binding::Rel(rel) => {
+            if let Some(reifier) = &rel.reifier {
+                out.push(reifier.clone());
+            }
+        }
+        Binding::Path { nodes, .. } => out.extend(nodes.iter().cloned()),
+        Binding::List(values) | Binding::Grouped(values) => {
+            for v in values {
+                collect_subject_sids(v, out);
+            }
+        }
+        Binding::Map(entries) => {
+            for (_, v) in entries {
+                collect_subject_sids(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn binding_cell<'a>(
@@ -263,7 +315,13 @@ struct NodeHydrator<'a> {
     rdf_type: Option<Sid>,
     node_marker: Option<Sid>,
     cache: HashMap<Sid, CypherNode>,
+    /// Raw subject flakes, shared by node hydration, annotation
+    /// properties, and path nodes; populated in bulk by [`Self::prefetch`].
+    flake_cache: HashMap<Sid, Arc<Vec<fluree_db_core::Flake>>>,
 }
+
+/// Concurrent subject fetches in flight during [`NodeHydrator::prefetch`].
+const PREFETCH_CONCURRENCY: usize = 16;
 
 impl<'a> NodeHydrator<'a> {
     fn new(view: &'a GraphDb, compactor: &'a IriCompactor) -> Self {
@@ -273,11 +331,61 @@ impl<'a> NodeHydrator<'a> {
             rdf_type: view.snapshot.encode_iri(fluree_vocab::rdf::TYPE),
             node_marker: view.snapshot.encode_iri(fluree_vocab::fluree::NODE),
             cache: HashMap::new(),
+            flake_cache: HashMap::new(),
         }
     }
 
-    async fn subject_flakes(&self, sid: &Sid) -> Result<Vec<fluree_db_core::Flake>> {
-        self.view
+    /// Bulk-fetch the flakes of every not-yet-cached subject, with bounded
+    /// concurrency, issued in subject order so adjacent subjects hit the
+    /// same leaflets.
+    async fn prefetch(&mut self, mut sids: Vec<Sid>) -> Result<()> {
+        sids.sort_unstable_by(|a, b| {
+            (a.namespace_code, a.name.as_ref()).cmp(&(b.namespace_code, b.name.as_ref()))
+        });
+        sids.dedup();
+        sids.retain(|sid| !self.flake_cache.contains_key(sid));
+        if sids.is_empty() {
+            return Ok(());
+        }
+
+        let view = self.view;
+        let fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> =
+            stream::iter(sids.into_iter().map(|sid| {
+                let db = view.as_graph_db_ref();
+                async move {
+                    let flakes = db
+                        .range_with_opts(
+                            IndexType::Spot,
+                            RangeTest::Eq,
+                            RangeMatch::subject(sid.clone()),
+                            RangeOptions::default(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            FormatError::InvalidBinding(format!("node property fetch failed: {e}"))
+                        })?;
+                    Ok::<_, FormatError>((sid, flakes))
+                }
+            }))
+            .buffer_unordered(PREFETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        for (sid, flakes) in fetched {
+            self.flake_cache.insert(sid, Arc::new(flakes));
+        }
+        Ok(())
+    }
+
+    /// A subject's flakes, from the prefetch cache when warm; the fallback
+    /// single fetch covers subjects the prefetch pass couldn't see
+    /// (encoded bindings that materialized during the row walk).
+    async fn subject_flakes(&mut self, sid: &Sid) -> Result<Arc<Vec<fluree_db_core::Flake>>> {
+        if let Some(hit) = self.flake_cache.get(sid) {
+            return Ok(Arc::clone(hit));
+        }
+        let flakes = self
+            .view
             .as_graph_db_ref()
             .range_with_opts(
                 IndexType::Spot,
@@ -286,7 +394,10 @@ impl<'a> NodeHydrator<'a> {
                 RangeOptions::default(),
             )
             .await
-            .map_err(|e| FormatError::InvalidBinding(format!("node property fetch failed: {e}")))
+            .map_err(|e| FormatError::InvalidBinding(format!("node property fetch failed: {e}")))?;
+        let flakes = Arc::new(flakes);
+        self.flake_cache.insert(sid.clone(), Arc::clone(&flakes));
+        Ok(flakes)
     }
 
     async fn node(&mut self, sid: &Sid) -> Result<CypherNode> {
@@ -296,7 +407,8 @@ impl<'a> NodeHydrator<'a> {
         let iri = self.compactor.decode_sid(sid)?;
         let mut labels = Vec::new();
         let mut props: Vec<(String, Vec<CypherCell>)> = Vec::new();
-        for flake in self.subject_flakes(sid).await? {
+        let flakes = self.subject_flakes(sid).await?;
+        for flake in flakes.iter() {
             if !flake.op {
                 continue;
             }
@@ -344,7 +456,8 @@ impl<'a> NodeHydrator<'a> {
     /// only — the `db:reifies*` bookkeeping and `rdf:type` are skipped.
     async fn annotation_properties(&mut self, sid: &Sid) -> Result<Vec<(String, CypherCell)>> {
         let mut props: Vec<(String, CypherCell)> = Vec::new();
-        for flake in self.subject_flakes(sid).await? {
+        let flakes = self.subject_flakes(sid).await?;
+        for flake in flakes.iter() {
             if !flake.op || Some(&flake.p) == self.rdf_type.as_ref() {
                 continue;
             }
@@ -450,5 +563,52 @@ impl<'a> NodeHydrator<'a> {
             FlakeValue::Null => CypherCell::Value(JsonValue::Null),
             other => CypherCell::Value(JsonValue::String(other.to_string())),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_query::binding::RelValue;
+
+    fn sid(name: &str) -> Sid {
+        Sid::new(100, name)
+    }
+
+    #[test]
+    fn collector_finds_every_hydration_subject() {
+        let rel = Binding::Rel(Box::new(RelValue {
+            start: sid("a"),
+            predicate: sid("knows"),
+            end: sid("b"),
+            reifier: Some(sid("ann1")),
+        }));
+        let nested = Binding::List(vec![
+            Binding::Sid {
+                sid: sid("n1"),
+                t: None,
+                op: None,
+            },
+            Binding::Map(vec![(
+                Arc::from("k"),
+                Binding::IriMatch {
+                    iri: Arc::from("http://x/n2"),
+                    primary_sid: sid("n2"),
+                    ledger_alias: Arc::from("l"),
+                },
+            )]),
+        ]);
+        let path = Binding::Path {
+            nodes: vec![sid("p1"), sid("p2")],
+            edges: vec![(sid("p1"), sid("knows"), sid("p2"))],
+        };
+
+        let mut out = Vec::new();
+        collect_subject_sids(&rel, &mut out);
+        collect_subject_sids(&nested, &mut out);
+        collect_subject_sids(&path, &mut out);
+
+        let names: Vec<&str> = out.iter().map(|s| s.name.as_ref()).collect();
+        assert_eq!(names, vec!["ann1", "n1", "n2", "p1", "p2"]);
     }
 }
