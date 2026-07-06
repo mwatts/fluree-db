@@ -368,6 +368,57 @@ fn time_cell(t: &fluree_db_core::temporal::Time) -> CypherTemporal {
     }
 }
 
+/// The subjects the overlay contributes flakes for, per graph — the
+/// per-subject gate for the batched crawl lane (untouched subjects read
+/// base truth; touched ones need the merge-correct per-subject path).
+///
+/// Derived from one full overlay SPOT walk and cached process-wide keyed
+/// on `(content_version, g_id)` — the contract `content_version` exists
+/// for. Returns `None` when the overlay can't be safely summarized (no
+/// version stamp): callers must treat every subject as dirty.
+fn overlay_dirty_subjects(
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    g_id: u16,
+) -> Option<Arc<std::collections::HashSet<Sid>>> {
+    use std::sync::OnceLock;
+    type DirtyCache =
+        parking_lot::Mutex<lru::LruCache<(u64, u16), Arc<std::collections::HashSet<Sid>>>>;
+    static CACHE: OnceLock<DirtyCache> = OnceLock::new();
+
+    if overlay.is_effectively_empty() {
+        static EMPTY: OnceLock<Arc<std::collections::HashSet<Sid>>> = OnceLock::new();
+        return Some(Arc::clone(
+            EMPTY.get_or_init(|| Arc::new(std::collections::HashSet::new())),
+        ));
+    }
+    let version = overlay.content_version()?;
+    let cache = CACHE.get_or_init(|| {
+        parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8).expect("nonzero"),
+        ))
+    });
+    if let Some(hit) = cache.lock().get(&(version, g_id)) {
+        return Some(Arc::clone(hit));
+    }
+    let mut subjects = std::collections::HashSet::new();
+    // Collect with no to_t cap: a superset stays conservative (a subject
+    // whose overlay flakes are all beyond the view's `t` just falls back).
+    overlay.for_each_overlay_flake(
+        g_id,
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |flake| {
+            subjects.insert(flake.s.clone());
+        },
+    );
+    let subjects = Arc::new(subjects);
+    cache.lock().put((version, g_id), Arc::clone(&subjects));
+    Some(subjects)
+}
+
 /// Fetches and caches node hydrations for one table walk.
 struct NodeHydrator<'a> {
     view: &'a GraphDb,
@@ -460,7 +511,14 @@ impl<'a> NodeHydrator<'a> {
     async fn prefetch(&mut self, wanted: Vec<WantedSubject>) -> Result<()> {
         let mut batched: Vec<(u64, Sid)> = Vec::new();
         let mut fallback: Vec<Sid> = Vec::new();
-        let batch_lane_open = self.gv.is_some() && self.view.overlay.is_effectively_empty();
+        // Per-subject lane choice: base truth (the batched sweep) is only
+        // complete for subjects the overlay doesn't touch. `None` means the
+        // overlay can't be summarized — every subject is treated as dirty.
+        let dirty = if self.gv.is_some() {
+            overlay_dirty_subjects(&*self.view.overlay, self.view.graph_id)
+        } else {
+            None
+        };
         let mut seen: std::collections::HashSet<Sid> = std::collections::HashSet::new();
         for subject in wanted {
             if self.cache.contains_key(&subject.sid)
@@ -469,12 +527,35 @@ impl<'a> NodeHydrator<'a> {
             {
                 continue;
             }
-            match subject.s_id {
-                Some(s_id) if batch_lane_open => batched.push((s_id, subject.sid)),
-                _ => fallback.push(subject.sid),
+            let clean = matches!(&dirty, Some(dirty) if !dirty.contains(&subject.sid));
+            if !clean {
+                fallback.push(subject.sid);
+                continue;
+            }
+            // Under live novelty the executor emits materialized `Sid`
+            // bindings (no raw s_id); a clean subject still belongs on the
+            // batched lane — one reverse dict lookup is far cheaper than a
+            // fallback point read. Novelty-only subjects (no persisted
+            // s_id) genuinely need the merge path.
+            let s_id = subject.s_id.or_else(|| {
+                self.gv.and_then(|gv| {
+                    gv.store()
+                        .find_subject_id_by_parts(subject.sid.namespace_code, &subject.sid.name)
+                        .ok()
+                        .flatten()
+                })
+            });
+            match s_id {
+                Some(s_id) => batched.push((s_id, subject.sid)),
+                None => fallback.push(subject.sid),
             }
         }
 
+        tracing::debug!(
+            batched = batched.len(),
+            fallback = fallback.len(),
+            "typed-table hydration lanes"
+        );
         if !batched.is_empty() {
             self.crawl_batched(batched)?;
         }

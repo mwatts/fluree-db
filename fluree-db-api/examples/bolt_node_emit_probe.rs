@@ -146,4 +146,78 @@ async fn main() {
         "query + typed: {:.3} ms/iter",
         total * 1000.0 / iters as f64
     );
+
+    // --- Live-novelty phase (the benchmark condition: writes ran, no
+    // reindex). The per-subject gate must keep untouched subjects on the
+    // batched lane, and touched subjects must render merged truth.
+    let ledger = fluree.ledger("probe:main").await.expect("ledger");
+    let res = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:newcomer", "@type": "ex:User", "ex:id": 9999, "ex:name": "newcomer",
+                     "ex:age": 99, "ex:gender": 1, "ex:region": "region0", "ex:cmpl": 1,
+                     "ex:eyes": "color0", "ex:hair": "hair0"},
+                    {"@id": "ex:u0", "ex:age": 77}
+                ]
+            }),
+        )
+        .await
+        .expect("novelty insert");
+    let db = fluree.db("probe:main").await.expect("db post-novelty");
+    assert!(res.ledger.t() > 1, "novelty commit landed");
+
+    let mut total = 0f64;
+    for _ in 0..iters {
+        let result = fluree.query_cypher(&db, query).await.expect("query");
+        let t0 = Instant::now();
+        std::hint::black_box(result.to_cypher_typed_table(&db).await.expect("typed"));
+        total += t0.elapsed().as_secs_f64();
+    }
+    eprintln!(
+        "typed  format under live novelty: {:.3} ms/iter",
+        total * 1000.0 / iters as f64
+    );
+
+    // Correctness: u0 was touched by novelty (age 18 -> now ALSO 77 as a
+    // multi-value assert) and must come off the merge-correct fallback;
+    // u1 is untouched and must still be exact off the batched lane.
+    let result = fluree.query_cypher(&db, query).await.expect("query");
+    let (_, rows) = result.to_cypher_typed_table(&db).await.expect("typed");
+    let find = |iri: &str| {
+        rows.iter().flat_map(|r| r.iter()).find_map(|c| match c {
+            CypherCell::Node(n) if n.iri == iri => Some(n.clone()),
+            _ => None,
+        })
+    };
+    let u0 = find("http://example.org/u0").expect("u0");
+    let age = u0
+        .properties
+        .iter()
+        .find(|(k, _)| k == "age")
+        .map(|(_, v)| v.clone());
+    match age {
+        Some(CypherCell::List(vals)) => assert!(
+            vals.contains(&CypherCell::Value(serde_json::json!(77))),
+            "dirty subject must reflect novelty: {vals:?}"
+        ),
+        Some(CypherCell::Value(v)) => assert_eq!(v, serde_json::json!(77), "novelty age"),
+        other => panic!("u0 age missing: {other:?}"),
+    }
+    let u1 = find("http://example.org/u1").expect("u1");
+    assert_eq!(
+        u1.properties
+            .iter()
+            .find(|(k, _)| k == "age")
+            .map(|(_, v)| v.clone()),
+        Some(CypherCell::Value(serde_json::json!(19))),
+        "untouched subject exact off the batched lane"
+    );
+    let newcomer = find("http://example.org/newcomer").expect("novelty-only subject in result");
+    assert_eq!(newcomer.labels, vec!["User"]);
+    eprintln!(
+        "live-novelty correctness verified (dirty=fallback, clean=batched, novelty-only present)"
+    );
 }
