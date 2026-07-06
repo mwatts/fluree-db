@@ -1125,12 +1125,13 @@ mem:fact-01kwvpa1cdekas5700mv919nte a mem:Fact ;
     mem:rationale "Follow-up work (explicit transactions, temporal/graph PackStream structures, auth) must preserve the pure-codec/server-glue split and the shared table converter rather than forking value mappings." .
 
 mem:fact-01kwvpa4y42ve0930eqqf0kz47 a mem:Fact ;
-    mem:content "Cypher parsed-AST cache: process-wide LRU (FLUREE_CYPHER_AST_CACHE entries, default 512, 0 disables; read once) keyed on statement text, caching the PRE-substitution Arc<CypherAst>. Single choke point query/helpers.rs parse_cypher_ast_cached + substituted_cypher_ast (clone-then-substitute-params); all five parse sites (read path, cypher_write_plan_with_skolem, lower_cypher_to_txn, transact_cypher_returning, plan_write_return_source) route through it, plus cypher_statement_is_write (Bolt read/write dispatch). Statements over 8KiB are never cached (unique bulk payloads would evict hot ones). Parse failures are not cached." ;
+    mem:content "Cypher parsed-AST cache: process-wide LRU (FLUREE_CYPHER_AST_CACHE entries, default 512, 0 disables; read once) keyed on statement text, caching the PRE-substitution Arc<CypherAst>. Single choke point query/helpers.rs parse_cypher_ast_cached + substituted_cypher_ast; all five parse sites route through it, plus cypher_statement_is_write (Bolt dispatch). Statements over 8KiB never cached; parse failures not cached. MEASURED (cypher_phase_profile, release): parse 1-4us, clone 0.2-1us, lower 1-4us — a lowered-IR cache is NOT warranted (plan+exec dominates by 3+ orders of magnitude). Profiler caveat: unindexed in-memory novelty path; filter/aggregate e2e is ms-to-minutes there (filter_topk 703ms @ 500 users), so keep PROF_USERS modest." ;
     mem:tag "cache" ;
     mem:tag "cypher" ;
     mem:tag "parser" ;
     mem:tag "performance" ;
     mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/examples/cypher_phase_profile.rs" ;
     mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
     mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
     mem:branch "feature/bolt" ;
