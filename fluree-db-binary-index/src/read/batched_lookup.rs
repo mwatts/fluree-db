@@ -273,11 +273,6 @@ pub fn batched_lookup_subject_properties(
     };
 
     for chunk in &chunks {
-        // Per-chunk membership: cursor batches are leaflet-granular and can
-        // spill rows past this chunk's subject range; those rows belong to
-        // (and are collected by) the neighboring chunk's scan. A global set
-        // here would collect them twice.
-        let chunk_set: HashSet<u64> = chunk.iter().copied().collect();
         let min_s = chunk[0];
         let max_s = *chunk.last().unwrap();
 
@@ -311,21 +306,71 @@ pub fn batched_lookup_subject_properties(
         );
         cursor.set_to_t(to_t);
 
+        // Batches are leaflet-granular and spill far past the wanted
+        // subjects, so testing every row is the dominant cost for small
+        // subject sets (a single-node hydration paid a full-leaflet
+        // membership scan). SPOT's primary sort key is `s_id`, so gallop
+        // instead: binary-search each wanted subject's contiguous run and
+        // copy only those rows. Spillover rows for a neighboring chunk's
+        // subjects are excluded by construction (only this chunk's ids are
+        // searched), preserving the no-double-collect invariant the
+        // per-chunk membership set used to provide.
         while let Some(batch) = cursor.next_batch()? {
-            for i in 0..batch.row_count {
-                let s_id = batch.s_id.get(i);
-                if !chunk_set.contains(&s_id) {
-                    continue;
-                }
+            for_each_subject_run(&batch, chunk, |s_id, i, batch| {
                 let p_id = batch.p_id.get_or(i, 0);
                 let o_type = batch.o_type.get_or(i, 0);
                 let o_key = batch.o_key.get(i);
                 out.entry(s_id).or_default().push((p_id, o_type, o_key));
-            }
+            });
         }
     }
 
     Ok(out)
+}
+
+/// Visit every row of `batch` whose `s_id` is in the sorted id list
+/// `wanted`, in row order, via sorted merge with galloping binary search.
+///
+/// Requires the batch's `s_id` column to be non-decreasing — true for
+/// SPOT-order leaflets (subject is the primary sort key), including
+/// time-travel replayed ones. NOT true for PSOT/OPST batches, where
+/// `s_id` only ascends within a single predicate/object run.
+fn for_each_subject_run(
+    batch: &super::column_types::ColumnBatch,
+    wanted: &[u64],
+    mut visit: impl FnMut(u64, usize, &super::column_types::ColumnBatch),
+) {
+    let n = batch.row_count;
+    let mut row = 0usize;
+    let mut w = 0usize;
+    while row < n && w < wanted.len() {
+        let target = wanted[w];
+        // First row with s_id >= target (binary search over [row, n)).
+        let (mut lo, mut hi) = (row, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if batch.s_id.get(mid) < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        row = lo;
+        if row >= n {
+            break;
+        }
+        let s = batch.s_id.get(row);
+        if s > target {
+            // No rows for `target` here; skip wanted ids below `s`.
+            w += wanted[w..].partition_point(|&x| x < s);
+            continue;
+        }
+        while row < n && batch.s_id.get(row) == target {
+            visit(target, row, batch);
+            row += 1;
+        }
+        w += 1;
+    }
 }
 
 /// Batched OPST lookup: all inbound `IRI_REF` edges pointing at each requested
