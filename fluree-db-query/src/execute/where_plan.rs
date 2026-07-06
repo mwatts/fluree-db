@@ -28,7 +28,7 @@ use crate::operator::BoxedOperator;
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
 use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
-use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
+use crate::property_path::PropertyPathOperator;
 use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
@@ -2256,8 +2256,12 @@ pub fn build_where_operators_seeded_with_needed(
                 let augmented_ref = augmented_rwv.as_deref();
 
                 operator = Some(Box::new(
-                    PropertyPathOperator::new(operator, pp.clone(), DEFAULT_MAX_VISITED)
-                        .with_out_schema(augmented_ref),
+                    PropertyPathOperator::new(
+                        operator,
+                        pp.clone(),
+                        crate::property_path::path_max_visited(),
+                    )
+                    .with_out_schema(augmented_ref),
                 ));
                 i += 1;
             }

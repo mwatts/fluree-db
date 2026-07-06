@@ -161,6 +161,20 @@ async fn main() {
         total * 1000.0 / iters as f64
     );
 
+    // shortestPath (bidirectional BFS): per-node range reads today.
+    let sp_q =
+        "MATCH p = shortestPath((a:User {id: 5})-[*..15]->(b:User {id: 137})) RETURN length(p)";
+    let mut total = 0f64;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        std::hint::black_box(fluree.query_cypher(&db, sp_q).await.expect("sp"));
+        total += t0.elapsed().as_secs_f64();
+    }
+    eprintln!(
+        "shortestPath wildcard: {:.3} ms/iter",
+        total * 1000.0 / iters as f64
+    );
+
     // --- Live-novelty phase (the benchmark condition: writes ran, no
     // reindex). The per-subject gate must keep untouched subjects on the
     // batched lane, and touched subjects must render merged truth.
