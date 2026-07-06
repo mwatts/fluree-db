@@ -232,6 +232,117 @@ fn test_minus_requires_left_pattern() {
 }
 
 #[test]
+fn test_union_of_subselects_preserves_both_arms() {
+    // Regression (azure-chat #42): `{ SELECT ... } UNION { SELECT ... }` used to
+    // drop the UNION entirely — the left sub-SELECT was pushed, then the UNION
+    // token hit "UNION must follow a pattern" and was discarded, collapsing the
+    // query into two independent subqueries. `assert_parses` also guards that no
+    // error diagnostic is emitted. Both arms must survive as a Union of SubSelects.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           { SELECT (?x AS ?n) WHERE { ?s ex:name ?x } } UNION \
+           { SELECT (?y AS ?n) WHERE { ?t ex:label ?y } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Union { left, right, .. } = &q.where_clause.pattern {
+            assert!(
+                matches!(left.as_ref(), GraphPattern::SubSelect { .. }),
+                "left arm should be a sub-SELECT, got {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), GraphPattern::SubSelect { .. }),
+                "right arm should be a sub-SELECT, got {right:?}"
+            );
+        } else {
+            panic!(
+                "Expected Union of sub-SELECTs, got {:?}",
+                q.where_clause.pattern
+            );
+        }
+    }
+}
+
+#[test]
+fn test_union_mixed_group_and_subselect_arms() {
+    // Either arm may be a sub-SELECT; a plain-group left arm must not swallow
+    // the union or drop the sub-SELECT right arm.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           { ?s ex:name ?n } UNION \
+           { SELECT (?y AS ?n) WHERE { ?t ex:label ?y } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Union { left, right, .. } = &q.where_clause.pattern {
+            assert!(
+                !matches!(left.as_ref(), GraphPattern::SubSelect { .. }),
+                "left arm should be a plain group, got {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), GraphPattern::SubSelect { .. }),
+                "right arm should be a sub-SELECT, got {right:?}"
+            );
+        } else {
+            panic!("Expected Union, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+#[test]
+fn test_minus_right_side_subselect_preserved() {
+    // Regression (azure-chat #43): the right arm of MINUS being a sub-SELECT was
+    // parsed as a bare BGP with the `(expr AS ?v)` projection dropped, so MINUS
+    // shared no bound variable with the left and subtracted nothing. The right
+    // arm must remain a sub-SELECT.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           ?s ex:name ?n MINUS \
+           { SELECT (?y AS ?n) WHERE { ?t ex:hidden ?y } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Minus { right, .. } = &q.where_clause.pattern {
+            assert!(
+                matches!(right.as_ref(), GraphPattern::SubSelect { .. }),
+                "MINUS right arm should be a sub-SELECT, got {right:?}"
+            );
+        } else {
+            panic!("Expected Minus, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+#[test]
+fn test_optional_subselect_preserved() {
+    // A sub-SELECT is a valid OPTIONAL body (grammar admits a group here, and a
+    // group may be a SubSelect). It must not be flattened to a bare BGP.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           ?s ex:name ?n OPTIONAL \
+           { SELECT (COUNT(?t) AS ?c) WHERE { ?t a ex:Thing } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Group { patterns, .. } = &q.where_clause.pattern {
+            let opt = patterns
+                .iter()
+                .find_map(|p| match p {
+                    GraphPattern::Optional { pattern, .. } => Some(pattern),
+                    _ => None,
+                })
+                .expect("expected an OPTIONAL pattern");
+            assert!(
+                matches!(opt.as_ref(), GraphPattern::SubSelect { .. }),
+                "OPTIONAL body should be a sub-SELECT, got {opt:?}"
+            );
+        } else {
+            panic!("Expected Group, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+#[test]
 fn test_values_single_var() {
     let ast = assert_parses(r"SELECT * WHERE { VALUES ?x { 1 2 3 } }");
     if let QueryBody::Select(q) = &ast.body {
