@@ -443,14 +443,11 @@ pub fn batched_lookup_inbound_refs(
 /// Break sorted subjects into chunks where each chunk spans at most
 /// `max_span` IDs and contains at most `max_chunk` subjects.
 fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]> {
-    // A new chunk costs one cursor descent (~a few µs ≈ scanning on the
-    // order of a thousand rows); scanning across a gap costs every row in
-    // it. Splitting on gaps larger than this keeps scattered id sets —
-    // BFS frontiers, arbitrary result sets — as near-point-seeks instead
-    // of dragging one scan across the whole id space, while dense sets
-    // still share long scans.
-    const MAX_GAP: u64 = 64;
-
+    // Deliberately no per-gap splitting: a cursor descent costs ~8 µs, so
+    // splitting a scattered id set (a hydration batch, a BFS frontier) into
+    // near-point-seeks multiplies setup cost far past what scanning the
+    // gapped rows costs. One scan per span-bounded cluster wins on real
+    // graphs (pokec node-emit regressed ~2x under gap-splitting).
     if sorted.is_empty() {
         return Vec::new();
     }
@@ -458,9 +455,8 @@ fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]
     let mut start = 0;
     for i in 1..sorted.len() {
         let span = sorted[i] - sorted[start];
-        let gap = sorted[i] - sorted[i - 1];
         let size = i - start;
-        if span > max_span || gap > MAX_GAP || size >= max_chunk {
+        if span > max_span || size >= max_chunk {
             chunks.push(&sorted[start..i]);
             start = i;
         }
