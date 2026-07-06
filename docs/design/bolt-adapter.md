@@ -34,9 +34,19 @@ of the sequencing below landed:
   and temporal literals map to `Date`/`DateTime`/`Time` (4.4 legacy
   variants handled). Typed results refuse to run under a view policy —
   format-time hydration reads raw SPOT state.
-- Remaining step-3 tail: auth schemes, driver-matrix polish, explicit
-  transactions — see the support matrix's Bolt section for current
-  transport semantics.
+- **Explicit transactions** (step-3 tail, landed): optimistic model in
+  `fluree-db-api/src/cypher_txn.rs` — `BEGIN` pins the cached head;
+  each write statement lowers/stages/`build_commit`s against the
+  transaction's private state (pure, unpublished; conditional `MERGE`
+  probes run against it) and advances it via
+  `StagedCommit::finalize_state`; `COMMIT` takes the ledger write lock,
+  verifies head == base (`t` + commit id), writes the pending blobs and
+  advances the head ref **once** (atomic visibility, commit chain keeps
+  per-statement provenance). Base moved → `TransactError::CommitConflict`
+  → `Neo.TransientError.*` on the wire, so managed transaction functions
+  retry. Single-node only; Raft/peer deployments reject `BEGIN`.
+- Remaining step-3 tail: auth schemes, driver-matrix polish — see the
+  support matrix's Bolt section for current transport semantics.
 
 The remainder of this document is the original design hand-off, kept for
 the anchor points and performance expectations worked out during the

@@ -104,17 +104,43 @@ def main():
             ).single()["c"]
             check("session recovers after failure", count == 3, f"count={count}")
 
-            # Explicit transactions are rejected with a clear error.
-            try:
-                with session.begin_transaction() as tx:
-                    tx.run("MATCH (n) RETURN n").consume()
-                check("explicit tx rejected", False, "BEGIN unexpectedly succeeded")
-            except Exception as e:
-                check(
-                    "explicit tx rejected",
-                    "not supported" in str(e),
-                    f"{type(e).__name__}: {e}",
-                )
+            # Explicit transaction: write + read-your-writes, then commit.
+            with session.begin_transaction() as tx:
+                tx.run("CREATE (n:Person {name: $name, age: 31})", name="Dave").consume()
+                in_tx = tx.run(
+                    "MATCH (n:Person) RETURN count(n) AS c"
+                ).single()["c"]
+                check("tx read-your-writes", in_tx == 4, f"count={in_tx}")
+                tx.commit()
+            count = session.run(
+                "MATCH (n:Person) RETURN count(n) AS c"
+            ).single()["c"]
+            check("tx commit visible", count == 4, f"count={count}")
+
+            # Managed transaction function (the retryable-closure API).
+            def add_person(tx):
+                tx.run("CREATE (n:Person {name: 'Eve', age: 29})").consume()
+                return tx.run("MATCH (n:Person) RETURN count(n) AS c").single()["c"]
+
+            managed = session.execute_write(add_person)
+            check("managed tx function", managed == 5, f"count={managed}")
+
+            # Rollback discards.
+            with session.begin_transaction() as tx:
+                tx.run("CREATE (n:Person {name: 'Ghost'})").consume()
+                tx.rollback()
+            count = session.run(
+                "MATCH (n:Person) RETURN count(n) AS c"
+            ).single()["c"]
+            check("tx rollback discards", count == 5, f"count={count}")
+
+            # RETURN n gives a typed Node with labels + properties.
+            record = session.run(
+                'MATCH (n:Person {name: "Alice"}) RETURN n'
+            ).single()
+            node = record["n"]
+            check("node labels", "Person" in node.labels, str(node.labels))
+            check("node properties", node.get("age") == 30, str(dict(node)))
 
     print()
     if failures:

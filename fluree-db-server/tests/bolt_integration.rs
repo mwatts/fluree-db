@@ -220,6 +220,39 @@ impl BoltClient {
         self.recv().await
     }
 
+    async fn begin(&mut self, db: &str) -> Reply {
+        let mut extra = MapValue::new();
+        extra.insert("db", db);
+        self.send(msg::BEGIN, vec![Value::Map(extra)]).await;
+        self.recv().await
+    }
+
+    async fn commit(&mut self) -> Reply {
+        self.send(msg::COMMIT, vec![]).await;
+        self.recv().await
+    }
+
+    async fn rollback(&mut self) -> Reply {
+        self.send(msg::ROLLBACK, vec![]).await;
+        self.recv().await
+    }
+
+    /// Autocommit count of :Person nodes.
+    async fn person_count(&mut self) -> i64 {
+        self.run(
+            "MATCH (n:Person) RETURN count(n) AS c",
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+        let (records, _) = self.pull(-1).await;
+        match records[0][0] {
+            Value::Integer(i) => i,
+            ref other => panic!("expected integer count, got {other:?}"),
+        }
+    }
+
     /// PULL n, collecting records until the trailing SUCCESS/FAILURE.
     async fn pull(&mut self, n: i64) -> (Vec<Vec<Value>>, Reply) {
         let mut extra = MapValue::new();
@@ -418,20 +451,18 @@ async fn bolt_error_surfaces_and_reset_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bolt_begin_fails_clearly() {
+async fn bolt_begin_without_database_fails_clearly() {
     let (_tmp, _state, addr) = bolt_server(LEDGER).await;
     let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
     client.ready(true).await;
 
+    // No `db` in BEGIN extra, none in HELLO, no server default configured.
     client.send(msg::BEGIN, vec![Value::empty_map()]).await;
     let reply = client.recv().await;
     let failure = reply.assert_failure();
     assert!(
-        failure
-            .get_str("message")
-            .unwrap()
-            .contains("not supported"),
-        "explicit-transaction failure must be self-explanatory"
+        failure.get_str("code").unwrap().contains("Database"),
+        "BEGIN without a database must name the problem"
     );
 }
 
@@ -572,5 +603,236 @@ async fn bolt_returns_relationship_structure() {
         rel.fields[7],
         Value::String("http://example.org/bob".into()),
         "end_element_id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_explicit_transaction_round_trip() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+    let (mut observer, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    observer.ready(true).await;
+
+    client.begin(LEDGER).await.assert_success();
+
+    // Write inside the transaction.
+    client
+        .run(
+            r#"CREATE (n:Person {name: "Carol", age: 27})"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (_, summary) = client.pull(-1).await;
+    let summary = summary.assert_success();
+    let Some(Value::Map(stats)) = summary.get("stats") else {
+        panic!("tx write summary must carry stats")
+    };
+    assert_eq!(stats.get("contains-updates"), Some(&Value::Boolean(true)));
+
+    // Read-your-writes inside the transaction.
+    client
+        .run(
+            "MATCH (n:Person) RETURN count(n) AS c",
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    assert_eq!(
+        records,
+        vec![vec![Value::Integer(3)]],
+        "tx sees its own write"
+    );
+
+    // Isolation: another session does NOT see the uncommitted write.
+    assert_eq!(
+        observer.person_count().await,
+        2,
+        "uncommitted write must be invisible"
+    );
+
+    // COMMIT surfaces a bookmark and the write becomes visible.
+    let commit_meta = client.commit().await;
+    let commit_meta = commit_meta.assert_success();
+    assert!(
+        commit_meta
+            .get_str("bookmark")
+            .unwrap_or("")
+            .starts_with("fluree:t:"),
+        "commit carries a bookmark"
+    );
+    assert_eq!(
+        observer.person_count().await,
+        3,
+        "committed write visible everywhere"
+    );
+    assert_eq!(
+        client.person_count().await,
+        3,
+        "session usable after commit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_multi_statement_transaction_commits_atomically() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    client.begin(LEDGER).await.assert_success();
+    for name in ["Carol", "Dave", "Erin"] {
+        client
+            .run(
+                "CREATE (n:Person {name: $name, age: 20})",
+                {
+                    let mut p = MapValue::new();
+                    p.insert("name", name);
+                    p
+                },
+                LEDGER,
+            )
+            .await
+            .assert_success();
+        client.pull(-1).await.1.assert_success();
+    }
+    // Second statement's effect is visible to the third: read count in-tx.
+    client
+        .run(
+            "MATCH (n:Person) RETURN count(n) AS c",
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    assert_eq!(records, vec![vec![Value::Integer(5)]]);
+
+    client.commit().await.assert_success();
+    assert_eq!(client.person_count().await, 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_rollback_discards_writes() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    client.begin(LEDGER).await.assert_success();
+    client
+        .run(
+            r#"CREATE (n:Person {name: "Ghost"})"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    client.pull(-1).await.1.assert_success();
+    client.rollback().await.assert_success();
+
+    assert_eq!(
+        client.person_count().await,
+        2,
+        "rolled-back write must vanish"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_tx_conflict_fails_transient_and_retries() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+    let (mut rival, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    rival.ready(true).await;
+
+    client.begin(LEDGER).await.assert_success();
+    client
+        .run(
+            r#"CREATE (n:Person {name: "Carol"})"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    client.pull(-1).await.1.assert_success();
+
+    // A rival autocommit write advances the head under the transaction.
+    rival
+        .run(
+            r#"CREATE (n:Person {name: "Rival"})"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    rival.pull(-1).await.1.assert_success();
+
+    // COMMIT must fail with a driver-retryable transient code.
+    let failure = client.commit().await;
+    let failure = failure.assert_failure();
+    let code = failure.get_str("code").expect("failure code");
+    assert!(
+        code.starts_with("Neo.TransientError."),
+        "conflict must be transient (drivers retry); got {code}"
+    );
+    assert_eq!(
+        rival.person_count().await,
+        3,
+        "only the rival's write landed"
+    );
+
+    // The retry (fresh transaction) succeeds — the managed-tx contract.
+    client.send(msg::RESET, vec![]).await;
+    client.recv().await.assert_success();
+    client.begin(LEDGER).await.assert_success();
+    client
+        .run(
+            r#"CREATE (n:Person {name: "Carol"})"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    client.pull(-1).await.1.assert_success();
+    client.commit().await.assert_success();
+    assert_eq!(client.person_count().await, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_tx_statement_failure_poisons_and_reset_recovers() {
+    let (_tmp, _state, addr) = bolt_server(LEDGER).await;
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    client.begin(LEDGER).await.assert_success();
+    client
+        .run(
+            r#"CREATE (n:Person {name: "Kept"})"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    client.pull(-1).await.1.assert_success();
+
+    // A bad statement poisons the transaction.
+    let failure = client.run("MATCH (n RETURN", MapValue::new(), LEDGER).await;
+    failure.assert_failure();
+
+    // COMMIT is IGNORED in the failed state.
+    client.send(msg::COMMIT, vec![]).await;
+    let reply = client.recv().await;
+    assert_eq!(reply.signature, msg::IGNORED);
+
+    // RESET drops the transaction; nothing committed.
+    client.send(msg::RESET, vec![]).await;
+    client.recv().await.assert_success();
+    assert_eq!(
+        client.person_count().await,
+        2,
+        "poisoned tx must not commit"
     );
 }

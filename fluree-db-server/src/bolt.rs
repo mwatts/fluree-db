@@ -15,13 +15,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use fluree_db_api::cypher_txn::CypherTransaction;
 use fluree_db_api::format::cypher_typed::{
     CypherCell, CypherNode, CypherPath, CypherRelationship, CypherTemporal,
 };
 use fluree_db_bolt::chunk::{write_message, ChunkAssembler};
 use fluree_db_bolt::handshake::{negotiate, HandshakeOutcome, HANDSHAKE_LEN, REJECT};
 use fluree_db_bolt::message::{Request, Response};
-use fluree_db_bolt::session::{ResultStream, RunRequest, Session, SessionConfig, Turn};
+use fluree_db_bolt::session::{
+    BeginRequest, ResultStream, RunRequest, Session, SessionConfig, Turn,
+};
 use fluree_db_bolt::value::{sig, MapValue, Structure, Value};
 use fluree_db_bolt::BoltVersion;
 use serde_json::Value as JsonValue;
@@ -35,6 +38,10 @@ const CODE_SYNTAX: &str = "Neo.ClientError.Statement.SyntaxError";
 const CODE_DB_NOT_FOUND: &str = "Neo.ClientError.Database.DatabaseNotFound";
 const CODE_INVALID: &str = "Neo.ClientError.Request.Invalid";
 const CODE_GENERAL: &str = "Neo.DatabaseError.General.UnknownError";
+/// Optimistic-concurrency conflict at COMMIT. The `TransientError`
+/// classification is what makes official drivers' managed transaction
+/// functions retry the whole (retryable-closure) transaction.
+const CODE_TX_CONFLICT: &str = "Neo.TransientError.Transaction.OptimisticConflict";
 
 /// Bind the Bolt listener and spawn the accept loop. Returns the bound
 /// address (`addr` may name port 0) and the accept-loop task.
@@ -99,6 +106,9 @@ async fn handle_connection(
     let mut assembler = ChunkAssembler::new();
     let mut read_buf = vec![0u8; 16 * 1024];
     let mut out_buf: Vec<u8> = Vec::new();
+    // The open explicit transaction, if any. Dropping it rolls back
+    // (nothing was published).
+    let mut open_txn: Option<CypherTransaction> = None;
     loop {
         let n = socket.read(&mut read_buf).await?;
         if n == 0 {
@@ -141,8 +151,27 @@ async fn handle_connection(
                 }
                 Turn::Execute(run) => {
                     let version = session.version();
-                    let reply = execute_run(&state, &mut session, run, version).await;
+                    let reply =
+                        execute_run(&state, &mut session, run, version, &mut open_txn).await;
                     write_message(&reply.encode(), &mut out_buf);
+                }
+                Turn::Begin(begin) => {
+                    let reply = handle_begin(&state, &mut session, &mut open_txn, begin).await;
+                    write_message(&reply.encode(), &mut out_buf);
+                }
+                Turn::Commit => {
+                    let reply = handle_commit(&state, &mut session, open_txn.take()).await;
+                    write_message(&reply.encode(), &mut out_buf);
+                }
+                Turn::Rollback => {
+                    open_txn = None;
+                    write_message(&session.rollback_done().encode(), &mut out_buf);
+                }
+                Turn::Reset(replies) => {
+                    open_txn = None;
+                    for reply in replies {
+                        write_message(&reply.encode(), &mut out_buf);
+                    }
                 }
             }
         }
@@ -184,15 +213,155 @@ async fn execute_run(
     session: &mut Session,
     run: RunRequest,
     version: BoltVersion,
+    open_txn: &mut Option<CypherTransaction>,
 ) -> Response {
     let started = Instant::now();
-    match try_execute_run(state, &run, version).await {
+    let outcome = match open_txn.as_mut() {
+        Some(txn) => try_execute_txn_run(state, txn, &run, version).await,
+        None => try_execute_run(state, &run, version).await,
+    };
+    match outcome {
         Ok(stream) => session.run_succeeded(stream, started.elapsed().as_millis() as i64),
         Err(f) => {
             debug!(code = f.code, error = %f.message, "bolt RUN failed");
+            // A failed statement poisons the open transaction.
+            *open_txn = None;
             session.run_failed(f.code, f.message)
         }
     }
+}
+
+/// Whether this deployment can honor explicit transactions: the optimistic
+/// commit path publishes through the local commit machinery, so replicated
+/// (Raft) and peer deployments must reject BEGIN clearly.
+fn explicit_tx_supported(state: &AppState) -> bool {
+    let single_node = !state.config.is_peer_mode();
+    #[cfg(feature = "raft")]
+    let single_node = single_node && !state.config.raft_enabled;
+    single_node
+}
+
+async fn handle_begin(
+    state: &AppState,
+    session: &mut Session,
+    open_txn: &mut Option<CypherTransaction>,
+    begin: BeginRequest,
+) -> Response {
+    if !explicit_tx_supported(state) {
+        return session.begin_failed(
+            CODE_INVALID,
+            "explicit transactions require a single-node server (local commit path);              this deployment replicates writes — use autocommit queries",
+        );
+    }
+    let Some(ledger_id) = begin.db.as_deref() else {
+        return session.begin_failed(
+            CODE_DB_NOT_FOUND,
+            "no database selected: pass `database=` in the driver session              (or set --bolt-default-db on the server)",
+        );
+    };
+    match state.fluree.begin_cypher_transaction(ledger_id).await {
+        Ok(txn) => {
+            *open_txn = Some(txn);
+            session.begin_succeeded()
+        }
+        Err(e) => session.begin_failed(CODE_DB_NOT_FOUND, e.to_string()),
+    }
+}
+
+async fn handle_commit(
+    state: &AppState,
+    session: &mut Session,
+    open_txn: Option<CypherTransaction>,
+) -> Response {
+    let Some(txn) = open_txn else {
+        return session.commit_failed(CODE_INVALID, "no open transaction");
+    };
+    match state.fluree.commit_cypher_transaction(txn).await {
+        Ok(t) => session.commit_succeeded(Some(format!("fluree:t:{t}"))),
+        Err(fluree_db_api::ApiError::Transact(
+            fluree_db_api::TransactError::CommitConflict { expected_t, head_t },
+        )) => session.commit_failed(
+            CODE_TX_CONFLICT,
+            format!(
+                "the transaction's base state (t={expected_t}) was superseded by a                  concurrent commit (t={head_t}); retry the transaction"
+            ),
+        ),
+        Err(e) => session.commit_failed(CODE_GENERAL, e.to_string()),
+    }
+}
+
+/// One RUN inside an open explicit transaction: reads query the
+/// transaction's private state; writes stage into it (publishing waits
+/// for COMMIT). Statement-level failures surface here, at RUN time.
+async fn try_execute_txn_run(
+    state: &AppState,
+    txn: &mut CypherTransaction,
+    run: &RunRequest,
+    version: BoltVersion,
+) -> Result<ResultStream, RunFailure> {
+    let params = params_to_json(&run.parameters)?;
+    let is_write = fluree_db_api::cypher_write::cypher_statement_is_write(&run.query)
+        .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
+    let ledger_id = txn.ledger_id().to_string();
+
+    if is_write {
+        let outcome = state
+            .fluree
+            .cypher_transaction_write(txn, &run.query, params.as_ref())
+            .await
+            .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
+
+        let mut summary = MapValue::new();
+        summary.insert("type", "w");
+        summary.insert("t_last", 0i64);
+        summary.insert("db", ledger_id.as_str());
+        let mut stats = MapValue::new();
+        stats.insert("contains-updates", outcome.flake_count > 0);
+        stats.insert("fluree-flakes", outcome.flake_count as i64);
+        summary.insert("stats", stats);
+
+        let (fields, rows) = match &outcome.return_envelope {
+            Some(envelope) => envelope_to_rows(envelope),
+            None => (Vec::new(), Default::default()),
+        };
+        return Ok(ResultStream {
+            fields,
+            rows,
+            summary,
+        });
+    }
+
+    let view = state
+        .fluree
+        .cypher_transaction_view(txn)
+        .await
+        .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
+    let result = state
+        .fluree
+        .query_cypher_with_params(&view, &run.query, params.as_ref())
+        .await
+        .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
+    let (columns, rows) = result
+        .to_cypher_typed_table(&view)
+        .await
+        .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
+
+    let mut summary = MapValue::new();
+    summary.insert("type", "r");
+    summary.insert("t_last", 0i64);
+    summary.insert("db", ledger_id.as_str());
+    Ok(ResultStream {
+        fields: columns,
+        rows: rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|c| typed_cell_to_bolt(c, version))
+                    .collect()
+            })
+            .collect(),
+        summary,
+    })
 }
 
 async fn try_execute_run(

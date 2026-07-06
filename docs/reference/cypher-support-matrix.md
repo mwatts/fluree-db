@@ -139,7 +139,7 @@ semantics:
 | Aspect | Status | Notes |
 |--------|:------:|-------|
 | Autocommit `RUN` (read + write), params, reactive `PULL`/`DISCARD` | ✅ | Same execution paths as the HTTP routes. |
-| Explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ⏳ | Clear `FAILURE` (never silent wrong behavior); needs session-pinned staged state reconciled with consensus locking. |
+| Explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ✅ | Optimistic: `BEGIN` pins the head; statements stage privately (read-your-writes; statement errors surface at `RUN`, poisoning the transaction until `RESET`); `COMMIT` publishes atomically only if the head is still the pinned base, else fails `Neo.TransientError.*` — managed transaction functions (`execute_write` etc.) retry automatically. Isolation is serializable-against-base, stronger than Neo4j's read-committed. Single-node (local commit) deployments only; Raft/peer reject `BEGIN` clearly. |
 | `db` selection | ✅ | Driver `database=` (HELLO defaults or per-RUN) → ledger id; fallback `--bolt-default-db`. |
 | `xsd:decimal` values | ⟂ | Bolt/PackStream has no decimal type: rendered as **Float** (Neo4j parity, precision loss). The JSON transport keeps exact lexical strings. Integer `/` produces decimals, so this shows on ordinary division. |
 | Temporal values (`xsd:date` / `dateTime` / `time`) | ✅ | Bolt `Date` / `DateTime` / `Time` structures (4.4 gets the legacy local-seconds `DateTime`; lexical forms without a timezone map to the Local variants). |

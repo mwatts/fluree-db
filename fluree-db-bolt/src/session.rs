@@ -2,14 +2,17 @@
 //!
 //! Pure and transport-free: the caller decodes a [`Request`], hands it to
 //! [`Session::on_request`], and acts on the returned [`Turn`] — writing
-//! replies, closing the connection, or executing a statement and reporting
-//! the outcome via [`Session::run_succeeded`] / [`Session::run_failed`].
+//! replies, closing the connection, executing statements, or driving the
+//! explicit-transaction lifecycle. Completion callbacks
+//! ([`Session::run_succeeded`], [`Session::begin_succeeded`], ...) return
+//! the response to write and advance the state.
 //!
-//! v1 scope: autocommit only. Results are fully materialized at RUN time by
-//! the caller; PULL serves batches from the buffered [`ResultStream`] with
-//! reactive `has_more` metadata. `BEGIN`/`COMMIT`/`ROLLBACK` answer a clear
-//! FAILURE (never a silent wrong behavior), matching the Cypher support
-//! matrix contract.
+//! Autocommit `RUN` and explicit transactions (`BEGIN`/`COMMIT`/
+//! `ROLLBACK`) are both supported. Results are fully materialized by the
+//! caller; `PULL`/`DISCARD` serve batches from buffered [`ResultStream`]s
+//! with reactive `has_more` metadata. Inside a transaction multiple
+//! results may be open concurrently, addressed by `qid` (Bolt 4.0+
+//! `PULL {qid}`); autocommit has one live stream.
 
 use std::collections::VecDeque;
 
@@ -26,7 +29,8 @@ pub struct SessionConfig {
     pub server_agent: String,
     /// Advertised in the HELLO SUCCESS `connection_id` field.
     pub connection_id: String,
-    /// Ledger used when neither HELLO defaults nor RUN extra name a `db`.
+    /// Ledger used when neither HELLO defaults nor RUN/BEGIN extra name a
+    /// `db`.
     pub default_db: Option<String>,
     /// `host:port` for the single-entry ROUTE table. `None` answers ROUTE
     /// with a failure directing clients at the `bolt://` scheme.
@@ -50,19 +54,39 @@ pub enum Turn {
     Reply(Vec<Response>),
     /// Write these replies (possibly none), then close the connection.
     Close(Vec<Response>),
-    /// Execute the statement, then call `run_succeeded` / `run_failed` and
-    /// write the response that returns.
+    /// Execute the statement (autocommit, or inside the open transaction
+    /// when the caller holds one), then call `run_succeeded` /
+    /// `run_failed` and write the response that returns.
     Execute(RunRequest),
+    /// Open an explicit transaction: set up caller-side state, then call
+    /// `begin_succeeded` / `begin_failed` and write the response.
+    Begin(BeginRequest),
+    /// Commit the open transaction: publish, then call
+    /// `commit_succeeded` / `commit_failed` and write the response.
+    Commit,
+    /// Roll back: drop caller-side transaction state, then call
+    /// `rollback_done` and write the response.
+    Rollback,
+    /// RESET: drop any caller-side transaction state, then write these
+    /// replies.
+    Reset(Vec<Response>),
 }
 
-/// An autocommit statement the server glue must execute.
+/// An autocommit or in-transaction statement the server glue must execute.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRequest {
     pub query: String,
     pub parameters: MapValue,
     /// From RUN extra `db`, HELLO defaults, or the configured default — in
-    /// that precedence. `None` means the server has no default ledger and
-    /// the request named none: fail the RUN.
+    /// that precedence. Inside a transaction the ledger was pinned at
+    /// BEGIN; the caller uses its transaction state instead.
+    pub db: Option<String>,
+}
+
+/// An explicit-transaction open request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeginRequest {
+    /// From BEGIN extra `db`, HELLO defaults, or the configured default.
     pub db: Option<String>,
 }
 
@@ -72,28 +96,36 @@ enum State {
     /// 5.1+: HELLO done, awaiting LOGON.
     Authentication,
     Ready,
+    /// Autocommit result being served.
     Streaming,
+    /// Explicit transaction open, no results pending.
+    TxReady,
+    /// Explicit transaction open with buffered results.
+    TxStreaming,
     Failed,
 }
 
 pub struct Session {
     config: SessionConfig,
     state: State,
-    stream: Option<ResultStream>,
+    /// Buffered results by `qid`, insertion-ordered (tiny: autocommit has
+    /// one; a transaction rarely holds more than a couple).
+    streams: Vec<(i64, ResultStream)>,
+    next_qid: i64,
     /// `db` from HELLO extra defaults (Bolt 5.x drivers can set a session
-    /// database there); RUN extra still overrides per statement.
+    /// database there); RUN/BEGIN extra still overrides.
     hello_db: Option<String>,
 }
 
 const CODE_INVALID: &str = "Neo.ClientError.Request.Invalid";
-const CODE_TX_UNSUPPORTED: &str = "Neo.ClientError.Statement.TypeError";
 
 impl Session {
     pub fn new(config: SessionConfig) -> Self {
         Self {
             config,
             state: State::AwaitingHello,
-            stream: None,
+            streams: Vec::new(),
+            next_qid: 0,
             hello_db: None,
         }
     }
@@ -104,7 +136,12 @@ impl Session {
 
     /// Whether the connection has completed HELLO (+LOGON where required).
     pub fn is_ready(&self) -> bool {
-        matches!(self.state, State::Ready | State::Streaming | State::Failed)
+        !matches!(self.state, State::AwaitingHello | State::Authentication)
+    }
+
+    /// Whether an explicit transaction is open.
+    pub fn in_transaction(&self) -> bool {
+        matches!(self.state, State::TxReady | State::TxStreaming)
     }
 
     pub fn on_request(&mut self, request: Request) -> Turn {
@@ -116,6 +153,8 @@ impl Session {
                 State::Authentication => self.on_authentication(other),
                 State::Ready => self.on_ready(other),
                 State::Streaming => self.on_streaming(other),
+                State::TxReady => self.on_tx_ready(other),
+                State::TxStreaming => self.on_tx_streaming(other),
                 State::Failed => Turn::Reply(vec![Response::Ignored]),
             },
         }
@@ -126,13 +165,13 @@ impl Session {
             // RESET before HELLO is a protocol violation.
             return Turn::Close(vec![Response::failure(CODE_INVALID, "RESET before HELLO")]);
         }
-        self.stream = None;
+        self.streams.clear();
         self.state = if self.state == State::Authentication {
             State::Authentication
         } else {
             State::Ready
         };
-        Turn::Reply(vec![Response::success_empty()])
+        Turn::Reset(vec![Response::success_empty()])
     }
 
     fn on_awaiting_hello(&mut self, request: Request) -> Turn {
@@ -171,6 +210,16 @@ impl Session {
         }
     }
 
+    /// `db` resolution shared by RUN and BEGIN: explicit extra, HELLO
+    /// session default, then the server's configured default.
+    fn resolve_db(&self, extra: &MapValue) -> Option<String> {
+        extra
+            .get_str("db")
+            .map(str::to_string)
+            .or_else(|| self.hello_db.clone())
+            .or_else(|| self.config.default_db.clone())
+    }
+
     fn on_ready(&mut self, request: Request) -> Turn {
         match request {
             Request::Run {
@@ -178,22 +227,16 @@ impl Session {
                 parameters,
                 extra,
             } => {
-                let db = extra
-                    .get_str("db")
-                    .map(str::to_string)
-                    .or_else(|| self.hello_db.clone())
-                    .or_else(|| self.config.default_db.clone());
+                let db = self.resolve_db(&extra);
                 Turn::Execute(RunRequest {
                     query,
                     parameters,
                     db,
                 })
             }
-            Request::Begin { .. } => self.fail(Response::failure(
-                CODE_TX_UNSUPPORTED,
-                "Explicit transactions (BEGIN/COMMIT/ROLLBACK) are not supported; \
-                 use autocommit queries. See the Fluree Cypher support matrix.",
-            )),
+            Request::Begin { extra } => Turn::Begin(BeginRequest {
+                db: self.resolve_db(&extra),
+            }),
             Request::Commit | Request::Rollback => self.fail(Response::failure(
                 CODE_INVALID,
                 "COMMIT/ROLLBACK outside a transaction",
@@ -217,13 +260,80 @@ impl Session {
 
     fn on_streaming(&mut self, request: Request) -> Turn {
         match request {
-            Request::Pull { extra } => {
-                let n = extra.get_int("n").unwrap_or(-1);
-                Turn::Reply(self.serve_pull(n))
+            Request::Pull { extra } => Turn::Reply(self.serve_pull(&extra)),
+            Request::Discard { extra } => Turn::Reply(vec![self.serve_discard(&extra)]),
+            other => self.fail(Response::failure(
+                CODE_INVALID,
+                format!("unexpected {} while streaming", request_name(&other)),
+            )),
+        }
+    }
+
+    fn on_tx_ready(&mut self, request: Request) -> Turn {
+        match request {
+            Request::Run {
+                query,
+                parameters,
+                extra,
+            } => {
+                let db = self.resolve_db(&extra);
+                Turn::Execute(RunRequest {
+                    query,
+                    parameters,
+                    db,
+                })
             }
-            Request::Discard { extra } => {
-                let n = extra.get_int("n").unwrap_or(-1);
-                Turn::Reply(vec![self.serve_discard(n)])
+            Request::Commit => {
+                self.streams.clear();
+                Turn::Commit
+            }
+            Request::Rollback => {
+                self.streams.clear();
+                Turn::Rollback
+            }
+            Request::Begin { .. } => self.fail(Response::failure(
+                CODE_INVALID,
+                "a transaction is already open on this session",
+            )),
+            Request::Telemetry { .. } => Turn::Reply(vec![Response::success_empty()]),
+            Request::Pull { .. } | Request::Discard { .. } => self.fail(Response::failure(
+                CODE_INVALID,
+                "no result stream to consume",
+            )),
+            other => self.fail(Response::failure(
+                CODE_INVALID,
+                format!("unexpected {} inside a transaction", request_name(&other)),
+            )),
+        }
+    }
+
+    fn on_tx_streaming(&mut self, request: Request) -> Turn {
+        match request {
+            Request::Pull { extra } => Turn::Reply(self.serve_pull(&extra)),
+            Request::Discard { extra } => Turn::Reply(vec![self.serve_discard(&extra)]),
+            // A new statement while results are buffered — Bolt 4.0+
+            // addresses the streams by qid.
+            Request::Run {
+                query,
+                parameters,
+                extra,
+            } => {
+                let db = self.resolve_db(&extra);
+                Turn::Execute(RunRequest {
+                    query,
+                    parameters,
+                    db,
+                })
+            }
+            // COMMIT/ROLLBACK with unconsumed results: the driver chose to
+            // abandon them; discard implicitly.
+            Request::Commit => {
+                self.streams.clear();
+                Turn::Commit
+            }
+            Request::Rollback => {
+                self.streams.clear();
+                Turn::Rollback
             }
             other => self.fail(Response::failure(
                 CODE_INVALID,
@@ -236,6 +346,8 @@ impl Session {
     /// the time from RUN to result availability, surfaced in the RUN
     /// SUCCESS metadata like Neo4j's.
     pub fn run_succeeded(&mut self, stream: ResultStream, t_first_ms: i64) -> Response {
+        let qid = self.next_qid;
+        self.next_qid += 1;
         let mut meta = MapValue::new();
         meta.insert(
             "fields",
@@ -248,26 +360,105 @@ impl Session {
             ),
         );
         meta.insert("t_first", t_first_ms);
-        meta.insert("qid", 0i64);
-        self.stream = Some(stream);
-        self.state = State::Streaming;
+        meta.insert("qid", qid);
+        self.streams.push((qid, stream));
+        self.state = if self.in_transaction() {
+            State::TxStreaming
+        } else {
+            State::Streaming
+        };
         Response::success(meta)
     }
 
-    /// The RUN handed out via [`Turn::Execute`] failed.
+    /// The RUN handed out via [`Turn::Execute`] failed. Inside a
+    /// transaction this poisons the whole transaction (the caller drops
+    /// its state; the client recovers with RESET), matching Bolt.
     pub fn run_failed(&mut self, code: impl Into<String>, message: impl Into<String>) -> Response {
         self.state = State::Failed;
-        self.stream = None;
+        self.streams.clear();
         Response::Failure {
             code: code.into(),
             message: message.into(),
         }
     }
 
-    fn serve_pull(&mut self, n: i64) -> Vec<Response> {
-        let Some(stream) = self.stream.as_mut() else {
-            return vec![Response::failure(CODE_INVALID, "no result stream")];
+    /// The BEGIN handed out via [`Turn::Begin`] succeeded.
+    pub fn begin_succeeded(&mut self) -> Response {
+        self.state = State::TxReady;
+        Response::success_empty()
+    }
+
+    /// The BEGIN handed out via [`Turn::Begin`] failed.
+    pub fn begin_failed(
+        &mut self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Response {
+        self.state = State::Failed;
+        Response::Failure {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The COMMIT handed out via [`Turn::Commit`] succeeded. `bookmark`
+    /// (when given) is surfaced in the SUCCESS metadata; drivers thread it
+    /// through causal chaining.
+    pub fn commit_succeeded(&mut self, bookmark: Option<String>) -> Response {
+        self.state = State::Ready;
+        let mut meta = MapValue::new();
+        if let Some(bookmark) = bookmark {
+            meta.insert("bookmark", bookmark);
+        }
+        Response::success(meta)
+    }
+
+    /// The COMMIT handed out via [`Turn::Commit`] failed (e.g. an
+    /// optimistic-concurrency conflict — use a `Neo.TransientError.*`
+    /// code so managed transaction functions retry).
+    pub fn commit_failed(
+        &mut self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Response {
+        self.state = State::Failed;
+        Response::Failure {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The ROLLBACK handed out via [`Turn::Rollback`] completed.
+    pub fn rollback_done(&mut self) -> Response {
+        self.state = State::Ready;
+        Response::success_empty()
+    }
+
+    /// Resolve which buffered stream a PULL/DISCARD targets: explicit
+    /// non-negative `qid`, else the most recent.
+    fn stream_index(&self, extra: &MapValue) -> Option<usize> {
+        match extra.get_int("qid") {
+            Some(qid) if qid >= 0 => self.streams.iter().position(|(q, _)| *q == qid),
+            _ => self.streams.len().checked_sub(1),
+        }
+    }
+
+    fn after_stream_close(&mut self) {
+        if self.streams.is_empty() {
+            self.state = if self.in_transaction() {
+                State::TxReady
+            } else {
+                State::Ready
+            };
+        }
+    }
+
+    fn serve_pull(&mut self, extra: &MapValue) -> Vec<Response> {
+        let n = extra.get_int("n").unwrap_or(-1);
+        let Some(idx) = self.stream_index(extra) else {
+            return vec![Response::failure(CODE_INVALID, "no such result stream")];
         };
+        let stream = &mut self.streams[idx].1;
         let take = if n < 0 {
             stream.rows.len()
         } else {
@@ -282,8 +473,8 @@ impl Session {
             let mut summary = std::mem::take(&mut stream.summary);
             summary.insert("has_more", false);
             replies.push(Response::success(summary));
-            self.stream = None;
-            self.state = State::Ready;
+            self.streams.remove(idx);
+            self.after_stream_close();
         } else {
             let mut meta = MapValue::new();
             meta.insert("has_more", true);
@@ -292,10 +483,12 @@ impl Session {
         replies
     }
 
-    fn serve_discard(&mut self, n: i64) -> Response {
-        let Some(stream) = self.stream.as_mut() else {
-            return Response::failure(CODE_INVALID, "no result stream");
+    fn serve_discard(&mut self, extra: &MapValue) -> Response {
+        let n = extra.get_int("n").unwrap_or(-1);
+        let Some(idx) = self.stream_index(extra) else {
+            return Response::failure(CODE_INVALID, "no such result stream");
         };
+        let stream = &mut self.streams[idx].1;
         let drop_n = if n < 0 {
             stream.rows.len()
         } else {
@@ -305,8 +498,8 @@ impl Session {
         if stream.rows.is_empty() {
             let mut summary = std::mem::take(&mut stream.summary);
             summary.insert("has_more", false);
-            self.stream = None;
-            self.state = State::Ready;
+            self.streams.remove(idx);
+            self.after_stream_close();
             Response::success(summary)
         } else {
             let mut meta = MapValue::new();
@@ -317,7 +510,7 @@ impl Session {
 
     fn fail(&mut self, failure: Response) -> Turn {
         self.state = State::Failed;
-        self.stream = None;
+        self.streams.clear();
         Turn::Reply(vec![failure])
     }
 
@@ -421,14 +614,31 @@ mod tests {
         Request::Pull { extra }
     }
 
-    fn three_row_stream() -> ResultStream {
+    fn pull_qid(n: i64, qid: i64) -> Request {
+        let mut extra = MapValue::new();
+        extra.insert("n", n);
+        extra.insert("qid", qid);
+        Request::Pull { extra }
+    }
+
+    fn begin() -> Request {
+        Request::Begin {
+            extra: MapValue::new(),
+        }
+    }
+
+    fn stream_of(rows: std::ops::RangeInclusive<i64>) -> ResultStream {
         let mut summary = MapValue::new();
         summary.insert("type", "r");
         ResultStream {
             fields: vec!["x".into()],
-            rows: (1..=3).map(|i| vec![Value::Integer(i)]).collect(),
+            rows: rows.map(|i| vec![Value::Integer(i)]).collect(),
             summary,
         }
+    }
+
+    fn three_row_stream() -> ResultStream {
+        stream_of(1..=3)
     }
 
     #[test]
@@ -530,32 +740,6 @@ mod tests {
     }
 
     #[test]
-    fn begin_fails_clearly_and_reset_recovers() {
-        let mut s = ready_session_54();
-        let Turn::Reply(replies) = s.on_request(Request::Begin {
-            extra: MapValue::new(),
-        }) else {
-            panic!()
-        };
-        let Response::Failure { code, message } = &replies[0] else {
-            panic!()
-        };
-        assert_eq!(code, "Neo.ClientError.Statement.TypeError");
-        assert!(message.contains("not supported"));
-
-        // Everything is IGNORED until RESET.
-        assert_eq!(
-            s.on_request(run_req("q")),
-            Turn::Reply(vec![Response::Ignored])
-        );
-        assert_eq!(
-            s.on_request(Request::Reset),
-            Turn::Reply(vec![Response::success_empty()])
-        );
-        assert!(matches!(s.on_request(run_req("q")), Turn::Execute(_)));
-    }
-
-    #[test]
     fn run_failure_ignores_pipelined_pull() {
         let mut s = ready_session_54();
         s.on_request(run_req("bad query"));
@@ -563,6 +747,13 @@ mod tests {
         assert!(matches!(failure, Response::Failure { .. }));
         // The pipelined PULL that followed the RUN must be IGNORED.
         assert_eq!(s.on_request(pull(-1)), Turn::Reply(vec![Response::Ignored]));
+
+        // RESET recovers.
+        assert_eq!(
+            s.on_request(Request::Reset),
+            Turn::Reset(vec![Response::success_empty()])
+        );
+        assert!(matches!(s.on_request(run_req("q")), Turn::Execute(_)));
     }
 
     #[test]
@@ -655,5 +846,168 @@ mod tests {
             panic!()
         };
         assert_eq!(servers.len(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Explicit transactions
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn begin_run_commit_lifecycle() {
+        let mut s = ready_session_54();
+
+        let Turn::Begin(begin_req) = s.on_request(begin()) else {
+            panic!("expected Turn::Begin")
+        };
+        assert_eq!(begin_req.db.as_deref(), Some("test:main"));
+        assert!(matches!(s.begin_succeeded(), Response::Success(_)));
+        assert!(s.in_transaction());
+
+        // RUN inside the transaction.
+        assert!(matches!(
+            s.on_request(run_req("CREATE (:X)")),
+            Turn::Execute(_)
+        ));
+        s.run_succeeded(ResultStream::default(), 0);
+        let Turn::Reply(replies) = s.on_request(pull(-1)) else {
+            panic!()
+        };
+        assert!(matches!(replies.last(), Some(Response::Success(_))));
+        assert!(s.in_transaction(), "still in tx after draining a result");
+
+        // COMMIT.
+        assert_eq!(s.on_request(Request::Commit), Turn::Commit);
+        let reply = s.commit_succeeded(Some("fluree:t:7".into()));
+        let Response::Success(meta) = &reply else {
+            panic!()
+        };
+        assert_eq!(meta.get_str("bookmark"), Some("fluree:t:7"));
+        assert!(!s.in_transaction());
+        // Session is reusable.
+        assert!(matches!(s.on_request(run_req("q")), Turn::Execute(_)));
+    }
+
+    #[test]
+    fn rollback_returns_to_ready() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        s.begin_succeeded();
+        assert_eq!(s.on_request(Request::Rollback), Turn::Rollback);
+        assert!(matches!(s.rollback_done(), Response::Success(_)));
+        assert!(!s.in_transaction());
+    }
+
+    #[test]
+    fn nested_begin_fails() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        s.begin_succeeded();
+        let Turn::Reply(replies) = s.on_request(begin()) else {
+            panic!()
+        };
+        assert!(matches!(replies[0], Response::Failure { .. }));
+    }
+
+    #[test]
+    fn commit_outside_transaction_fails() {
+        let mut s = ready_session_54();
+        let Turn::Reply(replies) = s.on_request(Request::Commit) else {
+            panic!()
+        };
+        assert!(matches!(replies[0], Response::Failure { .. }));
+    }
+
+    #[test]
+    fn multiple_tx_results_addressed_by_qid() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        s.begin_succeeded();
+
+        s.on_request(run_req("q1"));
+        let Response::Success(meta1) = s.run_succeeded(stream_of(1..=2), 0) else {
+            panic!()
+        };
+        let qid1 = meta1.get_int("qid").unwrap();
+
+        s.on_request(run_req("q2"));
+        let Response::Success(meta2) = s.run_succeeded(stream_of(10..=11), 0) else {
+            panic!()
+        };
+        let qid2 = meta2.get_int("qid").unwrap();
+        assert_ne!(qid1, qid2);
+
+        // Pull the FIRST stream explicitly by qid.
+        let Turn::Reply(replies) = s.on_request(pull_qid(-1, qid1)) else {
+            panic!()
+        };
+        assert_eq!(replies.len(), 3); // 2 records + summary
+        assert_eq!(
+            replies[0],
+            Response::Record(vec![Value::Integer(1)]),
+            "qid must address the first stream"
+        );
+        assert!(s.in_transaction());
+
+        // Default PULL now drains the remaining (latest) stream.
+        let Turn::Reply(replies) = s.on_request(pull(-1)) else {
+            panic!()
+        };
+        assert_eq!(replies[0], Response::Record(vec![Value::Integer(10)]));
+        // All streams drained: back to TxReady, still in the transaction.
+        assert!(s.in_transaction());
+        assert!(matches!(s.on_request(Request::Commit), Turn::Commit));
+    }
+
+    #[test]
+    fn commit_with_unconsumed_results_discards_them() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        s.begin_succeeded();
+        s.on_request(run_req("q"));
+        s.run_succeeded(three_row_stream(), 0);
+        assert_eq!(s.on_request(Request::Commit), Turn::Commit);
+        s.commit_succeeded(None);
+        assert!(!s.in_transaction());
+    }
+
+    #[test]
+    fn tx_statement_failure_poisons_until_reset() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        s.begin_succeeded();
+        s.on_request(run_req("bad"));
+        s.run_failed("Neo.ClientError.Statement.SyntaxError", "boom");
+
+        // COMMIT after an in-tx failure is IGNORED (driver must RESET).
+        assert_eq!(
+            s.on_request(Request::Commit),
+            Turn::Reply(vec![Response::Ignored])
+        );
+        let turn = s.on_request(Request::Reset);
+        assert!(matches!(turn, Turn::Reset(_)), "reset drops the tx");
+        assert!(!s.in_transaction());
+        assert!(matches!(s.on_request(run_req("q")), Turn::Execute(_)));
+    }
+
+    #[test]
+    fn reset_mid_transaction_signals_caller() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        s.begin_succeeded();
+        let turn = s.on_request(Request::Reset);
+        assert_eq!(turn, Turn::Reset(vec![Response::success_empty()]));
+        assert!(!s.in_transaction());
+    }
+
+    #[test]
+    fn begin_failure_poisons_session() {
+        let mut s = ready_session_54();
+        s.on_request(begin());
+        let reply = s.begin_failed("Neo.ClientError.Request.Invalid", "no tx here");
+        assert!(matches!(reply, Response::Failure { .. }));
+        assert_eq!(
+            s.on_request(run_req("q")),
+            Turn::Reply(vec![Response::Ignored])
+        );
     }
 }

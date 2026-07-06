@@ -43,6 +43,7 @@ pub mod config_resolver;
 pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
+pub mod cypher_txn;
 pub mod cypher_write;
 pub mod dataset;
 mod error;
