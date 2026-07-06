@@ -226,3 +226,140 @@ async fn cypher_indexed_whole_graph_count_declines_on_edge_annotations() {
         "annotated graph: fold must defer to the pipeline"
     );
 }
+
+/// Incrementally-built indexes currently persist delta-only per-graph
+/// property stats (base entries lost; net-zero churn kept at count 0). The
+/// folds must stay correct anyway: COUNT(DISTINCT ?p) always walks PSOT
+/// directories, and the whole-graph fold's hidden-predicate gate checks the
+/// predicate dictionary rather than the stats. This drives the corruption
+/// trigger — full index, then writes (new predicate, net-zero churn, a
+/// reified edge), then an incremental index — and pins fold == pipeline.
+#[tokio::test]
+async fn folds_stay_correct_on_incremental_index() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:incremental-stats";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx = json!({"ex": "http://example.org/"});
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 30, "ex:score": 1},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Post-index novelty: a brand-new predicate + class...
+    let ledger2 = fluree
+        .insert(
+            ledger1,
+            &json!({
+                "@context": ctx,
+                "@id": "ex:w1", "@type": "ex:Widget", "ex:brandnew": 7
+            }),
+        )
+        .await
+        .expect("new predicate")
+        .ledger;
+    // ...net-zero churn on ex:score (retract 1, assert 2 — count unchanged)...
+    let ledger3 = fluree
+        .update(
+            ledger2,
+            &json!({
+                "@context": ctx,
+                "delete": [{"@id": "ex:alice", "ex:score": 1}],
+                "insert": [{"@id": "ex:alice", "ex:score": 2}]
+            }),
+        )
+        .await
+        .expect("churn")
+        .ledger;
+    // ...and a reified edge (f:reifies* enters the predicate dictionary).
+    let _ledger4 = fluree
+        .insert(
+            ledger3,
+            &json!({
+                "@context": ctx,
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}}
+            }),
+        )
+        .await
+        .expect("annotated edge")
+        .ledger;
+
+    // Incremental index (base exists, small commit gap → incremental path).
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("incremental view");
+
+    // COUNT(DISTINCT ?p): the fold's PSOT directory walk vs the general
+    // pipeline (GROUP BY blocks the distinct-count fold).
+    let folded = fluree
+        .query(
+            &db,
+            fluree_db_api::QueryInput::Sparql(
+                "SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }",
+            ),
+        )
+        .await
+        .expect("distinct preds")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let truth = fluree
+        .query(
+            &db,
+            fluree_db_api::QueryInput::Sparql("SELECT ?p WHERE { ?s ?p ?o } GROUP BY ?p"),
+        )
+        .await
+        .expect("preds truth")
+        .row_count();
+    assert_eq!(
+        folded[0][0].as_i64(),
+        Some(truth as i64),
+        "COUNT(DISTINCT ?p) fold vs pipeline: {folded} vs {truth}"
+    );
+
+    // Whole-graph count: reifies facts are in the dictionary, so the fold
+    // must decline (dict-based gate) — and agree with the WITH-blocked
+    // pipeline either way.
+    let count_fold = fluree
+        .query_cypher(&db, "MATCH (n) RETURN count(n) AS c")
+        .await
+        .expect("count")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cj");
+    let count_truth = fluree
+        .query_cypher(&db, "MATCH (n) WITH n RETURN count(n) AS c")
+        .await
+        .expect("count truth")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cj");
+    assert_eq!(
+        count_fold["results"][0]["data"][0]["row"], count_truth["results"][0]["data"][0]["row"],
+        "whole-graph count on incremental+reified store"
+    );
+
+    // Class-anchored histogram still folds correctly on the incremental
+    // index (class stats are maintained incrementally).
+    let hist = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN n.age, COUNT(*)")
+        .await
+        .expect("hist")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cj");
+    let rows = hist["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "{hist}");
+}

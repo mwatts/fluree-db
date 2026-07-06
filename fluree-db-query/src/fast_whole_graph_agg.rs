@@ -662,32 +662,27 @@ fn compute_task(
     }
 }
 
-/// Whether the graph carries any predicate the variable-predicate scan hides —
-/// `f:reifies*` in every graph, the broader `f:` namespace in the default
-/// graph (mirrors `BinaryScanOperator::is_internal_predicate`). Such facts are
-/// invisible to the `?n ?p ?o` pipeline but present in the SPOT directories
-/// this fold reads, so their presence makes the fold inexact. Errs toward
-/// declining when the per-graph stats are unavailable.
-fn graph_has_scan_hidden_predicates(
+/// Whether the store's predicate dictionary contains any predicate the
+/// variable-predicate scan hides — `f:reifies*` in every graph, the broader
+/// `f:` namespace in the default graph (mirrors
+/// `BinaryScanOperator::is_internal_predicate`). Such facts are invisible to
+/// the `?n ?p ?o` pipeline but present in the SPOT directories this fold
+/// reads, so their presence makes the fold inexact.
+///
+/// Deliberately checks the **dictionary**, not the per-graph stats: the
+/// incremental index build currently persists delta-only per-graph property
+/// stats (base entries lost), so a stats-driven check can silently pass on a
+/// graph that does carry hidden facts. Dictionary membership over-declines
+/// only when every row of a hidden predicate has been retracted — the safe
+/// direction. The predicate dictionary is small (one entry per predicate
+/// ever used), so the walk is trivial.
+pub(crate) fn graph_has_scan_hidden_predicates(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &BinaryIndexStore,
 ) -> Result<bool> {
-    let Some(graphs) = ctx
-        .active_snapshot
-        .stats
-        .as_ref()
-        .and_then(|s| s.graphs.as_ref())
-    else {
-        return Ok(true);
-    };
-    let Some(g) = graphs.iter().find(|g| g.g_id == ctx.binary_g_id) else {
-        return Ok(true);
-    };
-    for prop in &g.properties {
-        if prop.count == 0 {
-            continue;
-        }
-        let Some(sid) = store.predicate_sid(prop.p_id) else {
+    for p_id in 0..store.predicate_count() {
+        let Some(sid) = store.predicate_sid(p_id) else {
+            // Unresolvable dictionary entry — err toward declining.
             return Ok(true);
         };
         if fluree_db_core::is_reserved_reifies_predicate(&sid)
