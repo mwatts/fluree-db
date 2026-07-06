@@ -39,6 +39,31 @@ impl super::Parser<'_> {
     pub(super) fn parse_group_graph_pattern(&mut self) -> Option<GraphPattern> {
         let start = self.stream.previous_span(); // The opening brace
 
+        // SPARQL grammar: GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}'
+        //
+        // The opening '{' has already been consumed by the caller, so a leading
+        // SELECT means this brace encloses a *sub-SELECT*, not a basic graph
+        // pattern. Detecting it here — rather than only in the nested-'{' branch
+        // of the loop below — is what makes a sub-SELECT a legal operand in EVERY
+        // position that admits a group: OPTIONAL, GRAPH, SERVICE, the right arm of
+        // MINUS, and every arm of UNION (and, via the free `parse_group_graph_pattern`
+        // wrapper, EXISTS / NOT EXISTS). Previously those positions consumed the
+        // '{' and called straight into the loop, which only recognises a
+        // sub-SELECT after itself consuming a nested '{'; the leading SELECT was
+        // therefore treated as an unexpected token and the projection was dropped.
+        // `parse_subquery` consumes through the matching closing '}'.
+        if self.stream.check_keyword(TokenKind::KwSelect) {
+            return self.parse_subquery(start).or_else(|| {
+                // Malformed sub-SELECT: skip to the matching '}' so its tokens
+                // don't leak into the enclosing scope. The opening brace was
+                // already consumed by the caller, so `skip_balanced` starts at
+                // depth 1 (mirrors the recovery the '{' branch performed before).
+                self.stream
+                    .skip_balanced(&TokenKind::LBrace, &TokenKind::RBrace);
+                None
+            });
+        }
+
         let mut patterns: Vec<GraphPattern> = Vec::new();
         let mut current_triples: Vec<crate::ast::TriplePattern> = Vec::new();
 
@@ -113,24 +138,20 @@ impl super::Parser<'_> {
                     patterns.push(values);
                 }
             } else if self.stream.check(&TokenKind::LBrace) {
-                // Nested group or subquery
+                // Nested group or sub-SELECT.
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
-                let brace_span = self.stream.current_span();
                 self.stream.advance(); // consume {
 
-                // Check if this is a subquery: { SELECT ... }
-                if self.stream.check_keyword(TokenKind::KwSelect) {
-                    if let Some(subquery) = self.parse_subquery(brace_span) {
-                        patterns.push(subquery);
-                    } else {
-                        // Subquery parse failed — skip to matching } to prevent
-                        // the unparsed tokens from leaking into the outer scope.
-                        self.stream
-                            .skip_balanced(&TokenKind::LBrace, &TokenKind::RBrace);
-                    }
-                } else if let Some(inner) = self.parse_group_graph_pattern() {
-                    // Check for UNION after the group
+                // `parse_group_graph_pattern` handles BOTH a basic group and a
+                // `{ SELECT ... }` sub-SELECT (see the SubSelect check at its
+                // top). Either is a valid left operand of a UNION, so the
+                // trailing-UNION check below must run for both. Previously the
+                // sub-SELECT case pushed the subquery and skipped this check, so
+                // `{ SELECT ... } UNION { ... }` silently dropped the UNION (the
+                // `UNION` token then hit "UNION must follow a pattern" and was
+                // discarded, leaving two independent patterns).
+                if let Some(inner) = self.parse_group_graph_pattern() {
                     if self.stream.check_keyword(TokenKind::KwUnion) {
                         if let Some(union) = self.parse_union_continuation(inner) {
                             patterns.push(union);
