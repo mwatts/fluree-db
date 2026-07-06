@@ -178,6 +178,14 @@ struct Parser<'a> {
     /// object/subject term. The enclosing object-list / triples-block parser
     /// drains these into its BGP once the term that produced them is placed.
     pending_bnpl_triples: Vec<TriplePattern>,
+    /// Non-triple graph patterns produced while parsing an object/subject
+    /// term: a property path used as the verb inside a blank-node property
+    /// list (`[ :p|:q ?x ]`) emits a `GraphPattern::Path`, which cannot ride
+    /// the `pending_bnpl_triples` channel. Drained alongside the triples by
+    /// the enclosing triples-block / path-object-list parser; template
+    /// contexts (CONSTRUCT, INSERT/DELETE) reject a non-empty channel since
+    /// paths are not legal there.
+    pending_bnpl_patterns: Vec<GraphPattern>,
 }
 
 impl<'a> Parser<'a> {
@@ -186,6 +194,7 @@ impl<'a> Parser<'a> {
             stream,
             bnode_counter: 0,
             pending_bnpl_triples: Vec::new(),
+            pending_bnpl_patterns: Vec::new(),
         }
     }
 
