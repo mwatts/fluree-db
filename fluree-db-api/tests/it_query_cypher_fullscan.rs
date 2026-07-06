@@ -301,6 +301,32 @@ async fn folds_stay_correct_on_incremental_index() {
     support::build_and_publish_index(&fluree, ledger_id).await;
     let db = fluree.db(ledger_id).await.expect("incremental view");
 
+    // The incremental root must carry the BASE per-graph property stats
+    // forward, not just the novelty deltas: every property entry sums to the
+    // graph's flake total. (The regression dropped base entries and kept
+    // net-zero churn at count 0 — the sums diverged immediately.)
+    let stats = db.snapshot.stats.as_ref().expect("index stats");
+    let g0 = stats
+        .graphs
+        .as_ref()
+        .expect("per-graph stats")
+        .iter()
+        .find(|g| g.g_id == 0)
+        .expect("default graph stats");
+    let prop_sum: u64 = g0.properties.iter().map(|p| p.count).sum();
+    assert_eq!(
+        prop_sum, g0.flakes,
+        "per-graph property counts must cover all flakes (delta-only stats?)"
+    );
+    assert!(
+        g0.properties.iter().all(|p| p.count > 0),
+        "net-zero churn must keep the base count, not zero: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.count))
+            .collect::<Vec<_>>()
+    );
+
     // COUNT(DISTINCT ?p): the fold's PSOT directory walk vs the general
     // pipeline (GROUP BY blocks the distinct-count fold).
     let folded = fluree
