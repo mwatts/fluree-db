@@ -237,8 +237,8 @@ fn lower_node<E: IriEncoder>(
     // Labels — emit `s rdf:type <label-iri>` for each.
     for Label { name, .. } in &n.labels {
         let iri = ctx.resolve_iri(name);
-        let pred = Ref::Iri(ctx.rdf_type_iri().into());
-        let obj = Term::Iri(iri.into());
+        let pred = ctx.iri_ref(ctx.rdf_type_iri().to_string());
+        let obj = ctx.iri_term(iri);
         out.push(Pattern::Triple(TriplePattern::new(subj.clone(), pred, obj)));
     }
 
@@ -258,7 +258,7 @@ fn lower_inline_props<E: IriEncoder>(
 ) -> Result<()> {
     for (key, val_expr) in &props.entries {
         let pred_iri = ctx.resolve_predicate(key)?;
-        let pred = Ref::Iri(pred_iri.into());
+        let pred = ctx.iri_ref(pred_iri);
         let obj = expr_to_object_term(ctx, val_expr)?;
         out.push(Pattern::Triple(TriplePattern::new(subj.clone(), pred, obj)));
     }
@@ -338,7 +338,7 @@ fn build_rel_hop<E: IriEncoder>(
         }
         1 => {
             let iri = ctx.resolve_predicate(&rel.types[0].name)?;
-            Ref::Iri(iri.into())
+            ctx.iri_ref(iri)
         }
         _ => {
             // Alternation — a `Union` of one concrete-predicate branch per
@@ -347,12 +347,13 @@ fn build_rel_hop<E: IriEncoder>(
             let mut branches: Vec<Vec<Pattern>> = Vec::with_capacity(rel.types.len());
             for t in &rel.types {
                 let iri = ctx.resolve_predicate(&t.name)?;
+                let pred = ctx.iri_ref(iri);
                 let mut branch = Vec::new();
                 push_rel_triple(
                     ctx,
                     &rel.var,
                     &rel.props,
-                    Ref::Iri(iri.into()),
+                    pred,
                     s.clone(),
                     o.clone(),
                     &mut branch,
@@ -702,7 +703,13 @@ fn build_fixed_chain<E: IriEncoder>(
         } else {
             Ref::Var(ctx.fresh_synth())
         };
-        push_hop(&prev, &next, type_iri, direction, &mut chain);
+        push_hop(
+            &prev,
+            &next,
+            ctx.iri_ref(type_iri.to_string()),
+            direction,
+            &mut chain,
+        );
         nodes.push(next.clone());
         prev = next;
     }
@@ -852,8 +859,7 @@ fn empty_path_result(s: &Ref, o: &Ref) -> Pattern {
 
 /// Push one hop between `a` and `b`. Directed hops emit a single triple;
 /// undirected hops emit a forward∪reverse `Union`.
-fn push_hop(a: &Ref, b: &Ref, type_iri: &str, direction: Direction, out: &mut Vec<Pattern>) {
-    let pred = Ref::Iri(type_iri.into());
+fn push_hop(a: &Ref, b: &Ref, pred: Ref, direction: Direction, out: &mut Vec<Pattern>) {
     let fwd = || {
         Pattern::Triple(TriplePattern::new(
             a.clone(),
@@ -996,7 +1002,7 @@ fn build_annotation_body<E: IriEncoder>(
     if let Some(map) = props {
         for (key, val_expr) in &map.entries {
             let pred_iri = ctx.resolve_predicate(key)?;
-            let pred = Ref::Iri(pred_iri.into());
+            let pred = ctx.iri_ref(pred_iri);
             let obj = expr_to_object_term(ctx, val_expr)?;
             body.push(Pattern::Triple(TriplePattern::new(ann.clone(), pred, obj)));
         }

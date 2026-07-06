@@ -519,7 +519,7 @@ pub(crate) fn resolve_property_accessor<E: IriEncoder>(
         aux.push(Pattern::Optional(vec![Pattern::Triple(
             TriplePattern::new(
                 Ref::Var(target_id),
-                Ref::Iri(pred_iri.into()),
+                ctx.iri_ref(pred_iri),
                 Term::Var(prop_var),
             ),
         )]));

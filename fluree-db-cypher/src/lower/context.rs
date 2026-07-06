@@ -161,4 +161,24 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     pub fn rdf_type_iri(&self) -> &'static str {
         rdf::TYPE
     }
+
+    /// Lower a resolved IRI to a pattern `Ref`, encoding to `Ref::Sid` when
+    /// the namespace is registered (parity with the SPARQL lowering — the
+    /// planner's stats lookups and the batched join lanes are Sid-gated and
+    /// silently degrade to per-row paths on `Ref::Iri`). Unregistered
+    /// namespaces stay `Ref::Iri`, which matches nothing at scan time.
+    pub fn iri_ref(&self, iri: String) -> fluree_db_query::ir::Ref {
+        match self.encoder.encode_iri_strict(&iri) {
+            Some(sid) => fluree_db_query::ir::Ref::Sid(sid),
+            None => fluree_db_query::ir::Ref::Iri(iri.into()),
+        }
+    }
+
+    /// Object-position counterpart of [`Self::iri_ref`].
+    pub fn iri_term(&self, iri: String) -> fluree_db_query::ir::Term {
+        match self.encoder.encode_iri_strict(&iri) {
+            Some(sid) => fluree_db_query::ir::Term::Sid(sid),
+            None => fluree_db_query::ir::Term::Iri(iri.into()),
+        }
+    }
 }

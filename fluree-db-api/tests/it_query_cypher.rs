@@ -6697,3 +6697,45 @@ async fn cypher_power_binds_tighter_than_unary_minus() {
         );
     }
 }
+
+#[tokio::test]
+async fn cypher_explain_reports_sid_encoded_plan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:explain");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:id": 7,
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let explain = fluree_db_api::explain::explain_cypher(
+        &db.snapshot,
+        "MATCH (n:Person {id: 7}) RETURN n",
+        db.default_context.as_ref(),
+    )
+    .await
+    .expect("explain");
+
+    // The lowering must encode registered-namespace IRIs to SIDs (parity
+    // with SPARQL) — Sid-gated planner analyses and batched join lanes
+    // depend on it. The physical PropertyJoin renders Sid predicates in
+    // `ns:name` form; an unencoded pattern would render the full IRI.
+    let physical = serde_json::to_string(&explain["plan"]["physical"]).expect("physical");
+    assert!(physical.contains("PropertyJoinOperator"), "{explain}");
+    assert!(
+        physical.contains("3:type"),
+        "rdf:type not SID-encoded: {explain}"
+    );
+    assert!(
+        !physical.contains("http://example.org/id"),
+        "id not SID-encoded: {explain}"
+    );
+}
