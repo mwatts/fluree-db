@@ -909,3 +909,74 @@ async fn bolt_indexed_node_structures_via_batched_crawl() {
         Value::String("http://example.org/alice".into())
     );
 }
+
+/// The reified-edge gate's tiers, end to end. On an indexed ledger with no
+/// annotations the per-hop probe is skipped (bound edge vars synthesize
+/// their value — properties empty). An annotation inserted into novelty
+/// afterwards must REOPEN the gate (tier 3, the overlay walk): the bound
+/// edge var binds the annotation and exposes its properties. A closed gate
+/// that failed to reopen would silently drop annotation bindings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_reified_edge_gate_reopens_for_novelty_annotations() {
+    let (_tmp, state, addr) = bolt_server(LEDGER).await;
+    state
+        .fluree
+        .reindex(LEDGER, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let (mut client, _) = BoltClient::connect(addr, [0, 0, 4, 5]).await;
+    client.ready(true).await;
+
+    // Tier 2 closed: no annotations anywhere — bound edge var synthesizes.
+    client
+        .run(
+            r#"MATCH (a:Person {name: "Alice"})-[e:knows]->(b) RETURN e"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    let rel = as_structure(&records[0][0]);
+    assert_eq!(rel.signature, SIG_RELATIONSHIP);
+    let Value::Map(props) = &rel.fields[4] else {
+        panic!("rel props")
+    };
+    assert!(props.is_empty(), "unannotated edge has no properties");
+
+    // Insert an annotated edge into NOVELTY (post-index): tier 3 must
+    // reopen the gate via the overlay walk.
+    insert(
+        &state,
+        LEDGER,
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:alice",
+            "ex:likes": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}}
+        }),
+    )
+    .await;
+
+    client
+        .run(
+            r#"MATCH (a:Person {name: "Alice"})-[e:likes]->(b) RETURN e"#,
+            MapValue::new(),
+            LEDGER,
+        )
+        .await
+        .assert_success();
+    let (records, _) = client.pull(-1).await;
+    assert_eq!(records.len(), 1, "annotated edge matches");
+    let rel = as_structure(&records[0][0]);
+    assert_eq!(rel.signature, SIG_RELATIONSHIP);
+    assert_eq!(rel.fields[3], Value::String("likes".into()));
+    let Value::Map(props) = &rel.fields[4] else {
+        panic!("rel props")
+    };
+    assert_eq!(
+        props.get_int("since"),
+        Some(2020),
+        "novelty annotation must bind through the reopened gate: {props:?}"
+    );
+}

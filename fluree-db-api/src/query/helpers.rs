@@ -111,9 +111,10 @@ pub(crate) fn parse_cypher_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
 ) -> Result<(VarRegistry, Query)> {
     let ast = substituted_cypher_ast(cypher, params)?;
-    lower_cypher_ast_to_ir(&ast, snapshot, default_context)
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay)
 }
 
 /// Statements longer than this are parsed but never cached: unique bulk
@@ -206,6 +207,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
     ast: &fluree_db_cypher::CypherAst,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the
@@ -216,12 +218,94 @@ pub(crate) fn lower_cypher_ast_to_ir(
     let mut vars = VarRegistry::new();
     let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
         .with_vocab(vocab)
-        .with_allow_full_scan(cypher_full_scan_enabled());
+        .with_allow_full_scan(cypher_full_scan_enabled())
+        .with_reified_edges_possible(reified_edges_possible(snapshot, overlay));
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
     let parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
     Ok((vars, parsed))
+}
+
+/// Whether any reified edge can exist in the queried view — the gate for
+/// value-only bound relationship variables' per-hop OPTIONAL annotation
+/// probe. Three tiers, each conservative (`true`) when it can't decide:
+///
+/// 1. Dictionary: `f:reifiesSubject` never entered the dictionary — no
+///    annotation was ever written; certain `false`.
+/// 2. Index stats: per-property counts show `f:reifiesSubject` facts.
+/// 3. Overlay: one PSOT walk answering "any `f:reifiesSubject` flake in
+///    novelty?", cached process-wide on `content_version` — callers that
+///    can't supply the overlay stay conservative.
+fn reified_edges_possible(
+    snapshot: &LedgerSnapshot,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+) -> bool {
+    let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::reifies_iris::SUBJECT) else {
+        return false;
+    };
+    if index_has_reified_edges(snapshot, &reifies_sid) {
+        return true;
+    }
+    match overlay {
+        None => true,
+        Some((overlay, g_id)) => overlay_has_reified_edges(overlay, g_id, &reifies_sid),
+    }
+}
+
+fn index_has_reified_edges(snapshot: &LedgerSnapshot, reifies_sid: &fluree_db_core::Sid) -> bool {
+    let Some(stats) = &snapshot.stats else {
+        return true;
+    };
+    let Some(props) = &stats.properties else {
+        return true;
+    };
+    props.iter().any(|p| {
+        p.count > 0
+            && p.sid.0 == reifies_sid.namespace_code
+            && p.sid.1.as_str() == reifies_sid.name.as_ref()
+    })
+}
+
+fn overlay_has_reified_edges(
+    overlay: &dyn OverlayProvider,
+    g_id: u16,
+    reifies_sid: &fluree_db_core::Sid,
+) -> bool {
+    use std::sync::OnceLock;
+    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, u16), bool>>;
+    static CACHE: OnceLock<ReifiesCache> = OnceLock::new();
+
+    if overlay.is_effectively_empty() {
+        return false;
+    }
+    let Some(version) = overlay.content_version() else {
+        return true;
+    };
+    let cache = CACHE.get_or_init(|| {
+        parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8).expect("nonzero"),
+        ))
+    });
+    if let Some(&hit) = cache.lock().get(&(version, g_id)) {
+        return hit;
+    }
+    let mut found = false;
+    overlay.for_each_overlay_flake(
+        g_id,
+        fluree_db_core::IndexType::Psot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |flake| {
+            if flake.p == *reifies_sid {
+                found = true;
+            }
+        },
+    );
+    cache.lock().put((version, g_id), found);
+    found
 }
 
 /// Whether bare `MATCH (n)` whole-graph scans are opted in for Cypher

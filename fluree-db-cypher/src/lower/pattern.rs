@@ -991,12 +991,15 @@ fn push_rel_triple<E: IriEncoder>(
                 if let Ref::Var(pv) = &pred {
                     out.push(Pattern::Filter(untyped_edge_set_filter(ctx, *pv, &o)));
                 }
-                // `f:reifies*` absent from the dictionary ⇒ no edge in this
-                // ledger is reified ⇒ skip the per-edge annotation probe.
-                let expr = if ctx
-                    .encoder
-                    .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
-                    .is_some()
+                // Skip the per-edge annotation probe when no edge in this
+                // view can be reified: `f:reifies*` absent from the
+                // dictionary, or the caller proved (index stats + overlay)
+                // that no `f:reifies*` fact exists.
+                let expr = if ctx.reified_edges_possible
+                    && ctx
+                        .encoder
+                        .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
+                        .is_some()
                 {
                     let ann = ctx.fresh_synth();
                     out.push(Pattern::Optional(vec![Pattern::EdgeAnnotation {

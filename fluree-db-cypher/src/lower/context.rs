@@ -44,6 +44,13 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// scan is rarely what a production query intends; benchmarks and ad-hoc
     /// exploration opt in (server flag `FLUREE_CYPHER_ALLOW_FULL_SCAN`).
     pub allow_full_scan: bool,
+    /// Whether any reified edge can exist in the queried view. When the
+    /// caller proves it cannot (index stats + overlay both show no
+    /// `f:reifies*` facts), value-only bound relationship variables skip
+    /// the per-hop OPTIONAL annotation probe entirely. Defaults to `true`
+    /// (conservative): reified parallel edges must never be silently
+    /// dropped.
+    pub reified_edges_possible: bool,
     /// Whether chains of anonymous untyped hops (`-->()-->()-->(n)`) may
     /// lower to a single exact-depth wildcard path (frontier BFS with
     /// per-level dedup) instead of per-hop triple joins. Join chains produce
@@ -67,6 +74,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             scopes: Vec::new(),
             annotation_dependent: std::collections::HashSet::new(),
             allow_full_scan: false,
+            reified_edges_possible: true,
             fuse_reachability_chains: false,
         }
     }
@@ -74,6 +82,13 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     /// Opt in to whole-graph scans for bare `MATCH (n)` patterns.
     pub fn with_allow_full_scan(mut self, allow: bool) -> Self {
         self.allow_full_scan = allow;
+        self
+    }
+
+    /// Tell the lowering whether the queried view can contain reified
+    /// edges (see the field docs; `false` is a caller-proved guarantee).
+    pub fn with_reified_edges_possible(mut self, possible: bool) -> Self {
+        self.reified_edges_possible = possible;
         self
     }
 

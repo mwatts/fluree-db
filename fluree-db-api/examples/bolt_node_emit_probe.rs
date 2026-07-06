@@ -147,6 +147,20 @@ async fn main() {
         total * 1000.0 / iters as f64
     );
 
+    // Bound-edge-var pattern (task A): value-only edge vars add an OPTIONAL
+    // annotation probe per hop unless the gate proves no reified edges exist.
+    let pattern_q = "MATCH (a:User {id: 5})-[e1]->(b:User)-[e2]->(c:User) RETURN count(c) AS n";
+    let mut total = 0f64;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        std::hint::black_box(fluree.query_cypher(&db, pattern_q).await.expect("pattern"));
+        total += t0.elapsed().as_secs_f64();
+    }
+    eprintln!(
+        "bound-edge 2-hop pattern: {:.3} ms/iter",
+        total * 1000.0 / iters as f64
+    );
+
     // --- Live-novelty phase (the benchmark condition: writes ran, no
     // reindex). The per-subject gate must keep untouched subjects on the
     // batched lane, and touched subjects must render merged truth.

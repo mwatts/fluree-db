@@ -1339,3 +1339,72 @@ fn reserved_predicate_is_rejected_in_property_filter() {
     // protection kicks in.
     let _ = lower_cypher(&ast, &encoder, &mut vars);
 }
+
+/// Encoder stub whose dictionary "contains" every IRI — the reified-edges
+/// dictionary pre-gate passes, so the `reified_edges_possible` flag alone
+/// decides whether the per-hop annotation probe lowers.
+struct AllKnownEncoder;
+impl fluree_db_query::parse::encode::IriEncoder for AllKnownEncoder {
+    fn encode_iri(&self, iri: &str) -> Option<fluree_db_core::Sid> {
+        Some(fluree_db_core::Sid::new(1, iri))
+    }
+    fn encode_iri_strict(&self, iri: &str) -> Option<fluree_db_core::Sid> {
+        Some(fluree_db_core::Sid::new(1, iri))
+    }
+}
+
+fn lower_with_reified_flag(src: &str, possible: bool) -> fluree_db_query::ir::Query {
+    let out = parse_cypher(src);
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+    let ast = out.ast.expect("ast");
+    let encoder = AllKnownEncoder;
+    let mut vars = VarRegistry::new();
+    let mut ctx = LoweringContext::new(&encoder, &mut vars).with_reified_edges_possible(possible);
+    lower_cypher_with_context(&ast, &mut ctx).expect("lower")
+}
+
+fn count_optionals(patterns: &[Pattern]) -> usize {
+    patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::Optional(_)))
+        .count()
+}
+
+#[test]
+fn value_only_edge_var_probes_when_reified_edges_possible() {
+    let q = lower_with_reified_flag("MATCH (a)-[e:knows]->(b) RETURN e", true);
+    assert_eq!(
+        count_optionals(&q.patterns),
+        1,
+        "possible reified edges require the annotation probe: {:?}",
+        q.patterns
+    );
+}
+
+#[test]
+fn value_only_edge_var_skips_probe_when_no_reified_edges() {
+    let q = lower_with_reified_flag("MATCH (a)-[e:knows]->(b) RETURN e", false);
+    assert_eq!(
+        count_optionals(&q.patterns),
+        0,
+        "proved-absent reified edges must skip the probe: {:?}",
+        q.patterns
+    );
+    // The variable still binds (via the synthesized relationship value).
+    assert!(
+        q.patterns.iter().any(|p| matches!(p, Pattern::Bind { .. })),
+        "e must still bind: {:?}",
+        q.patterns
+    );
+}
+
+#[test]
+fn property_reading_edge_var_ignores_reified_gate() {
+    // `e.since` reads annotation properties — the gate must NOT change the
+    // annotation-only lowering (no silent wrong empty results).
+    let with_flag =
+        lower_with_reified_flag("MATCH (a)-[e:knows]->(b) WHERE e.since > 5 RETURN a", false);
+    let without_flag =
+        lower_with_reified_flag("MATCH (a)-[e:knows]->(b) WHERE e.since > 5 RETURN a", true);
+    assert_eq!(with_flag.patterns.len(), without_flag.patterns.len());
+}

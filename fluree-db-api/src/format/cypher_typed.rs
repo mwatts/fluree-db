@@ -269,10 +269,8 @@ fn binding_cell<'a>(
         }
         match binding {
             Binding::Unbound | Binding::Poisoned => Ok(CypherCell::Value(JsonValue::Null)),
-            Binding::Sid { sid, .. } => Ok(CypherCell::Node(Box::new(hydrator.node(sid).await?))),
-            Binding::IriMatch { primary_sid, .. } => Ok(CypherCell::Node(Box::new(
-                hydrator.node(primary_sid).await?,
-            ))),
+            Binding::Sid { sid, .. } => hydrator.subject_cell(sid).await,
+            Binding::IriMatch { primary_sid, .. } => hydrator.subject_cell(primary_sid).await,
             Binding::Rel(rel) => {
                 let start_iri = hydrator.compactor.decode_sid(&rel.start)?;
                 let end_iri = hydrator.compactor.decode_sid(&rel.end)?;
@@ -429,7 +427,16 @@ struct NodeHydrator<'a> {
     enforcer: Option<Arc<fluree_db_query::policy::QueryPolicyEnforcer>>,
     rdf_type: Option<Sid>,
     node_marker: Option<Sid>,
+    /// The `f:reifies{Subject,Predicate,Object}` predicate Sids (when the
+    /// dictionary knows them): a subject carrying these is an edge
+    /// annotation and renders as a Relationship, never a Node.
+    reifies_subject: Option<Sid>,
+    reifies_predicate: Option<Sid>,
+    reifies_object: Option<Sid>,
     cache: HashMap<Sid, CypherNode>,
+    /// Rendered top-level cells per subject (Node, or Relationship for
+    /// reifier subjects); what [`Self::subject_cell`] serves.
+    cell_cache: HashMap<Sid, CypherCell>,
     /// Raw subject flakes, shared by node hydration, annotation
     /// properties, and path nodes; populated in bulk by [`Self::prefetch`].
     flake_cache: HashMap<Sid, Arc<Vec<fluree_db_core::Flake>>>,
@@ -466,6 +473,14 @@ impl<'a> NodeHydrator<'a> {
             enforcer,
             rdf_type: view.snapshot.encode_iri(fluree_vocab::rdf::TYPE),
             node_marker: view.snapshot.encode_iri(fluree_vocab::fluree::NODE),
+            reifies_subject: view
+                .snapshot
+                .encode_iri(fluree_vocab::reifies_iris::SUBJECT),
+            reifies_predicate: view
+                .snapshot
+                .encode_iri(fluree_vocab::reifies_iris::PREDICATE),
+            reifies_object: view.snapshot.encode_iri(fluree_vocab::reifies_iris::OBJECT),
+            cell_cache: HashMap::new(),
             cache: HashMap::new(),
             flake_cache: HashMap::new(),
             key_names: HashMap::new(),
@@ -557,7 +572,7 @@ impl<'a> NodeHydrator<'a> {
         };
         let mut seen: std::collections::HashSet<Sid> = std::collections::HashSet::new();
         for subject in wanted {
-            if self.cache.contains_key(&subject.sid)
+            if self.cell_cache.contains_key(&subject.sid)
                 || self.flake_cache.contains_key(&subject.sid)
                 || !seen.insert(subject.sid.clone())
             {
@@ -619,12 +634,88 @@ impl<'a> NodeHydrator<'a> {
                 FormatError::InvalidBinding(format!("batched subject crawl failed: {e}"))
             })?;
 
+        let reifies_pids: Option<(u32, u32, u32)> = match (
+            self.reifies_subject.as_ref(),
+            self.reifies_predicate.as_ref(),
+            self.reifies_object.as_ref(),
+        ) {
+            (Some(rs), Some(rp), Some(ro)) => match (
+                store.sid_to_p_id(rs),
+                store.sid_to_p_id(rp),
+                store.sid_to_p_id(ro),
+            ) {
+                (Some(a), Some(b), Some(c)) => Some((a, b, c)),
+                _ => None,
+            },
+            _ => None,
+        };
         for (s_id, sid) in subjects {
             let rows = rows_by_subject.remove(&s_id).unwrap_or_default();
-            let node = self.node_from_rows(&sid, &rows, store.as_ref(), g_id)?;
-            self.cache.insert(sid, node);
+            let cell = if let Some(rel) =
+                self.relationship_from_rows(&sid, &rows, store.as_ref(), g_id, reifies_pids)?
+            {
+                CypherCell::Relationship(Box::new(rel))
+            } else {
+                let node = self.node_from_rows(&sid, &rows, store.as_ref(), g_id)?;
+                self.cache.insert(sid.clone(), node.clone());
+                CypherCell::Node(Box::new(node))
+            };
+            self.cell_cache.insert(sid, cell);
         }
         Ok(())
+    }
+
+    /// Detect and render a reifier subject from batched-crawl rows: present
+    /// `f:reifies{Subject,Predicate,Object}` rows with node-ref objects make
+    /// it a Relationship. Returns `None` for ordinary nodes.
+    fn relationship_from_rows(
+        &mut self,
+        sid: &Sid,
+        rows: &[(u32, u16, u64)],
+        store: &fluree_db_binary_index::BinaryIndexStore,
+        g_id: u16,
+        reifies_pids: Option<(u32, u32, u32)>,
+    ) -> Result<Option<CypherRelationship>> {
+        let Some((rs_pid, rp_pid, ro_pid)) = reifies_pids else {
+            return Ok(None);
+        };
+        let mut start = None;
+        let mut pred = None;
+        let mut end = None;
+        for &(p_id, o_type, o_key) in rows {
+            if p_id != rs_pid && p_id != rp_pid && p_id != ro_pid {
+                continue;
+            }
+            if !fluree_db_core::o_type::OType::from_u16(o_type).is_node_ref() {
+                continue;
+            }
+            let decoded = store
+                .decode_value_v3(o_type, o_key, p_id, g_id)
+                .map_err(|e| FormatError::InvalidBinding(format!("decode reifies ref: {e}")))?;
+            let FlakeValue::Ref(target) = decoded else {
+                continue;
+            };
+            if p_id == rs_pid {
+                start = Some(target);
+            } else if p_id == rp_pid {
+                pred = Some(target);
+            } else {
+                end = Some(target);
+            }
+        }
+        let (Some(start), Some(pred), Some(end)) = (start, pred, end) else {
+            return Ok(None);
+        };
+        // Annotation (user) properties: the scalar rows minus bookkeeping.
+        let node = self.node_from_rows(sid, rows, store, g_id)?;
+        let type_iri = self.compactor.decode_sid(&pred)?;
+        Ok(Some(CypherRelationship {
+            start_iri: self.compactor.decode_sid(&start)?,
+            end_iri: self.compactor.decode_sid(&end)?,
+            type_name: cypher_name_from_iri(&type_iri),
+            reifier_iri: Some(node.iri),
+            properties: node.properties,
+        }))
     }
 
     /// Build a node from batched-crawl rows. Ref-valued rows are skipped by
@@ -805,6 +896,55 @@ impl<'a> NodeHydrator<'a> {
         let flakes = Arc::new(flakes);
         self.flake_cache.insert(sid.clone(), Arc::clone(&flakes));
         Ok(flakes)
+    }
+
+    /// The rendered cell for a top-level subject binding: a Relationship
+    /// when the subject is an edge annotation (bound relationship vars
+    /// resolve to the reifier subject via `coalesce(ann, …)`), a Node
+    /// otherwise.
+    async fn subject_cell(&mut self, sid: &Sid) -> Result<CypherCell> {
+        if let Some(hit) = self.cell_cache.get(sid) {
+            return Ok(hit.clone());
+        }
+        let flakes = self.subject_flakes(sid).await?;
+        let mut start = None;
+        let mut pred = None;
+        let mut end = None;
+        for flake in flakes.iter().filter(|f| f.op) {
+            if Some(&flake.p) == self.reifies_subject.as_ref() {
+                if let FlakeValue::Ref(s) = &flake.o {
+                    start = Some(s.clone());
+                }
+            } else if Some(&flake.p) == self.reifies_predicate.as_ref() {
+                if let FlakeValue::Ref(p) = &flake.o {
+                    pred = Some(p.clone());
+                }
+            } else if Some(&flake.p) == self.reifies_object.as_ref() {
+                if let FlakeValue::Ref(o) = &flake.o {
+                    end = Some(o.clone());
+                }
+            }
+        }
+        let cell = match (start, pred, end) {
+            // A reified node→node edge. (Literal-object annotations keep
+            // the node rendering — Bolt relationships need node endpoints.)
+            (Some(start), Some(pred), Some(end)) => {
+                let start_iri = self.compactor.decode_sid(&start)?;
+                let end_iri = self.compactor.decode_sid(&end)?;
+                let type_iri = self.compactor.decode_sid(&pred)?;
+                let properties = self.annotation_properties(sid).await?;
+                CypherCell::Relationship(Box::new(CypherRelationship {
+                    start_iri,
+                    end_iri,
+                    type_name: cypher_name_from_iri(&type_iri),
+                    reifier_iri: Some(self.compactor.decode_sid(sid)?),
+                    properties,
+                }))
+            }
+            _ => CypherCell::Node(Box::new(self.node(sid).await?)),
+        };
+        self.cell_cache.insert(sid.clone(), cell.clone());
+        Ok(cell)
     }
 
     async fn node(&mut self, sid: &Sid) -> Result<CypherNode> {
