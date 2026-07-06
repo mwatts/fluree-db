@@ -56,7 +56,6 @@ pub(crate) mod fast_vector_topk;
 pub(crate) mod fast_whole_graph_agg;
 pub mod filter;
 pub(crate) mod filter_fold;
-pub(crate) mod frontier;
 pub mod geo_rewrite;
 pub mod geo_search;
 pub mod graph;

@@ -52,7 +52,6 @@ pub fn batched_lookup_predicate_refs(
     sorted_subjects.sort_unstable();
     sorted_subjects.dedup();
 
-    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
     let mut out: HashMap<u64, Vec<u64>> = HashMap::new();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
@@ -128,6 +127,11 @@ pub fn batched_lookup_predicate_refs(
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         current_chunk_idx.store(chunk_idx as u64, std::sync::atomic::Ordering::Relaxed);
+        // Per-chunk membership: cursor batches are leaflet-granular and can
+        // spill rows past this chunk's subject range; those rows belong to
+        // (and are collected by) the neighboring chunk's scan. A global set
+        // here would collect them twice.
+        let chunk_set: HashSet<u64> = chunk.iter().copied().collect();
         let min_s = chunk[0];
         let max_s = *chunk.last().unwrap();
 
@@ -182,7 +186,7 @@ pub fn batched_lookup_predicate_refs(
             scanned_rows.fetch_add(batch.row_count as u64, std::sync::atomic::Ordering::Relaxed);
             for i in 0..batch.row_count {
                 let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
+                if !chunk_set.contains(&s_id) {
                     continue;
                 }
                 let ot = batch.o_type.get_or(i, 0);
@@ -247,7 +251,6 @@ pub fn batched_lookup_subject_properties(
     let mut sorted_subjects = subjects.to_vec();
     sorted_subjects.sort_unstable();
     sorted_subjects.dedup();
-    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
         return Ok(out);
@@ -270,6 +273,11 @@ pub fn batched_lookup_subject_properties(
     };
 
     for chunk in &chunks {
+        // Per-chunk membership: cursor batches are leaflet-granular and can
+        // spill rows past this chunk's subject range; those rows belong to
+        // (and are collected by) the neighboring chunk's scan. A global set
+        // here would collect them twice.
+        let chunk_set: HashSet<u64> = chunk.iter().copied().collect();
         let min_s = chunk[0];
         let max_s = *chunk.last().unwrap();
 
@@ -306,7 +314,7 @@ pub fn batched_lookup_subject_properties(
         while let Some(batch) = cursor.next_batch()? {
             for i in 0..batch.row_count {
                 let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
+                if !chunk_set.contains(&s_id) {
                     continue;
                 }
                 let p_id = batch.p_id.get_or(i, 0);
@@ -345,7 +353,6 @@ pub fn batched_lookup_inbound_refs(
     let mut sorted = objects.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let obj_set: HashSet<u64> = sorted.iter().copied().collect();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
         return Ok(out);
@@ -371,6 +378,11 @@ pub fn batched_lookup_inbound_refs(
     };
 
     for chunk in &chunks {
+        // Per-chunk membership: cursor batches are leaflet-granular and can
+        // spill rows past this chunk's subject range; those rows belong to
+        // (and are collected by) the neighboring chunk's scan. A global set
+        // here would collect them twice.
+        let chunk_set: HashSet<u64> = chunk.iter().copied().collect();
         let min_o = chunk[0];
         let max_o = *chunk.last().unwrap();
 
@@ -411,7 +423,7 @@ pub fn batched_lookup_inbound_refs(
                     continue;
                 }
                 let o_key = batch.o_key.get(i);
-                if !obj_set.contains(&o_key) {
+                if !chunk_set.contains(&o_key) {
                     continue;
                 }
                 out.entry(o_key)
@@ -431,6 +443,14 @@ pub fn batched_lookup_inbound_refs(
 /// Break sorted subjects into chunks where each chunk spans at most
 /// `max_span` IDs and contains at most `max_chunk` subjects.
 fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]> {
+    // A new chunk costs one cursor descent (~a few µs ≈ scanning on the
+    // order of a thousand rows); scanning across a gap costs every row in
+    // it. Splitting on gaps larger than this keeps scattered id sets —
+    // BFS frontiers, arbitrary result sets — as near-point-seeks instead
+    // of dragging one scan across the whole id space, while dense sets
+    // still share long scans.
+    const MAX_GAP: u64 = 64;
+
     if sorted.is_empty() {
         return Vec::new();
     }
@@ -438,8 +458,9 @@ fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]
     let mut start = 0;
     for i in 1..sorted.len() {
         let span = sorted[i] - sorted[start];
+        let gap = sorted[i] - sorted[i - 1];
         let size = i - start;
-        if span > max_span || size >= max_chunk {
+        if span > max_span || gap > MAX_GAP || size >= max_chunk {
             chunks.push(&sorted[start..i]);
             start = i;
         }

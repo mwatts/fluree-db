@@ -21,7 +21,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let users = env_usize("PROBE_USERS", 200);
+    let users = env_usize("PROBE_USERS", 20_000);
     let iters = env_usize("PROBE_ITERS", 30);
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -44,7 +44,12 @@ async fn main() {
                 "ex:cmpl": (i % 100),
                 "ex:eyes": format!("color{}", i % 5),
                 "ex:hair": format!("hair{}", i % 7),
-                "ex:knows": (1..=10).map(|k| json!({"@id": format!("ex:u{}", (i + k * 7) % users)})).collect::<Vec<_>>()
+                // Scattered targets (multiplicative hash) — BFS frontiers on
+                // real graphs are uniform over the id space, not clustered.
+                "ex:knows": (1..=10u64).map(|k| {
+                    let target = ((i as u64 + k) .wrapping_mul(2_654_435_761)) % users as u64;
+                    json!({"@id": format!("ex:u{target}")})
+                }).collect::<Vec<_>>()
             })
         })
         .collect();
@@ -163,7 +168,7 @@ async fn main() {
 
     // shortestPath (bidirectional BFS): per-node range reads today.
     let sp_q =
-        "MATCH p = shortestPath((a:User {id: 5})-[*..15]->(b:User {id: 137})) RETURN length(p)";
+        "MATCH p = shortestPath((a:User {id: 5})-[*..15]->(b:User {id: 10487})) RETURN length(p)";
     let mut total = 0f64;
     for _ in 0..iters {
         let t0 = Instant::now();

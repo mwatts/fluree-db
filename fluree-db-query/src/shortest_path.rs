@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use fluree_db_core::{
     range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
 };
-use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Safety bound: maximum nodes visited across both BFS frontiers per search.
@@ -305,51 +305,12 @@ impl ShortestPathOperator {
 
     /// Bidirectional BFS for a single shortest path. Returns the node sequence
     /// (start..end inclusive) or `None` if no path exists within the bounds.
-    /// Which edge orientation a search side follows: `None` means both
-    /// (`Either` direction).
-    fn edge_forward(&self, search_forward: bool) -> Option<bool> {
-        match (self.pattern.direction, search_forward) {
-            (PathDirection::Outgoing, true) | (PathDirection::Incoming, false) => Some(true),
-            (PathDirection::Outgoing, false) | (PathDirection::Incoming, true) => Some(false),
-            (PathDirection::Either, _) => None,
-        }
-    }
-
-    /// One batched frontier level for a search side, streamed edge by edge
-    /// (`Break` from `on_edge` stops the level early).
-    fn expand_level(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        expander: &crate::frontier::FrontierExpander,
-        frontier: &[crate::frontier::PathNode],
-        search_forward: bool,
-        on_edge: &mut dyn FnMut(
-            crate::frontier::PathNode,
-            crate::frontier::PathNode,
-        ) -> std::ops::ControlFlow<()>,
-    ) -> Result<()> {
-        match self.edge_forward(search_forward) {
-            Some(forward) => {
-                expander.expand_with(ctx, frontier, forward, on_edge)?;
-            }
-            None => {
-                if expander.expand_with(ctx, frontier, true, on_edge)? {
-                    expander.expand_with(ctx, frontier, false, on_edge)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     async fn bidirectional(
         &self,
         ctx: &ExecutionContext<'_>,
         start: &Sid,
         end: &Sid,
     ) -> Result<Option<Vec<Sid>>> {
-        use crate::frontier::{FrontierExpander, PathNode};
-        use std::ops::ControlFlow;
-
         let min_hops = self.pattern.min_hops.unwrap_or(1);
         let max_hops = self.pattern.max_hops;
 
@@ -361,19 +322,15 @@ impl ShortestPathOperator {
             // else fall through: look for a non-trivial cycle back to start.
         }
 
-        let expander = FrontierExpander::new(ctx, self.pattern.predicate.as_ref())?;
-        let start_node = expander.path_node(start);
-        let end_node = expander.path_node(end);
+        // predecessor[node] = node it was reached from on the forward side;
+        // the start maps to itself (chain sentinel).
+        let mut fwd_prev: HashMap<Sid, Sid> = HashMap::new();
+        let mut bwd_next: HashMap<Sid, Sid> = HashMap::new();
+        fwd_prev.insert(start.clone(), start.clone());
+        bwd_next.insert(end.clone(), end.clone());
 
-        // Per side: node → (predecessor, depth-on-that-side); the seeds map
-        // to themselves at depth 0 (chain sentinel).
-        let mut fwd_prev: FxHashMap<PathNode, (PathNode, u32)> = FxHashMap::default();
-        let mut bwd_next: FxHashMap<PathNode, (PathNode, u32)> = FxHashMap::default();
-        fwd_prev.insert(start_node.clone(), (start_node.clone(), 0));
-        bwd_next.insert(end_node.clone(), (end_node.clone(), 0));
-
-        let mut fwd_frontier: Vec<PathNode> = vec![start_node.clone()];
-        let mut bwd_frontier: Vec<PathNode> = vec![end_node.clone()];
+        let mut fwd_frontier: Vec<Sid> = vec![start.clone()];
+        let mut bwd_frontier: Vec<Sid> = vec![end.clone()];
         let mut depth = 0u32;
 
         while !fwd_frontier.is_empty() && !bwd_frontier.is_empty() {
@@ -391,55 +348,38 @@ impl ShortestPathOperator {
             }
             depth += 1;
 
-            // Expand the smaller frontier (the bidirectional win), one
-            // level at a time — batched index sweeps + the overlay delta,
-            // streamed so no whole-level edge list materializes.
+            // Expand the smaller frontier (the bidirectional win).
             let expand_forward = fwd_frontier.len() <= bwd_frontier.len();
             let frontier = if expand_forward {
                 std::mem::take(&mut fwd_frontier)
             } else {
                 std::mem::take(&mut bwd_frontier)
             };
+            let mut next: Vec<Sid> = Vec::new();
 
-            let mut next: Vec<PathNode> = Vec::new();
-            let mut meet: Option<PathNode> = None;
-            self.expand_level(
-                ctx,
-                &expander,
-                &frontier,
-                expand_forward,
-                &mut |node, nb| {
+            for node in &frontier {
+                let nbrs = self.neighbors(ctx, node, expand_forward).await?;
+                for nb in nbrs {
                     let (near, far) = if expand_forward {
                         (&mut fwd_prev, &bwd_next)
                     } else {
                         (&mut bwd_next, &fwd_prev)
                     };
                     if near.contains_key(&nb) {
-                        return ControlFlow::Continue(());
+                        continue;
                     }
-                    let node_depth = near.get(&node).map(|(_, d)| *d).unwrap_or(0);
-                    near.insert(nb.clone(), (node, node_depth + 1));
-                    if let Some((_, far_depth)) = far.get(&nb) {
-                        // Frontiers meet at `nb`. Only a long-enough total path
-                        // ends the search (min_hops); the node stays recorded
-                        // either way so we don't loop.
-                        if node_depth + 1 + far_depth >= min_hops {
-                            meet = Some(nb);
-                            return ControlFlow::Break(());
+                    near.insert(nb.clone(), node.clone());
+                    if far.contains_key(&nb) {
+                        // Frontiers meet at `nb`. Reconstruct, honouring min_hops.
+                        let path = self.reconstruct(&fwd_prev, &bwd_next, &nb, start, end);
+                        if path.len().saturating_sub(1) as u32 >= min_hops {
+                            return Ok(Some(path));
                         }
+                        // Too short for the requested min; keep searching by not
+                        // returning, but the node is recorded so we don't loop.
                     }
                     next.push(nb);
-                    ControlFlow::Continue(())
-                },
-            )?;
-
-            if let Some(meet) = meet {
-                let path = reconstruct(&fwd_prev, &bwd_next, &meet, &start_node, &end_node);
-                let mut sids = Vec::with_capacity(path.len());
-                for node in &path {
-                    sids.push(expander.sid_of(ctx, node)?);
                 }
-                return Ok(Some(sids));
             }
 
             if expand_forward {
@@ -452,6 +392,44 @@ impl ShortestPathOperator {
         Ok(None)
     }
 
+    /// Stitch the forward and backward predecessor chains through meeting node
+    /// `meet` into a single start→end node sequence.
+    fn reconstruct(
+        &self,
+        fwd_prev: &HashMap<Sid, Sid>,
+        bwd_next: &HashMap<Sid, Sid>,
+        meet: &Sid,
+        start: &Sid,
+        end: &Sid,
+    ) -> Vec<Sid> {
+        // Forward: meet back to start.
+        let mut left: Vec<Sid> = vec![meet.clone()];
+        let mut cur = meet.clone();
+        while &cur != start {
+            match fwd_prev.get(&cur) {
+                Some(p) if p != &cur => {
+                    left.push(p.clone());
+                    cur = p.clone();
+                }
+                _ => break,
+            }
+        }
+        left.reverse(); // start .. meet
+
+        // Backward: meet toward end (skip meet itself, already in `left`).
+        let mut cur = meet.clone();
+        while &cur != end {
+            match bwd_next.get(&cur) {
+                Some(n) if n != &cur => {
+                    left.push(n.clone());
+                    cur = n.clone();
+                }
+                _ => break,
+            }
+        }
+        left
+    }
+
     /// Layered forward BFS that records all minimal-length predecessors, then
     /// enumerates every shortest path (capped at `max_paths`).
     async fn all_shortest(
@@ -460,8 +438,6 @@ impl ShortestPathOperator {
         start: &Sid,
         end: &Sid,
     ) -> Result<Vec<Vec<Sid>>> {
-        use crate::frontier::{FrontierExpander, PathNode};
-
         let min_hops = self.pattern.min_hops.unwrap_or(1);
         let max_hops = self.pattern.max_hops;
 
@@ -469,14 +445,10 @@ impl ShortestPathOperator {
             return Ok(vec![vec![start.clone()]]);
         }
 
-        let expander = FrontierExpander::new(ctx, self.pattern.predicate.as_ref())?;
-        let start_node = expander.path_node(start);
-        let end_node = expander.path_node(end);
-
-        let mut dist: FxHashMap<PathNode, u32> = FxHashMap::default();
-        let mut preds: FxHashMap<PathNode, Vec<PathNode>> = FxHashMap::default();
-        dist.insert(start_node.clone(), 0);
-        let mut frontier: Vec<PathNode> = vec![start_node.clone()];
+        let mut dist: HashMap<Sid, u32> = HashMap::new();
+        let mut preds: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        dist.insert(start.clone(), 0);
+        let mut frontier: Vec<Sid> = vec![start.clone()];
         let mut depth = 0u32;
         let mut found_depth: Option<u32> = None;
 
@@ -500,25 +472,27 @@ impl ShortestPathOperator {
             }
             depth += 1;
 
-            let mut next: Vec<PathNode> = Vec::new();
-            self.expand_level(ctx, &expander, &frontier, true, &mut |node, nb| {
-                match dist.get(&nb).copied() {
-                    None => {
-                        dist.insert(nb.clone(), depth);
-                        preds.entry(nb.clone()).or_default().push(node);
-                        if nb == end_node {
-                            found_depth = Some(depth);
+            let mut next: Vec<Sid> = Vec::new();
+            for node in &frontier {
+                let nbrs = self.neighbors(ctx, node, true).await?;
+                for nb in nbrs {
+                    match dist.get(&nb).copied() {
+                        None => {
+                            dist.insert(nb.clone(), depth);
+                            preds.entry(nb.clone()).or_default().push(node.clone());
+                            next.push(nb.clone());
+                            if &nb == end {
+                                found_depth = Some(depth);
+                            }
                         }
-                        next.push(nb);
+                        Some(d) if d == depth => {
+                            // Another equally-short predecessor.
+                            preds.entry(nb.clone()).or_default().push(node.clone());
+                        }
+                        Some(_) => {}
                     }
-                    Some(d) if d == depth => {
-                        // Another equally-short predecessor.
-                        preds.entry(nb).or_default().push(node);
-                    }
-                    Some(_) => {}
                 }
-                std::ops::ControlFlow::Continue(())
-            })?;
+            }
             frontier = next;
         }
 
@@ -530,17 +504,9 @@ impl ShortestPathOperator {
         }
 
         // Enumerate all shortest paths via DFS over the predecessor sets.
-        let mut node_paths: Vec<Vec<PathNode>> = Vec::new();
-        let mut suffix: Vec<PathNode> = vec![end_node.clone()];
-        self.enumerate(&end_node, &start_node, &preds, &mut suffix, &mut node_paths)?;
-        let mut paths = Vec::with_capacity(node_paths.len());
-        for node_path in node_paths {
-            let mut sids = Vec::with_capacity(node_path.len());
-            for node in &node_path {
-                sids.push(expander.sid_of(ctx, node)?);
-            }
-            paths.push(sids);
-        }
+        let mut paths: Vec<Vec<Sid>> = Vec::new();
+        let mut suffix: Vec<Sid> = vec![end.clone()];
+        self.enumerate(end, start, &preds, &mut suffix, &mut paths)?;
         Ok(paths)
     }
 
@@ -552,11 +518,11 @@ impl ShortestPathOperator {
     /// while dropping paths.
     fn enumerate(
         &self,
-        node: &crate::frontier::PathNode,
-        start: &crate::frontier::PathNode,
-        preds: &FxHashMap<crate::frontier::PathNode, Vec<crate::frontier::PathNode>>,
-        suffix: &mut Vec<crate::frontier::PathNode>,
-        out: &mut Vec<Vec<crate::frontier::PathNode>>,
+        node: &Sid,
+        start: &Sid,
+        preds: &HashMap<Sid, Vec<Sid>>,
+        suffix: &mut Vec<Sid>,
+        out: &mut Vec<Vec<Sid>>,
     ) -> Result<()> {
         if node == start {
             let mut path = suffix.clone();
@@ -835,42 +801,4 @@ impl Operator for ShortestPathOperator {
             ShortestPathMode::All => None,
         }
     }
-}
-
-/// Stitch the forward and backward predecessor chains through meeting node
-/// `meet` into a single start→end node sequence. Map values carry
-/// `(predecessor, depth)`; the seeds map to themselves.
-fn reconstruct(
-    fwd_prev: &FxHashMap<crate::frontier::PathNode, (crate::frontier::PathNode, u32)>,
-    bwd_next: &FxHashMap<crate::frontier::PathNode, (crate::frontier::PathNode, u32)>,
-    meet: &crate::frontier::PathNode,
-    start: &crate::frontier::PathNode,
-    end: &crate::frontier::PathNode,
-) -> Vec<crate::frontier::PathNode> {
-    // Forward: meet back to start.
-    let mut left = vec![meet.clone()];
-    let mut cur = meet.clone();
-    while &cur != start {
-        match fwd_prev.get(&cur) {
-            Some((p, _)) if p != &cur => {
-                left.push(p.clone());
-                cur = p.clone();
-            }
-            _ => break,
-        }
-    }
-    left.reverse(); // start .. meet
-
-    // Backward: meet toward end (skip meet itself, already in `left`).
-    let mut cur = meet.clone();
-    while &cur != end {
-        match bwd_next.get(&cur) {
-            Some((n, _)) if n != &cur => {
-                left.push(n.clone());
-                cur = n.clone();
-            }
-            _ => break,
-        }
-    }
-    left
 }
