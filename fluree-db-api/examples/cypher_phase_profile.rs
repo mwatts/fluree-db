@@ -16,13 +16,21 @@
 //!
 //! plan+exec is derived: e2e - (parse + clone + subst + lower).
 //!
+//! CAVEAT: the ledger is in-memory and never reindexed, so e2e runs the
+//! novelty scan path — absolute e2e values are ms-scale and NOT comparable
+//! to indexed-server numbers (they exist only to show parse/lower is
+//! negligible against execution). Measured answer (2026-07): parse 1-4 us,
+//! lower 1-4 us => a lowered-IR cache is not warranted; see
+//! docs/design/bolt-adapter.md. Keep PROF_USERS modest: aggregate-heavy
+//! statements over large unindexed novelty run for minutes.
+//!
 //! ## Config (env vars)
 //! | Var | Default | Meaning |
 //! |---|---|---|
-//! | `PROF_USERS` | `2000` | users in the synthetic graph |
-//! | `PROF_EDGES_PER_USER` | `10` | `knows` edges per user |
-//! | `PROF_ITERS` | `500` | timed iterations per phase |
-//! | `PROF_WARMUP` | `50` | untimed warmup iterations |
+//! | `PROF_USERS` | `500` | users in the synthetic graph |
+//! | `PROF_EDGES_PER_USER` | `5` | `knows` edges per user |
+//! | `PROF_ITERS` | `100` | timed iterations per phase |
+//! | `PROF_WARMUP` | `10` | untimed warmup iterations |
 //!
 //! ## Run
 //! ```bash
@@ -130,10 +138,10 @@ fn time_us<R>(iters: usize, warmup: usize, mut f: impl FnMut() -> R) -> f64 {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    let users = env_usize("PROF_USERS", 2000);
-    let edges = env_usize("PROF_EDGES_PER_USER", 10);
-    let iters = env_usize("PROF_ITERS", 500);
-    let warmup = env_usize("PROF_WARMUP", 50);
+    let users = env_usize("PROF_USERS", 500);
+    let edges = env_usize("PROF_EDGES_PER_USER", 5);
+    let iters = env_usize("PROF_ITERS", 100);
+    let warmup = env_usize("PROF_WARMUP", 10);
 
     let fluree: Fluree = FlureeBuilder::memory().build_memory();
     let ledger = fluree
@@ -175,8 +183,8 @@ async fn main() {
         });
 
         // Full round trip, sequential requests (single client).
-        let e2e_iters = iters.min(200);
-        for _ in 0..warmup.min(20) {
+        let e2e_iters = iters.min(20);
+        for _ in 0..warmup.min(5) {
             fluree
                 .query_cypher_with_params(&db, stmt.text, Some(&stmt.params))
                 .await

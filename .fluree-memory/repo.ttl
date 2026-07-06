@@ -1108,6 +1108,34 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
+mem:fact-01kwvpa1cdekas5700mv919nte a mem:Fact ;
+    mem:content "Bolt v1 landed on feature/bolt: pure codec crate fluree-db-bolt (PackStream/chunking/handshake 4.4+5.0-5.4/session machine, zero Fluree deps) + server feature `bolt` (default off, --bolt-listen-addr/--bolt-default-db). Session is action-based: on_request returns Turn::Execute(RunRequest), server glue executes then calls run_succeeded/run_failed — keeps the state machine sync/pure. Reads use QueryResult::to_cypher_table (pre-cypherify RDF-faithful cells factored out of format/cypher.rs) then cell_to_bolt: xsd:decimal→Float, temporal→ISO strings, nodes→IRI strings (v1). Writes reuse pub(crate) submit_via_consensus/wait_for_committed_state. Listener refuses to start under data_auth_mode=required." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "packstream" ;
+    mem:tag "protocol" ;
+    mem:tag "server" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/bolt-adapter.md" ;
+    mem:artifactRef "fluree-db-api/src/format/cypher.rs" ;
+    mem:artifactRef "fluree-db-bolt/src/session.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T12:26:35.277629+00:00"^^xsd:dateTime ;
+    mem:rationale "Follow-up work (explicit transactions, temporal/graph PackStream structures, auth) must preserve the pure-codec/server-glue split and the shared table converter rather than forking value mappings." .
+
+mem:fact-01kwvpa4y42ve0930eqqf0kz47 a mem:Fact ;
+    mem:content "Cypher parsed-AST cache: process-wide LRU (FLUREE_CYPHER_AST_CACHE entries, default 512, 0 disables; read once) keyed on statement text, caching the PRE-substitution Arc<CypherAst>. Single choke point query/helpers.rs parse_cypher_ast_cached + substituted_cypher_ast (clone-then-substitute-params); all five parse sites (read path, cypher_write_plan_with_skolem, lower_cypher_to_txn, transact_cypher_returning, plan_write_return_source) route through it, plus cypher_statement_is_write (Bolt read/write dispatch). Statements over 8KiB are never cached (unique bulk payloads would evict hot ones). Parse failures are not cached." ;
+    mem:tag "cache" ;
+    mem:tag "cypher" ;
+    mem:tag "parser" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T12:26:38.916498+00:00"^^xsd:dateTime .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
@@ -1533,19 +1561,6 @@ mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
     mem:artifactRef "fluree-db-policy/src/index.rs" ;
     mem:branch "feature/rdfs-enforcement-entailment" ;
     mem:createdAt "2026-07-03T01:47:52.379794+00:00"^^xsd:dateTime .
-mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
-    mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
-    mem:tag "dataset" ;
-    mem:tag "derived-facts" ;
-    mem:tag "history-mode" ;
-    mem:tag "reasoning" ;
-    mem:tag "time-travel" ;
-    mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
-    mem:artifactRef "fluree-db-api/src/view/dataset_builder.rs" ;
-    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
-    mem:branch "feature/shacl-property-paths" ;
-    mem:createdAt "2026-07-05T13:38:04.147463+00:00"^^xsd:dateTime .
 
 mem:fact-01kwktkb2r0ktxt5xaxvbwev3e a mem:Fact ;
     mem:content "The \"query peer over HTTP\" model exists as server peer proxy mode: ProxyStorage + ProxyNameService wired via FlureeBuilder::memory().build_with(storage, NameServiceMode::ReadOnly); serving side is the StorageProxyBearer route group; GET /nameservice/snapshot filters to the token's fluree.storage.ledgers scope. ProxyStorage is mode-aware (feature/remote-mounts): ProxyReadMode::Raw fetches canonical CID-verified bytes via GET /storage/objects/{cid} (peer default; what makes indexed ledgers readable), ProxyReadMode::Filtered uses POST /storage/block FLKB negotiation. CRITICAL: no production code decodes FLKB — the filtered tier is transport-only until a leaf decoder exists on the read path. Remaining gaps: one upstream per server (no composite nameservice), no HTTP Range on ProxyStorage, no vended-credential/origin handoff." ;
@@ -1635,6 +1650,20 @@ mem:fact-01kws95166gqpjjfda0nvmkraq a mem:Fact ;
     mem:branch "feature/remote-mounts" ;
     mem:createdAt "2026-07-05T13:58:10.886197+00:00"^^xsd:dateTime ;
     mem:rationale "Non-obvious: indexed snapshot t and effective (novelty-inclusive) t diverge between a commit and the next reindex; config changes live in novelty, so t-keyed caches of config-derived state silently go stale if keyed on the base t." .
+
+mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
+    mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
+    mem:tag "dataset" ;
+    mem:tag "derived-facts" ;
+    mem:tag "history-mode" ;
+    mem:tag "reasoning" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_builder.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:branch "feature/shacl-property-paths" ;
+    mem:createdAt "2026-07-05T13:38:04.147463+00:00"^^xsd:dateTime .
 
 mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
     mem:content "SPARQL property paths, branch feature/sparql-property-paths: closed ALL reported gaps PLUS inverse-in-composite (wired in BOTH sparql lower/path.rs AND query parse/lower.rs for JSON-LD parity). (1) ZeroOrOne p?: PathModifier::ZeroOrOne; BFS self+1hop. (2) Negated sets !: fresh ?__np{n} pred-var triple + FILTER(?p != IRI(...)); fwd/inv/mixed=UNION. (3) Nested modifiers (p*)*: collapse_modifiers (zero=any */?, unbounded=any +/*). (4) Composite-transitive (a/b)+ incl inverse steps (^a/b)+: PropertyPathPattern has predicates+first_inverse+sequence_steps:Vec<PathStep{predicates,inverse}>; operator's read_step reads SPOT/POST by direction (opposite index when retreating); single_predicate() bails on composite. ONLY UNSUPPORTED (niche): nested transitive step in a composite unit (a+/b)+ — not exercised by any W3C test." ;
@@ -2041,17 +2070,16 @@ mem:fact-01kwsthd6k6xagy4tdtre2ncew a mem:Fact ;
     mem:createdAt "2026-07-05T19:02:02.195415+00:00"^^xsd:dateTime .
 
 mem:fact-01kwsthhc6fkb931xyd6anfjye a mem:Fact ;
-    mem:content "Cypher RETURN-on-write (benchgraph F1) is still deferred; the viable design: expose the staging skolem txn_id + WHERE solution count through CommitReceipt/TransactionReceipt (6 construction sites + Raft path), OR pre-supply txn_id via TxnOpts derived from the request tx-id. Created-node Sids are then reconstructible statelessly: Sid::new(BLANK_NODE, \"fdb-{txn_id}-{solution}-{label-sans-_:}\") — blank_node_sid needs no registry state. Server side then swaps the commit-receipt body for the cypher-json envelope (fluree-db-api/src/format/cypher.rs) when the statement had RETURN." ;
+    mem:content "Cypher RETURN-on-write (benchgraph F1) LANDED (fce28d8e9, on feature/bolt lineage): caller pre-supplies txn_id via TxnOpts.skolem_txn_id — plan_write_return_source validates the RETURN shape pre-submission, fresh_skolem_txn_id ships with the TransactionRequest, and write_return_rows reconstructs created-node Sids statelessly post-commit (Sid::new(BLANK_NODE, \"fdb-{txn_id}-{solution}-{label}\")) then answers the cypher-json envelope. Both the HTTP route (routes/transact.rs execute_cypher_transact) and the Bolt glue (server src/bolt.rs execute_write) use this path." ;
     mem:tag "consensus" ;
     mem:tag "cypher" ;
     mem:tag "design" ;
     mem:tag "return-on-write" ;
     mem:tag "skolemization" ;
     mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-consensus/src/lib.rs" ;
+    mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
     mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
-    mem:artifactRef "fluree-db-transact/src/generate/flakes.rs" ;
-    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
     mem:branch "main" ;
     mem:createdAt "2026-07-05T19:02:06.470017+00:00"^^xsd:dateTime .
 

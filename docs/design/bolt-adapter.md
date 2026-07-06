@@ -7,6 +7,15 @@ of the sequencing below landed:
   (`FLUREE_CYPHER_AST_CACHE`, default 512 entries); all five parse sites
   route through `query/helpers.rs::parse_cypher_ast_cached`. The
   parse/lower split profiler is `fluree-db-api/examples/cypher_phase_profile.rs`.
+  **Measured split (release, benchmark-shaped statements)**: parse 1–4 µs,
+  AST clone 0.2–1 µs, substitute ≈0, lower 1–4 µs — engine-side per-request
+  parse+lower tax is single-digit µs, far below this doc's ~50–100 µs
+  estimate. Consequence: a lowered-IR cache is **not warranted** (its
+  snapshot-keyed invalidation would buy back almost nothing); the AST cache
+  stands on eliminating per-request work at zero risk, not on wall-clock.
+  plan+exec dominates everything (the profiler's unindexed novelty-path
+  numbers are ms-scale and not comparable to the indexed-server figures
+  below).
 - **`fluree-db-bolt` crate** — pure codec: PackStream, chunking,
   handshake (4.4 + 5.0–5.4), typed messages, autocommit session state
   machine. No Fluree deps; byte-fixture unit tests.
