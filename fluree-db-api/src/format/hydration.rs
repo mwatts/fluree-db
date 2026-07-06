@@ -1166,7 +1166,11 @@ impl<'a> HydrationFormatter<'a> {
                 // by the prefetch pass for top-level roots; nested refs and
                 // repeat subjects fill it on demand). Dataset mode bypasses
                 // the cache — per-ledger Sids share an encoding space.
-                _ if self.dataset.is_none() => match cache.subject_flakes.get(sid) {
+                // Wildcard ONLY: a narrowed K ≥ 2 projection must keep its
+                // predicate_filter (the filter drops rows before decode and
+                // dict-touch fuel; caching the unfiltered set would silently
+                // pay for every predicate).
+                None if self.dataset.is_none() => match cache.subject_flakes.get(sid) {
                     Some(hit) => Arc::clone(hit),
                     None => {
                         let fetched = Arc::new(self.fetch_subject_properties(sid, None).await?);
