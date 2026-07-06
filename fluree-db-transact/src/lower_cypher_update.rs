@@ -81,9 +81,10 @@ impl LowerCypherError {
 /// even though Cypher writes default to LPG mode.
 #[derive(Debug, Default)]
 pub struct CypherLowerOpts {
-    /// Default vocab IRI used to resolve bare Cypher identifiers
-    /// (labels, types, property keys). Defaults to
-    /// `http://example.org/`.
+    /// Optional `@vocab` IRI prefix used to resolve bare Cypher
+    /// identifiers (labels, types, property keys) — the RDF-compat
+    /// mode. `None` (the default) writes bare names under namespace 0
+    /// (no IRI prefix), the native LPG mode.
     pub vocab: Option<String>,
     /// Per-term IRI overrides. A bare Cypher identifier (label,
     /// relationship type, property key) that has an entry here resolves
@@ -115,7 +116,7 @@ pub fn lower_cypher_update(
 
 struct CypherLowering<'a> {
     ns: &'a mut NamespaceRegistry,
-    vocab: String,
+    vocab: Option<String>,
     overrides: std::collections::HashMap<String, String>,
     vars: VarRegistry,
     txn_type: TxnType,
@@ -153,12 +154,9 @@ struct CypherLowering<'a> {
 
 impl<'a> CypherLowering<'a> {
     fn new(ns: &'a mut NamespaceRegistry, opts: TxnOpts, cypher_opts: CypherLowerOpts) -> Self {
-        let vocab = cypher_opts
-            .vocab
-            .unwrap_or_else(|| "http://example.org/".to_string());
         Self {
             ns,
-            vocab,
+            vocab: cypher_opts.vocab,
             overrides: cypher_opts.overrides,
             vars: VarRegistry::new(),
             txn_type: TxnType::Insert,
@@ -1742,7 +1740,13 @@ impl<'a> CypherLowering<'a> {
         if let Some(iri) = self.overrides.get(name) {
             return iri.clone();
         }
-        format!("{}{}", self.vocab, name)
+        match &self.vocab {
+            Some(vocab) => format!("{vocab}{name}"),
+            // No @vocab: bare names land under namespace 0 (the empty
+            // prefix is a pre-registered builtin, so `sid_for_iri`
+            // never allocates for them).
+            None => name.to_string(),
+        }
     }
 
     fn resolve_predicate(&self, name: &str) -> Result<String, LowerCypherError> {

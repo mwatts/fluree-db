@@ -75,8 +75,10 @@ Results carry typed PackStream values, sharing the per-binding semantic
 conversion with the Cypher JSON transport:
 
 - **Nodes** (`RETURN n`): Bolt `Node` structures. `element_id` is the
-  node's full IRI (the durable identity); the numeric `id` is a stable
-  hash of it (an opaque handle — use `element_id` for identity). Labels
+  node's durable identity — its stored name (a plain name for
+  Cypher-created data; a full IRI when the ledger interoperates with
+  RDF via `@vocab`). The numeric `id` is a stable hash of it (an
+  opaque handle — use `element_id` for identity). Labels
   follow the `labels()` rule (`rdf:type` local names; the `db:Node`
   existence marker is hidden). Properties are fetched per node at result
   time; multi-valued literal predicates become lists. Ref-valued

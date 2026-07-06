@@ -100,12 +100,11 @@ pub(crate) fn parse_sparql_to_ir(
 
 /// Parse a Cypher (openCypher 9) query and prepare it for execution.
 ///
-/// Cypher has no prologue/prefix syntax of its own. The ledger's
-/// default JSON-LD context supplies `@vocab` (used to resolve bare
-/// labels/types/property keys) and named term mappings (used as
-/// overrides). Without a default context, the lowering falls back to
-/// `http://example.org/` for the vocab — useful for tests, not for
-/// production data.
+/// Cypher has no prologue/prefix syntax of its own. Bare identifiers
+/// (labels/types/property keys) are plain namespace-0 names by
+/// default; the ledger's default JSON-LD context can opt into RDF
+/// compat by supplying `@vocab` (a prefix for bare identifiers) and
+/// named term mappings (per-name overrides).
 pub(crate) fn parse_cypher_to_ir(
     cypher: &str,
     snapshot: &LedgerSnapshot,
@@ -217,7 +216,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
 
     let mut vars = VarRegistry::new();
     let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
-        .with_vocab(vocab)
+        .with_vocab_opt(vocab)
         .with_allow_full_scan(cypher_full_scan_enabled())
         .with_reified_edges_possible(reified_edges_possible(snapshot, overlay));
     if !overrides.is_empty() {
@@ -327,12 +326,12 @@ fn cypher_full_scan_enabled() -> bool {
 /// ledger-context mappings.
 pub(crate) fn extract_cypher_iri_mapping(
     default_context: Option<&JsonValue>,
-) -> (String, std::collections::HashMap<String, String>) {
-    let mut vocab = "http://example.org/".to_string();
+) -> (Option<String>, std::collections::HashMap<String, String>) {
+    let mut vocab = None;
     let mut overrides = std::collections::HashMap::new();
     if let Some(obj) = default_context.and_then(|v| v.as_object()) {
         if let Some(v) = obj.get("@vocab").and_then(|v| v.as_str()) {
-            vocab = v.to_string();
+            vocab = Some(v.to_string());
         }
         for (k, v) in obj {
             if k.starts_with('@') {

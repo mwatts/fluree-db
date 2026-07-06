@@ -107,21 +107,20 @@ fn build_dataset(users: usize, edges_per_user: usize) -> JsonValue {
     let graph: Vec<JsonValue> = (0..users)
         .map(|i| {
             let knows: Vec<JsonValue> = (1..=edges_per_user)
-                .map(|k| json!({ "@id": format!("ex:u{}", (i + k * 7) % users) }))
+                .map(|k| json!({ "@id": format!("u{}", (i + k * 7) % users) }))
                 .collect();
             json!({
-                "@id": format!("ex:u{i}"),
-                "@type": "ex:User",
-                "ex:id": i,
-                "ex:name": format!("{}{}", names[i % names.len()], i),
-                "ex:age": 18 + (i % 60),
-                "ex:knows": knows,
+                "@id": format!("u{i}"),
+                "@type": "User",
+                "id": i,
+                "name": format!("{}{}", names[i % names.len()], i),
+                "age": 18 + (i % 60),
+                "knows": knows,
             })
         })
         .collect();
     json!({
-        "@context": { "ex": "http://example.org/" },
-        "@graph": graph,
+                "@graph": graph,
     })
 }
 
@@ -177,8 +176,7 @@ async fn main() {
         substitute_params(&mut substituted, &stmt.params).expect("subst");
         let lower_us = time_us(iters, warmup, || {
             let mut vars = VarRegistry::new();
-            let mut ctx =
-                LoweringContext::new(&*db.snapshot, &mut vars).with_vocab("http://example.org/");
+            let mut ctx = LoweringContext::new(&*db.snapshot, &mut vars);
             lower_cypher_with_context(&substituted, &mut ctx).expect("lower")
         });
 

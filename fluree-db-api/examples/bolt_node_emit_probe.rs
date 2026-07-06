@@ -34,30 +34,27 @@ async fn main() {
     let graph: Vec<_> = (0..users)
         .map(|i| {
             json!({
-                "@id": format!("ex:u{i}"),
-                "@type": "ex:User",
-                "ex:id": i,
-                "ex:name": format!("user{i}"),
-                "ex:age": 18 + (i % 60),
-                "ex:gender": (i % 2),
-                "ex:region": format!("region{}", i % 20),
-                "ex:cmpl": (i % 100),
-                "ex:eyes": format!("color{}", i % 5),
-                "ex:hair": format!("hair{}", i % 7),
+                "@id": format!("u{i}"),
+                "@type": "User",
+                "id": i,
+                "name": format!("user{i}"),
+                "age": 18 + (i % 60),
+                "gender": (i % 2),
+                "region": format!("region{}", i % 20),
+                "cmpl": (i % 100),
+                "eyes": format!("color{}", i % 5),
+                "hair": format!("hair{}", i % 7),
                 // Scattered targets (multiplicative hash) — BFS frontiers on
                 // real graphs are uniform over the id space, not clustered.
-                "ex:knows": (1..=10u64).map(|k| {
+                "knows": (1..=10u64).map(|k| {
                     let target = ((i as u64 + k) .wrapping_mul(2_654_435_761)) % users as u64;
-                    json!({"@id": format!("ex:u{target}")})
+                    json!({"@id": format!("u{target}")})
                 }).collect::<Vec<_>>()
             })
         })
         .collect();
     fluree
-        .insert(
-            ledger,
-            &json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}),
-        )
+        .insert(ledger, &json!({"@graph": graph}))
         .await
         .expect("seed");
 
@@ -91,7 +88,7 @@ async fn main() {
         .iter()
         .flat_map(|r| r.iter())
         .find_map(|c| match c {
-            CypherCell::Node(n) if n.iri.as_ref() == "http://example.org/u0" => Some(n),
+            CypherCell::Node(n) if n.iri.as_ref() == "u0" => Some(n),
             _ => None,
         })
         .expect("u0 in result");
@@ -188,12 +185,11 @@ async fn main() {
         .insert(
             ledger,
             &json!({
-                "@context": {"ex": "http://example.org/"},
-                "@graph": [
-                    {"@id": "ex:newcomer", "@type": "ex:User", "ex:id": 9999, "ex:name": "newcomer",
-                     "ex:age": 99, "ex:gender": 1, "ex:region": "region0", "ex:cmpl": 1,
-                     "ex:eyes": "color0", "ex:hair": "hair0"},
-                    {"@id": "ex:u0", "ex:age": 77}
+                                "@graph": [
+                    {"@id": "newcomer", "@type": "User", "id": 9999, "name": "newcomer",
+                     "age": 99, "gender": 1, "region": "region0", "cmpl": 1,
+                     "eyes": "color0", "hair": "hair0"},
+                    {"@id": "u0", "age": 77}
                 ]
             }),
         )
@@ -225,7 +221,7 @@ async fn main() {
             _ => None,
         })
     };
-    let u0 = find("http://example.org/u0").expect("u0");
+    let u0 = find("u0").expect("u0");
     let age = u0
         .properties
         .iter()
@@ -239,7 +235,7 @@ async fn main() {
         Some(CypherCell::Value(v)) => assert_eq!(v, serde_json::json!(77), "novelty age"),
         other => panic!("u0 age missing: {other:?}"),
     }
-    let u1 = find("http://example.org/u1").expect("u1");
+    let u1 = find("u1").expect("u1");
     assert_eq!(
         u1.properties
             .iter()
@@ -248,7 +244,7 @@ async fn main() {
         Some(CypherCell::Value(serde_json::json!(19))),
         "untouched subject exact off the batched lane"
     );
-    let newcomer = find("http://example.org/newcomer").expect("novelty-only subject in result");
+    let newcomer = find("newcomer").expect("novelty-only subject in result");
     assert_eq!(newcomer.labels.as_slice(), &["User".into()]);
     eprintln!(
         "live-novelty correctness verified (dirty=fallback, clean=batched, novelty-only present)"

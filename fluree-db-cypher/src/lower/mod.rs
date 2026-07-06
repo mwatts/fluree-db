@@ -53,8 +53,9 @@ impl LowerError {
 pub type Result<T> = std::result::Result<T, LowerError>;
 
 /// Lower a Cypher AST to a `Query` with the default lowering context
-/// (`@vocab` = `http://example.org/`, no overrides). Useful for tests
-/// and for callers that don't have a ledger context to apply.
+/// (no `@vocab`: bare identifiers stay namespace-0 names; no
+/// overrides). Useful for tests and for callers that don't have a
+/// ledger context to apply.
 ///
 /// Most callers should use [`lower_cypher_with_context`] and pass a
 /// `LoweringContext` configured with the ledger's `@vocab` and

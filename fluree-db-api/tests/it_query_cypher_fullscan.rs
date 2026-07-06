@@ -20,11 +20,10 @@ async fn cypher_bare_match_full_scan_opt_in() {
         .insert(
             ledger0,
             &json!({
-                "@context": {"ex": "http://example.org/"},
-                "@graph": [
-                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 25},
-                    {"@id": "ex:bob",   "@type": "ex:Person"},
-                    {"@id": "ex:acme",  "@type": "ex:Company", "ex:age": 99},
+                                "@graph": [
+                    {"@id": "alice", "@type": "Person", "age": 25},
+                    {"@id": "bob",   "@type": "Person"},
+                    {"@id": "acme",  "@type": "Company", "age": 99},
                 ]
             }),
         )
@@ -105,15 +104,14 @@ async fn cypher_indexed_whole_graph_aggregates_match_pipeline() {
         .insert(
             ledger0,
             &json!({
-                "@context": {"ex": "http://example.org/"},
-                "@graph": [
+                                "@graph": [
                     // alice has TWO ages: the accessor left-join gives her two
                     // rows, so count(n) = 5 over 4 subjects while
                     // count(n.age) = 4 values.
-                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": [25, 30]},
-                    {"@id": "ex:bob",   "@type": "ex:Person"},
-                    {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 40},
-                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:age": 40},
+                    {"@id": "alice", "@type": "Person", "age": [25, 30]},
+                    {"@id": "bob",   "@type": "Person"},
+                    {"@id": "carol", "@type": "Person", "age": 40},
+                    {"@id": "dave",  "@type": "Person", "age": 40},
                 ]
             }),
         )
@@ -193,17 +191,16 @@ async fn cypher_indexed_whole_graph_count_declines_on_edge_annotations() {
         .insert(
             ledger0,
             &json!({
-                "@context": {"ex": "http://example.org/"},
-                "@graph": [
+                                "@graph": [
                     {
-                        "@id": "ex:alice",
-                        "@type": "ex:Person",
-                        "ex:knows": {
-                            "@id": "ex:bob",
-                            "@annotation": {"ex:since": 2020}
+                        "@id": "alice",
+                        "@type": "Person",
+                        "knows": {
+                            "@id": "bob",
+                            "@annotation": {"since": 2020}
                         }
                     },
-                    {"@id": "ex:bob", "@type": "ex:Person"},
+                    {"@id": "bob", "@type": "Person"},
                 ]
             }),
         )
@@ -241,15 +238,15 @@ async fn folds_stay_correct_on_incremental_index() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/cypher:incremental-stats";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
-    let ctx = json!({"ex": "http://example.org/"});
+    let ctx = json!({"ex": ""});
     let ledger1 = fluree
         .insert(
             ledger0,
             &json!({
                 "@context": ctx,
                 "@graph": [
-                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 30, "ex:score": 1},
-                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:age": 40},
+                    {"@id": "alice", "@type": "Person", "age": 30, "score": 1},
+                    {"@id": "bob",   "@type": "Person", "age": 40},
                 ]
             }),
         )
@@ -264,7 +261,7 @@ async fn folds_stay_correct_on_incremental_index() {
             ledger1,
             &json!({
                 "@context": ctx,
-                "@id": "ex:w1", "@type": "ex:Widget", "ex:brandnew": 7
+                "@id": "w1", "@type": "Widget", "brandnew": 7
             }),
         )
         .await
@@ -276,8 +273,8 @@ async fn folds_stay_correct_on_incremental_index() {
             ledger2,
             &json!({
                 "@context": ctx,
-                "delete": [{"@id": "ex:alice", "ex:score": 1}],
-                "insert": [{"@id": "ex:alice", "ex:score": 2}]
+                "delete": [{"@id": "alice", "score": 1}],
+                "insert": [{"@id": "alice", "score": 2}]
             }),
         )
         .await
@@ -289,8 +286,8 @@ async fn folds_stay_correct_on_incremental_index() {
             ledger3,
             &json!({
                 "@context": ctx,
-                "@id": "ex:alice",
-                "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}}
+                "@id": "alice",
+                "knows": {"@id": "bob", "@annotation": {"since": 2020}}
             }),
         )
         .await

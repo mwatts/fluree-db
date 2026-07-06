@@ -72,6 +72,16 @@ re-checked per statement (`Neo.ClientError.Security.TokenExpired`
 tells 5.x drivers to re-authenticate). See the
 [Bolt reference](../api/bolt.md#authentication) for details.
 
+## Names
+
+Labels, relationship types, and property keys are plain names, exactly
+as a Neo4j user expects — `CREATE (n:Person {name: "Ada"})` stores and
+matches the names `Person` and `name` with no namespace involved. If
+the ledger also holds RDF-style data (full IRIs), configure the
+ledger's default context with `@vocab` so bare Cypher names resolve
+into that vocabulary — see
+[names and IRIs](../query/cypher.md#names-and-opting-into-iris).
+
 ## Connect (Python)
 
 ```python
@@ -90,7 +100,7 @@ with driver.session(database="mydb:main") as session:
     for record in result:
         print(record["name"])
 
-    # Nodes come back typed: labels + properties + elementId (the IRI).
+    # Nodes come back typed: labels + properties + elementId (the durable identity).
     node = session.run("MATCH (p:Person) RETURN p LIMIT 1").single()["p"]
     print(node.labels, dict(node), node.element_id)
 

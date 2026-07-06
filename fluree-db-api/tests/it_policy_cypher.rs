@@ -18,14 +18,12 @@ use serde_json::{json, Value as JsonValue};
 use support::{genesis_ledger, graphdb_from_ledger};
 
 fn ctx() -> JsonValue {
-    json!({
-        "ex": "http://example.org/"
-    })
+    json!({})
 }
 
 /// Two Person nodes, each with a visible `name` and a sensitive `secret`.
-/// All properties live under the `ex:` (`http://example.org/`) vocab so they
-/// match Cypher's default-`@vocab` resolution of `n.name` / `n.secret`.
+/// Everything is bare namespace-0 names, matching Cypher's default
+/// resolution of `n.name` / `n.secret`.
 async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api::LedgerState {
     let ledger0 = genesis_ledger(fluree, ledger_id);
     fluree
@@ -34,10 +32,10 @@ async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api:
             &json!({
                 "@context": ctx(),
                 "@graph": [
-                    {"@id": "ex:alice", "@type": "ex:Person",
-                     "ex:name": "Alice", "ex:secret": "ALICE-SECRET"},
-                    {"@id": "ex:bob", "@type": "ex:Person",
-                     "ex:name": "Bob", "ex:secret": "BOB-SECRET"},
+                    {"@id": "alice", "@type": "Person",
+                     "name": "Alice", "secret": "ALICE-SECRET"},
+                    {"@id": "bob", "@type": "Person",
+                     "name": "Bob", "secret": "BOB-SECRET"},
                 ]
             }),
         )
@@ -50,14 +48,14 @@ async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api:
 fn deny_secret_policy() -> JsonValue {
     json!([
         {
-            "@id": "ex:denySecret",
+            "@id": "denySecret",
             "@type": "f:AccessPolicy",
             "f:action": "f:view",
-            "f:onProperty": [{"@id": "http://example.org/secret"}],
+            "f:onProperty": [{"@id": "secret"}],
             "f:allow": false
         },
         {
-            "@id": "ex:allowAll",
+            "@id": "allowAll",
             "@type": "f:AccessPolicy",
             "f:action": "f:view",
             "f:allow": true

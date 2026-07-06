@@ -3452,14 +3452,14 @@ impl Fluree {
     /// `docs/concepts/cypher.md` for the surface.
     ///
     /// Context resolution: the ledger's configured `default_context`
-    /// (if any) supplies `@vocab` and bare-identifier overrides.
-    /// A CAS read or parse failure on a configured context
-    /// propagates as an error — writes never silently fall back to
-    /// the built-in vocab when a custom context was specified.
-    /// The built-in fallback (`http://example.org/`) applies only
-    /// when (a) the ledger has no nameservice record yet
-    /// (genesis / pre-commit), or (b) the record exists but no
-    /// `default_context` CID is configured.
+    /// (if any) supplies `@vocab` and bare-identifier overrides
+    /// (RDF-compat mode). A CAS read or parse failure on a configured
+    /// context propagates as an error — writes never silently fall
+    /// back to bare names when a custom context was specified. Bare
+    /// namespace-0 names (the default) apply only when (a) the ledger
+    /// has no nameservice record yet (genesis / pre-commit), or
+    /// (b) the record exists but no `default_context` CID is
+    /// configured.
     pub async fn transact_cypher(
         &self,
         ledger: LedgerState,
@@ -3861,8 +3861,9 @@ impl Fluree {
         // write Cypher resolves bare identifiers the same way `query_cypher`
         // does. `Ok(None)` (no default_context configured) and
         // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
-        // context"; every other error propagates so writes never silently land
-        // under the built-in vocab when a custom context couldn't be loaded.
+        // context" (bare namespace-0 names); every other error propagates so
+        // writes never silently land under bare names when a custom context
+        // couldn't be loaded.
         let default_context = match self.get_default_context(ledger_id).await {
             Ok(ctx) => ctx,
             Err(ApiError::NotFound(_)) => None,
@@ -3870,10 +3871,8 @@ impl Fluree {
         };
         let (vocab, overrides) =
             crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
-        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
-            vocab: Some(vocab),
-            overrides,
-        };
+        let cypher_opts =
+            fluree_db_transact::lower_cypher_update::CypherLowerOpts { vocab, overrides };
 
         let mut ns = NamespaceRegistry::from_db(snapshot);
         Ok(

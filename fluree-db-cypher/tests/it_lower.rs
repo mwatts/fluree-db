@@ -26,10 +26,12 @@ fn match_labeled_node_returns_var() {
     assert_eq!(q.patterns.len(), 1);
     match &q.patterns[0] {
         Pattern::Triple(tp) => {
-            // s = ?n, p = rdf:type Iri, o = Person Iri
+            // s = ?n, p = rdf:type Iri, o = the bare namespace-0 label
             assert!(matches!(tp.s, Ref::Var(_)));
             assert!(matches!(&tp.p, Ref::Iri(iri) if iri.as_ref().ends_with("type")));
-            assert!(matches!(&tp.o, Term::Iri(iri) if iri.as_ref() == "http://example.org/Person"));
+            assert!(
+                matches!(&tp.o, Term::Sid(sid) if sid.namespace_code == 0 && sid.name.as_ref() == "Person")
+            );
         }
         other => panic!("expected Triple, got {other:?}"),
     }
@@ -107,7 +109,7 @@ fn anonymous_relationship_lowers_to_plain_triple() {
         .iter()
         .find_map(|p| match p {
             Pattern::Triple(tp)
-                if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/KNOWS") =>
+                if matches!(&tp.p, Ref::Sid(sid) if sid.namespace_code == 0 && sid.name.as_ref() == "KNOWS") =>
             {
                 Some(tp)
             }
@@ -119,19 +121,24 @@ fn anonymous_relationship_lowers_to_plain_triple() {
 }
 
 #[test]
-fn named_relationship_lowers_to_edge_annotation() {
-    // Shape 2 — bag semantics, only sees reifier-bundled edges.
+fn named_relationship_lowers_to_value_only_edge() {
+    // A value-only bound relationship var (`RETURN r`, no annotation
+    // property reads): `NoEncoder` cannot even encode `f:reifiesSubject`,
+    // so the dictionary pre-gate proves no reified edge can exist and the
+    // var binds a synthesized relationship from the plain base triple.
+    // 2 label triples + 1 relationship triple + 1 MakeRel bind = 4.
     let q = lower("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b");
-    // 2 label triples + 1 EdgeAnnotation = 3
-    assert_eq!(q.patterns.len(), 3);
-    let has_edge_ann = q
-        .patterns
-        .iter()
-        .any(|p| matches!(p, Pattern::EdgeAnnotation { .. }));
+    assert_eq!(q.patterns.len(), 4, "{:?}", q.patterns);
     assert!(
-        has_edge_ann,
-        "expected EdgeAnnotation; got {:?}",
+        q.patterns.iter().any(|p| matches!(p, Pattern::Bind { .. })),
+        "r must bind the synthesized relationship: {:?}",
         q.patterns
+    );
+    assert!(
+        !q.patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::EdgeAnnotation { .. })),
+        "no annotation bundle when reified edges are proved absent"
     );
 }
 
@@ -415,7 +422,7 @@ fn inverse_direction() {
         .iter()
         .find_map(|p| match p {
             Pattern::Triple(tp)
-                if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/KNOWS") =>
+                if matches!(&tp.p, Ref::Sid(sid) if sid.namespace_code == 0 && sid.name.as_ref() == "KNOWS") =>
             {
                 Some(tp)
             }
@@ -566,10 +573,10 @@ fn type_alternation_lowers_to_union_of_concrete_predicates() {
     for branch in union {
         let has_concrete_pred = branch
             .iter()
-            .any(|p| matches!(p, Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(_))));
+            .any(|p| matches!(p, Pattern::Triple(tp) if matches!(&tp.p, Ref::Sid(_))));
         assert!(
             has_concrete_pred,
-            "each Union branch must use a concrete predicate Iri"
+            "each Union branch must use a concrete namespace-0 predicate Sid"
         );
     }
 }
@@ -1099,12 +1106,13 @@ fn with_where_without_aggregates_stays_a_filter() {
 /// Search the pattern tree for an Optional-wrapped Triple whose
 /// predicate is the given IRI. Property accessors emit this shape
 /// to give Cypher-nullable semantics.
-fn has_optional_prop_triple(patterns: &[Pattern], pred_iri: &str) -> bool {
+fn has_optional_prop_triple(patterns: &[Pattern], pred_name: &str) -> bool {
     patterns.iter().any(|p| match p {
         Pattern::Optional(inner) => inner.iter().any(|ip| {
             matches!(
                 ip,
-                Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == pred_iri)
+                Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(sid) if sid.namespace_code == 0 && sid.name.as_ref() == pred_name)
             )
         }),
         _ => false,
@@ -1117,7 +1125,7 @@ fn property_accessor_in_where_emits_optional_triple_and_filter() {
     // Expect: 1 label triple + 1 Optional containing the property
     // triple + 1 Filter.
     assert!(
-        has_optional_prop_triple(&q.patterns, "http://example.org/age"),
+        has_optional_prop_triple(&q.patterns, "age"),
         "expected Optional-wrapped property triple for n.age; got {:?}",
         q.patterns
     );
@@ -1152,7 +1160,7 @@ fn property_accessor_is_nullable_for_is_null_check() {
     // `IS NULL` (i.e. `NOT Bound`) evaluates true.
     let q = lower("MATCH (n:Person) WHERE n.missing IS NULL RETURN n");
     assert!(
-        has_optional_prop_triple(&q.patterns, "http://example.org/missing"),
+        has_optional_prop_triple(&q.patterns, "missing"),
         "IS NULL on a property still needs the Optional-wrapped triple in the pattern list"
     );
     let has_filter = q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
@@ -1163,7 +1171,7 @@ fn property_accessor_is_nullable_for_is_null_check() {
 fn property_accessor_in_return_emits_optional_triple_and_bind() {
     let q = lower("MATCH (n:Person) RETURN n.name");
     assert!(
-        has_optional_prop_triple(&q.patterns, "http://example.org/name"),
+        has_optional_prop_triple(&q.patterns, "name"),
         "expected Optional-wrapped property triple for n.name"
     );
     let has_bind = q.patterns.iter().any(|p| matches!(p, Pattern::Bind { .. }));
@@ -1175,10 +1183,7 @@ fn property_accessor_in_aggregate_arg() {
     // RETURN avg(n.age) — the aggregate's input is a property var.
     use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
     let q = lower("MATCH (n:Person) RETURN avg(n.age) AS avg_age");
-    assert!(has_optional_prop_triple(
-        &q.patterns,
-        "http://example.org/age"
-    ));
+    assert!(has_optional_prop_triple(&q.patterns, "age"));
     let grouping = q.grouping.expect("expected implicit grouping");
     match grouping {
         Grouping::Implicit { aggregation, .. } => {
@@ -1219,7 +1224,7 @@ fn property_accessor_drives_explicit_group_by() {
 fn property_accessor_in_order_by() {
     let q = lower("MATCH (n:Person) RETURN n ORDER BY n.age DESC");
     assert!(
-        has_optional_prop_triple(&q.patterns, "http://example.org/age"),
+        has_optional_prop_triple(&q.patterns, "age"),
         "ORDER BY n.age must emit the Optional-wrapped property triple"
     );
     assert_eq!(q.ordering.len(), 1);

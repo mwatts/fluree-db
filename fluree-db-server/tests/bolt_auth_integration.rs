@@ -98,10 +98,10 @@ async fn seed_ledger(state: &Arc<AppState>, ledger: &str) {
         state,
         &format!("/v1/fluree/insert/{ledger}"),
         serde_json::json!({
-            "@context": {"ex": "http://example.org/"},
+            "@context": {},
             "@graph": [
-                {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
-                {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"}
+                {"@id": "alice", "@type": "Person", "name": "Alice"},
+                {"@id": "bob", "@type": "Person", "name": "Bob"}
             ]
         }),
     )
@@ -574,14 +574,14 @@ async fn identity_derived_policy_filters_bolt_reads() {
         &state,
         &format!("/v1/fluree/insert/{ledger}"),
         serde_json::json!({
-            "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+            "@context": {"schema": "http://schema.org/"},
             "insert": [
-                {"@id": "ex:doc1", "@type": "ex:Document",
-                 "schema:name": "Public Post", "ex:classification": "public"},
-                {"@id": "ex:doc2", "@type": "ex:Document",
-                 "schema:name": "Internal Memo", "ex:classification": "internal"},
-                {"@id": "ex:doc3", "@type": "ex:Document",
-                 "schema:name": "Executive Salaries", "ex:classification": "confidential"}
+                {"@id": "doc1", "@type": "Document",
+                 "schema:name": "Public Post", "classification": "public"},
+                {"@id": "doc2", "@type": "Document",
+                 "schema:name": "Internal Memo", "classification": "internal"},
+                {"@id": "doc3", "@type": "Document",
+                 "schema:name": "Executive Salaries", "classification": "confidential"}
             ]
         }),
     )
@@ -590,33 +590,33 @@ async fn identity_derived_policy_filters_bolt_reads() {
         &state,
         &format!("/v1/fluree/insert/{ledger}"),
         serde_json::json!({
-            "@context": {"f": "https://ns.flur.ee/db#", "ex": "http://example.org/"},
+            "@context": {"f": "https://ns.flur.ee/db#"},
             "insert": [
                 {
-                    "@id": "ex:public-policy",
-                    "@type": ["f:AccessPolicy", "ex:PublicClass"],
+                    "@id": "public-policy",
+                    "@type": ["f:AccessPolicy", "PublicClass"],
                     "f:action": [{"@id": "f:view"}],
                     "f:query": {
                         "@type": "@json",
                         "@value": {
-                            "@context": {"ex": "http://example.org/"},
-                            "where": [{"@id": "?$this", "ex:classification": "public"}]
+                            "@context": {},
+                            "where": [{"@id": "?$this", "classification": "public"}]
                         }
                     }
                 },
                 {
-                    "@id": "ex:manager-policy",
-                    "@type": ["f:AccessPolicy", "ex:ManagerClass"],
+                    "@id": "manager-policy",
+                    "@type": ["f:AccessPolicy", "ManagerClass"],
                     "f:action": [{"@id": "f:view"}],
                     "f:allow": true
                 },
                 {
-                    "@id": "http://example.org/public-user",
-                    "f:policyClass": [{"@id": "ex:PublicClass"}]
+                    "@id": "did:example:public-user",
+                    "f:policyClass": [{"@id": "PublicClass"}]
                 },
                 {
-                    "@id": "http://example.org/manager-user",
-                    "f:policyClass": [{"@id": "ex:ManagerClass"}]
+                    "@id": "did:example:manager-user",
+                    "f:policyClass": [{"@id": "ManagerClass"}]
                 }
             ]
         }),
@@ -627,7 +627,7 @@ async fn identity_derived_policy_filters_bolt_reads() {
 
     // The public identity sees only the public document — including in the
     // hydrated node's properties (the typed-table/Bolt hydration path).
-    let token = identity_token("http://example.org/public-user", ledger);
+    let token = identity_token("did:example:public-user", ledger);
     let mut c = BoltClient::ready_54(addr, auth_map("bearer", None, Some(&token))).await;
     let rows = c.query_rows(q, ledger).await;
     assert_eq!(rows.len(), 1, "public identity sees one document: {rows:?}");
@@ -638,7 +638,7 @@ async fn identity_derived_policy_filters_bolt_reads() {
     );
 
     // The manager identity sees all three with the SAME query.
-    let token = identity_token("http://example.org/manager-user", ledger);
+    let token = identity_token("did:example:manager-user", ledger);
     let mut c = BoltClient::ready_54(addr, auth_map("bearer", None, Some(&token))).await;
     let rows = c.query_rows(q, ledger).await;
     assert_eq!(

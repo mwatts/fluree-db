@@ -17,13 +17,15 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// Counter for `?#__cy_<n>` synthetic vars.
     next_synth: u32,
     /// Optional default-vocabulary prefix used to resolve bare
-    /// identifiers (e.g. `Person`) into IRIs. Without this, only
-    /// fully-qualified IRIs work — and Cypher doesn't have a syntax
-    /// for those, so a default is essentially required in practice.
+    /// identifiers (e.g. `Person`) into IRIs — the RDF-compat mode,
+    /// sourced from the ledger context's `@vocab`.
     ///
-    /// Default in v1: `http://example.org/`. Real wiring will pull
-    /// this from the ledger config / request envelope.
-    pub vocab: String,
+    /// `None` (the default) means Cypher identifiers are plain names
+    /// with no IRI at all: they live under namespace code 0 (the empty
+    /// prefix), so `Person` is just `Person`. This is the native LPG
+    /// mode — a Cypher user never sees or enters a namespace unless
+    /// they opt into RDF interop by configuring `@vocab`.
+    pub vocab: Option<String>,
     /// Per-variable IRI overrides for labels/types/properties, set
     /// either via request envelope or test fixture. Bare identifier →
     /// IRI string.
@@ -69,7 +71,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             encoder,
             vars,
             next_synth: 0,
-            vocab: "http://example.org/".to_string(),
+            vocab: None,
             overrides: HashMap::new(),
             scopes: Vec::new(),
             annotation_dependent: std::collections::HashSet::new(),
@@ -132,7 +134,12 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     }
 
     pub fn with_vocab(mut self, vocab: impl Into<String>) -> Self {
-        self.vocab = vocab.into();
+        self.vocab = Some(vocab.into());
+        self
+    }
+
+    pub fn with_vocab_opt(mut self, vocab: Option<String>) -> Self {
+        self.vocab = vocab;
         self
     }
 
@@ -161,8 +168,9 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         self.vars.get_or_insert(name)
     }
 
-    /// Resolve a bare Cypher identifier (label, type, property key) to
-    /// an IRI. Order: per-request override → vocab + bare identifier.
+    /// Resolve a bare Cypher identifier (label, type, property key).
+    /// Order: per-request override → `@vocab` + bare identifier (RDF
+    /// compat) → the bare name itself (namespace 0, no IRI).
     pub fn resolve_iri(&self, name: &str) -> String {
         if name == "*" {
             return name.to_string();
@@ -170,8 +178,12 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         if let Some(iri) = self.overrides.get(name) {
             return iri.clone();
         }
-        // No prefixing rules in Cypher; concatenate vocab + name.
-        format!("{}{}", self.vocab, name)
+        match &self.vocab {
+            // RDF compat: concatenate vocab + name (no prefixing rules
+            // in Cypher).
+            Some(vocab) => format!("{vocab}{name}"),
+            None => name.to_string(),
+        }
     }
 
     /// Resolve and reject reserved-system predicates.
@@ -196,6 +208,15 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     pub fn iri_ref(&self, iri: String) -> fluree_db_query::ir::Ref {
         match self.encoder.encode_iri_strict(&iri) {
             Some(sid) => fluree_db_query::ir::Ref::Sid(sid),
+            // No @vocab: a bare Cypher name (no scheme — identifiers
+            // can't contain `:`) lives under namespace 0 (empty
+            // prefix) — construct the Sid directly; `encode_iri_strict`
+            // rejects namespace 0 by design. Scheme-ful strings (system
+            // IRIs like rdf:type, backticked IRIs) keep the strict
+            // behavior: unregistered namespaces stay `Ref::Iri`.
+            None if self.vocab.is_none() && !iri.contains(':') => fluree_db_query::ir::Ref::Sid(
+                fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri),
+            ),
             None => fluree_db_query::ir::Ref::Iri(iri.into()),
         }
     }
@@ -204,6 +225,10 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     pub fn iri_term(&self, iri: String) -> fluree_db_query::ir::Term {
         match self.encoder.encode_iri_strict(&iri) {
             Some(sid) => fluree_db_query::ir::Term::Sid(sid),
+            // Bare namespace-0 name — see [`Self::iri_ref`].
+            None if self.vocab.is_none() && !iri.contains(':') => fluree_db_query::ir::Term::Sid(
+                fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri),
+            ),
             None => fluree_db_query::ir::Term::Iri(iri.into()),
         }
     }

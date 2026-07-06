@@ -73,12 +73,12 @@ async fn bolt_server(ledger: &str) -> (TempDir, Arc<AppState>, std::net::SocketA
         &state,
         ledger,
         json!({
-            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "@context": {"xsd": "http://www.w3.org/2001/XMLSchema#"},
             "@graph": [
-                {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 30,
-                 "ex:birthday": {"@value": "1990-11-23", "@type": "xsd:date"},
-                 "ex:knows": {"@id": "ex:bob"}},
-                {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob", "ex:age": 45}
+                {"@id": "alice", "@type": "Person", "name": "Alice", "age": 30,
+                 "birthday": {"@value": "1990-11-23", "@type": "xsd:date"},
+                 "knows": {"@id": "bob"}},
+                {"@id": "bob", "@type": "Person", "name": "Bob", "age": 45}
             ]
         }),
     )
@@ -550,7 +550,7 @@ async fn bolt5_returns_node_structures() {
     assert_eq!(birthday.signature, SIG_DATE);
     assert_eq!(
         node.fields[3],
-        Value::String("http://example.org/alice".into()),
+        Value::String("alice".into()),
         "element_id is the full IRI"
     );
 }
@@ -617,14 +617,10 @@ async fn bolt_returns_relationship_structure() {
     assert_eq!(rel.fields[3], Value::String("knows".into()));
     assert_eq!(
         rel.fields[6],
-        Value::String("http://example.org/alice".into()),
+        Value::String("alice".into()),
         "start_element_id"
     );
-    assert_eq!(
-        rel.fields[7],
-        Value::String("http://example.org/bob".into()),
-        "end_element_id"
-    );
+    assert_eq!(rel.fields[7], Value::String("bob".into()), "end_element_id");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -904,10 +900,7 @@ async fn bolt_indexed_node_structures_via_batched_crawl() {
     };
     assert_eq!(birthday.signature, SIG_DATE);
     assert_eq!(birthday.fields, vec![Value::Integer(7631)]);
-    assert_eq!(
-        node.fields[3],
-        Value::String("http://example.org/alice".into())
-    );
+    assert_eq!(node.fields[3], Value::String("alice".into()));
 }
 
 /// The reified-edge gate's tiers, end to end. On an indexed ledger with no
@@ -951,9 +944,9 @@ async fn bolt_reified_edge_gate_reopens_for_novelty_annotations() {
         &state,
         LEDGER,
         json!({
-            "@context": {"ex": "http://example.org/"},
-            "@id": "ex:alice",
-            "ex:likes": {"@id": "ex:bob", "@annotation": {"ex:since": 2020}}
+            "@context": {},
+            "@id": "alice",
+            "likes": {"@id": "bob", "@annotation": {"since": 2020}}
         }),
     )
     .await;
