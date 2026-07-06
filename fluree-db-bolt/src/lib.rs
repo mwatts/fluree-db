@@ -9,7 +9,7 @@
 //! [`session::Session`], and executes the [`session::Turn::Run`] actions it
 //! emits against the Fluree query/transact API.
 //!
-//! Scope (v1, see `docs/design/bolt-adapter.md`): Bolt 4.4 and 5.x,
+//! Scope (v1, see `docs/api/bolt.md`): Bolt 4.4 and 5.x,
 //! autocommit only. `BEGIN` answers a clear FAILURE; explicit transactions
 //! are deliberately unsupported.
 

@@ -55,7 +55,7 @@ raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
 # Bolt protocol listener (Neo4j drivers speak to the openCypher surface).
 # Default on — the listener only binds when bolt_listen_addr is configured,
 # so runtime config is the real gate; exclude the feature only for minimal
-# builds. See docs/design/bolt-adapter.md.
+# builds. See docs/api/bolt.md.
 bolt = ["dep:fluree-db-bolt"]
 
 [dependencies]

@@ -1,7 +1,7 @@
 //! Per-phase Cypher cost profiler: parse vs AST-clone vs param-substitution
 //! vs lowering vs full round trip.
 //!
-//! Built to answer one question from `docs/design/bolt-adapter.md`: where does
+//! Built to answer one question from the Bolt adapter effort: where does
 //! the per-request engine-side time go for benchmark-shaped statements, and
 //! therefore is a parsed-AST cache (text -> Arc<CypherAst>, clone + substitute
 //! per request) enough, or does lowered IR need caching too (which would need
@@ -20,8 +20,8 @@
 //! novelty scan path — absolute e2e values are ms-scale and NOT comparable
 //! to indexed-server numbers (they exist only to show parse/lower is
 //! negligible against execution). Measured answer (2026-07): parse 1-4 us,
-//! lower 1-4 us => a lowered-IR cache is not warranted; see
-//! docs/design/bolt-adapter.md. Keep PROF_USERS modest: aggregate-heavy
+//! lower 1-4 us => a lowered-IR cache is not warranted (its
+//! snapshot-keyed invalidation would buy back single-digit microseconds). Keep PROF_USERS modest: aggregate-heavy
 //! statements over large unindexed novelty run for minutes.
 //!
 //! ## Config (env vars)

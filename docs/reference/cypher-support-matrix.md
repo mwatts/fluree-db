@@ -130,11 +130,10 @@ These shape everything below; read them first.
 
 ## Bolt protocol (Neo4j drivers)
 
-The server accepts official Neo4j drivers
-(`bolt://` scheme) against the openCypher surface — versions 4.4 and
-5.0–5.4, autocommit only. See [Bolt adapter design](../design/bolt-adapter.md)
-and [configuration](../operations/configuration.md). Transport-specific
-semantics:
+The server accepts official Neo4j drivers (`bolt://` scheme) against
+the openCypher surface — versions 4.4 and 5.0–5.4, autocommit and
+explicit transactions. See the [Bolt guide](../guides/bolt.md) and
+[Bolt reference](../api/bolt.md). Transport-specific semantics:
 
 | Aspect | Status | Notes |
 |--------|:------:|-------|

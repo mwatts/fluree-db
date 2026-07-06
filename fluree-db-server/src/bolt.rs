@@ -6,7 +6,7 @@
 //! [`AppState`], and executes autocommit `RUN` statements through exactly
 //! the entry points the HTTP routes use: `query_cypher_with_params` for
 //! reads, the consensus submit path for writes. See
-//! `docs/design/bolt-adapter.md`.
+//! `docs/api/bolt.md`.
 //!
 //! v1 runs open (no auth): the listener refuses to start when the server
 //! has credentials configured for the data plane, rather than inventing a
@@ -620,8 +620,8 @@ fn local_name(datatype_iri: &str) -> &str {
 fn typed_literal_to_bolt(value: JsonValue, datatype_local: &str) -> Value {
     match (datatype_local, &value) {
         // PackStream has no decimal type; Neo4j returns Float. The JSON
-        // transport keeps the exact lexical string instead — decided in
-        // docs/design/bolt-adapter.md (open question 1).
+        // transport keeps the exact lexical string instead — see the
+        // value-mapping notes in docs/api/bolt.md.
         ("decimal", JsonValue::String(s)) => s
             .parse::<f64>()
             .map(Value::Float)
