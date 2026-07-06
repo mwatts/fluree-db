@@ -28,7 +28,7 @@ use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
-use fluree_db_core::{FlakeValue, GraphId, OverlayProvider};
+use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
 
@@ -68,7 +68,7 @@ pub fn count_rows_operator(
 
             // Lane 1 — metadata-only predicate row count (instant) when there is
             // no novelty overlay and the target is the indexed head.
-            let overlay_free = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0) == 0;
+            let overlay_free = !crate::fast_path_common::overlay_has_novelty(ctx);
             if overlay_free && ctx.to_t == store.max_t() {
                 let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 return Ok(Some(build_count_batch(

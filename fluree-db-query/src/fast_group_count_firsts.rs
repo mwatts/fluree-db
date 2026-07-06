@@ -192,12 +192,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
         // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
         //
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
-        {
+        if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match group_count_v6(
                     binary_index_store,
@@ -438,12 +433,7 @@ impl Operator for PredicateObjectCountFirstsOperator {
         // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
         //
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
-        {
+        if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match count_bound_object_v6(
                     ctx.active_snapshot,

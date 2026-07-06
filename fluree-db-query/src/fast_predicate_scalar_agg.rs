@@ -171,11 +171,7 @@ pub fn predicate_scalar_agg_operator(
             // constant-folding / directory shortcuts). An uncommitted overlay or
             // `to_t < max_t` would make that scan stale, so fold the same
             // aggregate over a POST overlay cursor instead.
-            let has_overlay = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let has_overlay = crate::fast_path_common::overlay_has_novelty(ctx);
             let result = if !has_overlay && ctx.to_t == store.max_t() {
                 scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind)?
             } else {
@@ -492,11 +488,7 @@ fn scan_predicate_scalar_agg_overlay(
         // Predicate absent from the persisted dictionary. With novelty present it
         // may exist only in the overlay (no `p_id` to range-bound a cursor), so
         // fall back to the planned pipeline; otherwise the input is genuinely empty.
-        let overlay_has_rows = ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            != 0;
+        let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
         return if overlay_has_rows {
             Ok(None)
         } else {

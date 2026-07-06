@@ -662,20 +662,23 @@ fn compute_task(
     }
 }
 
-/// Whether the store's predicate dictionary contains any predicate the
+/// Whether the queried graph carries rows under any predicate the
 /// variable-predicate scan hides — `f:reifies*` in every graph, the broader
 /// `f:` namespace in the default graph (mirrors
 /// `BinaryScanOperator::is_internal_predicate`). Such facts are invisible to
 /// the `?n ?p ?o` pipeline but present in the SPOT directories this fold
 /// reads, so their presence makes the fold inexact.
 ///
-/// Deliberately checks the **dictionary**, not the per-graph stats: the
-/// incremental index build currently persists delta-only per-graph property
-/// stats (base entries lost), so a stats-driven check can silently pass on a
-/// graph that does carry hidden facts. Dictionary membership over-declines
-/// only when every row of a hidden predicate has been retracted — the safe
-/// direction. The predicate dictionary is small (one entry per predicate
-/// ever used), so the walk is trivial.
+/// Two deliberate choices:
+/// - Candidates come from the store's predicate **dictionary**, not the
+///   per-graph stats: the incremental index build can persist delta-only
+///   per-graph property stats (base entries lost), so a stats-driven check
+///   can silently pass on a graph that does carry hidden facts.
+/// - Each hidden candidate is confirmed by its **row count in the queried
+///   graph** (`count_rows_for_predicate_psot`, directory-only): the
+///   dictionary is global across graphs, so commit-metadata `f:` predicates
+///   from the txn-meta graph are always present in it — bare membership
+///   would permanently decline every ledger.
 pub(crate) fn graph_has_scan_hidden_predicates(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &BinaryIndexStore,
@@ -685,9 +688,9 @@ pub(crate) fn graph_has_scan_hidden_predicates(
             // Unresolvable dictionary entry — err toward declining.
             return Ok(true);
         };
-        if fluree_db_core::is_reserved_reifies_predicate(&sid)
-            || (ctx.binary_g_id == 0 && sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB)
-        {
+        let hidden = fluree_db_core::is_reserved_reifies_predicate(&sid)
+            || (ctx.binary_g_id == 0 && sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB);
+        if hidden && count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)? > 0 {
             return Ok(true);
         }
     }
