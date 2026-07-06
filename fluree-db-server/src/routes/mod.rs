@@ -98,9 +98,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let v1_admin_protected_writes =
         v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
 
-    // Forward to the Raft leader (when running in Raft mode) before
-    // admin-token auth: an out-of-date follower with stale credentials
-    // shouldn't reject a request the leader would accept.
+    // Admin auth runs BEFORE leader-forward. Axum runs the
+    // last-applied layer outermost, so `require_admin_token`
+    // (applied after `apply_leader_forward`) is the outer layer and
+    // gates the request first: an unauthenticated write is rejected
+    // locally with 401 rather than relayed across the cluster —
+    // forwarding an unauthenticated request would be a DoS
+    // amplifier. The trade-off is that a follower whose JWKS cache
+    // is stale during a key rotation 401s a request the leader
+    // would accept, instead of forwarding it; that's the safe
+    // direction to fail. The gate is pinned by
+    // `tests/admin_auth_layering.rs`.
     let v1_admin_protected_writes = apply_leader_forward(v1_admin_protected_writes, &state);
 
     let v1_admin_protected_writes = v1_admin_protected_writes
