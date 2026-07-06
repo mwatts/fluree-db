@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::FutureExt;
 use serde_json::Value as JsonValue;
 
@@ -148,7 +147,7 @@ pub(crate) async fn typed_table(
         for row_idx in 0..batch.len() {
             for &var_id in &col_vars {
                 if let Some(b) = batch.get(row_idx, var_id) {
-                    collect_subject_sids(b, &mut wanted);
+                    collect_subject_sids(result.binary_graph.as_ref(), b, &mut wanted)?;
                 }
             }
         }
@@ -174,10 +173,21 @@ pub(crate) async fn typed_table(
 
 /// Collect every subject this binding will hydrate when rendered: node
 /// refs, relationship reifiers (annotation properties), and path nodes.
-/// Mirrors the dispatch in [`binding_cell`]; encoded bindings are skipped.
-fn collect_subject_sids(binding: &Binding, out: &mut Vec<Sid>) {
+/// Mirrors the dispatch in [`binding_cell`]. Encoded subject refs
+/// (`EncodedSid`, the shape bare node vars carry off the binary scan)
+/// materialize here — skipping them silently empties the prefetch and
+/// degrades every row to a serial fetch.
+fn collect_subject_sids(
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    binding: &Binding,
+    out: &mut Vec<Sid>,
+) -> Result<()> {
     if binding.is_encoded() {
-        return;
+        if binding.is_encoded_sid() {
+            let materialized = super::materialize::materialize_with_graph(gv, binding)?;
+            collect_subject_sids(gv, &materialized, out)?;
+        }
+        return Ok(());
     }
     match binding {
         Binding::Sid { sid, .. } => out.push(sid.clone()),
@@ -190,16 +200,17 @@ fn collect_subject_sids(binding: &Binding, out: &mut Vec<Sid>) {
         Binding::Path { nodes, .. } => out.extend(nodes.iter().cloned()),
         Binding::List(values) | Binding::Grouped(values) => {
             for v in values {
-                collect_subject_sids(v, out);
+                collect_subject_sids(gv, v, out)?;
             }
         }
         Binding::Map(entries) => {
             for (_, v) in entries {
-                collect_subject_sids(v, out);
+                collect_subject_sids(gv, v, out)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Hydrate a flat list of subjects into [`CypherNode`]s against `view`
@@ -335,6 +346,12 @@ struct NodeHydrator<'a> {
     /// Raw subject flakes, shared by node hydration, annotation
     /// properties, and path nodes; populated in bulk by [`Self::prefetch`].
     flake_cache: HashMap<Sid, Arc<Vec<fluree_db_core::Flake>>>,
+    /// Predicate Sid → Cypher property key (None = system predicate,
+    /// hidden). Predicates repeat across every node; decoding each flake's
+    /// predicate IRI per occurrence is pure waste.
+    key_names: HashMap<Sid, Option<Arc<str>>>,
+    /// Class Sid → Cypher label (None = the hidden `db:Node` marker).
+    label_names: HashMap<Sid, Option<Arc<str>>>,
 }
 
 /// Concurrent subject fetches in flight during [`NodeHydrator::prefetch`].
@@ -349,12 +366,48 @@ impl<'a> NodeHydrator<'a> {
             node_marker: view.snapshot.encode_iri(fluree_vocab::fluree::NODE),
             cache: HashMap::new(),
             flake_cache: HashMap::new(),
+            key_names: HashMap::new(),
+            label_names: HashMap::new(),
         }
     }
 
-    /// Bulk-fetch the flakes of every not-yet-cached subject, with bounded
-    /// concurrency, issued in subject order so adjacent subjects hit the
-    /// same leaflets.
+    /// Memoized predicate Sid → property key (`None` hides system predicates).
+    fn key_name(&mut self, pred: &Sid) -> Result<Option<Arc<str>>> {
+        if let Some(hit) = self.key_names.get(pred) {
+            return Ok(hit.clone());
+        }
+        let p_iri = self.compactor.decode_sid(pred)?;
+        let name = if p_iri.starts_with(FLUREE_SYSTEM_NS) {
+            None
+        } else {
+            Some(Arc::from(cypher_name_from_iri(&p_iri).as_str()))
+        };
+        self.key_names.insert(pred.clone(), name.clone());
+        Ok(name)
+    }
+
+    /// Memoized class Sid → label (`None` hides the `db:Node` marker).
+    fn label_name(&mut self, class_sid: &Sid) -> Result<Option<Arc<str>>> {
+        if let Some(hit) = self.label_names.get(class_sid) {
+            return Ok(hit.clone());
+        }
+        let name = if Some(class_sid) == self.node_marker.as_ref() {
+            None
+        } else {
+            let class_iri = self.compactor.decode_sid(class_sid)?;
+            Some(Arc::from(cypher_name_from_iri(&class_iri).as_str()))
+        };
+        self.label_names.insert(class_sid.clone(), name.clone());
+        Ok(name)
+    }
+
+    /// Bulk-fetch the flakes of every not-yet-cached subject.
+    ///
+    /// The fetches are CPU-bound in-memory work (cursor setup, leaflet
+    /// decode, dict resolves — ~tens of µs each), so cooperative
+    /// concurrency alone doesn't help: the chunks are spawned as tasks to
+    /// run on parallel workers, each walking its share of the
+    /// subject-sorted list in order.
     async fn prefetch(&mut self, mut sids: Vec<Sid>) -> Result<()> {
         sids.sort_unstable_by(|a, b| {
             (a.namespace_code, a.name.as_ref()).cmp(&(b.namespace_code, b.name.as_ref()))
@@ -365,11 +418,20 @@ impl<'a> NodeHydrator<'a> {
             return Ok(());
         }
 
-        let view = self.view;
-        let fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> =
-            stream::iter(sids.into_iter().map(|sid| {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(4)
+            .min(PREFETCH_CONCURRENCY)
+            .min(sids.len());
+        let chunk_size = sids.len().div_ceil(workers);
+        let mut handles = Vec::with_capacity(workers);
+        for chunk in sids.chunks(chunk_size) {
+            let chunk = chunk.to_vec();
+            let view = self.view.clone();
+            handles.push(tokio::spawn(async move {
                 let db = view.as_graph_db_ref();
-                async move {
+                let mut out = Vec::with_capacity(chunk.len());
+                for sid in chunk {
                     let flakes = db
                         .range_with_opts(
                             IndexType::Spot,
@@ -381,15 +443,18 @@ impl<'a> NodeHydrator<'a> {
                         .map_err(|e| {
                             FormatError::InvalidBinding(format!("node property fetch failed: {e}"))
                         })?;
-                    Ok::<_, FormatError>((sid, flakes))
+                    out.push((sid, flakes));
                 }
-            }))
-            .buffer_unordered(PREFETCH_CONCURRENCY)
-            .try_collect()
-            .await?;
-
-        for (sid, flakes) in fetched {
-            self.flake_cache.insert(sid, Arc::new(flakes));
+                Ok::<_, FormatError>(out)
+            }));
+        }
+        for handle in handles {
+            let fetched = handle.await.map_err(|e| {
+                FormatError::InvalidBinding(format!("node property fetch task failed: {e}"))
+            })??;
+            for (sid, flakes) in fetched {
+                self.flake_cache.insert(sid, Arc::new(flakes));
+            }
         }
         Ok(())
     }
@@ -431,23 +496,19 @@ impl<'a> NodeHydrator<'a> {
             }
             if Some(&flake.p) == self.rdf_type.as_ref() {
                 if let FlakeValue::Ref(class_sid) = &flake.o {
-                    if Some(class_sid) == self.node_marker.as_ref() {
-                        continue;
+                    if let Some(label) = self.label_name(class_sid)? {
+                        labels.push(label.to_string());
                     }
-                    let class_iri = self.compactor.decode_sid(class_sid)?;
-                    labels.push(cypher_name_from_iri(&class_iri));
                 }
                 continue;
             }
-            let p_iri = self.compactor.decode_sid(&flake.p)?;
-            if p_iri.starts_with(FLUREE_SYSTEM_NS) {
+            let Some(key) = self.key_name(&flake.p)? else {
                 continue;
-            }
-            let key = cypher_name_from_iri(&p_iri);
+            };
             let cell = self.flake_value_cell(&flake.o)?;
-            match props.iter_mut().find(|(k, _)| *k == key) {
+            match props.iter_mut().find(|(k, _)| *k == key.as_ref()) {
                 Some((_, cells)) => cells.push(cell),
-                None => props.push((key, vec![cell])),
+                None => props.push((key.to_string(), vec![cell])),
             }
         }
         let node = CypherNode {
@@ -478,14 +539,10 @@ impl<'a> NodeHydrator<'a> {
             if !flake.op || Some(&flake.p) == self.rdf_type.as_ref() {
                 continue;
             }
-            let p_iri = self.compactor.decode_sid(&flake.p)?;
-            if p_iri.starts_with(FLUREE_SYSTEM_NS) {
+            let Some(key) = self.key_name(&flake.p)? else {
                 continue;
-            }
-            props.push((
-                cypher_name_from_iri(&p_iri),
-                self.flake_value_cell(&flake.o)?,
-            ));
+            };
+            props.push((key.to_string(), self.flake_value_cell(&flake.o)?));
         }
         Ok(props)
     }
@@ -621,9 +678,9 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        collect_subject_sids(&rel, &mut out);
-        collect_subject_sids(&nested, &mut out);
-        collect_subject_sids(&path, &mut out);
+        collect_subject_sids(None, &rel, &mut out).unwrap();
+        collect_subject_sids(None, &nested, &mut out).unwrap();
+        collect_subject_sids(None, &path, &mut out).unwrap();
 
         let names: Vec<&str> = out.iter().map(|s| s.name.as_ref()).collect();
         assert_eq!(names, vec!["ann1", "n1", "n2", "p1", "p2"]);
