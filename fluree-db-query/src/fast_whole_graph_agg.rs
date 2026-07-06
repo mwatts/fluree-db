@@ -32,11 +32,28 @@
 //! (`#P1(n) × #P2(n)`), which changes duplicate-sensitive aggregates — the
 //! detector only admits the single-accessor shape.
 //!
+//! The class-anchored family generalizes the same folds to
+//! `MATCH (n:C) RETURN …` (anchor = `?n rdf:type <C>`): the subject universe
+//! becomes the class's instance count from the per-graph class stats, and
+//! property-derived folds additionally require the **containment proof**
+//! `class_property_flakes(C, P) == predicate_rows(P)` — equality means every
+//! `P`-bearing subject is a `C`, so predicate-scoped folds equal the
+//! class-restricted join. Both sides are current-state-exact at HEAD (class
+//! stats per issue #1266; rows from PSOT directories).
+//!
+//! Beyond the single-row scalar shape, `GROUP BY ?prop` + `COUNT(*)` (the
+//! Cypher histogram `RETURN n.age, COUNT(*)`) folds to a predicate-scoped
+//! POST run-length group count (values are physically contiguous in POST)
+//! plus one null-group row (`subjects − subj(P)` — the left join gives
+//! property-less subjects a single unbound-key row).
+//!
 //! The fold requires the strict metadata-lane gate ([`fast_path_store`]:
-//! single-ledger, root/no policy, no overlay, at HEAD) and declines when the
-//! graph carries predicates the variable-predicate scan hides (`f:reifies*`
-//! anywhere, the `f:` namespace in the default graph) — those facts are
-//! invisible to `?n ?p ?o` but not to the SPOT directories this fold reads.
+//! single-ledger, root/no policy, no overlay, at HEAD). The whole-graph
+//! anchor additionally declines when the graph carries predicates the
+//! variable-predicate scan hides (`f:reifies*` anywhere, the `f:` namespace
+//! in the default graph) — those facts are invisible to `?n ?p ?o` but not
+//! to the SPOT directories; a class anchor reads only class stats, so it is
+//! immune.
 
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
@@ -52,6 +69,7 @@ use crate::fast_path_common::{
 use crate::fast_predicate_scalar_agg::{scan_predicate_scalar_agg, ScalarAggKind, SumExprI64};
 use crate::ir::grouping::{AggregateFn, Aggregation, Grouping, InputSemantics};
 use crate::ir::triple::{Ref, Term};
+use crate::ir::Expression;
 use crate::ir::{Pattern, Query};
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
@@ -83,28 +101,37 @@ impl AggTask {
     }
 }
 
-/// Detected plan: the accessor predicate (if any) and one task per projected
-/// output column, in projection order.
+/// The subject universe the aggregates range over.
+enum Anchor {
+    /// Bare `MATCH (n)`: the DISTINCT-subject subquery over `?n ?p ?o`.
+    AllSubjects,
+    /// `MATCH (n:C)`: `?n rdf:type <C>` with a concrete class SID.
+    Class(Sid),
+}
+
+/// What the fold produces.
+enum FoldKind {
+    /// One row of scalar aggregates (implicit grouping), one task per
+    /// projected column in projection order.
+    Scalars(Vec<AggTask>),
+    /// `GROUP BY ?prop` + `COUNT(*)`: one row per distinct property value
+    /// plus a null group. Column positions index into `schema`.
+    Histogram { prop_col: usize, count_col: usize },
+}
+
+/// Detected plan: anchor, accessor predicate (if any), fold kind, and the
+/// output schema in projection order.
 pub(crate) struct WholeGraphAggPlan {
+    anchor: Anchor,
     accessor: Option<Ref>,
-    tasks: Vec<AggTask>,
+    kind: FoldKind,
     schema: Vec<VarId>,
 }
 
-/// Recognize the whole-graph scalar-aggregate shape. See the module docs for
-/// the exact pattern and per-aggregate soundness arguments.
+/// Recognize the whole-graph / class-anchored aggregate shapes. See the
+/// module docs for the exact patterns and per-aggregate soundness arguments.
 pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraphAggPlan> {
-    // Single implicit group, aggregates only — no HAVING, post-binds,
-    // ordering, offset, DISTINCT output, or LIMIT 0.
-    let Some(Grouping::Implicit {
-        aggregation: Aggregation { aggregates, binds },
-        having: None,
-    }) = &query.grouping
-    else {
-        return None;
-    };
-    if !binds.is_empty()
-        || !query.ordering.is_empty()
+    if !query.ordering.is_empty()
         || !query.order_binds.is_empty()
         || query.offset.is_some()
         || query.output.is_distinct()
@@ -114,50 +141,114 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
         return None;
     }
 
-    // Pattern shape: the DISTINCT-subject subquery, then at most one
-    // single-triple property-accessor OPTIONAL.
+    // Anchor: DISTINCT-subject subquery, or a single class triple.
     let (first, rest) = query.patterns.split_first()?;
-    let Pattern::Subquery(sq) = first else {
-        return None;
+    let (anchor, subject_var) = match first {
+        Pattern::Subquery(sq) => (Anchor::AllSubjects, distinct_subject_scan_var(sq)?),
+        Pattern::Triple(tp) => {
+            if !tp.p.is_rdf_type() || tp.dtc.is_some() {
+                return None;
+            }
+            let sv = tp.s.as_var()?;
+            let Term::Sid(class_sid) = &tp.o else {
+                return None;
+            };
+            (Anchor::Class(class_sid.clone()), sv)
+        }
+        _ => return None,
     };
-    let subject_var = distinct_subject_scan_var(sq)?;
 
-    let accessor = match rest {
-        [] => None,
-        [Pattern::Optional(inner)] => {
-            let [Pattern::Triple(tp)] = inner.as_slice() else {
-                return None;
-            };
-            if tp.s.as_var() != Some(subject_var) || !tp.p_bound() || tp.dtc.is_some() {
+    // At most one single-triple property-accessor OPTIONAL, optionally
+    // followed by an identity Bind aliasing the accessor var into the
+    // projected column (`RETURN n.age, COUNT(*)` emits `?alias = ?prop`).
+    let parse_accessor = |inner: &[Pattern]| -> Option<(Ref, VarId)> {
+        let [Pattern::Triple(tp)] = inner else {
+            return None;
+        };
+        if tp.s.as_var() != Some(subject_var) || !tp.p_bound() || tp.dtc.is_some() {
+            return None;
+        }
+        let Term::Var(prop_var) = tp.o else {
+            return None;
+        };
+        if prop_var == subject_var {
+            return None;
+        }
+        Some((tp.p.clone(), prop_var))
+    };
+    let (accessor, prop_alias) = match rest {
+        [] => (None, None),
+        [Pattern::Optional(inner)] => (Some(parse_accessor(inner)?), None),
+        [Pattern::Optional(inner), Pattern::Bind { var, expr }] => {
+            let acc = parse_accessor(inner)?;
+            if *expr != Expression::Var(acc.1) || *var == acc.1 || *var == subject_var {
                 return None;
             }
-            let Term::Var(prop_var) = tp.o else {
-                return None;
-            };
-            if prop_var == subject_var {
-                return None;
-            }
-            Some((tp.p.clone(), prop_var))
+            (Some(acc), Some(*var))
         }
         _ => return None,
     };
     let prop_var = accessor.as_ref().map(|(_, v)| *v);
-
-    // Every aggregate must fold, and the projection must be exactly the
-    // aggregate outputs.
     let select_vars = query.output.projected_vars()?;
-    if select_vars.len() != aggregates.len() {
-        return None;
-    }
-    let mut tasks = Vec::with_capacity(select_vars.len());
-    for out in &select_vars {
-        let spec = aggregates.iter().find(|a| a.output_var == *out)?;
-        tasks.push(classify_aggregate(&spec.function, subject_var, prop_var)?);
-    }
+
+    let kind = match &query.grouping {
+        // Scalars: single implicit group, aggregates only.
+        Some(Grouping::Implicit {
+            aggregation: Aggregation { aggregates, binds },
+            having: None,
+        }) => {
+            if !binds.is_empty() || select_vars.len() != aggregates.len() {
+                return None;
+            }
+            let mut tasks = Vec::with_capacity(select_vars.len());
+            for out in &select_vars {
+                let spec = aggregates.iter().find(|a| a.output_var == *out)?;
+                tasks.push(classify_aggregate(&spec.function, subject_var, prop_var)?);
+            }
+            FoldKind::Scalars(tasks)
+        }
+        // Histogram: GROUP BY the accessor value, one COUNT(*) / COUNT(?n).
+        Some(Grouping::Explicit {
+            group_by,
+            aggregation: Some(Aggregation { aggregates, binds }),
+            having: None,
+        }) => {
+            let prop_var = prop_var?;
+            // The group key is the accessor var or its projection alias
+            // (identity bind — identical value per row).
+            let key = *group_by.first();
+            if group_by.len() != 1 || (key != prop_var && Some(key) != prop_alias) {
+                return None;
+            }
+            if aggregates.len() != 1 || !binds.is_empty() {
+                return None;
+            }
+            let agg = aggregates.first();
+            match &agg.function {
+                AggregateFn::CountAll => {}
+                AggregateFn::Count(v) if *v == subject_var => {}
+                _ => return None,
+            }
+            if select_vars.len() != 2 {
+                return None;
+            }
+            let prop_col = select_vars.iter().position(|v| *v == key)?;
+            let count_col = select_vars.iter().position(|v| *v == agg.output_var)?;
+            if prop_col == count_col {
+                return None;
+            }
+            FoldKind::Histogram {
+                prop_col,
+                count_col,
+            }
+        }
+        _ => return None,
+    };
 
     Some(WholeGraphAggPlan {
+        anchor,
         accessor: accessor.map(|(p, _)| p),
-        tasks,
+        kind,
         schema: select_vars,
     })
 }
@@ -213,6 +304,10 @@ fn classify_aggregate(
     }
 }
 
+/// Histograms above this many distinct property values decline to the
+/// general pipeline (bounds the single output batch).
+const HISTOGRAM_MAX_GROUPS: usize = 65_536;
+
 /// Create the fused operator; declines to `fallback` whenever any component
 /// cannot be answered exactly.
 pub(crate) fn whole_graph_scalar_aggs_operator(
@@ -226,16 +321,26 @@ pub(crate) fn whole_graph_scalar_aggs_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            if graph_has_scan_hidden_predicates(ctx, store)? {
-                return Ok(None);
-            }
 
-            // N: distinct subjects, from SPOT leaflet lead groups
-            // (SPOT key layout: s_id(8) + …).
-            let subjects =
-                count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?;
+            // Subject universe.
+            let subjects = match &plan.anchor {
+                Anchor::AllSubjects => {
+                    if graph_has_scan_hidden_predicates(ctx, store)? {
+                        return Ok(None);
+                    }
+                    // Distinct subjects from SPOT leaflet lead groups
+                    // (SPOT key layout: s_id(8) + …).
+                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?
+                }
+                Anchor::Class(class_sid) => {
+                    let Some(class) = class_stats(ctx, class_sid) else {
+                        return Ok(None);
+                    };
+                    class.count
+                }
+            };
             if subjects == 0 {
-                // Empty graph: leave empty-input aggregate identities
+                // Empty universe: leave empty-input aggregate identities
                 // (COUNT 0 / unbound MIN) to the general pipeline.
                 return Ok(None);
             }
@@ -249,6 +354,25 @@ pub(crate) fn whole_graph_scalar_aggs_operator(
                         return Ok(None);
                     };
                     let rows = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
+                    // Class anchor: property-derived folds are predicate-
+                    // scoped, so every P-bearing subject must be an instance
+                    // of the class. Equality of the per-(class, property)
+                    // flake count with the predicate's total row count proves
+                    // exactly that (both current-state-exact at HEAD).
+                    if let Anchor::Class(class_sid) = &plan.anchor {
+                        let Some(class) = class_stats(ctx, class_sid) else {
+                            return Ok(None);
+                        };
+                        let class_prop_rows: u64 = class
+                            .properties
+                            .iter()
+                            .find(|p| p.property_sid == pred_sid)
+                            .map(|p| p.datatypes.iter().map(|&(_, c)| c).sum())
+                            .unwrap_or(0);
+                        if class_prop_rows != rows {
+                            return Ok(None);
+                        }
+                    }
                     let Some(with_prop) =
                         count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id)?
                     else {
@@ -264,22 +388,142 @@ pub(crate) fn whole_graph_scalar_aggs_operator(
                 None => None,
             };
 
-            let mut row = Vec::with_capacity(plan.tasks.len());
-            for task in &plan.tasks {
-                let Some(binding) =
-                    compute_task(*task, store, ctx.binary_g_id, subjects, accessor.as_ref())?
-                else {
-                    return Ok(None);
-                };
-                row.push(binding);
-            }
-            let batch = Batch::single_row(schema.clone(), row)
-                .map_err(|e| QueryError::execution(format!("whole-graph agg batch: {e}")))?;
+            let batch = match &plan.kind {
+                FoldKind::Scalars(tasks) => {
+                    let mut row = Vec::with_capacity(tasks.len());
+                    for task in tasks {
+                        let Some(binding) = compute_task(
+                            *task,
+                            store,
+                            ctx.binary_g_id,
+                            subjects,
+                            accessor.as_ref(),
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        row.push(binding);
+                    }
+                    Batch::single_row(schema.clone(), row)
+                        .map_err(|e| QueryError::execution(format!("whole-graph agg batch: {e}")))?
+                }
+                FoldKind::Histogram {
+                    prop_col,
+                    count_col,
+                } => {
+                    let Some(a) = accessor.as_ref() else {
+                        return Ok(None);
+                    };
+                    let Some(b) =
+                        compute_histogram(ctx, store, a, subjects, &schema, *prop_col, *count_col)?
+                    else {
+                        return Ok(None);
+                    };
+                    b
+                }
+            };
             Ok(Some(batch))
         },
         fallback,
         "whole-graph scalar aggregates",
     )
+}
+
+/// The per-graph class stats entry for `class_sid`, if present.
+fn class_stats<'a>(
+    ctx: &'a crate::context::ExecutionContext<'_>,
+    class_sid: &Sid,
+) -> Option<&'a fluree_db_core::index_stats::ClassStatEntry> {
+    ctx.active_snapshot
+        .stats
+        .as_ref()?
+        .graphs
+        .as_ref()?
+        .iter()
+        .find(|g| g.g_id == ctx.binary_g_id)?
+        .classes
+        .as_ref()?
+        .iter()
+        .find(|c| &c.class_sid == class_sid)
+}
+
+/// `GROUP BY ?prop COUNT(*)`: per-value counts from a POST run-length pass
+/// (values are contiguous in POST order) plus one null-group row for
+/// subjects without the property. Declines on very wide histograms and on
+/// stores the group-count walk cannot serve.
+fn compute_histogram(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    accessor: &AccessorCounts,
+    subjects: u64,
+    schema: &Arc<[VarId]>,
+    prop_col: usize,
+    count_col: usize,
+) -> Result<Option<Batch>> {
+    // Bound the output (one batch) and guarantee the top-K walk keeps every
+    // group: the directory-level distinct-object count must fit the cap.
+    match count_distinct_objects_for_predicate(store, ctx.binary_g_id, accessor.p_id)? {
+        Some(distinct) if (distinct as usize) <= HISTOGRAM_MAX_GROUPS => {}
+        _ => return Ok(None),
+    }
+    let Ok(groups) = crate::fast_group_count_firsts::group_count_v6(
+        store,
+        ctx.binary_g_id,
+        &accessor.pred,
+        HISTOGRAM_MAX_GROUPS,
+        &ctx.cancellation,
+    ) else {
+        return Ok(None);
+    };
+
+    let view = fluree_db_binary_index::BinaryGraphView::with_novelty(
+        Arc::clone(store),
+        ctx.binary_g_id,
+        ctx.dict_novelty.clone(),
+    )
+    .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone());
+
+    let null_rows = subjects.saturating_sub(accessor.subjects_with);
+    let mut col_prop: Vec<Binding> = Vec::with_capacity(groups.len() + 1);
+    let mut col_count: Vec<Binding> = Vec::with_capacity(groups.len() + 1);
+    for (o_type, o_key, count) in groups {
+        if o_type == fluree_db_core::o_type::OType::IRI_REF.as_u16() {
+            col_prop.push(Binding::encoded_sid(o_key));
+        } else {
+            let val = view
+                .decode_value(o_type, o_key, accessor.p_id)
+                .map_err(|e| QueryError::Internal(format!("histogram decode: {e}")))?;
+            let dt = store
+                .resolve_datatype_sid_for_value(o_type, &val)
+                .unwrap_or_else(|| Sid::new(0, ""));
+            let dtc = match store.resolve_lang_tag(o_type) {
+                Some(tag) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag)),
+                None => fluree_db_core::DatatypeConstraint::Explicit(dt),
+            };
+            col_prop.push(Binding::Lit {
+                val,
+                dtc,
+                t: None,
+                op: None,
+                p_id: None,
+            });
+        }
+        col_count.push(Binding::lit(FlakeValue::Long(count), Sid::xsd_integer()));
+    }
+    if null_rows > 0 {
+        col_prop.push(Binding::Unbound);
+        col_count.push(Binding::lit(
+            FlakeValue::Long(count_to_i64(null_rows, "histogram null group")?),
+            Sid::xsd_integer(),
+        ));
+    }
+
+    let mut cols: Vec<Vec<Binding>> = vec![Vec::new(), Vec::new()];
+    cols[prop_col] = col_prop;
+    cols[count_col] = col_count;
+    let batch = Batch::new(schema.clone(), cols)
+        .map_err(|e| QueryError::execution(format!("histogram batch: {e}")))?;
+    Ok(Some(batch))
 }
 
 struct AccessorCounts {

@@ -14,7 +14,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, graphdb_from_ledger};
+use support::{genesis_ledger, graphdb_from_ledger, rebuild_and_publish_index};
 
 fn ctx() -> JsonValue {
     json!({
@@ -6877,4 +6877,131 @@ async fn cypher_anonymous_hop_chain_fuses_to_reachability_under_distinct() {
         .await
         .expect("cypher json");
     assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(4), "{cj}");
+}
+
+/// Class-anchored aggregate folds (`MATCH (n:C) …`): the histogram
+/// (`RETURN n.age, COUNT(*)`) folds to a POST group count + null-group row,
+/// and the scalar family reuses the whole-graph folds under the containment
+/// proof. Indexed (fold) and novelty (pipeline) must agree.
+#[tokio::test]
+async fn cypher_class_anchored_histogram_and_scalars_match_pipeline() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:class-agg";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    // alice multi-valued: contributes to two histogram groups.
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": [25, 30]},
+                    {"@id": "ex:bob",   "@type": "ex:Person"},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 30},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let histogram = |cj: &JsonValue| -> Vec<(JsonValue, JsonValue)> {
+        let mut rows: Vec<(JsonValue, JsonValue)> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| (r["row"][0].clone(), r["row"][1].clone()))
+            .collect();
+        rows.sort_by_key(|(k, _)| k.to_string());
+        rows
+    };
+
+    for db in [&novelty_db, &indexed_db] {
+        let cj = fluree
+            .query_cypher(db, "MATCH (n:Person) RETURN n.age, COUNT(*)")
+            .await
+            .expect("histogram")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        // Groups: 25→1 (alice), 30→2 (alice+carol), 40→1 (dave),
+        // null→1 (bob).
+        assert_eq!(
+            histogram(&cj),
+            vec![
+                (json!(25), json!(1)),
+                (json!(30), json!(2)),
+                (json!(40), json!(1)),
+                (json!(null), json!(1)),
+            ],
+            "{cj}"
+        );
+
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) RETURN COUNT(DISTINCT n.age) AS d, count(n) AS c",
+            )
+            .await
+            .expect("scalars")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let row = &cj["results"][0]["data"][0]["row"];
+        assert_eq!(row[0], json!(3), "distinct ages: {cj}");
+        // count(n) over the left join: alice 2 rows + bob 1 + carol 1 + dave 1.
+        assert_eq!(row[1], json!(5), "count rows: {cj}");
+    }
+}
+
+/// The containment proof must fail when a non-class subject bears the
+/// property — the fold defers and the pipeline restricts to the class.
+#[tokio::test]
+async fn cypher_class_anchored_fold_declines_without_containment() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:class-agg-decline";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 30},
+                    // A Robot with an age: age is NOT contained in Person.
+                    {"@id": "ex:r2d2", "@type": "ex:Robot", "ex:age": 200},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    for db in [&novelty_db, &indexed_db] {
+        let cj = fluree
+            .query_cypher(db, "MATCH (n:Person) RETURN n.age, COUNT(*)")
+            .await
+            .expect("histogram")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows = cj["results"][0]["data"].as_array().expect("rows");
+        // Only alice's age — the Robot's 200 must not leak in.
+        assert_eq!(rows.len(), 1, "{cj}");
+        assert_eq!(rows[0]["row"], json!([30, 1]), "{cj}");
+
+        let cj = fluree
+            .query_cypher(db, "MATCH (n:Person) RETURN max(n.age) AS m")
+            .await
+            .expect("max")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(30), "{cj}");
+    }
 }

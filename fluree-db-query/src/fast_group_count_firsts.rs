@@ -823,7 +823,7 @@ fn offer_topk(heap: &mut BinaryHeap<GroupTopK>, limit: usize, cand: GroupTopK) {
     }
 }
 
-fn group_count_v6(
+pub(crate) fn group_count_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &crate::ir::triple::Ref,
