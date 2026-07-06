@@ -25,15 +25,24 @@
 //! transaction is serializable against the base it read. The cost is
 //! optimistic-conflict retries under write contention.
 //!
-//! Scope notes (v1): no policy/identity enforcement (Bolt runs open; the
-//! listener refuses to start when data auth is required) and local-commit
-//! deployments only — Raft/peer modes must reject `BEGIN` at the
-//! transport layer.
+//! ## Governance
+//!
+//! `BEGIN` carries the session's [`GovernanceOptions`]; each write
+//! statement builds the transaction's policy context against the private
+//! state (same `build_transact_policy_context` choke point the consensus
+//! committer uses) and stages under it, so `f:modify` is enforced at
+//! staging time — since `COMMIT` re-verifies the base is unchanged,
+//! staging-time enforcement is the enforcement. Conditional `MERGE`
+//! probes are policy-wrapped like the autocommit path, and the identity
+//! lands in each pending commit's `f:identity` for provenance.
+//!
+//! Scope notes: local-commit deployments only — Raft/peer modes must
+//! reject `BEGIN` at the transport layer.
 
 use crate::cypher_write::{self, WritePlan};
 use crate::error::ApiError;
 use crate::view::GraphDb;
-use crate::{Fluree, Result, Tracker};
+use crate::{Fluree, GovernanceOptions, Result, Tracker};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, RefKind, RefValue};
@@ -52,6 +61,9 @@ pub struct CypherTransaction {
     state: LedgerState,
     /// Built-but-unpublished commits, in statement order.
     pending: Vec<PendingCommit>,
+    /// Session identity + policy inputs pinned at BEGIN; governs every
+    /// statement staged in this transaction.
+    governance: GovernanceOptions,
 }
 
 struct PendingCommit {
@@ -91,8 +103,13 @@ impl CypherTransaction {
 
 impl Fluree {
     /// Open an interactive Cypher transaction pinned to the ledger's
-    /// current cached head.
-    pub async fn begin_cypher_transaction(&self, ledger_id: &str) -> Result<CypherTransaction> {
+    /// current cached head. `governance` (the session's authenticated
+    /// identity and policy inputs) governs every statement staged in it.
+    pub async fn begin_cypher_transaction(
+        &self,
+        ledger_id: &str,
+        governance: GovernanceOptions,
+    ) -> Result<CypherTransaction> {
         let handle = self.ledger_cached(ledger_id).await?;
         let state = handle.snapshot().await.to_ledger_state();
         let base_head = state.head_commit_id.clone().map(|cid| RefValue {
@@ -105,6 +122,7 @@ impl Fluree {
             base_head,
             state,
             pending: Vec::new(),
+            governance,
         })
     }
 
@@ -144,11 +162,34 @@ impl Fluree {
         let lowered = match plan {
             WritePlan::Single(t) => *t,
             WritePlan::Conditional(cw) => {
+                // Policy-wrap the branch-choosing probe (mirrors the
+                // consensus committer's `resolve_cypher_under_lock`): a
+                // restricted writer's MERGE picks its branch from
+                // policy-visible data only.
                 let probe = GraphDb::from_ledger_state(&txn.state);
+                let probe = if txn.governance.has_any_policy_inputs() {
+                    self.wrap_policy(probe, &txn.governance, None).await?
+                } else {
+                    probe
+                };
                 self.resolve_conditional_cypher(&cw, probe, &txn.ledger_id, &txn.state.snapshot)
                     .await?
             }
         };
+
+        // Built against the private state so earlier statements in this
+        // transaction are visible to policy evaluation. Staging-time
+        // enforcement is the enforcement: COMMIT only re-verifies that the
+        // base is unchanged.
+        let policy = crate::build_transact_policy_context(
+            self,
+            &txn.state.snapshot,
+            txn.state.novelty.as_ref(),
+            Some(txn.state.novelty.as_ref()),
+            txn.state.t(),
+            &txn.governance,
+        )
+        .await?;
 
         let index_config = crate::server_defaults::default_index_config();
         let tracker = Tracker::disabled();
@@ -157,7 +198,7 @@ impl Fluree {
                 txn.state.clone(),
                 lowered,
                 Some(&index_config),
-                None,
+                policy.as_ref(),
                 Some(&tracker),
             )
             .await?;
@@ -185,9 +226,12 @@ impl Fluree {
             });
         }
 
-        let commit_opts = CommitOpts::default()
+        let mut commit_opts = CommitOpts::default()
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
+        if let Some(identity) = &txn.governance.identity {
+            commit_opts = commit_opts.identity(identity.clone());
+        }
 
         // Head temporal metadata is needed by build_commit's monotonicity
         // guard; resolve it lazily exactly like the autocommit path.

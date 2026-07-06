@@ -260,7 +260,8 @@ impl QueryResult {
     /// The typed Cypher tabular result: node refs hydrate into
     /// [`format::cypher_typed::CypherNode`] (labels + properties fetched
     /// from `view` at format time), relationship/path/temporal values stay
-    /// typed. Errors under a view policy — hydration reads raw SPOT state.
+    /// typed. Under a view policy, hydration filters each subject's raw
+    /// SPOT fetch through the view's enforcer before rendering.
     pub async fn to_cypher_typed_table(
         &self,
         view: &crate::view::GraphDb,

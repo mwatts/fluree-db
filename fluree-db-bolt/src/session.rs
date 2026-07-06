@@ -54,6 +54,13 @@ pub enum Turn {
     Reply(Vec<Response>),
     /// Write these replies (possibly none), then close the connection.
     Close(Vec<Response>),
+    /// Verify the presented credentials (async, in the glue), then call
+    /// `auth_succeeded` / `auth_failed` and act on what returns. Carries
+    /// the auth map from HELLO (≤5.0) or LOGON (5.1+).
+    Authenticate(AuthRequest),
+    /// LOGOFF: drop the caller-side identity, then write these replies.
+    /// The session is back in the authentication state (5.1+ only).
+    Logoff(Vec<Response>),
     /// Execute the statement (autocommit, or inside the open transaction
     /// when the caller holds one), then call `run_succeeded` /
     /// `run_failed` and write the response that returns.
@@ -90,11 +97,40 @@ pub struct BeginRequest {
     pub db: Option<String>,
 }
 
+/// Credentials presented in HELLO (≤5.0) or LOGON (5.1+). The codec does
+/// not interpret them; the glue decides which schemes it honors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthRequest {
+    /// `none`, `basic`, `bearer`, ... Drivers always send one; `None`
+    /// means the client omitted the field entirely.
+    pub scheme: Option<String>,
+    pub principal: Option<String>,
+    pub credentials: Option<String>,
+}
+
+impl AuthRequest {
+    fn from_map(map: &MapValue) -> Self {
+        Self {
+            scheme: map.get_str("scheme").map(str::to_string),
+            principal: map.get_str("principal").map(str::to_string),
+            credentials: map.get_str("credentials").map(str::to_string),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     AwaitingHello,
     /// 5.1+: HELLO done, awaiting LOGON.
     Authentication,
+    /// Credentials handed out via [`Turn::Authenticate`]; awaiting the
+    /// `auth_succeeded` / `auth_failed` callback.
+    Authenticating {
+        /// Whether the credentials came in HELLO (≤5.0) — success must
+        /// answer with the HELLO metadata, failure closes the connection
+        /// (there is no re-auth path before 5.1).
+        via_hello: bool,
+    },
     Ready,
     /// Autocommit result being served.
     Streaming,
@@ -108,6 +144,10 @@ enum State {
 pub struct Session {
     config: SessionConfig,
     state: State,
+    /// Set by `auth_succeeded`, cleared by LOGOFF. Tracked separately from
+    /// `state` so RESET after a failed LOGON returns to the authentication
+    /// state instead of skipping it.
+    authenticated: bool,
     /// Buffered results by `qid`, insertion-ordered (tiny: autocommit has
     /// one; a transaction rarely holds more than a couple).
     streams: Vec<(i64, ResultStream)>,
@@ -124,6 +164,7 @@ impl Session {
         Self {
             config,
             state: State::AwaitingHello,
+            authenticated: false,
             streams: Vec::new(),
             next_qid: 0,
             hello_db: None,
@@ -136,7 +177,10 @@ impl Session {
 
     /// Whether the connection has completed HELLO (+LOGON where required).
     pub fn is_ready(&self) -> bool {
-        !matches!(self.state, State::AwaitingHello | State::Authentication)
+        !matches!(
+            self.state,
+            State::AwaitingHello | State::Authentication | State::Authenticating { .. }
+        )
     }
 
     /// Whether an explicit transaction is open.
@@ -151,6 +195,12 @@ impl Session {
             other => match self.state {
                 State::AwaitingHello => self.on_awaiting_hello(other),
                 State::Authentication => self.on_authentication(other),
+                // Unreachable when the caller resolves Turn::Authenticate
+                // before feeding the next request, as the glue loop does.
+                State::Authenticating { .. } => Turn::Close(vec![Response::failure(
+                    CODE_INVALID,
+                    "request while authentication is in flight",
+                )]),
                 State::Ready => self.on_ready(other),
                 State::Streaming => self.on_streaming(other),
                 State::TxReady => self.on_tx_ready(other),
@@ -166,10 +216,12 @@ impl Session {
             return Turn::Close(vec![Response::failure(CODE_INVALID, "RESET before HELLO")]);
         }
         self.streams.clear();
-        self.state = if self.state == State::Authentication {
-            State::Authentication
-        } else {
+        // RESET recovers to READY only once authenticated; a failed LOGON
+        // (Failed state, not authenticated) recovers to re-authentication.
+        self.state = if self.authenticated {
             State::Ready
+        } else {
+            State::Authentication
         };
         Turn::Reset(vec![Response::success_empty()])
     }
@@ -178,15 +230,16 @@ impl Session {
         match request {
             Request::Hello { extra } => {
                 self.hello_db = extra.get_str("db").map(str::to_string);
-                let mut meta = MapValue::new();
-                meta.insert("server", self.config.server_agent.as_str());
-                meta.insert("connection_id", self.config.connection_id.as_str());
-                self.state = if self.config.version.uses_logon() {
-                    State::Authentication
+                if self.config.version.uses_logon() {
+                    // 5.1+: auth arrives in LOGON; HELLO answers immediately.
+                    self.state = State::Authentication;
+                    Turn::Reply(vec![Response::success(self.hello_meta())])
                 } else {
-                    State::Ready
-                };
-                Turn::Reply(vec![Response::success(meta)])
+                    // ≤5.0: auth rides in the HELLO extra map; the HELLO
+                    // SUCCESS waits for the auth_succeeded callback.
+                    self.state = State::Authenticating { via_hello: true };
+                    Turn::Authenticate(AuthRequest::from_map(&extra))
+                }
             }
             other => Turn::Close(vec![Response::failure(
                 CODE_INVALID,
@@ -197,16 +250,47 @@ impl Session {
 
     fn on_authentication(&mut self, request: Request) -> Turn {
         match request {
-            // v1 runs open: any principal/scheme is accepted. Servers that
-            // require auth do not expose the Bolt listener.
-            Request::Logon { auth: _ } => {
-                self.state = State::Ready;
-                Turn::Reply(vec![Response::success_empty()])
+            Request::Logon { auth } => {
+                self.state = State::Authenticating { via_hello: false };
+                Turn::Authenticate(AuthRequest::from_map(&auth))
             }
             other => Turn::Close(vec![Response::failure(
                 CODE_INVALID,
                 format!("expected LOGON, got {}", request_name(&other)),
             )]),
+        }
+    }
+
+    fn hello_meta(&self) -> MapValue {
+        let mut meta = MapValue::new();
+        meta.insert("server", self.config.server_agent.as_str());
+        meta.insert("connection_id", self.config.connection_id.as_str());
+        meta
+    }
+
+    /// The credentials handed out via [`Turn::Authenticate`] verified.
+    pub fn auth_succeeded(&mut self) -> Response {
+        let via_hello = matches!(self.state, State::Authenticating { via_hello: true });
+        self.authenticated = true;
+        self.state = State::Ready;
+        if via_hello {
+            Response::success(self.hello_meta())
+        } else {
+            Response::success_empty()
+        }
+    }
+
+    /// The credentials handed out via [`Turn::Authenticate`] were rejected
+    /// (use `Neo.ClientError.Security.Unauthorized`). During HELLO there is
+    /// no re-auth path, so the connection closes; after LOGON the client
+    /// recovers with RESET and retries LOGON.
+    pub fn auth_failed(&mut self, code: impl Into<String>, message: impl Into<String>) -> Turn {
+        let failure = Response::failure(code, message);
+        if matches!(self.state, State::Authenticating { via_hello: true }) {
+            Turn::Close(vec![failure])
+        } else {
+            self.state = State::Failed;
+            Turn::Reply(vec![failure])
         }
     }
 
@@ -242,8 +326,9 @@ impl Session {
                 "COMMIT/ROLLBACK outside a transaction",
             )),
             Request::Logoff if self.config.version.uses_logon() => {
+                self.authenticated = false;
                 self.state = State::Authentication;
-                Turn::Reply(vec![Response::success_empty()])
+                Turn::Logoff(vec![Response::success_empty()])
             }
             Request::Route { extra, .. } => Turn::Reply(vec![self.route_table(&extra)]),
             Request::Telemetry { .. } => Turn::Reply(vec![Response::success_empty()]),
@@ -593,9 +678,11 @@ mod tests {
     fn ready_session_54() -> Session {
         let mut s = Session::new(config(BoltVersion::V5_4));
         s.on_request(hello(MapValue::new()));
-        s.on_request(Request::Logon {
+        let turn = s.on_request(Request::Logon {
             auth: MapValue::new(),
         });
+        assert!(matches!(turn, Turn::Authenticate(_)));
+        s.auth_succeeded();
         assert!(s.is_ready());
         s
     }
@@ -654,17 +741,98 @@ mod tests {
         assert!(meta.get_str("server").unwrap().starts_with("Neo4j/"));
         assert!(!s.is_ready(), "5.4 needs LOGON before READY");
 
-        let turn = s.on_request(Request::Logon {
-            auth: MapValue::new(),
-        });
-        assert_eq!(turn, Turn::Reply(vec![Response::success_empty()]));
+        let mut auth = MapValue::new();
+        auth.insert("scheme", "bearer");
+        auth.insert("credentials", "tok-123");
+        let turn = s.on_request(Request::Logon { auth });
+        let Turn::Authenticate(req) = turn else {
+            panic!("expected authenticate")
+        };
+        assert_eq!(req.scheme.as_deref(), Some("bearer"));
+        assert_eq!(req.credentials.as_deref(), Some("tok-123"));
+        assert!(!s.is_ready(), "not ready until auth resolves");
+
+        assert_eq!(s.auth_succeeded(), Response::success_empty());
         assert!(s.is_ready());
     }
 
     #[test]
-    fn bolt44_hello_goes_straight_to_ready() {
+    fn bolt44_hello_carries_auth_and_defers_success() {
         let mut s = Session::new(config(BoltVersion::V4_4));
+        let mut extra = MapValue::new();
+        extra.insert("scheme", "basic");
+        extra.insert("principal", "ana");
+        extra.insert("credentials", "pw");
+        let Turn::Authenticate(req) = s.on_request(hello(extra)) else {
+            panic!("expected authenticate")
+        };
+        assert_eq!(req.scheme.as_deref(), Some("basic"));
+        assert_eq!(req.principal.as_deref(), Some("ana"));
+        assert!(!s.is_ready(), "HELLO success waits for auth");
+
+        // The deferred HELLO SUCCESS carries the server metadata.
+        let Response::Success(meta) = s.auth_succeeded() else {
+            panic!("expected success")
+        };
+        assert!(meta.get_str("server").unwrap().starts_with("Neo4j/"));
+        assert!(meta.get_str("connection_id").is_some());
+        assert!(s.is_ready());
+    }
+
+    #[test]
+    fn bolt44_hello_auth_failure_closes() {
+        let mut s = Session::new(config(BoltVersion::V4_4));
+        assert!(matches!(
+            s.on_request(hello(MapValue::new())),
+            Turn::Authenticate(_)
+        ));
+        let turn = s.auth_failed("Neo.ClientError.Security.Unauthorized", "bad token");
+        let Turn::Close(replies) = turn else {
+            panic!("HELLO auth failure must close the connection")
+        };
+        assert!(matches!(replies[0], Response::Failure { .. }));
+    }
+
+    #[test]
+    fn logon_failure_recovers_via_reset_to_reauth() {
+        let mut s = Session::new(config(BoltVersion::V5_4));
         s.on_request(hello(MapValue::new()));
+        s.on_request(Request::Logon {
+            auth: MapValue::new(),
+        });
+        let turn = s.auth_failed("Neo.ClientError.Security.Unauthorized", "bad token");
+        assert!(
+            matches!(turn, Turn::Reply(ref r) if matches!(r[0], Response::Failure { .. })),
+            "LOGON failure replies, connection stays open"
+        );
+        // Post-failure requests are IGNORED until RESET.
+        assert_eq!(
+            s.on_request(run_req("q")),
+            Turn::Reply(vec![Response::Ignored])
+        );
+        // RESET returns to authentication, NOT to READY.
+        s.on_request(Request::Reset);
+        assert!(!s.is_ready(), "reset before successful auth must re-auth");
+        let turn = s.on_request(Request::Logon {
+            auth: MapValue::new(),
+        });
+        assert!(matches!(turn, Turn::Authenticate(_)));
+        s.auth_succeeded();
+        assert!(s.is_ready());
+    }
+
+    #[test]
+    fn logoff_returns_to_authentication_and_signals_caller() {
+        let mut s = ready_session_54();
+        let turn = s.on_request(Request::Logoff);
+        assert_eq!(turn, Turn::Logoff(vec![Response::success_empty()]));
+        assert!(!s.is_ready());
+        // Re-auth works (5.1+ re-authentication).
+        let turn = s.on_request(Request::Logon {
+            auth: MapValue::new(),
+        });
+        assert!(matches!(turn, Turn::Authenticate(_)));
+        s.auth_succeeded();
         assert!(s.is_ready());
     }
 
@@ -775,6 +943,7 @@ mod tests {
         let mut hello_extra = MapValue::new();
         hello_extra.insert("db", "hello:db");
         s.on_request(hello(hello_extra));
+        s.auth_succeeded();
 
         let Turn::Execute(run) = s.on_request(run_req("q")) else {
             panic!()
@@ -828,6 +997,7 @@ mod tests {
         s.on_request(Request::Logon {
             auth: MapValue::new(),
         });
+        s.auth_succeeded();
         let Turn::Reply(replies) = s.on_request(Request::Route {
             routing: MapValue::new(),
             bookmarks: vec![],

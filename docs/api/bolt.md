@@ -16,12 +16,58 @@ connect unmodified. For setup and driver examples see the
 | Queries | Autocommit `RUN` with parameters; reactive `PULL {n}` / `DISCARD` batching with `has_more` |
 | Transactions | `BEGIN` / `COMMIT` / `ROLLBACK`, multiple open results per transaction addressed by `qid` |
 | Database selection | `db` in HELLO defaults or per-`RUN`/`BEGIN` extra → ledger id; server-wide default via `--bolt-default-db` |
-| Auth | v1 runs open: `none` accepted, any credentials accepted. The listener refuses to start when `data_auth_mode=required` rather than bypass it. |
+| Auth | `bearer` (data-plane JWT/JWS), `basic` (token as password), `none` — enforced per session against `data_auth_mode`, same pipeline as HTTP. See [Authentication](#authentication). |
 | Routing | Direct (`bolt://`) scheme. `ROUTE` answers a failure unless an advertised address is configured. |
 | TLS | Not terminated by the server — front with a proxy if needed. |
 
 The server agent string is `Neo4j/5.4.0 (compatible; Fluree/<version>)`;
 drivers parse the `Neo4j/<semver>` prefix for feature gating.
+
+## Authentication
+
+Bolt authenticates against the **same identity pipeline as the HTTP data
+plane** — the tokens, trusted issuers, and `data_auth_mode` you already
+configured apply unchanged; there is no separate Bolt credential store.
+Credentials arrive in `HELLO` (4.4/5.0) or `LOGON` (5.1+):
+
+| Scheme | Meaning |
+|---|---|
+| `bearer` | Credentials = a data-plane token (DID-JWS or OIDC JWT) — the same token the HTTP `Authorization: Bearer` header accepts. `AuthTokens.bearer(token)` in official drivers. |
+| `basic` | Token-carrier form: the **password field holds the token**, the username is ignored (identity always comes from the verified claims). Lets driver code shaped as user/password work unchanged. |
+| `none` | Anonymous — allowed only when `data_auth_mode` is not `required`. |
+
+Enforcement mirrors the HTTP extractor per mode: `none` ignores
+credentials entirely, `optional` verifies them when presented (an
+invalid token is refused, not downgraded to anonymous), `required`
+refuses anonymous sessions. Rejected credentials answer
+`Neo.ClientError.Security.Unauthorized`, which drivers surface as an
+auth error.
+
+Because a Bolt session outlives the single request HTTP verifies
+per-call, two checks repeat **per statement**:
+
+- **Expiry** — a session whose token passed `exp` fails statements with
+  `Neo.ClientError.Security.TokenExpired`; 5.x drivers configured with
+  an auth-token manager re-authenticate (`LOGOFF`/`LOGON`) instead of
+  failing. Re-auth is also available manually on 5.1+ sessions.
+- **Ledger scopes** — the token's `fluree.ledger.read.*` /
+  `fluree.ledger.write.*` claims gate each statement by ledger and
+  read/write kind. Out-of-scope statements fail with
+  `Neo.ClientError.Database.DatabaseNotFound` (existence-hiding, like
+  the HTTP routes' 404). `BEGIN` requires either scope on its ledger;
+  statements inside the transaction are checked individually.
+
+### Policy
+
+The verified identity (`fluree.identity` claim, else `sub`) drives
+[data policies](../guides/cookbook-policies.md) exactly as over HTTP:
+reads are policy-filtered per flake (including node hydration for
+`RETURN n`), writes enforce `f:modify` at staging, and the identity is
+recorded as `f:identity` on commits for provenance. Bolt deliberately
+carries **no policy knobs** (HTTP's `policy-class` / `default-allow`
+headers have no Bolt equivalent): policy derives entirely from the
+identity's in-ledger bindings — the graph governs itself; the transport
+only authenticates.
 
 ## Value mapping
 
@@ -82,5 +128,8 @@ fixtures. The TCP listener and execution glue live in
 `query_cypher_with_params` for reads, the consensus submit path for
 autocommit writes, and `fluree-db-api/src/cypher_txn.rs` for explicit
 transactions (its module docs describe the commit model in detail).
-End-to-end tests: `fluree-db-server/tests/bolt_integration.rs`;
+Token verification goes through the same
+`verify_data_principal` pipeline as the HTTP bearer extractor.
+End-to-end tests: `fluree-db-server/tests/bolt_integration.rs` and
+`fluree-db-server/tests/bolt_auth_integration.rs`;
 official-driver smoke script: `fluree-db-server/tests/bolt_driver_smoke.py`.

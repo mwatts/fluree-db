@@ -41,10 +41,36 @@ Sessions pick their ledger with the driver's standard database
 selection; `default_db` is the fallback. A session with neither fails
 its queries with a clear error.
 
-The v1 listener is **unauthenticated** — any credentials (or none) are
-accepted. It refuses to start when the server requires data-plane auth
-(`data_auth_mode=required`) rather than silently bypassing it. Front
-with a TCP proxy for TLS if the wire crosses trust boundaries.
+Authentication follows the server's `data_auth_mode`, exactly like the
+HTTP data plane: `none` (default) runs open, `optional` verifies tokens
+when presented, `required` refuses anonymous sessions. Front with a TCP
+proxy for TLS if the wire crosses trust boundaries — tokens on a bare
+TCP wire are visible to the network.
+
+## Authenticate
+
+Pass the **same data-plane token the HTTP API accepts** (DID-JWS or
+OIDC JWT) as a bearer credential — there is no separate Bolt user store:
+
+```python
+from neo4j import GraphDatabase, AuthTokens
+
+driver = GraphDatabase.driver("bolt://localhost:7687",
+                              auth=AuthTokens.bearer(token))
+
+# Driver code shaped as user/password works too: the password field
+# carries the token and the username is ignored.
+driver = GraphDatabase.driver("bolt://localhost:7687",
+                              auth=("token", token))
+```
+
+The token's ledger scopes (`fluree.ledger.read.*` / `.write.*`) gate
+every statement, its identity (`fluree.identity` claim) drives
+[data policies](cookbook-policies.md) — two sessions with different
+tokens can see different graphs from the same Cypher — and expiry is
+re-checked per statement (`Neo.ClientError.Security.TokenExpired`
+tells 5.x drivers to re-authenticate). See the
+[Bolt reference](../api/bolt.md#authentication) for details.
 
 ## Connect (Python)
 
@@ -52,6 +78,7 @@ with a TCP proxy for TLS if the wire crosses trust boundaries.
 from neo4j import GraphDatabase
 
 # bolt:// (direct) scheme — neo4j:// routing is not served.
+# auth=None works when the server doesn't require data auth.
 driver = GraphDatabase.driver("bolt://localhost:7687", auth=None)
 
 with driver.session(database="mydb:main") as session:
@@ -113,6 +140,15 @@ works everywhere).
   Upgrade the driver.
 - **`neo4j://` scheme fails** — use `bolt://`; server-side routing
   tables are not served.
+- **AuthError / `Security.Unauthorized`** — the server runs
+  `data_auth_mode=required` and the session presented no (or an
+  invalid) token; connect with `AuthTokens.bearer(<data-plane token>)`.
+- **Queries fail with `DatabaseNotFound` on a ledger that exists** —
+  the token's ledger scopes don't cover it (out-of-scope access is
+  reported as not-found to avoid leaking ledger existence).
+- **`Security.TokenExpired` mid-session** — the bearer token outlived
+  its `exp`; re-authenticate (5.x drivers with an auth-token manager do
+  this automatically) or reconnect with a fresh token.
 - **BEGIN fails with "single-node server"** — the deployment replicates
   writes (Raft) or is a peer; use autocommit queries.
 - **Numbers look different from the JSON API** — `xsd:decimal` is

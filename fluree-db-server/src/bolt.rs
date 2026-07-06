@@ -8,9 +8,13 @@
 //! reads, the consensus submit path for writes. See
 //! `docs/api/bolt.md`.
 //!
-//! v1 runs open (no auth): the listener refuses to start when the server
-//! has credentials configured for the data plane, rather than inventing a
-//! parallel identity path.
+//! Authentication follows the HTTP data plane exactly (`data_auth_mode` +
+//! [`verify_data_principal`](crate::extract::verify_data_principal)) — no
+//! parallel identity path. Drivers present tokens via `bearer` auth (or
+//! `basic` with the token as the password); the verified token's ledger
+//! scopes gate every statement, and its expiry is re-checked per statement
+//! because Bolt sessions outlive the single HTTP request the token
+//! verification model assumes.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,7 +27,7 @@ use fluree_db_bolt::chunk::{write_message, ChunkAssembler};
 use fluree_db_bolt::handshake::{negotiate, HandshakeOutcome, HANDSHAKE_LEN, REJECT};
 use fluree_db_bolt::message::{Request, Response};
 use fluree_db_bolt::session::{
-    BeginRequest, ResultStream, RunRequest, Session, SessionConfig, Turn,
+    AuthRequest, BeginRequest, ResultStream, RunRequest, Session, SessionConfig, Turn,
 };
 use fluree_db_bolt::value::{sig, MapValue, Structure, Value};
 use fluree_db_bolt::BoltVersion;
@@ -32,6 +36,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::config::DataAuthMode;
+use crate::extract::DataPrincipal;
 use crate::state::AppState;
 
 const CODE_SYNTAX: &str = "Neo.ClientError.Statement.SyntaxError";
@@ -42,6 +48,74 @@ const CODE_GENERAL: &str = "Neo.DatabaseError.General.UnknownError";
 /// classification is what makes official drivers' managed transaction
 /// functions retry the whole (retryable-closure) transaction.
 const CODE_TX_CONFLICT: &str = "Neo.TransientError.Transaction.OptimisticConflict";
+/// Credential rejection at HELLO/LOGON. Official drivers surface this as
+/// an `AuthError` and do not retry with the same credentials.
+const CODE_UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
+/// The session's token outlived its `exp`. 5.x drivers react by
+/// re-authenticating (LOGOFF/LOGON with a fresh token) where the app
+/// provides an auth-token manager, instead of failing the session.
+const CODE_TOKEN_EXPIRED: &str = "Neo.ClientError.Security.TokenExpired";
+
+/// The authenticated identity of one Bolt session.
+///
+/// `principal: None` is an anonymous session (allowed outside Required
+/// mode, mirroring the HTTP extractor); scope checks then allow all.
+struct SessionAuth {
+    /// Policy identity (`fluree.identity ?? sub`) for governance wiring.
+    identity: Option<String>,
+    principal: Option<DataPrincipal>,
+}
+
+impl SessionAuth {
+    fn anonymous() -> Self {
+        Self {
+            identity: None,
+            principal: None,
+        }
+    }
+
+    /// Bolt sessions outlive the login-time `exp` validation; statements
+    /// on an expired token must fail with [`CODE_TOKEN_EXPIRED`].
+    fn expired(&self) -> bool {
+        self.principal
+            .as_ref()
+            .is_some_and(|p| now_unix() > p.expires_unix)
+    }
+
+    fn can_read(&self, ledger_id: &str) -> bool {
+        self.principal
+            .as_ref()
+            .is_none_or(|p| p.can_read(ledger_id))
+    }
+
+    fn can_write(&self, ledger_id: &str) -> bool {
+        self.principal
+            .as_ref()
+            .is_none_or(|p| p.can_write(ledger_id))
+    }
+
+    /// Governance for statements in this session. Bolt has no header
+    /// channel for policy knobs (policy-class, default-allow) by design:
+    /// policy derives entirely from the identity's in-ledger bindings
+    /// (plus the ledger's `#config` defaults, merged downstream).
+    fn governance(&self) -> fluree_db_api::GovernanceOptions {
+        fluree_db_api::GovernanceOptions {
+            identity: self.identity.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+fn session_governance(auth: Option<&SessionAuth>) -> fluree_db_api::GovernanceOptions {
+    auth.map(SessionAuth::governance).unwrap_or_default()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Bind the Bolt listener and spawn the accept loop. Returns the bound
 /// address (`addr` may name port 0) and the accept-loop task.
@@ -109,6 +183,9 @@ async fn handle_connection(
     // The open explicit transaction, if any. Dropping it rolls back
     // (nothing was published).
     let mut open_txn: Option<CypherTransaction> = None;
+    // Set when Turn::Authenticate verifies; cleared by LOGOFF. The session
+    // state machine guarantees no statement executes before it is set.
+    let mut session_auth: Option<SessionAuth> = None;
     loop {
         let n = socket.read(&mut read_buf).await?;
         if n == 0 {
@@ -149,18 +226,64 @@ async fn handle_connection(
                     close = true;
                     break;
                 }
+                Turn::Authenticate(auth) => match authenticate(&state, &auth).await {
+                    Ok(verified) => {
+                        session_auth = Some(verified);
+                        write_message(&session.auth_succeeded().encode(), &mut out_buf);
+                    }
+                    Err(f) => {
+                        debug!(code = f.code, error = %f.message, "bolt auth failed");
+                        match session.auth_failed(f.code, f.message) {
+                            Turn::Close(replies) => {
+                                for reply in replies {
+                                    write_message(&reply.encode(), &mut out_buf);
+                                }
+                                close = true;
+                                break;
+                            }
+                            Turn::Reply(replies) => {
+                                for reply in replies {
+                                    write_message(&reply.encode(), &mut out_buf);
+                                }
+                            }
+                            other => unreachable!("auth_failed returned {other:?}"),
+                        }
+                    }
+                },
+                Turn::Logoff(replies) => {
+                    session_auth = None;
+                    for reply in replies {
+                        write_message(&reply.encode(), &mut out_buf);
+                    }
+                }
                 Turn::Execute(run) => {
                     let version = session.version();
-                    let reply =
-                        execute_run(&state, &mut session, run, version, &mut open_txn).await;
+                    let reply = execute_run(
+                        &state,
+                        &mut session,
+                        run,
+                        version,
+                        &mut open_txn,
+                        session_auth.as_ref(),
+                    )
+                    .await;
                     write_message(&reply.encode(), &mut out_buf);
                 }
                 Turn::Begin(begin) => {
-                    let reply = handle_begin(&state, &mut session, &mut open_txn, begin).await;
+                    let reply = handle_begin(
+                        &state,
+                        &mut session,
+                        &mut open_txn,
+                        begin,
+                        session_auth.as_ref(),
+                    )
+                    .await;
                     write_message(&reply.encode(), &mut out_buf);
                 }
                 Turn::Commit => {
-                    let reply = handle_commit(&state, &mut session, open_txn.take()).await;
+                    let reply =
+                        handle_commit(&state, &mut session, open_txn.take(), session_auth.as_ref())
+                            .await;
                     write_message(&reply.encode(), &mut out_buf);
                 }
                 Turn::Rollback => {
@@ -208,17 +331,101 @@ impl RunFailure {
     }
 }
 
+/// Resolve the session identity from a HELLO/LOGON auth map, mirroring the
+/// HTTP extractor's `data_auth_mode` semantics: `None` ignores credentials
+/// entirely, `Optional` verifies them when present, `Required` refuses
+/// anonymous sessions. Bearer tokens go through the same
+/// [`verify_data_principal`](crate::extract::verify_data_principal)
+/// pipeline as HTTP; `basic` is honored as a token carrier (the password
+/// field holds the token) so driver code shaped as user/password works
+/// without a server-side credential store.
+async fn authenticate(state: &AppState, auth: &AuthRequest) -> Result<SessionAuth, RunFailure> {
+    if state.config.data_auth_mode == DataAuthMode::None {
+        return Ok(SessionAuth::anonymous());
+    }
+    let scheme = auth.scheme.as_deref().unwrap_or("none");
+    let token = match scheme {
+        "none" => None,
+        // The principal field is deliberately ignored: identity comes from
+        // the verified token's claims, never from a client-asserted name.
+        "bearer" | "basic" => auth.credentials.as_deref().filter(|c| !c.is_empty()),
+        other => {
+            return Err(RunFailure::new(
+                CODE_UNAUTHORIZED,
+                format!(
+                    "unsupported auth scheme `{other}`: use bearer \
+                     (or basic with the token as the password)"
+                ),
+            ))
+        }
+    };
+    let Some(token) = token else {
+        return if state.config.data_auth_mode == DataAuthMode::Required {
+            Err(RunFailure::new(
+                CODE_UNAUTHORIZED,
+                "authentication required: connect with a bearer token \
+                 (or basic auth with the token as the password)",
+            ))
+        } else {
+            Ok(SessionAuth::anonymous())
+        };
+    };
+    let principal = crate::extract::verify_data_principal(token, state)
+        .await
+        .map_err(|e| RunFailure::new(CODE_UNAUTHORIZED, e.to_string()))?;
+    Ok(SessionAuth {
+        identity: principal.identity.clone(),
+        principal: Some(principal),
+    })
+}
+
+/// Statement-time auth gate: the token must still be unexpired and its
+/// ledger scopes must cover the statement. Scope denials answer
+/// DatabaseNotFound (not Forbidden) to avoid leaking ledger existence,
+/// exactly like the HTTP routes' 404.
+fn check_statement_auth(
+    auth: Option<&SessionAuth>,
+    ledger_id: &str,
+    is_write: bool,
+) -> Result<(), RunFailure> {
+    let Some(auth) = auth else {
+        return Err(RunFailure::new(
+            CODE_UNAUTHORIZED,
+            "session is not authenticated",
+        ));
+    };
+    if auth.expired() {
+        return Err(RunFailure::new(
+            CODE_TOKEN_EXPIRED,
+            "the session's auth token has expired; re-authenticate with a fresh token",
+        ));
+    }
+    let allowed = if is_write {
+        auth.can_write(ledger_id)
+    } else {
+        auth.can_read(ledger_id)
+    };
+    if !allowed {
+        return Err(RunFailure::new(
+            CODE_DB_NOT_FOUND,
+            format!("database `{ledger_id}` not found"),
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_run(
     state: &AppState,
     session: &mut Session,
     run: RunRequest,
     version: BoltVersion,
     open_txn: &mut Option<CypherTransaction>,
+    auth: Option<&SessionAuth>,
 ) -> Response {
     let started = Instant::now();
     let outcome = match open_txn.as_mut() {
-        Some(txn) => try_execute_txn_run(state, txn, &run, version).await,
-        None => try_execute_run(state, &run, version).await,
+        Some(txn) => try_execute_txn_run(state, txn, &run, version, auth).await,
+        None => try_execute_run(state, &run, version, auth).await,
     };
     match outcome {
         Ok(stream) => session.run_succeeded(stream, started.elapsed().as_millis() as i64),
@@ -246,6 +453,7 @@ async fn handle_begin(
     session: &mut Session,
     open_txn: &mut Option<CypherTransaction>,
     begin: BeginRequest,
+    auth: Option<&SessionAuth>,
 ) -> Response {
     if !explicit_tx_supported(state) {
         return session.begin_failed(
@@ -259,7 +467,18 @@ async fn handle_begin(
             "no database selected: pass `database=` in the driver session              (or set --bolt-default-db on the server)",
         );
     };
-    match state.fluree.begin_cypher_transaction(ledger_id).await {
+    // The transaction may hold reads and writes; either scope opens it.
+    // Per-statement checks inside the transaction refine this.
+    if let Err(f) = check_statement_auth(auth, ledger_id, false)
+        .or_else(|_| check_statement_auth(auth, ledger_id, true))
+    {
+        return session.begin_failed(f.code, f.message);
+    }
+    match state
+        .fluree
+        .begin_cypher_transaction(ledger_id, session_governance(auth))
+        .await
+    {
         Ok(txn) => {
             *open_txn = Some(txn);
             session.begin_succeeded()
@@ -272,10 +491,17 @@ async fn handle_commit(
     state: &AppState,
     session: &mut Session,
     open_txn: Option<CypherTransaction>,
+    auth: Option<&SessionAuth>,
 ) -> Response {
     let Some(txn) = open_txn else {
         return session.commit_failed(CODE_INVALID, "no open transaction");
     };
+    if auth.is_some_and(SessionAuth::expired) {
+        return session.commit_failed(
+            CODE_TOKEN_EXPIRED,
+            "the session's auth token has expired; re-authenticate and retry the transaction",
+        );
+    }
     match state.fluree.commit_cypher_transaction(txn).await {
         Ok(t) => session.commit_succeeded(Some(format!("fluree:t:{t}"))),
         Err(fluree_db_api::ApiError::Transact(
@@ -298,11 +524,13 @@ async fn try_execute_txn_run(
     txn: &mut CypherTransaction,
     run: &RunRequest,
     version: BoltVersion,
+    auth: Option<&SessionAuth>,
 ) -> Result<ResultStream, RunFailure> {
     let params = params_to_json(&run.parameters)?;
     let is_write = fluree_db_api::cypher_write::cypher_statement_is_write(&run.query)
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     let ledger_id = txn.ledger_id().to_string();
+    check_statement_auth(auth, &ledger_id, is_write)?;
 
     if is_write {
         let outcome = state
@@ -345,6 +573,18 @@ async fn try_execute_txn_run(
         .cypher_transaction_view(txn)
         .await
         .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
+    // Reads inside the transaction see the private staged state, filtered
+    // by the same identity-derived policy as autocommit reads.
+    let governance = session_governance(auth);
+    let view = if governance.has_any_policy_inputs() {
+        state
+            .fluree
+            .wrap_policy(view, &governance, None)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
+    } else {
+        view
+    };
     let result = state
         .fluree
         .query_cypher_with_params(&view, &run.query, params.as_ref())
@@ -377,6 +617,7 @@ async fn try_execute_run(
     state: &AppState,
     run: &RunRequest,
     version: BoltVersion,
+    auth: Option<&SessionAuth>,
 ) -> Result<ResultStream, RunFailure> {
     let Some(ledger_id) = run.db.as_deref() else {
         return Err(RunFailure::new(
@@ -388,10 +629,11 @@ async fn try_execute_run(
     let params = params_to_json(&run.parameters)?;
     let is_write = fluree_db_api::cypher_write::cypher_statement_is_write(&run.query)
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
+    check_statement_auth(auth, ledger_id, is_write)?;
     if is_write {
-        execute_write(state, ledger_id, &run.query, params, version).await
+        execute_write(state, ledger_id, &run.query, params, version, auth).await
     } else {
-        execute_read(state, ledger_id, &run.query, params, version).await
+        execute_read(state, ledger_id, &run.query, params, version, auth).await
     }
 }
 
@@ -401,12 +643,25 @@ async fn execute_read(
     query: &str,
     params: Option<fluree_db_api::CypherParamMap>,
     version: BoltVersion,
+    auth: Option<&SessionAuth>,
 ) -> Result<ResultStream, RunFailure> {
     let view = state
         .fluree
         .db_with_default_context(ledger_id)
         .await
         .map_err(|e| RunFailure::new(CODE_DB_NOT_FOUND, e.to_string()))?;
+    // Same policy wrap as the HTTP Cypher route (`execute_cypher_ledger`):
+    // the session identity resolves to its in-ledger policy bindings.
+    let governance = session_governance(auth);
+    let view = if governance.has_any_policy_inputs() {
+        state
+            .fluree
+            .wrap_policy(view, &governance, None)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
+    } else {
+        view
+    };
     let result = state
         .fluree
         .query_cypher_with_params(&view, query, params.as_ref())
@@ -441,6 +696,7 @@ async fn execute_write(
     query: &str,
     params: Option<fluree_db_api::CypherParamMap>,
     version: BoltVersion,
+    auth: Option<&SessionAuth>,
 ) -> Result<ResultStream, RunFailure> {
     use fluree_db_api::{CommitOpts, TxnOpts};
     use fluree_db_consensus::{TransactionBody, TransactionRequest};
@@ -458,6 +714,14 @@ async fn execute_write(
         ..TxnOpts::default()
     };
 
+    // Identity into governance (f:modify policy via the consensus
+    // committer's policy-context build) and the commit record's
+    // f:identity (authorship provenance, like credentialed HTTP writes).
+    let governance = session_governance(auth);
+    let mut commit_opts = CommitOpts::default();
+    if let Some(identity) = &governance.identity {
+        commit_opts = commit_opts.identity(identity.clone());
+    }
     let request = TransactionRequest {
         idempotency_key: None,
         ledger_id: ledger_id.to_string(),
@@ -466,9 +730,9 @@ async fn execute_write(
             params,
         },
         txn_opts,
-        commit_opts: CommitOpts::default(),
+        commit_opts,
         tracking: None,
-        governance: fluree_db_api::GovernanceOptions::default(),
+        governance,
     };
 
     let empty_headers = axum::http::HeaderMap::new();

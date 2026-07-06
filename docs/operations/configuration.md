@@ -202,9 +202,10 @@ See the [Bolt guide](../guides/bolt.md) for driver examples and the
 | `--bolt-default-db` | `FLUREE_BOLT_DEFAULT_DB`  | (none)     |
 
 `--bolt-default-db` names the ledger served to sessions that select no
-database; drivers can select one per session (`database=` / `db`). The v1
-listener is unauthenticated and refuses to start when
-`data_auth_mode=required`.
+database; drivers can select one per session (`database=` / `db`).
+Authentication follows `data_auth_mode` per session, exactly like the
+HTTP data plane (bearer tokens through the same verification pipeline);
+see the [Bolt reference](../api/bolt.md#authentication).
 
 ```bash
 fluree-server --bolt-listen-addr 0.0.0.0:7687 --bolt-default-db mydb:main

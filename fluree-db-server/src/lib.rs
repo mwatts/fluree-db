@@ -302,23 +302,15 @@ impl FlureeServer {
             })
         });
 
-        // Bolt protocol listener (Neo4j drivers). v1 runs open — refuse to
-        // start rather than silently bypassing a required data-plane auth.
+        // Bolt protocol listener (Neo4j drivers). Auth is enforced
+        // per-session against `data_auth_mode`, same as the HTTP data plane.
         #[cfg(feature = "bolt")]
         let bolt_task = match self.state.config.bolt_listen_addr {
-            Some(bolt_addr) => {
-                if self.state.config.data_auth_mode == crate::config::DataAuthMode::Required {
-                    return Err(std::io::Error::other(
-                        "bolt_listen_addr is set but data_auth_mode=required: the Bolt \
-                         listener is unauthenticated in v1 and would bypass data auth",
-                    ));
-                }
-                Some(
-                    bolt::spawn_listener(Arc::clone(&self.state), bolt_addr)
-                        .await?
-                        .1,
-                )
-            }
+            Some(bolt_addr) => Some(
+                bolt::spawn_listener(Arc::clone(&self.state), bolt_addr)
+                    .await?
+                    .1,
+            ),
             None => None,
         };
         #[cfg(not(feature = "bolt"))]

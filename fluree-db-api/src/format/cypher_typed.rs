@@ -11,10 +11,12 @@
 //! ([`fluree_db_query::eval::cypher_name_from_iri`]) so `labels(n)` and a
 //! returned node never disagree.
 //!
-//! Hydration reads raw SPOT state (snapshot + overlay at the view's `t`)
-//! and therefore **must not run under a view policy** — the caller checks
-//! `GraphDb::has_policy()` and errors rather than leaking filtered
-//! properties.
+//! Hydration reads raw SPOT state (snapshot + overlay at the view's `t`),
+//! which bypasses the scan operators' per-flake policy filtering — so when
+//! the view carries a policy, every fetched subject's flakes run through
+//! the same enforcer the scan path uses
+//! (`QueryPolicyEnforcer::filter_flakes_for_graph`, with the class cache
+//! populated for `f:onClass` targeting) before any property is rendered.
 
 use std::collections::HashMap;
 
@@ -121,13 +123,6 @@ pub(crate) async fn typed_table(
     compactor: &IriCompactor,
     view: &GraphDb,
 ) -> Result<(Vec<String>, Vec<Vec<CypherCell>>)> {
-    if view.has_policy() {
-        return Err(FormatError::InvalidBinding(
-            "typed Cypher results are not supported under a view policy: format-time \
-             node hydration would bypass per-flake policy filtering"
-                .to_string(),
-        ));
-    }
     let col_vars = super::cypher::column_vars(result);
     let columns: Vec<String> = col_vars
         .iter()
@@ -424,8 +419,14 @@ struct NodeHydrator<'a> {
     view: &'a GraphDb,
     compactor: &'a IriCompactor,
     /// Binary graph of the result, when it has one — carries the store the
-    /// batched sorted-crawl lane reads.
+    /// batched sorted-crawl lane reads. Forced to `None` under a non-root
+    /// policy: the batched lane builds nodes from raw index rows, bypassing
+    /// the flake-level policy filter.
     gv: Option<&'a fluree_db_binary_index::BinaryGraphView>,
+    /// The view's policy enforcer: hydration fetches read raw SPOT state,
+    /// so per-flake view policy is applied here (never `None` when the
+    /// view has a non-root policy).
+    enforcer: Option<Arc<fluree_db_query::policy::QueryPolicyEnforcer>>,
     rdf_type: Option<Sid>,
     node_marker: Option<Sid>,
     cache: HashMap<Sid, CypherNode>,
@@ -452,10 +453,17 @@ impl<'a> NodeHydrator<'a> {
         compactor: &'a IriCompactor,
         gv: Option<&'a fluree_db_binary_index::BinaryGraphView>,
     ) -> Self {
+        let enforcer = view
+            .policy_enforcer()
+            .filter(|e| !e.is_root())
+            .map(Arc::clone);
         Self {
             view,
             compactor,
-            gv,
+            // Under policy every subject takes the fallback lane, where
+            // `apply_view_policy` filters the fetched flakes per subject.
+            gv: if enforcer.is_none() { gv } else { None },
+            enforcer,
             rdf_type: view.snapshot.encode_iri(fluree_vocab::rdf::TYPE),
             node_marker: view.snapshot.encode_iri(fluree_vocab::fluree::NODE),
             cache: HashMap::new(),
@@ -464,6 +472,34 @@ impl<'a> NodeHydrator<'a> {
             label_names: HashMap::new(),
             key_names_by_pid: HashMap::new(),
         }
+    }
+
+    /// Run one subject batch's raw-SPOT fetch through the view policy — the
+    /// same two-step enforcement the scan path applies
+    /// (`BinaryScanOperator::filter_flakes_by_policy`): populate the class
+    /// cache for `f:onClass` targeting, then per-flake filtering with
+    /// `f:query` support against the view's own snapshot/overlay/t.
+    async fn apply_view_policy(
+        &self,
+        subjects: &[Sid],
+        flakes: Vec<fluree_db_core::Flake>,
+    ) -> Result<Vec<fluree_db_core::Flake>> {
+        let Some(enforcer) = self.enforcer.as_ref() else {
+            return Ok(flakes);
+        };
+        if flakes.is_empty() {
+            return Ok(flakes);
+        }
+        let db = self.view.as_graph_db_ref();
+        enforcer
+            .populate_class_cache_for_graph(db, subjects)
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
+        let tracker = fluree_db_core::Tracker::disabled();
+        enforcer
+            .filter_flakes_for_graph(db.snapshot, db.overlay, db.t, &tracker, flakes)
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
     }
 
     /// Memoized predicate Sid → property key (`None` hides system predicates).
@@ -712,13 +748,36 @@ impl<'a> NodeHydrator<'a> {
                 Ok::<_, FormatError>(out)
             }));
         }
+        let mut fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> = Vec::new();
         for handle in handles {
-            let fetched = handle.await.map_err(|e| {
+            fetched.extend(handle.await.map_err(|e| {
                 FormatError::InvalidBinding(format!("node property fetch task failed: {e}"))
-            })??;
+            })??);
+        }
+        if self.enforcer.is_none() {
             for (sid, flakes) in fetched {
                 self.flake_cache.insert(sid, Arc::new(flakes));
             }
+            return Ok(());
+        }
+
+        // Policy runs over the whole batch (one class-cache populate),
+        // then the flakes regroup by subject — including empty groups, so
+        // fully-filtered subjects cache as property-less instead of
+        // refetching on the row walk.
+        let subjects: Vec<Sid> = fetched.iter().map(|(s, _)| s.clone()).collect();
+        let all: Vec<fluree_db_core::Flake> =
+            fetched.into_iter().flat_map(|(_, flakes)| flakes).collect();
+        let visible = self.apply_view_policy(&subjects, all).await?;
+        let mut grouped: HashMap<Sid, Vec<fluree_db_core::Flake>> =
+            subjects.into_iter().map(|sid| (sid, Vec::new())).collect();
+        for flake in visible {
+            if let Some(group) = grouped.get_mut(&flake.s) {
+                group.push(flake);
+            }
+        }
+        for (sid, flakes) in grouped {
+            self.flake_cache.insert(sid, Arc::new(flakes));
         }
         Ok(())
     }
@@ -740,6 +799,9 @@ impl<'a> NodeHydrator<'a> {
             )
             .await
             .map_err(|e| FormatError::InvalidBinding(format!("node property fetch failed: {e}")))?;
+        let flakes = self
+            .apply_view_policy(std::slice::from_ref(sid), flakes)
+            .await?;
         let flakes = Arc::new(flakes);
         self.flake_cache.insert(sid.clone(), Arc::clone(&flakes));
         Ok(flakes)

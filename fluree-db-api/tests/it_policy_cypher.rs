@@ -234,6 +234,120 @@ async fn cypher_where_metadata_filter_under_policy_sees_filtered_flakes() {
     );
 }
 
+/// Every string inside a typed cell tree (node labels, property keys and
+/// values, nested lists/maps), for leak assertions on the Bolt-facing
+/// typed-table formatter.
+fn typed_cell_strings(
+    cell: &fluree_db_api::format::cypher_typed::CypherCell,
+    out: &mut Vec<String>,
+) {
+    use fluree_db_api::format::cypher_typed::CypherCell;
+    match cell {
+        CypherCell::Value(v) => flatten_strings(v, out),
+        CypherCell::Decimal(s) | CypherCell::BigInt(s) => out.push(s.clone()),
+        CypherCell::Temporal(_) => {}
+        CypherCell::List(cells) => cells.iter().for_each(|c| typed_cell_strings(c, out)),
+        CypherCell::Map(entries) => entries.iter().for_each(|(k, c)| {
+            out.push(k.clone());
+            typed_cell_strings(c, out);
+        }),
+        CypherCell::Node(n) => {
+            out.push(n.iri.clone());
+            out.extend(n.labels.iter().cloned());
+            for (k, c) in &n.properties {
+                out.push(k.clone());
+                typed_cell_strings(c, out);
+            }
+        }
+        CypherCell::Relationship(r) => {
+            out.push(r.type_name.clone());
+            for (k, c) in &r.properties {
+                out.push(k.clone());
+                typed_cell_strings(c, out);
+            }
+        }
+        CypherCell::Path(p) => {
+            for n in &p.nodes {
+                typed_cell_strings(&CypherCell::Node(Box::new(n.clone())), out);
+            }
+            for r in &p.rels {
+                typed_cell_strings(&CypherCell::Relationship(Box::new(r.clone())), out);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cypher_typed_table_under_policy_filters_node_hydration() {
+    // The typed-table formatter (Bolt's node/relationship transport) hydrates
+    // node properties from raw SPOT state at format time — a read that
+    // bypasses the scan operators. Under a view policy that hydration must
+    // filter per flake (it used to fail closed instead).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-cypher:typed-table";
+    let l = seed(&fluree, ledger_id).await;
+
+    let qc_opts = GovernanceOptions {
+        policy: Some(deny_secret_policy()),
+        default_allow: true,
+        ..Default::default()
+    };
+    let db_policy = fluree
+        .db_with_policy(ledger_id, &qc_opts)
+        .await
+        .expect("db_with_policy");
+
+    let q = "MATCH (n:Person) RETURN n ORDER BY n.name";
+    let (_, rows) = fluree
+        .query_cypher(&db_policy, q)
+        .await
+        .expect("cypher typed under policy")
+        .to_cypher_typed_table(&db_policy)
+        .await
+        .expect("typed table must work under a view policy (filtered, not refused)");
+
+    let mut strings = Vec::new();
+    for row in &rows {
+        for cell in row {
+            typed_cell_strings(cell, &mut strings);
+        }
+    }
+    assert!(
+        !strings
+            .iter()
+            .any(|s| s.contains("SECRET") || s == "secret"),
+        "hydrated node must not carry the policy-hidden property: {strings:?}"
+    );
+    assert!(
+        strings.iter().any(|s| s == "Alice"),
+        "hydrated node must keep visible properties: {strings:?}"
+    );
+    assert!(
+        strings.iter().any(|s| s == "Person"),
+        "hydrated node must keep its labels: {strings:?}"
+    );
+
+    // Positive control: the same typed table without policy carries the secret.
+    let db_root = graphdb_from_ledger(&l);
+    let (_, rows) = fluree
+        .query_cypher(&db_root, q)
+        .await
+        .expect("cypher typed root")
+        .to_cypher_typed_table(&db_root)
+        .await
+        .expect("typed table");
+    let mut strings = Vec::new();
+    for row in &rows {
+        for cell in row {
+            typed_cell_strings(cell, &mut strings);
+        }
+    }
+    assert!(
+        strings.iter().any(|s| s.contains("SECRET")),
+        "without policy the secret property is present: {strings:?}"
+    );
+}
+
 #[tokio::test]
 async fn cypher_list_comprehension_member_under_policy_is_filtered() {
     // The loop-local `x.secret` is an `Expression::Member` over a list element,
