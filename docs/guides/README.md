@@ -34,6 +34,10 @@ Git-like workflows for data: safe experimentation, review-before-merge, multi-en
 
 Set up fine-grained access control: department isolation, role-based access, property redaction, multi-tenant isolation, and default-deny patterns.
 
+### [Sharing Data with Downstream Consumers](sharing-data.md)
+
+Serve your ledgers to other teams and organizations: choosing between query serving (your compute, row-level policy) and peer/block serving (their compute, whole-ledger), minting scoped tokens, declaring per-ledger participation with `f:servingDefaults`, identity-bound permissioning end to end, and the consumer-side CLI workflow.
+
 ### [SHACL Validation](cookbook-shacl.md)
 
 Define data quality constraints: required properties, datatype validation, value ranges, string patterns, cardinality, and allowed values.

@@ -121,6 +121,27 @@ pub fn builtin_prefix_trie() -> &'static PrefixTrie {
 /// split at this boundary unconditionally, before any other splitting logic.
 pub const BLANK_NODE_PREFIX: &str = "_:";
 
+/// Label prefix reserved for Fluree-minted stable blank-node identifiers.
+///
+/// Every skolemized blank node the system mints has a local name beginning
+/// with `fdb-` (e.g. `fdb-<ulid>`, `fdb-<txn>-<label>`), rendered as
+/// `_:fdb-...` in query results. Labels with this prefix are reserved: when
+/// they appear in incoming queries or transactions they denote the *existing*
+/// stored node rather than minting a fresh one (RDF 1.1 §3.5 skolemization,
+/// kept in blank-node syntax). Client-chosen labels never collide because
+/// transaction skolemization wraps them with a txn id before adding `fdb-`.
+pub const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
+
+/// If `iri` is a Fluree stable blank-node identifier (`_:fdb-...`), return
+/// its local name (the part after `_:`, keeping the `fdb-` prefix) so it can
+/// be resolved directly to the stored blank-node Sid. Returns `None` for
+/// ordinary blank-node labels, which keep fresh-mint semantics.
+#[inline]
+pub fn stable_blank_node_local(iri: &str) -> Option<&str> {
+    iri.strip_prefix(BLANK_NODE_PREFIX)
+        .filter(|local| local.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX))
+}
+
 /// Deterministically split an IRI into `(prefix, suffix)` based on the
 /// ledger's split mode.
 ///
@@ -969,6 +990,21 @@ mod tests {
         let (p, s) = canonical_split("_:fdb-abc123", NsSplitMode::MostGranular);
         assert_eq!(p, BLANK_NODE_PREFIX);
         assert_eq!(s, "fdb-abc123");
+    }
+
+    #[test]
+    fn stable_blank_node_local_reserved_form_only() {
+        assert_eq!(stable_blank_node_local("_:fdb-abc123"), Some("fdb-abc123"));
+        assert_eq!(
+            stable_blank_node_local("_:fdb-lubm:main-1-genid10"),
+            Some("fdb-lubm:main-1-genid10")
+        );
+        // Ordinary labels, near-misses, and non-blank strings are not stable ids.
+        assert_eq!(stable_blank_node_local("_:b0"), None);
+        assert_eq!(stable_blank_node_local("_:fdb"), None);
+        assert_eq!(stable_blank_node_local("_:fdbx-1"), None);
+        assert_eq!(stable_blank_node_local("fdb-abc123"), None);
+        assert_eq!(stable_blank_node_local("http://example.org/x"), None);
     }
 
     #[test]

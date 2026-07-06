@@ -7,6 +7,8 @@ mod it_concurrent_update_reconcile;
 mod it_enforce_unique_upsert_indexed;
 #[path = "it_raw_txn_parallel_upload.rs"]
 mod it_raw_txn_parallel_upload;
+#[path = "it_stable_blank_nodes.rs"]
+mod it_stable_blank_nodes;
 #[path = "it_transact.rs"]
 mod it_transact;
 #[path = "it_transact_conditional.rs"]

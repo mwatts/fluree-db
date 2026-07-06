@@ -1228,7 +1228,7 @@ impl Fluree {
             .await?;
 
         let StageResult {
-            view,
+            mut view,
             ns_registry,
             txn_meta,
             graph_delta,
@@ -1236,6 +1236,22 @@ impl Fluree {
         let mut commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
+
+        // Resolve head temporal metadata if it wasn't observed at load time
+        // (index == head, no novelty walk): the event-time monotonicity
+        // guard and sticky dual-stamp decision in `build_commit` need it.
+        // Gated on `None` so it costs nothing once resolved; uses the
+        // branch-aware store because a branched ledger's head commit may
+        // live in an ancestor's namespace.
+        if view.base().head_temporal.is_none() && view.base().head_commit_id.is_some() {
+            let store = self
+                .content_store_for_record_or_id(view.base().ns_record.as_ref(), ledger.id())
+                .await?;
+            view.base_mut()
+                .ensure_head_temporal(store.as_ref())
+                .await
+                .map_err(fluree_db_transact::TransactError::from)?;
+        }
 
         // Resolve the raw-txn CID before invoking the build phase
         // (build_commit is now pure and does no I/O). A pre-resolved

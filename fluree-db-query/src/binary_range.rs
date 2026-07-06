@@ -136,6 +136,123 @@ fn translate_overlay_ops_v3_with_raw(
     }
 }
 
+/// Identity of a cached range-provider overlay translation.
+///
+/// Every component that can change the translated product is included:
+/// `store_id` is process-unique per `BinaryIndexStore` instance (covering
+/// ledger identity and same-`index_t` store rebuilds that re-rank dict ids),
+/// `index_t` covers in-place incremental index advances, `content_version`
+/// is the overlay's globally-unique content stamp (see
+/// [`OverlayProvider::content_version`] — overlays that cannot vouch for one
+/// are never cached), and `to_t` bounds which overlay flakes the walk emits.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RangeTranslationKey {
+    store_id: u64,
+    index_t: i64,
+    content_version: u64,
+    to_t: i64,
+    g_id: GraphId,
+    index: IndexType,
+}
+
+/// Cached product of an **unfiltered** `translate_overlay_ops_v3_with_raw`
+/// call: ops sorted by the key's index order with lifecycles resolved, plus
+/// the raw untranslatable flakes (retracts intact — the raw-merge fallback
+/// in `binary_range_eq_v3` needs them to cancel base facts) and the
+/// ephemeral predicate mapping for decode.
+struct CachedRangeTranslation {
+    ops: Arc<[fluree_db_binary_index::OverlayOp]>,
+    raw: Arc<[Flake]>,
+    ephemeral_p_id_to_sid: Arc<HashMap<u32, Sid>>,
+}
+
+/// Cross-call LRU of range-provider overlay translations.
+///
+/// `range_with_overlay` looks like a cheap point lookup at call sites, but
+/// each call re-walked the graph's entire novelty, re-translated every flake
+/// (dict probes), and re-sorted the op set — so per-flake lookup loops
+/// (staging list-meta hydration, policy class lookups, upsert deletions,
+/// annotation cascades) cost O(calls × novelty log novelty) on
+/// novelty-heavy ledgers. Entries are large (~50 B/op), so capacity stays
+/// small: one or two hot database states × a few index orders.
+type RangeTranslationLru = lru::LruCache<RangeTranslationKey, Arc<CachedRangeTranslation>>;
+
+fn range_translation_cache() -> &'static std::sync::Mutex<RangeTranslationLru> {
+    use once_cell::sync::Lazy;
+    static CACHE: Lazy<std::sync::Mutex<RangeTranslationLru>> = Lazy::new(|| {
+        std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8).expect("capacity must be > 0"),
+        ))
+    });
+    &CACHE
+}
+
+/// Translate the full (unfiltered) overlay for `(g_id, index, to_t)`, served
+/// from [`range_translation_cache`] when the overlay reports a
+/// [`content_version`](OverlayProvider::content_version). Returns `None`
+/// when the overlay opts out of caching — callers fall back to a fresh
+/// per-call translation, preserving pre-cache behavior.
+#[allow(clippy::too_many_arguments)]
+fn cached_overlay_translation(
+    overlay: &dyn OverlayProvider,
+    g_id: GraphId,
+    index: IndexType,
+    effective_to_t: i64,
+    store: &Arc<BinaryIndexStore>,
+    dict_novelty: &Arc<DictNovelty>,
+    runtime_small_dicts: &Arc<RuntimeSmallDicts>,
+    warn_ctx: &'static str,
+) -> Option<Arc<CachedRangeTranslation>> {
+    let content_version = overlay.content_version()?;
+    let key = RangeTranslationKey {
+        store_id: store.store_id(),
+        index_t: store.max_t(),
+        content_version,
+        to_t: effective_to_t,
+        g_id,
+        index,
+    };
+
+    if let Some(hit) = range_translation_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(Arc::clone(hit));
+    }
+
+    let OverlayTranslateV3Result {
+        mut ops,
+        raw,
+        ephemeral_p_id_to_sid,
+        failed: _,
+    } = translate_overlay_ops_v3_with_raw(
+        overlay,
+        g_id,
+        index,
+        effective_to_t,
+        store,
+        dict_novelty,
+        runtime_small_dicts,
+        |_| true,
+        warn_ctx,
+    );
+    let order = index_type_to_sort_order(index);
+    fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
+    fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+
+    let entry = Arc::new(CachedRangeTranslation {
+        ops: ops.into(),
+        raw: raw.into(),
+        ephemeral_p_id_to_sid: Arc::new(ephemeral_p_id_to_sid),
+    });
+    range_translation_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .put(key, Arc::clone(&entry));
+    Some(entry)
+}
+
 /// Try persisted lookup first, then DictNovelty. Returns `None` if neither resolves.
 fn resolve_or_novelty<T>(
     persisted: Option<T>,
@@ -422,6 +539,7 @@ fn binary_range_eq_v3(
         || filter.o_type.is_some()
         || filter.o_key.is_some();
 
+    let mut range_keys: Option<(RunRecordV2, RunRecordV2)> = None;
     let mut cursor = if use_range {
         let min_key = RunRecordV2 {
             s_id: SubjectId(filter.s_id.unwrap_or(0)),
@@ -441,7 +559,7 @@ fn binary_range_eq_v3(
             o_type: filter.o_type.unwrap_or(u16::MAX),
             g_id,
         };
-        BinaryCursor::new(
+        let cursor = BinaryCursor::new(
             Arc::clone(store),
             order,
             branch,
@@ -449,7 +567,9 @@ fn binary_range_eq_v3(
             &max_key,
             filter,
             projection,
-        )
+        );
+        range_keys = Some((min_key, max_key));
+        cursor
     } else {
         BinaryCursor::scan_all(Arc::clone(store), order, branch, filter, projection)
     };
@@ -462,36 +582,86 @@ fn binary_range_eq_v3(
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
     cursor.set_to_t(effective_to_t);
 
-    // Overlay translation. When the caller supplied a projection-predicate
-    // allow-list, filter overlay flakes by `flake.p` before translation —
-    // this both skips work on discarded overlay rows and ensures the
-    // untranslated raw-fallback set doesn't smuggle non-selected predicates
-    // back in. Sid match (vs persisted p_id) so novel predicates still pass.
-    let predicate_filter_sids = opts.predicate_filter.clone();
-    let OverlayTranslateV3Result {
-        mut ops,
-        raw: untranslated,
-        ephemeral_p_id_to_sid,
-        failed: _overlay_failed_translation,
-    } = translate_overlay_ops_v3_with_raw(
-        overlay,
-        g_id,
-        index,
-        effective_to_t,
-        store,
-        dict_novelty,
-        runtime_small_dicts,
-        move |flake| match &predicate_filter_sids {
-            Some(allow) => allow.iter().any(|p| p == &flake.p),
-            None => true,
-        },
-        "V3 range",
-    );
+    // Overlay translation. Unfiltered translations are served from the
+    // cross-call LRU when the overlay reports a content version (raw
+    // `Novelty` does) — see `range_translation_cache` for why fresh per-call
+    // translation makes point-lookup loops quadratic in novelty size.
+    //
+    // When the caller supplied a projection-predicate allow-list, translate
+    // fresh with the `flake.p` filter as before — the allow-list changes
+    // both the translated set and the raw-fallback set (it must not smuggle
+    // non-selected predicates back in), so that product is not cacheable
+    // under the unfiltered key. Sid match (vs persisted p_id) so novel
+    // predicates still pass.
+    let cached = if opts.predicate_filter.is_none() {
+        cached_overlay_translation(
+            overlay,
+            g_id,
+            index,
+            effective_to_t,
+            store,
+            dict_novelty,
+            runtime_small_dicts,
+            "V3 range",
+        )
+    } else {
+        None
+    };
+    let (overlay_ops, untranslated, ephemeral_p_id_to_sid) = match cached {
+        Some(entry) => (
+            Arc::clone(&entry.ops),
+            entry.raw.to_vec(),
+            Arc::clone(&entry.ephemeral_p_id_to_sid),
+        ),
+        None => {
+            let predicate_filter_sids = opts.predicate_filter.clone();
+            let OverlayTranslateV3Result {
+                mut ops,
+                raw,
+                ephemeral_p_id_to_sid,
+                failed: _overlay_failed_translation,
+            } = translate_overlay_ops_v3_with_raw(
+                overlay,
+                g_id,
+                index,
+                effective_to_t,
+                store,
+                dict_novelty,
+                runtime_small_dicts,
+                move |flake| match &predicate_filter_sids {
+                    Some(allow) => allow.iter().any(|p| p == &flake.p),
+                    None => true,
+                },
+                "V3 range",
+            );
+            fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
+            fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+            (
+                Arc::<[fluree_db_binary_index::OverlayOp]>::from(ops),
+                raw,
+                Arc::new(ephemeral_p_id_to_sid),
+            )
+        }
+    };
 
-    if !ops.is_empty() {
-        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
-        fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-        cursor.set_overlay_ops(ops.into());
+    if !overlay_ops.is_empty() {
+        // Range-bounded cursors get only the ops window intersecting
+        // [min_key, max_key]: out-of-range ops can never match the filter,
+        // and carrying them costs an O(overlay) merge walk per call while
+        // defeating leaflet pre-skips (same pattern as
+        // `BinaryScanOperator::open`).
+        let (start, end) = match &range_keys {
+            Some((min_key, max_key)) => fluree_db_binary_index::overlay_window_for_range(
+                &overlay_ops,
+                min_key,
+                max_key,
+                order,
+            ),
+            None => (0, overlay_ops.len()),
+        };
+        if start < end {
+            cursor.set_overlay_ops_window(overlay_ops, start, end);
+        }
     }
 
     // Extend the row-loop allow-set with ephemeral p_ids whose mapped Sid is
@@ -504,7 +674,7 @@ fn binary_range_eq_v3(
         opts.predicate_filter.as_deref(),
         predicate_filter_p_ids.as_mut(),
     ) {
-        for (eph_p_id, sid) in &ephemeral_p_id_to_sid {
+        for (eph_p_id, sid) in ephemeral_p_id_to_sid.iter() {
             if allow_sids.iter().any(|s| s == sid) {
                 allow_ids.push(*eph_p_id);
             }

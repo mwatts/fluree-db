@@ -591,6 +591,33 @@ impl Fluree {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);
 
+        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root())
+            .await?;
+
+        Ok(executable)
+    }
+
+    /// Apply a view's reasoning configuration to an executable.
+    ///
+    /// Single choke point shared by the single-ledger path
+    /// ([`build_executable_for_view`](Self::build_executable_for_view)) and
+    /// the dataset path (`build_executable_for_dataset`, which passes the
+    /// dataset's primary view) so both engage the same reasoning surface:
+    /// mode precedence, the config materialization budget, config-graph
+    /// datalog restrictions, the query-time rule policy gate, local and
+    /// cross-ledger `f:rulesSource`, and the `f:schemaSource` bundle
+    /// (local, cross-ledger, and inline `opts.ontology`).
+    ///
+    /// `strip_query_rules` is true when a non-root view policy applies —
+    /// `!db.is_root()` for a single view, `dataset.any_non_root_policy()`
+    /// for a dataset. It strips *query-supplied* rules only; config-sourced
+    /// rules attach afterwards because they're admin-controlled.
+    pub(crate) async fn apply_reasoning_to_executable(
+        &self,
+        db: &GraphDb,
+        executable: &mut ExecutableQuery,
+        strip_query_rules: bool,
+    ) -> Result<()> {
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {
             // Check query's reasoning state
@@ -639,7 +666,7 @@ impl Fluree {
         // not its provenance, and a caller-invented predicate can't be
         // pre-denied. DB-stored rules and OWL reasoning are admin-controlled and
         // unaffected. See docs/security/policy-in-queries.md (Reasoning).
-        if !db.is_root() && !executable.reasoning.modes.rules.is_empty() {
+        if strip_query_rules && !executable.reasoning.modes.rules.is_empty() {
             tracing::debug!("stripping query-time datalog rules under non-root view policy");
             executable.reasoning.modes.rules.clear();
         }
@@ -674,14 +701,13 @@ impl Fluree {
         // `executable.reasoning.rules` so they pass through the
         // existing query-time rule code path. Same-ledger references
         // are handled above via `rules_source_g_id`.
-        self.attach_cross_ledger_rules(db, &mut executable, &mut ctx)
+        self.attach_cross_ledger_rules(db, executable, &mut ctx)
             .await?;
 
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
-        self.attach_schema_bundle(db, &mut executable, &mut ctx)
-            .await?;
+        self.attach_schema_bundle(db, executable, &mut ctx).await?;
 
-        Ok(executable)
+        Ok(())
     }
 
     /// If the resolved datalog config carries a cross-ledger
@@ -757,7 +783,9 @@ impl Fluree {
     ///   import; the bundle is a reasoning-only concern.
     ///
     /// Errors with [`ApiError::OntologyImport`] only when reasoning is
-    /// actually engaged and an import can't be resolved locally.
+    /// actually engaged and an import can't be resolved locally, or when
+    /// `f:followOwlImports` is combined with a cross-ledger
+    /// `f:schemaSource` (the cross-ledger materializer is single-graph).
     async fn attach_schema_bundle(
         &self,
         db: &GraphDb,
@@ -830,6 +858,21 @@ impl Fluree {
         // the resulting `SchemaArtifactWire` into a SchemaBundleFlakes
         // against D's snapshot.
         if schema_source.ledger.is_some() {
+            // The cross-ledger schema materializer resolves a single
+            // graph and does not walk `owl:imports`. Fail closed —
+            // silently ignoring `f:followOwlImports` would let the user
+            // believe the import closure is part of the reasoning view
+            // when only the starting graph is.
+            if reasoning.follow_owl_imports.unwrap_or(false) {
+                return Err(crate::error::ApiError::OntologyImport(
+                    "`f:followOwlImports` is not supported with a cross-ledger \
+                     `f:schemaSource` — the cross-ledger resolver materializes \
+                     the referenced graph only and does not walk `owl:imports`. \
+                     Consolidate the schema closure into the referenced graph, \
+                     or remove `f:followOwlImports`."
+                        .to_string(),
+                ));
+            }
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 schema_source,
                 crate::cross_ledger::ArtifactKind::SchemaClosure,

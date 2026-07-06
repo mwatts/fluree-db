@@ -398,6 +398,29 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             }
         }
 
+        #[cfg(feature = "shacl")]
+        Commands::Validate {
+            target,
+            graph,
+            shacl,
+            shacl_graph,
+            include_attached,
+            format,
+            fail_on,
+        } => {
+            commands::validate::run(
+                target.as_deref(),
+                graph.as_deref(),
+                shacl.as_deref(),
+                shacl_graph.as_deref(),
+                include_attached,
+                &format,
+                &fail_on,
+                config_path,
+            )
+            .await
+        }
+
         Commands::Export {
             ledger,
             format,
@@ -578,6 +601,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::track::run(action, &fluree_dir).await
         }
+
+        Commands::Cache { action } => commands::cache::run(action),
 
         Commands::Index { ledger } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;

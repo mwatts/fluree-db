@@ -89,6 +89,16 @@ async fn pack_ledger_local(
         .await
         .map_err(ServerError::Api)?;
 
+    // Serving gate: pack streams raw replication content, so it honors the
+    // ledger's f:serveBlocks posture (404 per the no-existence-leak convention).
+    let serving = crate::routes::serving::effective_serving_from_state(
+        &handle.snapshot().await.to_ledger_state(),
+    )
+    .await?;
+    if !serving.blocks {
+        return Err(ServerError::not_found("Ledger not found"));
+    }
+
     debug!(
         ledger = %ledger,
         want_count = pack_request.want.len(),

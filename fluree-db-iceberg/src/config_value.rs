@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 /// ).unwrap();
 /// assert_eq!(with_default.resolve().unwrap(), "default");
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ConfigValue {
     /// Literal string value
@@ -59,6 +59,28 @@ pub enum ConfigValue {
         #[serde(default)]
         default_val: Option<String>,
     },
+}
+
+/// Redacting `Debug`: `ConfigValue` carries auth secrets (bearer tokens, OAuth2
+/// client secrets), so a `{:?}` in a log or error must never leak them. The
+/// environment-variable *name* is shown (it aids debugging and is not secret);
+/// the literal value and any inline default are redacted.
+impl std::fmt::Debug for ConfigValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigValue::Literal(_) => f.write_str("Literal(\"***\")"),
+            ConfigValue::Dynamic {
+                env_var,
+                java_property,
+                default_val,
+            } => f
+                .debug_struct("Dynamic")
+                .field("env_var", env_var)
+                .field("java_property", java_property)
+                .field("default_val", &default_val.as_ref().map(|_| "***"))
+                .finish(),
+        }
+    }
 }
 
 impl ConfigValue {
@@ -220,5 +242,28 @@ mod tests {
         let value: ConfigValue = "test".into();
         assert!(value.is_literal());
         assert_eq!(value.resolve().unwrap(), "test");
+    }
+
+    #[test]
+    fn debug_redacts_literal_secret() {
+        let value = ConfigValue::literal("super-secret-token");
+        let dbg = format!("{value:?}");
+        assert!(
+            !dbg.contains("super-secret-token"),
+            "Debug must not leak the literal secret, got: {dbg}"
+        );
+        assert!(dbg.contains("***"), "got: {dbg}");
+    }
+
+    #[test]
+    fn debug_shows_env_var_name_but_redacts_default() {
+        let value = ConfigValue::from_env_with_default("POLARIS_TOKEN", "fallback-secret");
+        let dbg = format!("{value:?}");
+        // The env var NAME is safe to show; the inline default is a secret.
+        assert!(dbg.contains("POLARIS_TOKEN"), "got: {dbg}");
+        assert!(
+            !dbg.contains("fallback-secret"),
+            "Debug must not leak the default secret, got: {dbg}"
+        );
     }
 }

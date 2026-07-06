@@ -45,7 +45,7 @@ This endpoint is intended for debugging and operator support. See also [Admin, h
 
 ### POST /update
 
-Submit an **update** transaction (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE) to write data to a ledger.
+Submit an **update** transaction (WHERE/DELETE/INSERT JSON-LD, SPARQL UPDATE, or Cypher `CREATE`/`MERGE`/`SET`/`DELETE`) to write data to a ledger.
 
 **URL:**
 ```
@@ -70,6 +70,17 @@ For SPARQL UPDATE:
 Content-Type: application/sparql-update
 Accept: application/json
 ```
+
+For Cypher writes (`CREATE`/`MERGE`/`SET`/`DELETE`):
+```http
+Content-Type: application/cypher
+Accept: application/json
+```
+
+Note: Cypher targets a ledger directly and must use the path form
+(`POST /update/{ledger-id}`); it has no `FROM`/dataset clause. The body may be
+raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the
+[Cypher reference](../query/cypher.md) for details.
 
 Note: Turtle/TriG are not accepted on `/update`. Use `/insert` (Turtle) or `/upsert` (Turtle/TriG).
 
@@ -192,6 +203,20 @@ curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
   -d '{
     "@context": { "ex": "http://example.org/ns/" },
     "@graph": [{ "@id": "ex:alice", "ex:name": "Alice" }]
+  }'
+```
+
+JSON-LD transaction with a caller-supplied event time (backdated commit — see
+[Time Travel: Event Time](../concepts/time-travel.md#event-time-backdated-commits);
+must be RFC 3339, monotonically non-decreasing along the ledger's commit
+chain, and not in the future):
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@graph": [{ "@id": "ex:alice", "ex:role": "Engineer" }],
+    "opts": { "eventTime": "2021-03-15T00:00:00Z" }
   }'
 ```
 
@@ -900,6 +925,60 @@ curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8090/v1/fluree/storage/objects/bafybeig...leafCid?ledger=mydb:main"
 ```
 
+Single-range `Range: bytes=start-end` requests are honored with `206 Partial
+Content` (`Content-Range` included); the full object is verified against the
+CID before slicing. Unsupported Range forms fall back to a full `200`
+response; a start at or past the object length returns `416`.
+
+### GET /storage/credentials
+
+Mint STS credentials scoped to a ledger's S3 prefix, so an authorized peer
+reads index content **directly from S3** instead of proxying every object
+through this server. See [Remote mounts and serving
+tiers](../design/remote-mounts.md).
+
+**URL:**
+
+```
+GET /storage/credentials?ledger={ledger-id}
+```
+
+**Requirements (all must hold, else `404`):**
+
+- Server built with the `aws` feature and **single-bucket S3-backed storage**
+  (connection config)
+- `--storage-vend-enabled` and `--storage-vend-role-arn <arn>` configured
+- Bearer token with `fluree.storage.*` scope covering the ledger
+- The ledger's `f:serveBlocks` posture allows raw serving
+
+**Response Body** (200 OK):
+
+```json
+{
+  "access_key_id": "ASIA...",
+  "secret_access_key": "...",
+  "session_token": "...",
+  "expires_at_epoch_secs": 1751600000,
+  "bucket": "my-fluree-bucket",
+  "region": "us-east-1",
+  "key_prefix": "ledgers",
+  "scoped_prefix": "ledgers/mydb"
+}
+```
+
+The grant is an STS `AssumeRole` session narrowed by a session policy to
+`s3:GetObject` under the ledger's **name-level** prefix (covering all
+branches and the shared dictionary namespace) plus prefix-conditioned
+`s3:ListBucket`. TTL is `--storage-vend-ttl-secs` (default 900, the STS
+minimum).
+
+**Revocation caveat:** a minted grant stays valid until it expires — token
+revocations and `f:serveBlocks` changes take effect at grant expiry, so keep
+TTLs short.
+
+Consumers (CLI peer mode, `fluree-db-nameservice-sync::vended_s3`) probe this
+endpoint and fall back to proxied `/storage/objects` reads on `404`.
+
 ## Nameservice Sync Endpoints
 
 Used by replication clients and peer instances to push ref updates, initialize
@@ -1207,6 +1286,16 @@ FROM <txn-meta>
 WHERE { ?commit f:t ?t }'
 ```
 
+Cypher (`Content-Type: application/cypher` — ledger-scoped only, no `FROM`/dataset clause):
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
+  -H "Content-Type: application/cypher" \
+  --data 'MATCH (p:Person) RETURN p.name'
+```
+
+Cypher responses default to `cypher-json`; request RDF JSON-LD with `Accept: application/ld+json`. The body may be raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the [Cypher reference](../query/cypher.md).
+
 ### History Queries via POST /query
 
 Query the history of entities using the standard `/query` endpoint with `from` and `to` keys specifying the time range.
@@ -1404,6 +1493,83 @@ curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
 curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   -H "Content-Type: application/json" \
   -d '{"select":["?s"],"where":{"@id":"?s"}}'
+```
+
+### GET/POST /validate/{ledger...}
+
+Validate the current state of a ledger (or one of its named graphs) against SHACL shapes and return a **validation report** — the HTTP surface of `fluree validate`. Unlike transaction-time enforcement, this never rejects anything; it reports every result it finds. Requires the `shacl` build feature (on by default).
+
+**URL:**
+```
+GET  /validate/{ledger...}
+POST /validate/{ledger...}
+```
+
+**Request body** (POST; all fields optional — an empty body validates the default graph against the attached shapes):
+
+```json
+{
+  "graph": "http://example.org/graphs/data",
+  "shapes": { "...JSON-LD shapes document..." },
+  "shapesGraph": "http://example.org/graphs/shapes",
+  "includeAttached": false
+}
+```
+
+- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
+- `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
+- `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
+
+**Response** (negotiated via `Accept`):
+
+- Default / `application/json` — summary envelope:
+
+```json
+{
+  "conforms": false,
+  "violations": 1,
+  "warnings": 0,
+  "infos": 0,
+  "shapesChecked": 1,
+  "results": [{
+    "focus_node": "http://example.org/ns/bob",
+    "result_path": "http://schema.org/name",
+    "source_shape": "http://example.org/ns/UserShape",
+    "source_constraint": "http://example.org/ns/name-ps",
+    "constraint_component": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+    "severity": "http://www.w3.org/ns/shacl#Violation",
+    "message": "Expected at least 1 value(s) but found 0"
+  }]
+}
+```
+
+- `application/ld+json` — a W3C `sh:ValidationReport` JSON-LD document.
+- `text/turtle` — the same report as Turtle.
+
+`result_path` is present only when the path is a single predicate; complex paths are omitted rather than misrepresented.
+
+**Auth:** same read gate as `/query` (Bearer `can_read` on the ledger). Note that validation reads the full graph — results are **not** policy-filtered, so access to this endpoint implies read access to the data it reports on.
+
+**Status Codes:**
+- `200 OK` — report returned (conforming or not; non-conformance is not an error)
+- `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
+- `401 Unauthorized` — authentication required and missing
+- `404 Not Found` — ledger or named graph not found (or not authorized)
+
+**Examples:**
+
+```bash
+# Validate against the ledger's attached shapes
+curl http://localhost:8090/v1/fluree/validate/mydb
+
+# Trial ad-hoc Turtle shapes (replaces attached shapes)
+curl -X POST http://localhost:8090/v1/fluree/validate/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"shapes": "@prefix sh: <http://www.w3.org/ns/shacl#> . ..."}'
+
+# W3C report as Turtle
+curl http://localhost:8090/v1/fluree/validate/mydb -H "Accept: text/turtle"
 ```
 
 ## Nameservice Metadata
@@ -2805,7 +2971,7 @@ This section summarizes the contract that third-party server implementations (e.
 |----------|-------------|
 | `GET /info/{ledger}` | `info`, `push`, `pull`, `clone` |
 | `GET /show/{ledger}?commit=<ref>` | `show --remote` |
-| `POST /query/{ledger}` | `query` (JSON-LD and SPARQL) |
+| `POST /query/{ledger}` | `query` (JSON-LD, SPARQL, and Cypher) |
 | `POST /insert/{ledger}` | `insert` |
 | `POST /upsert/{ledger}` | `upsert` |
 | `GET /exists/{ledger}` | `clone` (pre-create check) |

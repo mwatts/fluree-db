@@ -626,6 +626,25 @@ impl VectorSlice {
     }
 }
 
+/// All of a [`LazyVectorArena`]'s shards, pinned for direct zero-probe access.
+pub struct VectorArenaSnapshot {
+    shards: Vec<Arc<VectorShard>>,
+    shard_capacity: u32,
+    total_count: u32,
+}
+
+impl VectorArenaSnapshot {
+    /// Zero-copy vector read by handle. `None` for out-of-range handles.
+    #[inline]
+    pub fn get_f32(&self, handle: u32) -> Option<&[f32]> {
+        if handle >= self.total_count {
+            return None;
+        }
+        let shard = self.shards.get((handle / self.shard_capacity) as usize)?;
+        shard.get_f32(handle % self.shard_capacity)
+    }
+}
+
 impl LazyVectorArena {
     /// Create a new lazy arena from a parsed manifest, shard source metadata,
     /// a shared cache handle, and an optional content store for remote fetching.
@@ -823,6 +842,22 @@ impl LazyVectorArena {
             return Ok(None);
         }
         Ok(Some(VectorSlice { shard, offset }))
+    }
+
+    /// Pin every shard once and return a direct-access snapshot.
+    ///
+    /// [`Self::lookup_vector`] pays a shard-cache probe (and its `Arc` clone)
+    /// per call; scan loops that touch most handles should resolve the shards
+    /// once up front and index into them directly.
+    pub fn snapshot(&self) -> io::Result<VectorArenaSnapshot> {
+        let shards = (0..self.shard_count())
+            .map(|i| self.load_shard_cached(i))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(VectorArenaSnapshot {
+            shards,
+            shard_capacity: self.manifest.shard_capacity,
+            total_count: self.manifest.total_count,
+        })
     }
 
     /// Batch point-lookup. Sorts handles for sequential shard access,

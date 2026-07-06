@@ -16,7 +16,7 @@
 //! - **Proxy**: All storage reads proxied through transaction server (no storage credentials)
 
 use crate::config::{ServerConfig, ServerRole};
-use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyStorage};
+use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyReadMode, ProxyStorage};
 use crate::registry::LedgerRegistry;
 use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
@@ -89,6 +89,15 @@ pub struct AppState {
     /// from stampeding the nameservice.
     query_refresh_last_checked: DashMap<String, Instant>,
 
+    /// Serving posture memo, keyed by ledger id with value `(t, posture)`.
+    ///
+    /// The peer raw-read path resolves the serving gate per object; without
+    /// this, a cold sync re-resolves the config graph for every leaf/branch/
+    /// root/dict/commit at the same `t`. One entry per ledger, overwritten when
+    /// `t` advances (a config change bumps `t`), so it stays bounded and
+    /// self-invalidating.
+    serving_posture_cache: DashMap<String, (i64, crate::routes::serving::EffectiveServing)>,
+
     /// Handle for the background leaflet cache stats logger task.
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
@@ -97,6 +106,12 @@ pub struct AppState {
     /// the presigned `.flpack` upload flow). Empty/unused unless
     /// `config.import_presign_enabled`.
     pub import_jobs: Arc<crate::import_jobs::ImportJobs>,
+
+    /// S3 vend scope for `GET /storage/credentials`, derived from the
+    /// connection config at startup. `None` when vending is disabled, the
+    /// backing storage isn't S3, or the commit/index buckets are split.
+    #[cfg(feature = "aws")]
+    pub storage_vend_scope: Option<fluree_db_api::vended_credentials::S3VendScope>,
 }
 
 /// Spawn the periodic LeafletCache stats logger task. Returned
@@ -137,6 +152,39 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
 }
 
 impl AppState {
+    /// Serving posture for a ledger, memoized per `(ledger, t)`.
+    ///
+    /// Resolves the serving gate for the ledger's current head, reusing a
+    /// cached posture when nothing has committed since (same `t`). The cheap
+    /// work (cached handle + ledger state) still runs each call; the memo skips
+    /// the config-graph resolution — the actual per-object cost on the peer
+    /// raw-read path. See [`Self::serving_posture_cache`].
+    pub(crate) async fn effective_serving_cached(
+        &self,
+        ledger_id: &str,
+    ) -> Result<crate::routes::serving::EffectiveServing, crate::error::ServerError> {
+        let handle = self
+            .fluree
+            .ledger_cached(ledger_id)
+            .await
+            .map_err(crate::error::ServerError::Api)?;
+        // Key on the novelty-inclusive `t` (what the resolver reads via
+        // `state.t()`), NOT the indexed base `snapshot.t`: a config change lands
+        // in novelty and bumps the effective `t` without touching the base until
+        // a reindex, so keying on the base would serve a stale posture.
+        let ledger_state = handle.snapshot().await.to_ledger_state();
+        let t = ledger_state.t();
+        if let Some(entry) = self.serving_posture_cache.get(ledger_id) {
+            if entry.0 == t {
+                return Ok(entry.1);
+            }
+        }
+        let serving = crate::routes::serving::effective_serving_from_state(&ledger_state).await?;
+        self.serving_posture_cache
+            .insert(ledger_id.to_string(), (t, serving));
+        Ok(serving)
+    }
+
     /// Create new application state from config.
     ///
     /// Convenience shortcut: builds the default `Fluree` instance
@@ -219,6 +267,9 @@ impl AppState {
             index_config.clone(),
         ));
 
+        #[cfg(feature = "aws")]
+        let storage_vend_scope = resolve_storage_vend_scope(&config);
+
         Ok(Self {
             fluree,
             config,
@@ -235,8 +286,11 @@ impl AppState {
             raft: None,
             refresh_counter: AtomicU64::new(0),
             query_refresh_last_checked: DashMap::new(),
+            serving_posture_cache: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
+            #[cfg(feature = "aws")]
+            storage_vend_scope,
         })
     }
 
@@ -422,6 +476,66 @@ async fn build_direct_fluree(
     Ok((fluree, handle))
 }
 
+/// Derive the S3 vend scope from the server's connection config, when
+/// credential vending is enabled and the backing storage is S3.
+///
+/// Failures are downgraded to `None` with a log: the endpoint then answers
+/// 404 (consumers fall back to proxied block reads) instead of the server
+/// refusing to start.
+#[cfg(feature = "aws")]
+fn resolve_storage_vend_scope(
+    config: &ServerConfig,
+) -> Option<fluree_db_api::vended_credentials::S3VendScope> {
+    if !config.storage_vend_enabled {
+        return None;
+    }
+    if config.storage_vend_role_arn.is_none() {
+        tracing::error!(
+            "--storage-vend-enabled requires --storage-vend-role-arn; credential vending disabled"
+        );
+        return None;
+    }
+    let Some(path) = &config.connection_config else {
+        tracing::error!(
+            "--storage-vend-enabled requires S3-backed storage (connection config); \
+             credential vending disabled"
+        );
+        return None;
+    };
+
+    let json_str = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "vended credentials: cannot read connection config");
+            return None;
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "vended credentials: cannot parse connection config");
+            return None;
+        }
+    };
+    let conn = match fluree_db_connection::ConnectionConfig::from_json_ld(&json) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "vended credentials: invalid connection config");
+            return None;
+        }
+    };
+
+    let scope = fluree_db_api::vended_credentials::S3VendScope::from_connection_config(&conn);
+    if scope.is_none() {
+        tracing::error!(
+            "--storage-vend-enabled requires single-bucket S3 storage; credential vending disabled"
+        );
+    } else {
+        tracing::info!("vended S3 credentials enabled");
+    }
+    scope
+}
+
 /// Build a proxy-backed `Fluree` for peer proxy mode. Reads land
 /// against a remote `ProxyNameService`; writes are forwarded to the
 /// transaction server.
@@ -437,7 +551,11 @@ fn build_proxy_fluree(
         fluree_db_api::ApiError::internal(format!("Failed to load storage proxy token: {e}"))
     })?;
 
-    let storage = ProxyStorage::new(tx_url.clone(), token.clone());
+    // Raw mode: the peer's `fluree.storage.*` token grants full read access,
+    // so it fetches canonical CAS bytes (CID-verified client-side). This is
+    // also what lets the binary index reader consume FLI3 leaves directly —
+    // the filtered (FLKB) tier has no leaf decoder on the read path.
+    let storage = ProxyStorage::new(tx_url.clone(), token.clone(), ProxyReadMode::Raw);
     let nameservice = ProxyNameService::new(tx_url, token);
 
     let ns_mode = NameServiceMode::ReadOnly(Arc::new(nameservice));

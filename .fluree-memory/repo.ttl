@@ -906,7 +906,7 @@ mem:fact-01kn800ps56as4xe2kycr10yq1 a mem:Fact ;
     mem:createdAt "2026-04-02T21:01:33.861145+00:00"^^xsd:dateTime .
 
 mem:fact-01knjakv2d3t3y7av973g38tm7 a mem:Fact ;
-    mem:content "Incremental indexing has two notable gotchas in `fluree-db-indexer`: 1) when incremental fulltext refresh cannot fetch/decode the prior fulltext arena, `build/incremental.rs` starts from `FulltextArena::new()` and then writes a replacement arena built from novelty only, which can drop historical `fulltext()` scoring data for that `(g_id,p_id)`; 2) incremental schema refresh carries forward the base schema if base-store load fails, which leaves `snapshot.schema` stale for reasoning until a later successful refresh/rebuild. Also, `IndexerConfig.incremental_max_commit_bytes` defaults to `None`, and only the embedded orchestrator populates it from `reindex_max_bytes`." ;
+    mem:content "Incremental indexing gotchas in `fluree-db-indexer`: 1) fulltext prior-arena fetch/decode failure now HARD-FAILS the incremental build (incremental.rs ~1482; recovery contract = build_index_for_ledger falls back to full rebuild) — the old silent start-from-empty fallback that dropped historical fulltext scoring is FIXED; 2) incremental schema refresh carries forward the base schema if base-store load fails, which leaves `snapshot.schema` stale for reasoning until a later successful refresh/rebuild. Also, `IndexerConfig.incremental_max_commit_bytes` defaults to `None`, and only the embedded orchestrator populates it from `reindex_max_bytes`." ;
     mem:tag "fulltext" ;
     mem:tag "incremental-indexing" ;
     mem:tag "indexer" ;
@@ -1202,6 +1202,20 @@ mem:fact-01krb618x0axad5mj8jev4ej0s a mem:Fact ;
     mem:branch "feature/edge-annotations" ;
     mem:createdAt "2026-05-11T09:31:32.640122+00:00"^^xsd:dateTime .
 
+mem:constraint-01kwscqt5qs9raejdt9drmr0xe a mem:Constraint ;
+    mem:content "Event-time validation belongs at the BUILD path (resolve_commit_times), NOT replay. resolve_commit_times rejects new commits with future/backwards event time or future receivedAt (bounded by MAX_EVENT_TIME_FUTURE_SKEW_MS=5min). apply_single_commit (incremental catch-up over already-durable commits) must only WARN on non-monotonic event time, never Err: history is immutable and the full-reload path load_novelty has no guard, so erroring wedges catch-up inconsistently. Separately: dual-stamp (db:receivedAt) is gated on received.is_some()||head.dual_stamp() — with_timestamp alone does NOT flip it (event-axis-only, e.g. fluree-memory git replay); the server pairs eventTime with with_received_at(now)." ;
+    mem:tag "commit" ;
+    mem:tag "dual-stamp" ;
+    mem:tag "event-time" ;
+    mem:tag "receivedat" ;
+    mem:tag "replay" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:branch "feature/event-time-commits" ;
+    mem:createdAt "2026-07-05T15:00:52.023159+00:00"^^xsd:dateTime ;
+    mem:rationale "Hard-erroring on replay broke incremental catch-up for pre-existing non-monotonic chains (NTP/raft skew), inconsistent with the unguarded full-reload path." .
+
 mem:constraint-01kv5g47r2z640tkx6nxd1d8qm a mem:Constraint ;
     mem:content "To roll back / delete a freshly-created ledger you must call `drop_ledger(name, mode)` with the BARE name (it rejects a `:branch` suffix), NOT `drop_branch` — drop_branch refuses the root branch (source_branch=None). Use `split_ledger_id(id)` to strip the branch. Also: after a commits-only restore, `handle.snapshot.t` is the INDEX t (0, no index built), not the commit-head t — assert restore success via `nameservice().lookup(id).commit_t` or a query, not snapshot.t." ;
     mem:tag "drop" ;
@@ -1447,6 +1461,154 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
+    mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
+    mem:tag "crate-boundary" ;
+    mem:tag "engine" ;
+    mem:tag "hierarchy" ;
+    mem:tag "shacl" ;
+    mem:tag "tx-path" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/validate.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T01:47:55.655870+00:00"^^xsd:dateTime .
+
+mem:decision-01kwm1agwk619zyf6rsxrjj7ap a mem:Decision ;
+    mem:content "Remote-mount / query-peer feature v1 scope: ledger access over the block-serving (peer) path is all-or-nothing per (token, ledger) — full-access raw CAS bytes (CID-verifiable, globally cacheable) or nothing; plus a public/anonymous tier. No policy-filtered (FLKB) leaf serving to peers in v1 — fine-grained permissions require query-shipping (server executes with row-level policy). Requires adding a full-access raw mode to the storage proxy (EnforcementMode::TrustedInternal gated on token scope; today PolicyEnforced/FLKB is the only proxy mode). v2 hooks: FLKB negotiation stays in ProxyStorage, serving advertisement uses distinct \"blocks\" vs future \"blocks:filtered\", cache writes carry a CID-verified flag." ;
+    mem:tag "caching" ;
+    mem:tag "feature-design" ;
+    mem:tag "peer-mode" ;
+    mem:tag "policy" ;
+    mem:tag "remote-mounts" ;
+    mem:tag "storage-proxy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/block_fetch.rs" ;
+    mem:artifactRef "fluree-db-server/src/peer/proxy_storage.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/storage_proxy.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T13:05:10.035196+00:00"^^xsd:dateTime ;
+    mem:rationale "Avoids the two hardest v1 problems: filtered leaves are not immutable (policy changes make cached filtered views a revocation leak) and non-byte-identical payloads break CAS integrity checks. All-or-nothing keeps every peer-fetched block canonical and cache-forever." .
+
+mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
+    mem:content "RDFS enforcement entailment (feature/rdfs-enforcement-entailment): always-on subclass+subproperty inference for SHACL and Policy. Epoch counters on Novelty bumped in apply_commit's routing loop (schema_epoch: subClassOf/subPropertyOf; shacl_epoch: sh:* predicates or rdf:type→SHACL-type/rdfs:Class/owl:Class) + two Arc caches on LedgerState carried across commits: SchemaHierarchyCache (core; keyed indexed-schema-t + schema_epoch) and a type-erased compiled-SHACL slot (+shacl_epoch +shapes_g_ids; data-only txns skip ShapeCompiler via ShaclEngine::from_shared_cache). RULE: enforcement uses COMMITTED hierarchy — same-txn schema does not entail (two-txn workflow, pinned by test)." ;
+    mem:tag "enforcement" ;
+    mem:tag "entailment" ;
+    mem:tag "epoch-cache" ;
+    mem:tag "policy" ;
+    mem:tag "rdfs" ;
+    mem:tag "shacl" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:artifactRef "fluree-db-core/src/schema_hierarchy.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/lib.rs" ;
+    mem:artifactRef "fluree-db-policy/src/index.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T01:47:52.379794+00:00"^^xsd:dateTime .
+mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
+    mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
+    mem:tag "dataset" ;
+    mem:tag "derived-facts" ;
+    mem:tag "history-mode" ;
+    mem:tag "reasoning" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_builder.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:branch "feature/shacl-property-paths" ;
+    mem:createdAt "2026-07-05T13:38:04.147463+00:00"^^xsd:dateTime .
+
+mem:fact-01kwktkb2r0ktxt5xaxvbwev3e a mem:Fact ;
+    mem:content "The \"query peer over HTTP\" model exists as server peer proxy mode: ProxyStorage + ProxyNameService wired via FlureeBuilder::memory().build_with(storage, NameServiceMode::ReadOnly); serving side is the StorageProxyBearer route group; GET /nameservice/snapshot filters to the token's fluree.storage.ledgers scope. ProxyStorage is mode-aware (feature/remote-mounts): ProxyReadMode::Raw fetches canonical CID-verified bytes via GET /storage/objects/{cid} (peer default; what makes indexed ledgers readable), ProxyReadMode::Filtered uses POST /storage/block FLKB negotiation. CRITICAL: no production code decodes FLKB — the filtered tier is transport-only until a leaf decoder exists on the read path. Remaining gaps: one upstream per server (no composite nameservice), no HTTP Range on ProxyStorage, no vended-credential/origin handoff." ;
+    mem:tag "auth" ;
+    mem:tag "federation" ;
+    mem:tag "nameservice" ;
+    mem:tag "peer-mode" ;
+    mem:tag "remote" ;
+    mem:tag "storage-proxy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-server/src/peer/proxy_nameservice.rs" ;
+    mem:artifactRef "fluree-db-server/src/peer/proxy_storage.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/nameservice_refs.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/storage_proxy.rs" ;
+    mem:artifactRef "fluree-db-server/src/state.rs" ;
+    mem:branch "feature/rdfs-enforcement-entailment" ;
+    mem:createdAt "2026-07-03T11:07:38.968674+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future \"connect to external Fluree as a data source\" feature should extend peer proxy mode rather than invent a new graph-source kind; re-discovering this subsystem map cost four parallel explorations." .
+
+mem:constraint-01kwm1fjv37hjcfsga916mc5wv a mem:Constraint ;
+    mem:content "docs/design/ files must document permanent design — what exists and how it works — never phased plans, roadmaps, or implementation sequencing. Planning content goes in a temporary file elsewhere (scratchpad or uncommitted), not in docs/design/." ;
+    mem:tag "design-docs" ;
+    mem:tag "docs" ;
+    mem:tag "user-feedback" ;
+    mem:tag "workflow" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T13:07:55.875908+00:00"^^xsd:dateTime ;
+    mem:rationale "User feedback when starting the remote-mounts feature: a proposed design doc had drifted toward a work plan (implementation slices/phases). Same spirit as the existing rule against plan labels in code comments and commit bodies." .
+
+mem:fact-01kwm585khra36js0r49n36k06 a mem:Fact ;
+    mem:content "Tests that run a peer-mode Fluree query against an in-process axum server must use #[tokio::test(flavor = \"multi_thread\")]: lazy dict-blob materialization during query execution bridges sync→async (block_on), which starves a current-thread runtime so the in-process server can never answer the HTTP fetch — the ProxyStorage request times out after its full 60s. See test_peer_proxy_fluree_queries_indexed_ledger." ;
+    mem:tag "gotcha" ;
+    mem:tag "peer-mode" ;
+    mem:tag "sync-bridge" ;
+    mem:tag "testing" ;
+    mem:tag "tokio" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-server/tests/proxy_integration.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T14:13:47.249260+00:00"^^xsd:dateTime .
+
+mem:fact-01kwm9svy064yer4ek7rn251hh a mem:Fact ;
+    mem:content "Per-ledger serving posture = f:servingDefaults setting group (f:serveQuery/f:serveBlocks/f:publicVisibility, ledger-scoped, LedgerConfig.serving) enforced only on transaction-role servers: query gate in load_ledger_for_query (403 stable msg), blocks gate in storage_proxy/pack/commits (404). GOTCHA: @shared dict-blob addresses carry only the ledger NAME, so ProxyStorage derives a default-branch alias — any server-side per-ledger guard on block/object endpoints must branch-resolve DictBlob requests via list_branches (resolve_block_ledger in storage_proxy.rs) or non-main-branch peers break on dict fetches. Legacy per-branch dict layout ({name}/{branch}/index/objects/dicts) is also parsed by cid_and_ledger_from_address." ;
+    mem:tag "config-graph" ;
+    mem:tag "dict-blob" ;
+    mem:tag "gotcha" ;
+    mem:tag "peer-mode" ;
+    mem:tag "serving-defaults" ;
+    mem:tag "storage-proxy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/config_resolver.rs" ;
+    mem:artifactRef "fluree-db-core/src/ledger_config.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/serving.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/storage_proxy.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T15:33:21.472958+00:00"^^xsd:dateTime .
+
+mem:fact-01kwmb5yq11y50j3kbd7c5tne4 a mem:Fact ;
+    mem:content "Remote mounts: FlureeBuilder::with_remote_mount(RemoteMountSpec) applies in finalize_with_backend → CompositeNameService (prefix-routed reads, records localized to \"acme/inventory:main\", writes to mounts rejected, full publisher surface) + StorageBackend::Routed (namespace-prefix → mount backend at the content_store seam; admin ops = default only). ProxyStorage/ProxyNameService live in fluree-db-nameservice-sync (server peer/* re-exports); ProxyStorage::with_local_prefix strips the mount prefix from derived aliases. Transact writes to mounts fail at routed ProxyStorage (read-only) before the NS guard — the guard backstops create/branch/publish." ;
+    mem:tag "builder" ;
+    mem:tag "composite-nameservice" ;
+    mem:tag "peer-mode" ;
+    mem:tag "remote-mounts" ;
+    mem:tag "storage-backend" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-core/src/storage.rs" ;
+    mem:artifactRef "fluree-db-nameservice-sync/src/proxy_storage.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/mount.rs" ;
+    mem:artifactRef "fluree-db-server/tests/proxy_integration.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-03T15:57:26.113125+00:00"^^xsd:dateTime .
+
+mem:fact-01kws95166gqpjjfda0nvmkraq a mem:Fact ;
+    mem:content "Any per-(ledger,t) cache of config-derived server state MUST key on the novelty-inclusive t (LedgerState::t() / state.t()), NOT the indexed base snapshot.snapshot.t. A config-graph change (e.g. f:servingDefaults) commits into novelty and bumps the effective t WITHOUT advancing the indexed base t until a reindex. Keying on the base t serves a stale posture across config changes. This exact bug hit AppState::effective_serving_cached and was caught by test_serving_defaults_gate_and_advertisement (proxy_integration.rs): got 200 expecting 404 because the cached entry didn't invalidate. resolve_ledger_config / effective_serving_from_state resolve at state.t(), so the cache key must match." ;
+    mem:tag "cache" ;
+    mem:tag "config-graph" ;
+    mem:tag "novelty" ;
+    mem:tag "server" ;
+    mem:tag "serving" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/config_resolver.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/serving.rs" ;
+    mem:artifactRef "fluree-db-server/src/state.rs" ;
+    mem:branch "feature/remote-mounts" ;
+    mem:createdAt "2026-07-05T13:58:10.886197+00:00"^^xsd:dateTime ;
+    mem:rationale "Non-obvious: indexed snapshot t and effective (novelty-inclusive) t diverge between a commit and the next reindex; config changes live in novelty, so t-keyed caches of config-derived state silently go stale if keyed on the base t." .
+
 mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
     mem:content "SPARQL property paths, branch feature/sparql-property-paths: closed ALL reported gaps PLUS inverse-in-composite (wired in BOTH sparql lower/path.rs AND query parse/lower.rs for JSON-LD parity). (1) ZeroOrOne p?: PathModifier::ZeroOrOne; BFS self+1hop. (2) Negated sets !: fresh ?__np{n} pred-var triple + FILTER(?p != IRI(...)); fwd/inv/mixed=UNION. (3) Nested modifiers (p*)*: collapse_modifiers (zero=any */?, unbounded=any +/*). (4) Composite-transitive (a/b)+ incl inverse steps (^a/b)+: PropertyPathPattern has predicates+first_inverse+sequence_steps:Vec<PathStep{predicates,inverse}>; operator's read_step reads SPOT/POST by direction (opposite index when retreating); single_predicate() bails on composite. ONLY UNSUPPORTED (niche): nested transitive step in a composite unit (a+/b)+ — not exercised by any W3C test." ;
     mem:tag "negated-set" ;
@@ -1499,6 +1661,100 @@ mem:fact-01ktyzzbs4ewxqpgvssvj72tt5 a mem:Fact ;
     mem:branch "fix/decimal-exactness" ;
     mem:createdAt "2026-06-12T22:41:50.884413+00:00"^^xsd:dateTime ;
     mem:rationale "Continuation point for the decimal fix series; the remaining priority-4 cluster (canonical identity) is the prerequisite for issues #1324/#1325." .
+
+mem:fact-01kwpj81fpnp0rk5s952wf3shd a mem:Fact ;
+    mem:content "FIXED (branch fix/filtered-delete-staging-hang): range_with_overlay point lookups paid a full overlay-translation tax per call (unbounded novelty walk + dict-translate + sort in binary_range_eq_v3) → per-flake lookup loops were O(calls × novelty log novelty); livelocked filtered-DELETE staging >900s. Two-layer fix: (1) staging list-meta hydration grouped per (g_id, s, p), FIRST-match dt-compatible meta per retraction — NOT distinct-per-duplicate: duplicate-value @list entries must lose exactly one entry per distinct WHERE binding, pinned by it_join_batched_overlay object-probe-list-retract; (2) cross-call LRU in binary_range.rs keyed (store_id, index_t, OverlayProvider::content_version, to_t, g, index) + overlay_window_for_range narrowing. content_version = globally-unique stamp refreshed on every Novelty mutation (per-instance epochs collide across divergent clones); wrapper overlays return None → uncached." ;
+    mem:tag "delete" ;
+    mem:tag "novelty" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "range-provider" ;
+    mem:tag "staging" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_range.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "fix/filtered-delete-staging-hang" ;
+    mem:createdAt "2026-07-04T12:39:23.382379+00:00"^^xsd:dateTime ;
+    mem:rationale "range_with_overlay looks like a cheap point lookup at call sites but is O(novelty log novelty) per call; future per-flake lookup loops will reintroduce this livelock class." .
+
+mem:decision-01kwphem9r3gvcvj2j5842ddt6 a mem:Decision ;
+    mem:content "Fulltext positioning: f:fullTextDefaults (#config graph) is the RECOMMENDED path — values keep standard xsd:string/rdf:langString datatypes (external RDF consumers see ordinary literals) and language-tagged values get per-language analyzers. The @fulltext datatype REPLACES the stored datatype with Fluree-specific f:fullText, so docs/guidance must not push it as the default; it's a quick-start for siloed databases or properties orthogonal to the core data model. Docs repositioned 2026-07 (fulltext.md, indexing-and-search README, cookbook-search, concepts/datatypes)." ;
+    mem:tag "datatypes" ;
+    mem:tag "docs" ;
+    mem:tag "fulltext" ;
+    mem:tag "positioning" ;
+    mem:tag "rdf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/concepts/datatypes.md" ;
+    mem:artifactRef "docs/guides/cookbook-search.md" ;
+    mem:artifactRef "docs/indexing-and-search/fulltext.md" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-04T12:25:30.680597+00:00"^^xsd:dateTime ;
+    mem:rationale "User-stated product intent (bplatz): don't steer standards-focused users to a custom datatype; @fulltext is only for silos/orthogonal properties. Future docs/examples/tutorials should default to the config path." .
+
+mem:fact-01kwn1qw4yhk6fy47xhmc9d7dm a mem:Fact ;
+    mem:content "fulltext() must handle BOTH binding shapes: BinaryScanOperator disables late materialization whenever overlay epoch != 0 (binary_scan.rs), so with ANY novelty every scanned value reaches eval_fulltext as Binding::Lit (p_id + lang in dtc), not EncodedLit. The Lit arm originally scored only @fulltext-datatype values → configured (f:fullTextDefaults) predicates returned unbound for EVERY row the moment one unindexed commit existed (Solo/S3 2026-07-03 bug; memory-mode tests passed because they queried exactly at index_t with empty novelty). Fixed on fix/fulltext-persisted-arena-lookup: Lit arm mirrors EncodedLit arena lookup. Persisted (file-backed, fresh-process) reproducers now in it_query_fulltext.rs." ;
+    mem:tag "binding" ;
+    mem:tag "bm25" ;
+    mem:tag "fulltext" ;
+    mem:tag "materialization" ;
+    mem:tag "novelty" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_fulltext.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/fulltext.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-03T22:31:41.982333+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future change to materialization gates or fulltext eval must keep both arms (EncodedLit and Lit) scoring configured predicates, or the field regression recurs invisibly (memory tests won't catch it)." .
+
+mem:fact-01kwn4gk9gz7vp31r6g9awth8g a mem:Fact ;
+    mem:content "fulltext() per-row eval is hot: PreparedFulltextQuery (eval/fulltext.rs) caches bucket analyzer choice, query stems, arena term_ids, IDFs, and effective stats per (store_id, epoch, to_t, g_id, p_id, lang_id, query) — moka + thread-local one-slot memo; per-row = doc_bow probe + one u32 binary search per term (50k rows: 1.45s→61ms, 24x). store_id in the key pins term_ids to the arena instance. Analyzer::shared(lang) is the per-language static (for_language CLONES the whole stopword set — never call per row). Materialized Lit rows resolve string_id→BoW instead of re-analyzing text. Next lever if still slow: posting-driven retrieval/WAND pushdown (graph-source BM25 already has WAND)." ;
+    mem:tag "bm25" ;
+    mem:tag "cache" ;
+    mem:tag "fulltext" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_fulltext.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/analyzer.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/fulltext.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-03T23:20:09.264477+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future work on fulltext eval or analyzers must preserve the once-per-query invariant; the ignored fulltext_perf_50k_labels test is the regression harness." .
+
+mem:fact-01kwncjr1vh93xbsx3q4213w54 a mem:Fact ;
+    mem:content "Flat vector scoring: eval resolves args to borrowed slices — f64 from Lit/const, and indexed EncodedLit VECTOR_ID via BinaryIndexStore::vector_slice (zero-copy f32 shard slice, widened into thread-local scratch; decode fallback for ephemeral novelty handles) — and routes through vector_math SIMD kernels. FlakeValue::Vector is Arc<[f64]> (O(1) clones). KEY MEASUREMENT (50k x 256): indexed pipeline = 21ms vs novelty-resident = 137ms for the SAME query (6.5x) — keep vector corpora indexed; novelty-path floor is per-row operator machinery, not scoring/copies. Zero-copy shard read saved ~22% on indexed warm (27→21ms). Next step-change = top-k fast path over packed f32 shards (~4-8x more, exact, consistent) or HNSW routing. Harness: vector_flatrank_perf_50k (ignored, scalar-verified, novelty + indexed phases)." ;
+    mem:tag "flatrank" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "simd" ;
+    mem:tag "vector" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_vector_flatrank.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/vector.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/vector_math.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-04T01:41:08.283260+00:00"^^xsd:dateTime ;
+    mem:rationale "Prevents re-optimizing eval when the flat-rank bottleneck is scan-side vector copying; documents that ComparableValue conversion of vectors is a full copy." .
+
+mem:fact-01kwnn592htcq4hcpjxtj1p69a a mem:Fact ;
+    mem:content "fast_vector_topk.rs: flat-rank top-k fast path — bind ?score dotProduct(?vec, const/1-row-VALUES) [+threshold/orderBy desc/limit, project {?s,?score}] runs as a direct shard scan: VectorArenaSnapshot pins shards once (per-row lookup_vector cache probe was the bottleneck capping gains at 2x), overlay-merging cursor rows, leaf/LEAFLET-refined subject partitions on rayon, ephemeral novelty vectors pre-decoded before the parallel section (ctx not Sync). Scores bit-identical (widen f32→f64, same dot kernel). 50k×256 indexed: 21ms→3.3ms (6.4x). GOTCHA: query VALUES vectors are NOT f32-quantized (only storage is) — ground truth = dot(quantized_row, raw_target)." ;
+    mem:tag "fast-path" ;
+    mem:tag "flatrank" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "topk" ;
+    mem:tag "vector" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_vector_flatrank.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/arena/vector.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_vector_topk.rs" ;
+    mem:branch "fix/fulltext-persisted-arena-lookup" ;
+    mem:createdAt "2026-07-04T04:11:04.145477+00:00"^^xsd:dateTime ;
+    mem:rationale "Extending the fast path (cosine/euclidean, hydration join, larger projections) starts here; snapshot + partition + overlay idioms are the reusable pieces. Parity harness: vector_topk_fast_path_parity." .
 
 mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
     mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;

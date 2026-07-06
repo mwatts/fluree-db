@@ -185,6 +185,7 @@ fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
         fluree_db_api::TimeSpec::Latest => "@t:latest".to_string(),
         fluree_db_api::TimeSpec::AtT(t) => format!("@t:{t}"),
         fluree_db_api::TimeSpec::AtTime(iso) => format!("@iso:{iso}"),
+        fluree_db_api::TimeSpec::AtRecorded(iso) => format!("@recorded:{iso}"),
         fluree_db_api::TimeSpec::AtCommit(prefix) => format!("@commit:{prefix}"),
     }
 }
@@ -377,8 +378,18 @@ pub async fn run(
 
     if is_cypher {
         // Cypher is local-only; it has no graph-source or connection form.
+        // A peer target provides a local (remote-backed) Fluree, so it runs
+        // like a local ledger under its remote alias.
         let mode = match target {
             context::QueryTarget::Ledger(mode) => mode,
+            context::QueryTarget::Peer {
+                fluree,
+                remote_alias,
+                ..
+            } => LedgerMode::Local {
+                fluree,
+                alias: remote_alias,
+            },
             context::QueryTarget::GraphSource { .. } => {
                 return Err(CliError::Usage(
                     "Cypher queries are not supported on graph source targets".to_string(),
@@ -437,6 +448,17 @@ pub async fn run(
             .await;
         }
         context::QueryTarget::Ledger(mode) => mode,
+        // Peer mode: local execution over the remote-backed Fluree. From here
+        // on it IS a local query — index blocks stream in over HTTP
+        // (CID-verified, disk-cached) as the engine touches them.
+        context::QueryTarget::Peer {
+            fluree,
+            remote_alias,
+            ..
+        } => LedgerMode::Local {
+            fluree,
+            alias: remote_alias,
+        },
     };
 
     match mode {
@@ -1542,9 +1564,8 @@ fn target_endpoint_id(target: &context::QueryTarget) -> String {
     match target {
         context::QueryTarget::GraphSource { alias, .. } => alias.clone(),
         context::QueryTarget::Ledger(LedgerMode::Local { alias, .. }) => alias.clone(),
-        context::QueryTarget::Ledger(LedgerMode::Tracked { remote_alias, .. }) => {
-            remote_alias.clone()
-        }
+        context::QueryTarget::Ledger(LedgerMode::Tracked { remote_alias, .. })
+        | context::QueryTarget::Peer { remote_alias, .. } => remote_alias.clone(),
     }
 }
 
@@ -1752,7 +1773,10 @@ async fn run_connection_query(
             result
         }
         context::QueryTarget::Ledger(LedgerMode::Local { fluree, .. })
-        | context::QueryTarget::GraphSource { fluree, .. } => {
+        | context::QueryTarget::GraphSource { fluree, .. }
+        // Peer: local federation over the remote-backed Fluree — FROM
+        // resolves remote aliases through its proxy nameservice.
+        | context::QueryTarget::Peer { fluree, .. } => {
             connection_query_local(
                 &fluree,
                 query_format,

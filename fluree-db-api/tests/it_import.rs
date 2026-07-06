@@ -1438,6 +1438,131 @@ ex:alice schema:name "Alice" .
     );
 }
 
+// TriG scopes blank-node labels to the whole document: a label shared between
+// the default graph and a GRAPH block must skolemize to ONE node, and the same
+// label in a different document (file/commit) must stay a DIFFERENT node.
+// Regression: named-graph blanks used to mint from the bare label (`fdb-b0`) —
+// diverging from the default graph within one document AND colliding across
+// every document in the ledger.
+#[tokio::test]
+async fn import_trig_blank_label_document_scoped() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // File 1: `_:shared` referenced from the default graph AND a GRAPH block.
+    let trig1 = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice ex:knows _:shared .
+_:shared schema:name "Document-scoped node" .
+
+GRAPH <http://example.org/graphs/g1> {
+    ex:bob ex:knows _:shared .
+}
+"#;
+    // File 2: the same label in another document's GRAPH block.
+    let trig2 = r"@prefix ex: <http://example.org/> .
+
+GRAPH <http://example.org/graphs/g2> {
+    ex:carol ex:knows _:shared .
+}
+";
+    std::fs::write(data_dir.path().join("a.trig"), trig1).expect("write trig1");
+    std::fs::write(data_dir.path().join("b.trig"), trig2).expect("write trig2");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/trig-bnode-scope:main")
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+
+    let ledger = fluree
+        .ledger("test/trig-bnode-scope:main")
+        .await
+        .expect("load ledger");
+
+    // Scans with a variable predicate and picks out the blank-node ref, so
+    // the assertions stay focused on node identity rather than predicate
+    // resolution (covered by import_trig_bound_predicate_queryable).
+    let knows_object = |json: &serde_json::Value, subject: &str| -> String {
+        let rows = json.as_array().expect("array result");
+        let refs: Vec<String> = rows
+            .iter()
+            .map(|r| r.as_array().expect("row"))
+            .filter(|r| r[0].as_str() == Some(subject))
+            .filter_map(|r| r[2].as_str())
+            .filter(|o| o.starts_with("_:fdb-"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected one _:fdb- ref for {subject}: {json}"
+        );
+        refs.into_iter().next().unwrap()
+    };
+
+    // Default graph: the node alice knows.
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }),
+    )
+    .await
+    .expect("default-graph query");
+    let default_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/alice",
+    );
+
+    // Named graph g1 (same document): must be the SAME node.
+    let qr = fluree
+        .query_connection(&json!({
+            "from": "test/trig-bnode-scope:main#http://example.org/graphs/g1",
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .await
+        .expect("g1 query");
+    let g1_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/bob",
+    );
+    assert_eq!(
+        g1_node, default_node,
+        "TriG label scope spans default graph and GRAPH blocks of one document"
+    );
+
+    // Named graph g2 (different document): must be a DIFFERENT node.
+    let qr = fluree
+        .query_connection(&json!({
+            "from": "test/trig-bnode-scope:main#http://example.org/graphs/g2",
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .await
+        .expect("g2 query");
+    let g2_node = knows_object(
+        &qr.to_jsonld(&ledger.snapshot).expect("jsonld"),
+        "http://example.org/carol",
+    );
+    assert_ne!(
+        g2_node, default_node,
+        "the same label in a different document must stay a distinct node"
+    );
+}
+
 // ============================================================================
 // N-Quads (.nq) import
 //
@@ -2081,4 +2206,95 @@ async fn import_directory_splits_large_compressed_file() {
     let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
     assert!(objs.contains(&"name-0".to_string()));
     assert!(objs.contains(&"name-39999".to_string()));
+}
+
+// Regression: the serial TriG import path allocated namespace codes only in
+// `state.ns_registry`, invisible to the SpoolContext (which resolves
+// code->prefix via the SHARED allocator at record-push time, mid-parse). Its
+// empty-prefix fallback wrote suffix-only predicate strings ("name" instead
+// of "http://schema.org/name") into the index's predicate dict, so
+// bound-predicate patterns matched nothing and results rendered bare
+// suffixes. The TriG path now allocates through a shared-allocator-backed
+// WorkerCache like the parallel Turtle path.
+#[tokio::test]
+async fn import_trig_bound_predicate_queryable() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+ex:bob schema:name "Bob" .
+
+GRAPH <http://example.org/graphs/g1> {
+    ex:event1 schema:description "login" .
+}
+"#;
+    let path = data_dir.path().join("data.trig");
+    std::fs::write(&path, trig).expect("write trig");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    fluree
+        .create("test/bound-pred:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger("test/bound-pred:main").await.expect("ledger");
+
+    // Full scan must render complete predicate IRIs (not bare suffixes).
+    let scan = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s","?p","?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("scan");
+    let scan_rows = scan.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let preds: Vec<&str> = scan_rows
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[1].as_str()))
+        .collect();
+    assert!(
+        preds.iter().all(|p| *p == "http://schema.org/name"),
+        "predicates must decode to full IRIs; got {scan_rows}"
+    );
+
+    // Bound-predicate pattern must match via the index predicate dict.
+    let bound = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s","?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("bound");
+    let bound_rows = bound.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        bound_rows.as_array().map(Vec::len),
+        Some(2),
+        "bound-predicate must match both subjects; got {bound_rows}"
+    );
+
+    // Named graph too: bound predicate against the GRAPH-block data.
+    let named = fluree
+        .query_connection(&json!({
+            "from": "test/bound-pred:main#http://example.org/graphs/g1",
+            "select": ["?s","?o"],
+            "where": {"@id": "?s", "http://schema.org/description": "?o"}
+        }))
+        .await
+        .expect("named bound");
+    let named_rows = named.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        named_rows.as_array().map(Vec::len),
+        Some(1),
+        "named-graph bound-predicate must match; got {named_rows}"
+    );
 }

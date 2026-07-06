@@ -1084,7 +1084,16 @@ fn subject_to_unresolved_delete_where(
     match term {
         SubjectTerm::Var(v) => Ok(UnresolvedTerm::Var(Arc::from(format!("?{}", v.name)))),
         SubjectTerm::Iri(iri) => Ok(UnresolvedTerm::Iri(Arc::from(expand_iri(iri, prologue)?))),
-        SubjectTerm::BlankNode(bn) => Ok(UnresolvedTerm::Var(bnodes.var_name(&bn.value))),
+        SubjectTerm::BlankNode(bn) => {
+            // Stable Fluree blank-node ids match the stored node as a
+            // constant; other labels act as existential variables (§3.1).
+            if let BlankNodeValue::Labeled(l) = &bn.value {
+                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                    return Ok(UnresolvedTerm::Iri(Arc::from(format!("_:{l}"))));
+                }
+            }
+            Ok(UnresolvedTerm::Var(bnodes.var_name(&bn.value)))
+        }
         SubjectTerm::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF-star quoted triple",
             span: qt.span,
@@ -1118,10 +1127,22 @@ fn object_to_unresolved_delete_where(
             dtc: None,
         }),
         Term::Literal(lit) => literal_to_unresolved(lit, prologue),
-        Term::BlankNode(bn) => Ok(UnresolvedTermWithMeta {
-            term: UnresolvedTerm::Var(bnodes.var_name(&bn.value)),
-            dtc: None,
-        }),
+        Term::BlankNode(bn) => {
+            // Stable Fluree blank-node ids match as constants
+            // (see subject_to_unresolved_delete_where).
+            if let BlankNodeValue::Labeled(l) = &bn.value {
+                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                    return Ok(UnresolvedTermWithMeta {
+                        term: UnresolvedTerm::Iri(Arc::from(format!("_:{l}"))),
+                        dtc: None,
+                    });
+                }
+            }
+            Ok(UnresolvedTermWithMeta {
+                term: UnresolvedTerm::Var(bnodes.var_name(&bn.value)),
+                dtc: None,
+            })
+        }
     }
 }
 
@@ -1140,8 +1161,18 @@ fn lower_triple_to_delete_template_delete_where(
             TemplateTerm::Sid(ns.sid_for_iri(&expanded))
         }
         SubjectTerm::BlankNode(bn) => {
-            let name = bnodes.var_name(&bn.value);
-            TemplateTerm::Var(vars.get_or_insert(&name))
+            let stable = match &bn.value {
+                BlankNodeValue::Labeled(l) => crate::namespace::stable_blank_node_sid_from_label(l),
+                BlankNodeValue::Anon => None,
+            };
+            match stable {
+                // Stable Fluree blank-node ids retract from the stored node.
+                Some(sid) => TemplateTerm::Sid(sid),
+                None => {
+                    let name = bnodes.var_name(&bn.value);
+                    TemplateTerm::Var(vars.get_or_insert(&name))
+                }
+            }
         }
         SubjectTerm::QuotedTriple(qt) => {
             return Err(LowerError::UnsupportedFeature {
@@ -1175,8 +1206,17 @@ fn lower_triple_to_delete_template_delete_where(
             (r.term, r.dtc)
         }
         Term::BlankNode(bn) => {
-            let name = bnodes.var_name(&bn.value);
-            (TemplateTerm::Var(vars.get_or_insert(&name)), None)
+            let stable = match &bn.value {
+                BlankNodeValue::Labeled(l) => crate::namespace::stable_blank_node_sid_from_label(l),
+                BlankNodeValue::Anon => None,
+            };
+            match stable {
+                Some(sid) => (TemplateTerm::Sid(sid), None),
+                None => {
+                    let name = bnodes.var_name(&bn.value);
+                    (TemplateTerm::Var(vars.get_or_insert(&name)), None)
+                }
+            }
         }
     };
 
@@ -1283,7 +1323,15 @@ fn subject_to_template(
         }
         SubjectTerm::BlankNode(bn) => {
             let label = match &bn.value {
-                BlankNodeValue::Labeled(l) => format!("_:{l}"),
+                BlankNodeValue::Labeled(l) => {
+                    // Stable Fluree blank-node ids address the existing
+                    // stored node instead of skolemizing a fresh one, which
+                    // makes DELETE templates on them meaningful.
+                    if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(l) {
+                        return Ok(TemplateTerm::Sid(sid));
+                    }
+                    format!("_:{l}")
+                }
                 BlankNodeValue::Anon => bnodes.next(),
             };
             Ok(TemplateTerm::BlankNode(label))
@@ -1338,7 +1386,14 @@ fn object_to_template(
         Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns)?.term),
         Term::BlankNode(bn) => {
             let label = match &bn.value {
-                BlankNodeValue::Labeled(l) => format!("_:{l}"),
+                BlankNodeValue::Labeled(l) => {
+                    // Stable Fluree blank-node ids resolve to the stored node
+                    // (see subject_to_template).
+                    if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(l) {
+                        return Ok(TemplateTerm::Sid(sid));
+                    }
+                    format!("_:{l}")
+                }
                 BlankNodeValue::Anon => bnodes.next(),
             };
             Ok(TemplateTerm::BlankNode(label))
@@ -1473,7 +1528,7 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
             if let Ok(FlakeValue::Vector(v)) =
                 fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
             {
-                return UnresolvedTerm::Literal(LiteralValue::Vector(v));
+                return UnresolvedTerm::Literal(LiteralValue::Vector(v.to_vec()));
             }
         }
         _ => {}

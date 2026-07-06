@@ -758,7 +758,7 @@ fn coerce_array_to_vector(arr: &[serde_json::Value]) -> CoercionResult<FlakeValu
             }
         }
     }
-    Ok(FlakeValue::Vector(vector))
+    Ok(FlakeValue::Vector(vector.into()))
 }
 
 /// Parse a string to an integer value, validating range constraints
