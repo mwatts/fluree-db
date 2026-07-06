@@ -793,7 +793,7 @@ fn extra_to_json(extra: &BTreeMap<String, CanonicalValue>) -> HashMap<String, se
 /// exhaustive destructuring in [`Self::from_value`] turns any
 /// HTTP-schema field change into a compile error at the conversion)
 /// and the open metadata map becomes a [`CanonicalValue`] tree, so
-/// the CAS comparison in `apply_push_status` is structural — no
+/// the CAS comparison in `apply_versioned_push` is structural — no
 /// serialization in the equality path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredStatus {
@@ -1384,8 +1384,15 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             ledger_id,
             expected,
             new,
-        } => apply_push_status(state, ledger_id, expected, new),
-        Command::PushConfig(args) => apply_push_config(state, *args),
+        } => apply_versioned_push(&state.ledgers, &mut state.status, ledger_id, expected, new),
+        Command::PushConfig(args) => {
+            let ConfigUpdate {
+                ledger_id,
+                expected,
+                new,
+            } = *args;
+            apply_versioned_push(&state.ledgers, &mut state.config, ledger_id, expected, new)
+        }
         Command::PublishGraphSource {
             name,
             branch,
@@ -2005,97 +2012,92 @@ fn apply_compare_and_set_ref(
     Response::RefCasUpdated
 }
 
-fn apply_push_status(
-    state: &mut NameServiceState,
-    ledger_id: String,
-    expected: Option<StoredStatus>,
-    new: StoredStatus,
-) -> Response {
-    let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
-        return Response::StatusConflict { actual: None };
-    };
-    let branch_registered = state
-        .ledgers
-        .get(&name)
-        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
-    if !branch_registered {
-        return Response::StatusConflict { actual: None };
-    }
-
-    // `state.status` is keyed by the command's `ledger_id` verbatim;
-    // proposers canonicalize it to `name:branch` (see
-    // `RaftNameService::push_status`). Canonicalizing here instead
-    // would make mixed-version nodes replay the same log entry to
-    // different keys.
-    //
-    // Absent record reads as `StoredStatus::initial`; the apply uses
-    // the same fallback so an initial CAS push from
-    // `expected = initial` lands on a fresh branch. The equality
-    // below is structural (`CanonicalValue` trees with sorted
-    // maps), so logically equal payloads compare equal regardless
-    // of construction order.
-    let current = state
-        .status
-        .get(&ledger_id)
-        .cloned()
-        .unwrap_or_else(StoredStatus::initial);
-
-    if expected.as_ref() != Some(&current) {
-        return Response::StatusConflict {
-            actual: Some(current),
-        };
-    }
-    if new.v <= current.v {
-        return Response::StatusConflict {
-            actual: Some(current),
-        };
-    }
-    state.status.insert(ledger_id, new);
-    Response::StatusUpdated
+/// A branch-scoped, CAS-updated value with a strictly-advancing
+/// version — the stored form of the nameservice's status and
+/// config values. Implementations supply the per-value pieces;
+/// [`apply_versioned_push`] owns the shared contract.
+trait VersionedValue: Clone + PartialEq {
+    /// The value an absent record reads as, so an initial CAS push
+    /// against a fresh branch lands.
+    fn absent() -> Self;
+    /// Monotonic version watermark; every push must strictly
+    /// advance it.
+    fn v(&self) -> i64;
+    fn conflict(actual: Option<Self>) -> Response;
+    fn updated() -> Response;
 }
 
-fn apply_push_config(state: &mut NameServiceState, args: ConfigUpdate) -> Response {
-    let ConfigUpdate {
-        ledger_id,
-        expected,
-        new,
-    } = args;
+impl VersionedValue for StoredStatus {
+    fn absent() -> Self {
+        Self::initial()
+    }
+    fn v(&self) -> i64 {
+        self.v
+    }
+    fn conflict(actual: Option<Self>) -> Response {
+        Response::StatusConflict { actual }
+    }
+    fn updated() -> Response {
+        Response::StatusUpdated
+    }
+}
+
+impl VersionedValue for StoredConfig {
+    fn absent() -> Self {
+        Self::unborn()
+    }
+    fn v(&self) -> i64 {
+        self.v
+    }
+    fn conflict(actual: Option<Self>) -> Response {
+        Response::ConfigConflict { actual }
+    }
+    fn updated() -> Response {
+        Response::ConfigUpdated
+    }
+}
+
+/// Shared apply body for [`Command::PushStatus`] and
+/// [`Command::PushConfig`]: validate the id and its branch
+/// registration, CAS against the current record (an absent record
+/// reads as [`VersionedValue::absent`], so an initial push lands
+/// on a fresh branch), and require the pushed version to strictly
+/// advance.
+///
+/// `values` is keyed by the command's `ledger_id` verbatim —
+/// proposers canonicalize it to `name:branch` (see
+/// `RaftNameService::push_status`); canonicalizing here instead
+/// would make mixed-version nodes replay the same log entry to
+/// different keys. The CAS equality is structural
+/// ([`CanonicalValue`] trees with sorted maps), so logically equal
+/// payloads compare equal regardless of construction order.
+fn apply_versioned_push<T: VersionedValue>(
+    ledgers: &HashMap<String, LedgerRecord>,
+    values: &mut HashMap<String, T>,
+    ledger_id: String,
+    expected: Option<T>,
+    new: T,
+) -> Response {
     let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
-        return Response::ConfigConflict { actual: None };
+        return T::conflict(None);
     };
-    let branch_registered = state
-        .ledgers
+    let branch_registered = ledgers
         .get(&name)
         .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
     if !branch_registered {
-        return Response::ConfigConflict { actual: None };
+        return T::conflict(None);
     }
 
-    // Keyed by the command's `ledger_id` verbatim — same
-    // canonicalize-at-the-proposer contract and structural
-    // equality as `apply_push_status`.
-    //
-    // Absent record reads as `StoredConfig::unborn`; the apply uses
-    // the same fallback so an initial CAS push from
-    // `expected = unborn` lands on a fresh branch.
-    let current = state
-        .config
-        .get(&ledger_id)
-        .cloned()
-        .unwrap_or_else(StoredConfig::unborn);
+    let current = values.get(&ledger_id).cloned().unwrap_or_else(T::absent);
 
     if expected.as_ref() != Some(&current) {
-        return Response::ConfigConflict {
-            actual: Some(current),
-        };
+        return T::conflict(Some(current));
     }
-    if new.v <= current.v {
-        return Response::ConfigConflict {
-            actual: Some(current),
-        };
+    if new.v() <= current.v() {
+        return T::conflict(Some(current));
     }
-    state.config.insert(ledger_id, new);
-    Response::ConfigUpdated
+    values.insert(ledger_id, new);
+    T::updated()
 }
 
 fn apply_publish_graph_source(
@@ -4754,7 +4756,7 @@ mod tests {
         }
     }
 
-    /// The CAS in `apply_push_status` is structural equality on
+    /// The CAS in `apply_versioned_push` is structural equality on
     /// `CanonicalValue` trees, and the replicated bytes are postcard
     /// over `BTreeMap`s — both must be independent of the insertion
     /// order of the HTTP-shaped `HashMap` the payload arrived in.
