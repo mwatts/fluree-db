@@ -414,17 +414,19 @@ The parser code for BIND is in fluree-db-sparql/src/parser/. Please find the
 common root cause and fix all three.
 ```
 
-## Query Surface Parity (JSON-LD and Cypher)
+## Query Surface Parity (JSON-LD)
 
 SPARQL, JSON-LD query, and Cypher (`fluree-db-cypher`) all compile to the **same intermediate representation** (`fluree-db-query/src/ir.rs`) and share the entire execution engine. Team guideline — every W3C compliance fix must classify itself as one of:
 
-1. **IR/engine-level fix** (evaluation semantics, planner, operators, storage): the fix lands once and applies to all three surfaces implicitly — the user-facing syntax of each surface is unchanged. Still add a JSON-LD regression test for the fixed behavior (see below): the W3C submodule guards the SPARQL surface, but nothing guards the same semantics through the JSON-LD surface unless we write it.
+1. **IR/engine-level fix** (evaluation semantics, planner, operators, storage): the fix lands once and applies to all surfaces implicitly — the user-facing syntax of each surface is unchanged. Still add a JSON-LD regression test for the fixed behavior (see below): the W3C submodule guards the SPARQL surface, but nothing guards the same semantics through the JSON-LD surface unless we write it.
 
-2. **Surface-syntax addition**: if we make something newly *possible in SPARQL* (new function, operator, clause, or syntax), it must also be made possible in JSON-LD query syntax as part of the same effort — with its own tests. Assess Cypher for the same addition against `docs/reference/cypher-support-matrix.md` (Cypher's grammar is fixed by openCypher, so parity there is a support-matrix decision, not automatic).
+2. **Surface-syntax addition**: if we make something newly *possible in SPARQL* (new function, operator, clause, or syntax), it must also be made possible in JSON-LD query syntax as part of the same effort — with its own tests. Fluree **owns** the JSON-LD query syntax, so this is always within our power.
 
 3. **SPARQL-only surface features**: property paths syntax, RDF-star/annotation syntax, ASK query form, and SPARQL UPDATE text forms have no JSON-LD equivalent. These don't require syntax parity — but if the underlying IR/engine capability is new (e.g., a new pattern type), consider whether JSON-LD should be able to express it and record the decision.
 
-**Regression-test rule:** a compliance fix is not done when the W3C test goes green — it is done when the register entry is removed AND an equivalent JSON-LD test exists for behavior that JSON-LD can express (plus Cypher where the support matrix says the construct is in scope).
+**Cypher is deliberately excluded from this guideline.** We do not own the openCypher grammar and do not introduce custom Cypher syntax, so SPARQL compliance work carries no Cypher syntax obligations. Cypher benefits from IR/engine-level fixes automatically; what openCypher exposes is governed separately by `docs/reference/cypher-support-matrix.md`.
+
+**Regression-test rule:** a compliance fix is not done when the W3C test goes green — it is done when the register entry is removed AND an equivalent JSON-LD test exists for behavior that JSON-LD can express.
 
 ### Where to add parity tests
 

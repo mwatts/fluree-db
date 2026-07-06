@@ -298,14 +298,15 @@ the query uses `fulltext(...)`):
    join hot paths), `insert_formats` + `import_bulk` (Turtle lexer), within
    `regression-budget.json` budgets; nightly bench workflow is the backstop.
 5. Harness-only changes (Phase A) carry zero engine risk by definition.
-6. **Three-surface parity (team guideline).** SPARQL, JSON-LD query, and
-   Cypher share the IR and engine. Every burn-down fix must classify as
-   IR/engine-level (fixes all three surfaces implicitly — still add a
-   JSON-LD regression test) or surface-syntax addition (anything newly
-   possible in SPARQL must be made possible in JSON-LD in the same effort,
-   with tests; Cypher assessed against the openCypher support matrix). The
-   W3C submodule only guards the SPARQL surface — JSON-LD/Cypher regression
-   coverage must be authored alongside each fix. See
+6. **JSON-LD parity (team guideline).** SPARQL, JSON-LD query, and Cypher
+   share the IR and engine. Every burn-down fix must classify as
+   IR/engine-level (fixes all surfaces implicitly — still add a JSON-LD
+   regression test) or surface-syntax addition (anything newly possible in
+   SPARQL must be made possible in JSON-LD in the same effort, with tests —
+   we own the JSON-LD query syntax). The W3C submodule only guards the
+   SPARQL surface — JSON-LD regression coverage must be authored alongside
+   each fix. Cypher is deliberately excluded: openCypher's grammar isn't
+   ours to extend; it benefits from IR/engine fixes automatically. See
    `docs/contributing/sparql-compliance.md` § "Query Surface Parity".
 
 ## 7. Phased implementation plan
