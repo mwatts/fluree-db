@@ -91,15 +91,15 @@ async fn main() {
         .iter()
         .flat_map(|r| r.iter())
         .find_map(|c| match c {
-            CypherCell::Node(n) if n.iri == "http://example.org/u0" => Some(n),
+            CypherCell::Node(n) if n.iri.as_ref() == "http://example.org/u0" => Some(n),
             _ => None,
         })
         .expect("u0 in result");
-    assert_eq!(node.labels, vec!["User"], "labels");
+    assert_eq!(node.labels.as_slice(), &["User".into()], "labels");
     let prop = |k: &str| {
         node.properties
             .iter()
-            .find(|(key, _)| key == k)
+            .find(|(key, _)| key.as_ref() == k)
             .map(|(_, v)| v)
     };
     assert_eq!(
@@ -221,7 +221,7 @@ async fn main() {
     let (_, rows) = result.to_cypher_typed_table(&db).await.expect("typed");
     let find = |iri: &str| {
         rows.iter().flat_map(|r| r.iter()).find_map(|c| match c {
-            CypherCell::Node(n) if n.iri == iri => Some(n.clone()),
+            CypherCell::Node(n) if n.iri.as_ref() == iri => Some(n.clone()),
             _ => None,
         })
     };
@@ -229,7 +229,7 @@ async fn main() {
     let age = u0
         .properties
         .iter()
-        .find(|(k, _)| k == "age")
+        .find(|(k, _)| k.as_ref() == "age")
         .map(|(_, v)| v.clone());
     match age {
         Some(CypherCell::List(vals)) => assert!(
@@ -243,13 +243,13 @@ async fn main() {
     assert_eq!(
         u1.properties
             .iter()
-            .find(|(k, _)| k == "age")
+            .find(|(k, _)| k.as_ref() == "age")
             .map(|(_, v)| v.clone()),
         Some(CypherCell::Value(serde_json::json!(19))),
         "untouched subject exact off the batched lane"
     );
     let newcomer = find("http://example.org/newcomer").expect("novelty-only subject in result");
-    assert_eq!(newcomer.labels, vec!["User"]);
+    assert_eq!(newcomer.labels.as_slice(), &["User".into()]);
     eprintln!(
         "live-novelty correctness verified (dirty=fallback, clean=batched, novelty-only present)"
     );

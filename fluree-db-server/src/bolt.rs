@@ -796,7 +796,7 @@ fn params_to_json(params: &MapValue) -> Result<Option<fluree_db_api::CypherParam
     }
     let mut map = fluree_db_api::CypherParamMap::new();
     for (k, v) in &params.0 {
-        map.insert(k.clone(), bolt_to_json(v)?);
+        map.insert(k.to_string(), bolt_to_json(v)?);
     }
     Ok(Some(map))
 }
@@ -809,13 +809,13 @@ fn bolt_to_json(value: &Value) -> Result<JsonValue, RunFailure> {
         Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
-        Value::String(s) => JsonValue::String(s.clone()),
+        Value::String(s) => JsonValue::String(s.to_string()),
         Value::List(items) => {
             JsonValue::Array(items.iter().map(bolt_to_json).collect::<Result<_, _>>()?)
         }
         Value::Map(m) => JsonValue::Object(
             m.0.iter()
-                .map(|(k, v)| bolt_to_json(v).map(|v| (k.clone(), v)))
+                .map(|(k, v)| bolt_to_json(v).map(|v| (k.to_string(), v)))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Bytes(_) | Value::Structure(_) => {
@@ -844,7 +844,7 @@ fn cell_to_bolt(cell: JsonValue) -> Value {
                 Value::Float(n.as_f64().unwrap_or(f64::NAN))
             }
         }
-        JsonValue::String(s) => Value::String(s),
+        JsonValue::String(s) => Value::String(s.into()),
         JsonValue::Array(items) => Value::List(items.into_iter().map(cell_to_bolt).collect()),
         JsonValue::Object(mut m) => {
             if let Some(v) = m.remove("@value") {
@@ -853,7 +853,7 @@ fn cell_to_bolt(cell: JsonValue) -> Value {
                 return typed_literal_to_bolt(v, local_name(datatype));
             }
             if let Some(JsonValue::String(iri)) = m.remove("@id") {
-                return Value::String(iri);
+                return Value::String(iri.into());
             }
             // A Cypher map value (`{a: n.name}`, `properties(n)`).
             Value::Map(m.into_iter().map(|(k, v)| (k, cell_to_bolt(v))).collect())
@@ -878,14 +878,14 @@ fn typed_literal_to_bolt(value: JsonValue, datatype_local: &str) -> Value {
         ("decimal", JsonValue::String(s)) => s
             .parse::<f64>()
             .map(Value::Float)
-            .unwrap_or_else(|_| Value::String(s.clone())),
+            .unwrap_or_else(|_| Value::String(s.as_str().into())),
         // Arbitrary-precision integer that exceeded i64 (rendered as a
         // string): degrade to Float like Neo4j's own out-of-range behavior.
         ("integer" | "long", JsonValue::String(s)) => s
             .parse::<i64>()
             .map(Value::Integer)
             .or_else(|_| s.parse::<f64>().map(Value::Float))
-            .unwrap_or_else(|_| Value::String(s.clone())),
+            .unwrap_or_else(|_| Value::String(s.as_str().into())),
         _ => cell_to_bolt(value),
     }
 }
@@ -914,11 +914,11 @@ fn typed_cell_to_bolt(cell: CypherCell, version: BoltVersion) -> Value {
         CypherCell::Decimal(s) => s
             .parse::<f64>()
             .map(Value::Float)
-            .unwrap_or_else(|_| Value::String(s)),
+            .unwrap_or_else(|_| Value::String(s.into())),
         CypherCell::BigInt(s) => match (s.parse::<i64>(), s.parse::<f64>()) {
             (Ok(i), _) => Value::Integer(i),
             (Err(_), Ok(f)) => Value::Float(f),
-            _ => Value::String(s),
+            _ => Value::String(s.into()),
         },
         CypherCell::Temporal(t) => temporal_structure(t, version),
         CypherCell::List(cells) => Value::List(
@@ -939,7 +939,10 @@ fn typed_cell_to_bolt(cell: CypherCell, version: BoltVersion) -> Value {
     }
 }
 
-fn properties_map(properties: Vec<(String, CypherCell)>, version: BoltVersion) -> Value {
+fn properties_map(
+    properties: Vec<(std::sync::Arc<str>, CypherCell)>,
+    version: BoltVersion,
+) -> Value {
     Value::Map(
         properties
             .into_iter()
@@ -966,12 +969,12 @@ fn node_structure(node: CypherNode, version: BoltVersion) -> Value {
 /// The relationship's numeric id: the reifier IRI when the edge is
 /// reified (durable), else a synthesized hash of (start, type, end) —
 /// stable within a result set, which is all pre-5.x drivers need.
-fn relationship_id(rel: &CypherRelationship) -> (i64, String) {
+fn relationship_id(rel: &CypherRelationship) -> (i64, std::sync::Arc<str>) {
     match &rel.reifier_iri {
         Some(iri) => (stable_id(iri), iri.clone()),
         None => {
             let synthetic = format!("{}|{}|{}", rel.start_iri, rel.type_name, rel.end_iri);
-            (stable_id(&synthetic), synthetic)
+            (stable_id(&synthetic), synthetic.into())
         }
     }
 }

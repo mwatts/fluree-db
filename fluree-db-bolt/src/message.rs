@@ -103,7 +103,7 @@ impl Request {
             RESET => Ok(Request::Reset),
             RUN => {
                 let query = match fields.next() {
-                    Some(Value::String(s)) => s,
+                    Some(Value::String(s)) => s.to_string(),
                     other => {
                         return Err(DecodeError::new(format!(
                             "RUN query: expected string, got {other:?}"

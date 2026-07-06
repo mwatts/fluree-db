@@ -275,7 +275,7 @@ impl<'a> Decoder<'a> {
         let bytes = self.take(len)?;
         let s =
             std::str::from_utf8(bytes).map_err(|_| DecodeError::new("invalid utf-8 in string"))?;
-        Ok(Value::String(s.to_string()))
+        Ok(Value::String(s.into()))
     }
 
     fn decode_list(&mut self, len: usize, depth: usize) -> Result<Value, DecodeError> {
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn spec_fixtures_strings_lists_maps() {
-        assert_eq!(encode_to_vec(&Value::String(String::new())), [0x80]);
+        assert_eq!(encode_to_vec(&Value::String("".into())), [0x80]);
         assert_eq!(
             encode_to_vec(&Value::from("hello")),
             [0x85, 0x68, 0x65, 0x6C, 0x6C, 0x6F]

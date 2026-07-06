@@ -62,24 +62,24 @@ pub enum CypherCell {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CypherNode {
     /// Full IRI — the durable identity (`elementId` on Bolt).
-    pub iri: String,
+    pub iri: std::sync::Arc<str>,
     /// `rdf:type` classes as Cypher label names (the `db:Node` existence
     /// marker is hidden, matching `labels()`).
-    pub labels: Vec<String>,
-    pub properties: Vec<(String, CypherCell)>,
+    pub labels: Vec<std::sync::Arc<str>>,
+    pub properties: Vec<(std::sync::Arc<str>, CypherCell)>,
 }
 
 /// A relationship value: endpoints, type, and annotation properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CypherRelationship {
-    pub start_iri: String,
-    pub end_iri: String,
+    pub start_iri: std::sync::Arc<str>,
+    pub end_iri: std::sync::Arc<str>,
     /// Cypher relationship type (predicate IRI local name).
-    pub type_name: String,
+    pub type_name: std::sync::Arc<str>,
     /// The reifier subject's IRI when the edge is reified — the durable
     /// relationship identity where one exists.
-    pub reifier_iri: Option<String>,
-    pub properties: Vec<(String, CypherCell)>,
+    pub reifier_iri: Option<std::sync::Arc<str>>,
+    pub properties: Vec<(std::sync::Arc<str>, CypherCell)>,
 }
 
 /// A path as Bolt models it: unique node and relationship lists plus the
@@ -272,12 +272,12 @@ fn binding_cell<'a>(
             Binding::Sid { sid, .. } => hydrator.subject_cell(sid).await,
             Binding::IriMatch { primary_sid, .. } => hydrator.subject_cell(primary_sid).await,
             Binding::Rel(rel) => {
-                let start_iri = hydrator.compactor.decode_sid(&rel.start)?;
-                let end_iri = hydrator.compactor.decode_sid(&rel.end)?;
+                let start_iri = hydrator.compactor.decode_sid_shared(&rel.start)?;
+                let end_iri = hydrator.compactor.decode_sid_shared(&rel.end)?;
                 let type_iri = hydrator.compactor.decode_sid(&rel.predicate)?;
                 let (reifier_iri, properties) = match &rel.reifier {
                     Some(reifier) => (
-                        Some(hydrator.compactor.decode_sid(reifier)?),
+                        Some(hydrator.compactor.decode_sid_shared(reifier)?),
                         hydrator.annotation_properties(reifier).await?,
                     ),
                     None => (None, Vec::new()),
@@ -285,7 +285,7 @@ fn binding_cell<'a>(
                 Ok(CypherCell::Relationship(Box::new(CypherRelationship {
                     start_iri,
                     end_iri,
-                    type_name: cypher_name_from_iri(&type_iri),
+                    type_name: cypher_name_from_iri(&type_iri).into(),
                     reifier_iri,
                     properties,
                 })))
@@ -710,9 +710,9 @@ impl<'a> NodeHydrator<'a> {
         let node = self.node_from_rows(sid, rows, store, g_id)?;
         let type_iri = self.compactor.decode_sid(&pred)?;
         Ok(Some(CypherRelationship {
-            start_iri: self.compactor.decode_sid(&start)?,
-            end_iri: self.compactor.decode_sid(&end)?,
-            type_name: cypher_name_from_iri(&type_iri),
+            start_iri: self.compactor.decode_sid_shared(&start)?,
+            end_iri: self.compactor.decode_sid_shared(&end)?,
+            type_name: cypher_name_from_iri(&type_iri).into(),
             reifier_iri: Some(node.iri),
             properties: node.properties,
         }))
@@ -728,13 +728,13 @@ impl<'a> NodeHydrator<'a> {
         store: &fluree_db_binary_index::BinaryIndexStore,
         g_id: u16,
     ) -> Result<CypherNode> {
-        let iri = self.compactor.decode_sid(sid)?;
+        let iri = self.compactor.decode_sid_shared(sid)?;
         let rdf_type_p_id = self
             .rdf_type
             .as_ref()
             .and_then(|sid| store.sid_to_p_id(sid));
         let mut labels = Vec::new();
-        let mut props: Vec<(String, Vec<CypherCell>)> = Vec::new();
+        let mut props: Vec<(Arc<str>, Vec<CypherCell>)> = Vec::new();
         for &(p_id, o_type, o_key) in rows {
             if Some(p_id) == rdf_type_p_id {
                 let decoded = store
@@ -742,7 +742,7 @@ impl<'a> NodeHydrator<'a> {
                     .map_err(|e| FormatError::InvalidBinding(format!("decode class ref: {e}")))?;
                 if let FlakeValue::Ref(class_sid) = decoded {
                     if let Some(label) = self.label_name(&class_sid)? {
-                        labels.push(label.to_string());
+                        labels.push(label);
                     }
                 }
                 continue;
@@ -757,9 +757,9 @@ impl<'a> NodeHydrator<'a> {
                 .decode_value_v3(o_type, o_key, p_id, g_id)
                 .map_err(|e| FormatError::InvalidBinding(format!("decode property: {e}")))?;
             let cell = self.flake_value_cell(&decoded)?;
-            match props.iter_mut().find(|(k, _)| *k == key.as_ref()) {
+            match props.iter_mut().find(|(k, _)| k.as_ref() == key.as_ref()) {
                 Some((_, cells)) => cells.push(cell),
-                None => props.push((key.to_string(), vec![cell])),
+                None => props.push((key, vec![cell])),
             }
         }
         Ok(CypherNode {
@@ -929,15 +929,15 @@ impl<'a> NodeHydrator<'a> {
             // A reified node→node edge. (Literal-object annotations keep
             // the node rendering — Bolt relationships need node endpoints.)
             (Some(start), Some(pred), Some(end)) => {
-                let start_iri = self.compactor.decode_sid(&start)?;
-                let end_iri = self.compactor.decode_sid(&end)?;
+                let start_iri = self.compactor.decode_sid_shared(&start)?;
+                let end_iri = self.compactor.decode_sid_shared(&end)?;
                 let type_iri = self.compactor.decode_sid(&pred)?;
                 let properties = self.annotation_properties(sid).await?;
                 CypherCell::Relationship(Box::new(CypherRelationship {
                     start_iri,
                     end_iri,
-                    type_name: cypher_name_from_iri(&type_iri),
-                    reifier_iri: Some(self.compactor.decode_sid(sid)?),
+                    type_name: cypher_name_from_iri(&type_iri).into(),
+                    reifier_iri: Some(self.compactor.decode_sid_shared(sid)?),
                     properties,
                 }))
             }
@@ -951,9 +951,9 @@ impl<'a> NodeHydrator<'a> {
         if let Some(hit) = self.cache.get(sid) {
             return Ok(hit.clone());
         }
-        let iri = self.compactor.decode_sid(sid)?;
+        let iri = self.compactor.decode_sid_shared(sid)?;
         let mut labels = Vec::new();
-        let mut props: Vec<(String, Vec<CypherCell>)> = Vec::new();
+        let mut props: Vec<(Arc<str>, Vec<CypherCell>)> = Vec::new();
         let flakes = self.subject_flakes(sid).await?;
         for flake in flakes.iter() {
             if !flake.op {
@@ -962,7 +962,7 @@ impl<'a> NodeHydrator<'a> {
             if Some(&flake.p) == self.rdf_type.as_ref() {
                 if let FlakeValue::Ref(class_sid) = &flake.o {
                     if let Some(label) = self.label_name(class_sid)? {
-                        labels.push(label.to_string());
+                        labels.push(label);
                     }
                 }
                 continue;
@@ -980,9 +980,9 @@ impl<'a> NodeHydrator<'a> {
                 continue;
             };
             let cell = self.flake_value_cell(&flake.o)?;
-            match props.iter_mut().find(|(k, _)| *k == key.as_ref()) {
+            match props.iter_mut().find(|(k, _)| k.as_ref() == key.as_ref()) {
                 Some((_, cells)) => cells.push(cell),
-                None => props.push((key.to_string(), vec![cell])),
+                None => props.push((key, vec![cell])),
             }
         }
         let node = CypherNode {
@@ -1006,8 +1006,8 @@ impl<'a> NodeHydrator<'a> {
 
     /// Properties of a reifier (annotation) subject: user annotation keys
     /// only — the `db:reifies*` bookkeeping and `rdf:type` are skipped.
-    async fn annotation_properties(&mut self, sid: &Sid) -> Result<Vec<(String, CypherCell)>> {
-        let mut props: Vec<(String, CypherCell)> = Vec::new();
+    async fn annotation_properties(&mut self, sid: &Sid) -> Result<Vec<(Arc<str>, CypherCell)>> {
+        let mut props: Vec<(Arc<str>, CypherCell)> = Vec::new();
         let flakes = self.subject_flakes(sid).await?;
         for flake in flakes.iter() {
             if !flake.op
@@ -1019,14 +1019,14 @@ impl<'a> NodeHydrator<'a> {
             let Some(key) = self.key_name(&flake.p)? else {
                 continue;
             };
-            props.push((key.to_string(), self.flake_value_cell(&flake.o)?));
+            props.push((key, self.flake_value_cell(&flake.o)?));
         }
         Ok(props)
     }
 
     async fn path(&mut self, nodes: &[Sid], edges: &[(Sid, Sid, Sid)]) -> Result<CypherPath> {
         let mut path_nodes: Vec<CypherNode> = Vec::new();
-        let mut node_index: HashMap<String, usize> = HashMap::new();
+        let mut node_index: HashMap<Arc<str>, usize> = HashMap::new();
         let mut index_of_node = |n: CypherNode, path_nodes: &mut Vec<CypherNode>| -> usize {
             if let Some(&i) = node_index.get(&n.iri) {
                 return i;
@@ -1054,13 +1054,13 @@ impl<'a> NodeHydrator<'a> {
                 break;
             };
             let forward = s == walk_from;
-            let start_iri = self.compactor.decode_sid(s)?;
-            let end_iri = self.compactor.decode_sid(o)?;
+            let start_iri = self.compactor.decode_sid_shared(s)?;
+            let end_iri = self.compactor.decode_sid_shared(o)?;
             let type_iri = self.compactor.decode_sid(p)?;
             let rel = CypherRelationship {
                 start_iri,
                 end_iri,
-                type_name: cypher_name_from_iri(&type_iri),
+                type_name: cypher_name_from_iri(&type_iri).into(),
                 reifier_iri: None,
                 properties: Vec::new(),
             };

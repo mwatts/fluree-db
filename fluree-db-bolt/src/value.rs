@@ -13,7 +13,7 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     Bytes(Vec<u8>),
-    String(String),
+    String(std::sync::Arc<str>),
     List(Vec<Value>),
     Map(MapValue),
     /// A tagged structure (nodes, relationships, dates, ...). Bolt limits
@@ -23,7 +23,7 @@ pub enum Value {
 
 /// An insertion-ordered string-keyed map.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct MapValue(pub Vec<(String, Value)>);
+pub struct MapValue(pub Vec<(std::sync::Arc<str>, Value)>);
 
 /// A PackStream structure: signature byte plus fields.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,7 +38,7 @@ impl MapValue {
     }
 
     /// Insert or replace a key.
-    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<Value>) {
+    pub fn insert(&mut self, key: impl Into<std::sync::Arc<str>>, value: impl Into<Value>) {
         let key = key.into();
         if let Some(slot) = self.0.iter_mut().find(|(k, _)| *k == key) {
             slot.1 = value.into();
@@ -48,7 +48,10 @@ impl MapValue {
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.0
+            .iter()
+            .find(|(k, _)| k.as_ref() == key)
+            .map(|(_, v)| v)
     }
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
@@ -74,9 +77,15 @@ impl MapValue {
     }
 }
 
+impl FromIterator<(std::sync::Arc<str>, Value)> for MapValue {
+    fn from_iter<T: IntoIterator<Item = (std::sync::Arc<str>, Value)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 impl FromIterator<(String, Value)> for MapValue {
     fn from_iter<T: IntoIterator<Item = (String, Value)>>(iter: T) -> Self {
-        Self(iter.into_iter().collect())
+        Self(iter.into_iter().map(|(k, v)| (k.into(), v)).collect())
     }
 }
 
@@ -121,12 +130,18 @@ impl From<f64> for Value {
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::String(v.to_string())
+        Value::String(v.into())
     }
 }
 
 impl From<String> for Value {
     fn from(v: String) -> Self {
+        Value::String(v.into())
+    }
+}
+
+impl From<std::sync::Arc<str>> for Value {
+    fn from(v: std::sync::Arc<str>) -> Self {
         Value::String(v)
     }
 }

@@ -252,17 +252,17 @@ fn typed_cell_strings(
             typed_cell_strings(c, out);
         }),
         CypherCell::Node(n) => {
-            out.push(n.iri.clone());
-            out.extend(n.labels.iter().cloned());
+            out.push(n.iri.to_string());
+            out.extend(n.labels.iter().map(ToString::to_string));
             for (k, c) in &n.properties {
-                out.push(k.clone());
+                out.push(k.to_string());
                 typed_cell_strings(c, out);
             }
         }
         CypherCell::Relationship(r) => {
-            out.push(r.type_name.clone());
+            out.push(r.type_name.to_string());
             for (k, c) in &r.properties {
-                out.push(k.clone());
+                out.push(k.to_string());
                 typed_cell_strings(c, out);
             }
         }
