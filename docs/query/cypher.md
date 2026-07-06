@@ -445,6 +445,15 @@ The mapping is **case-preserving**: `WORKS_FOR` becomes
 `<vocab>WORKS_FOR`, not `<vocab>worksFor`. Put any case-normalizing
 aliases in the context.
 
+The placement rule for a name (without `@vocab`) is: **no colon →
+the whole name, verbatim**. Backticked names containing `/`, `#`,
+spaces, or `@` (`` `a/b` ``, `` `my prop` ``, `` `user@host` ``) are
+never split into namespaces — they round-trip intact. A backticked
+name that *does* contain a colon is treated as an RDF identifier
+(prefixed name or full IRI): `` `ex:code` `` or
+`` `http://schema.org/name` `` registers its namespace and
+interoperates with SPARQL/JSON-LD views of the same data.
+
 Note the two modes address different data: bare names and
 vocab-resolved IRIs are different identifiers. Adding `@vocab` to a
 ledger whose data was written bare (or vice versa) changes what Cypher

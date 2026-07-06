@@ -7234,3 +7234,59 @@ async fn cypher_vocab_context_resolves_bare_names_to_rdf_iris() {
         "hydrated identity keeps the full IRI in RDF-compat mode"
     );
 }
+
+#[tokio::test]
+async fn cypher_backticked_names_round_trip_without_splitting() {
+    // The namespace-0 placement rule is "no colon → whole name": the IRI
+    // splitter (`canonical_split`) must never cut a colon-free Cypher name
+    // at `/`, `#`, a space, or an embedded `@` — the write path
+    // (sid_for_iri) and the read path (the lowering's namespace-0 arm)
+    // both keep it intact, so backticked exotic names round-trip.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:backtick-names");
+    let committed = fluree
+        .transact_cypher(
+            ledger0,
+            "CREATE (n:`Weird/Label` {`a/b`: 1, `a#b`: 2, `my prop`: 3, `user@host`: 4})",
+        )
+        .await
+        .expect("create with exotic names");
+
+    let db = graphdb_from_ledger(&committed.ledger);
+    let result = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:`Weird/Label`) \
+             RETURN n.`a/b` AS s, n.`a#b` AS h, n.`my prop` AS sp, n.`user@host` AS at",
+        )
+        .await
+        .expect("read exotic names back");
+    let (columns, rows) = result.to_cypher_table(&db.snapshot).expect("table");
+    assert_eq!(columns, ["s", "h", "sp", "at"]);
+    assert_eq!(
+        rows,
+        vec![vec![json!(1), json!(2), json!(3), json!(4)]],
+        "colon-free names must round-trip whole, never namespace-split"
+    );
+
+    // A colon-containing backticked name IS namespace-split (the RDF
+    // escape hatch): it still round-trips through Cypher, and the same
+    // data is reachable RDF-style through a SPARQL prefix.
+    let committed = fluree
+        .transact_cypher(committed.ledger, "CREATE (n:Coded {`ex:code`: 42})")
+        .await
+        .expect("create with prefixed name");
+    let db = graphdb_from_ledger(&committed.ledger);
+    let result = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Coded) WHERE n.`ex:code` = 42 RETURN n.`ex:code` AS c",
+        )
+        .await
+        .expect("read prefixed name back");
+    assert_eq!(
+        result.row_count(),
+        1,
+        "colon names round-trip via the split"
+    );
+}
