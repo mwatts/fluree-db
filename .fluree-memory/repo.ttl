@@ -1152,6 +1152,20 @@ mem:fact-01kwvtdzzsfecc56zgjs23ckwq a mem:Fact ;
     mem:createdAt "2026-07-06T13:38:39.225260+00:00"^^xsd:dateTime ;
     mem:rationale "Future Bolt tx work (Raft support, policy) must preserve the atomic single-ref-advance publish and the base-precondition; N sequential ref advances would expose intermediate states." .
 
+mem:fact-01kww286deybnkjrnyxn4w55fe a mem:Fact ;
+    mem:content "Bolt hydration perf (BOLT-1b, bench-confirmed): serial per-node SPOT fetches made data-heavy Bolt results 1.5-7x slower than HTTP (neighbours_2_with_data 1.07→7.58ms @ 188 rows). Fixed: typed_table prefetch collects all hydration subjects (nodes/reifiers/path nodes), sorts by subject for leaflet locality, fetches with buffer_unordered(16) into a shared flake cache. KEY: HTTP cypher-json never hydrates (bare RETURN n = IRI string), so HTTP numbers on *_with_data benchgraph queries under-deliver vs vendors — Bolt-after-fix vs vendors is the honest comparison. JSON-LD select-map [\"*\"] hydration is ALSO sequential per subject; same prefetch pattern can back-port at depth 0." ;
+    mem:tag "benchmark" ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "hydration" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/hydration.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T15:55:17.806942+00:00"^^xsd:dateTime ;
+    mem:rationale "Converge on hydration.rs fetch_subject_properties (policy-aware) when Bolt auth lands; the engine-level batched gather (property_join-style) is the long-term fix if hydration still shows hot." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
