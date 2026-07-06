@@ -1211,6 +1211,22 @@ mem:fact-01kww61y9crayg5pqd2ghnawt5 a mem:Fact ;
     mem:createdAt "2026-07-06T17:01:47.180471+00:00"^^xsd:dateTime ;
     mem:rationale "The hydrator is the pattern for any format-time raw-SPOT read under policy; the txn governance pinning and probe wrap must be preserved by future Bolt/txn work." .
 
+mem:fact-01kwwddyea3x6nyqmysg11vqvf a mem:Fact ;
+    mem:content "Bound-edge annotation probe gate (pattern_long/cycle 2.2-2.8x fix): value-only rel vars' per-hop OPTIONAL EdgeAnnotation probe is gated by LoweringContext.reified_edges_possible, computed in api helpers with three conservative tiers: (1) f:reifiesSubject absent from dict — useless alone since built-in vocab passes on ~every ledger (the old sole gate); (2) snapshot.stats.properties count for f:reifiesSubject; (3) overlay PSOT walk cached on content_version. Probe: 2-hop pattern 3.04→0.54ms. ALSO: a bound rel var on a reified edge binds the ANNOTATION SUBJECT Sid (coalesce(ann, MakeRel)) — cypher_typed subject cells detect f:reifies* rows and render Relationship not Node, in both hydration lanes." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "lowering" ;
+    mem:tag "performance" ;
+    mem:tag "reification" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T19:10:40.586531+00:00"^^xsd:dateTime ;
+    mem:rationale "Future annotation writes must keep the gate honest (stats/overlay reflect new f:reifies facts before queries run) or bound edge vars silently drop annotation bindings; bolt_reified_edge_gate_reopens_for_novelty_annotations pins this." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
