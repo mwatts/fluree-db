@@ -16,6 +16,14 @@ fluree-server \
   --bolt-default-db mydb:main
 ```
 
+The CLI's server management exposes the same flags on `run`, `start`,
+and `restart` (background servers keep them across restarts, and
+`fluree server status` shows the Bolt address):
+
+```bash
+fluree server start --bolt-listen-addr 0.0.0.0:7687 --bolt-default-db mydb:main
+```
+
 or in the config file:
 
 ```toml

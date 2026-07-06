@@ -1685,6 +1685,14 @@ pub enum ServerAction {
         #[arg(long)]
         log_level: Option<String>,
 
+        /// Bolt protocol listen address (e.g., "0.0.0.0:7687"); unset = Bolt disabled
+        #[arg(long)]
+        bolt_listen_addr: Option<SocketAddr>,
+
+        /// Default ledger for Bolt sessions that select no database
+        #[arg(long)]
+        bolt_default_db: Option<String>,
+
         /// Configuration profile to activate
         #[arg(long)]
         profile: Option<String>,
@@ -1711,6 +1719,14 @@ pub enum ServerAction {
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
         log_level: Option<String>,
+
+        /// Bolt protocol listen address (e.g., "0.0.0.0:7687"); unset = Bolt disabled
+        #[arg(long)]
+        bolt_listen_addr: Option<SocketAddr>,
+
+        /// Default ledger for Bolt sessions that select no database
+        #[arg(long)]
+        bolt_default_db: Option<String>,
 
         /// Configuration profile to activate
         #[arg(long)]
@@ -1752,6 +1768,14 @@ pub enum ServerAction {
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
         log_level: Option<String>,
+
+        /// Bolt protocol listen address (e.g., "0.0.0.0:7687"); unset = Bolt disabled
+        #[arg(long)]
+        bolt_listen_addr: Option<SocketAddr>,
+
+        /// Default ledger for Bolt sessions that select no database
+        #[arg(long)]
+        bolt_default_db: Option<String>,
 
         /// Configuration profile to activate
         #[arg(long)]
