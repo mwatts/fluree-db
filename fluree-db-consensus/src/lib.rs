@@ -23,6 +23,7 @@
 //! outcome. Callers who don't need those guarantees may omit the key.
 
 pub mod caching;
+pub mod http;
 pub mod local;
 #[cfg(feature = "raft")]
 pub mod raft;

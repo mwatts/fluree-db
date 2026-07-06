@@ -30,6 +30,7 @@
 //! via [`super::admin::RaftAdmin::add_learner`] is immediately
 //! reachable for forwarding on every other node — no restart.
 
+use crate::http::is_hop_by_hop;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
@@ -40,21 +41,6 @@ use openraft::Raft;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Hop-by-hop headers from RFC 7230 §6.1 plus a couple of modern
-/// additions. Stripped from both the outbound request and the
-/// returned response — they describe the *previous* connection and
-/// don't make sense on a forwarded one.
-const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-];
 
 /// Upper bound on the request body the follower will buffer before
 /// forwarding it to the leader. A follower that's still in catch-up
@@ -467,17 +453,20 @@ async fn response_from_upstream(upstream: reqwest::Response) -> Result<Response,
     Ok(resp)
 }
 
+/// Drop hop-by-hop headers (see [`crate::http::is_hop_by_hop`])
+/// plus `host`, which the outbound client rewrites for the leader's
+/// address.
 fn strip_hop_by_hop(mut headers: HeaderMap) -> HeaderMap {
     headers.remove("host");
-    for name in HOP_BY_HOP_HEADERS {
-        headers.remove(*name);
+    let hop_by_hop: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| is_hop_by_hop(name.as_str()))
+        .cloned()
+        .collect();
+    for name in hop_by_hop {
+        headers.remove(name);
     }
     headers
-}
-
-fn is_hop_by_hop(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    HOP_BY_HOP_HEADERS.iter().any(|h| *h == lower)
 }
 
 fn status_from_reqwest(s: reqwest::StatusCode) -> StatusCode {
@@ -503,6 +492,7 @@ mod tests {
         h.insert("host", "node-1:8080".parse().unwrap());
         h.insert("connection", "keep-alive".parse().unwrap());
         h.insert("upgrade", "h2c".parse().unwrap());
+        h.insert("proxy-authorization", "Basic xyz".parse().unwrap());
         h.insert("authorization", "Bearer abc".parse().unwrap());
         h.insert("x-custom", "value".parse().unwrap());
 
@@ -510,17 +500,11 @@ mod tests {
         assert!(!scrubbed.contains_key("host"));
         assert!(!scrubbed.contains_key("connection"));
         assert!(!scrubbed.contains_key("upgrade"));
+        // Previous-hop proxy credentials must not reach the leader.
+        assert!(!scrubbed.contains_key("proxy-authorization"));
         // End-to-end headers preserved.
         assert_eq!(scrubbed.get("authorization").unwrap(), "Bearer abc");
         assert_eq!(scrubbed.get("x-custom").unwrap(), "value");
-    }
-
-    #[test]
-    fn hop_by_hop_detection_is_case_insensitive() {
-        assert!(is_hop_by_hop("Connection"));
-        assert!(is_hop_by_hop("TRANSFER-ENCODING"));
-        assert!(!is_hop_by_hop("Content-Type"));
-        assert!(!is_hop_by_hop("Authorization"));
     }
 
     #[test]

@@ -514,6 +514,32 @@ impl Worker {
         }
     }
 
+    /// Persist a staged commit's blobs to `ledger_id`'s content
+    /// store: referenced payloads first, then the commit blob, so a
+    /// resolvable commit CID always implies its referenced payloads
+    /// are durable. (`referenced_bytes` is empty today; the
+    /// ordering matters the day it isn't.) `op` labels errors with
+    /// the operation being staged.
+    async fn persist_staged_blobs(
+        &self,
+        ledger_id: &str,
+        commit_cid: &ContentId,
+        staged: &fluree_db_transact::StagedCommit,
+        op: &str,
+    ) -> Result<(), WorkerError> {
+        let content_store = self.staging.fluree.content_store(ledger_id);
+        for (cid, bytes) in &staged.referenced_bytes {
+            content_store
+                .put_with_id(cid, bytes)
+                .await
+                .map_err(|e| stage_failure(&format!("{op} referenced blob write failed: {e}")))?;
+        }
+        content_store
+            .put_with_id(commit_cid, &staged.commit_bytes)
+            .await
+            .map_err(|e| stage_failure(&format!("{op} commit blob write failed: {e}")))
+    }
+
     /// Install staged ledger state through the held write guard
     /// after the head advance has been replicated. Called only on
     /// the publish-success path so the local cache never gets ahead
@@ -646,17 +672,8 @@ impl Worker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        let content_store = self.staging.fluree.content_store(&ledger_id);
-        content_store
-            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
-            .await
-            .map_err(|e| stage_failure(&format!("commit blob write failed: {e}")))?;
-        for (cid, bytes) in &staged_commit.referenced_bytes {
-            content_store
-                .put_with_id(cid, bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("referenced blob write failed: {e}")))?;
-        }
+        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "transact")
+            .await?;
 
         // Derive post-commit state but do NOT call finalize_commit
         // here — local install runs after the publish confirms the
@@ -745,17 +762,8 @@ impl Worker {
         let commit_t = staged_commit.commit.t;
 
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&ledger_id);
-        content_store
-            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
-            .await
-            .map_err(|e| stage_failure(&format!("revert commit blob write failed: {e}")))?;
-        for (cid, bytes) in &staged_commit.referenced_bytes {
-            content_store
-                .put_with_id(cid, bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("revert referenced blob write failed: {e}")))?;
-        }
+        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "revert")
+            .await?;
 
         let (_receipt, new_state) = staged_commit
             .finalize_state()
@@ -912,16 +920,8 @@ impl Worker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            let content_store = self.staging.fluree.content_store(&target_id);
-            content_store
-                .put_with_id(&commit_cid, &staged.commit_bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("merge commit blob write failed: {e}")))?;
-            for (cid, bytes) in &staged.referenced_bytes {
-                content_store.put_with_id(cid, bytes).await.map_err(|e| {
-                    stage_failure(&format!("merge referenced blob write failed: {e}"))
-                })?;
-            }
+            self.persist_staged_blobs(&target_id, &commit_cid, &staged, "merge")
+                .await?;
             let (_receipt, new_state) = staged
                 .finalize_state()
                 .map_err(|e| stage_failure(&format!("merge finalize_state failed: {e}")))?;
