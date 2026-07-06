@@ -7104,7 +7104,7 @@ async fn cypher_equality_seek_correct_under_predicate_novelty() {
     let ledger_id = "it/cypher:eq-seek-novelty";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
     let ctx_json = json!({"ex": "http://example.org/"});
-    let ledger = fluree
+    fluree
         .insert(
             ledger0,
             &json!({
@@ -7115,8 +7115,7 @@ async fn cypher_equality_seek_correct_under_predicate_novelty() {
             }),
         )
         .await
-        .expect("seed")
-        .ledger;
+        .expect("seed");
     rebuild_and_publish_index(&fluree, ledger_id).await;
 
     // Live novelty on the SAME predicate: a new subject with a new id value

@@ -30,16 +30,14 @@
 //! deployments only — Raft/peer modes must reject `BEGIN` at the
 //! transport layer.
 
-use fluree_db_core::ContentId;
-use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::{CasResult, RefKind, RefValue};
-use fluree_db_transact::{CommitOpts, TransactError};
-use serde_json::Value as JsonValue;
-
 use crate::cypher_write::{self, WritePlan};
 use crate::error::ApiError;
 use crate::view::GraphDb;
 use crate::{Fluree, Result, Tracker};
+use fluree_db_core::ContentId;
+use fluree_db_ledger::LedgerState;
+use fluree_db_nameservice::{CasResult, RefKind, RefValue};
+use fluree_db_transact::{CommitOpts, TransactError};
 
 /// An open interactive Cypher transaction. Create with
 /// [`Fluree::begin_cypher_transaction`]; drop to roll back.
@@ -66,9 +64,12 @@ struct PendingCommit {
 pub struct CypherTxnWriteOutcome {
     /// Flakes staged by this statement (0 for a no-effect statement).
     pub flake_count: usize,
-    /// Rows for a trailing `RETURN` on the write, as the Cypher-JSON
-    /// envelope (same shape as the autocommit write-RETURN path).
-    pub return_envelope: Option<JsonValue>,
+    /// Rows for a trailing `RETURN` on the write: hydrated typed cells
+    /// (created entities as nodes), same shape reads produce.
+    pub return_table: Option<(
+        Vec<String>,
+        Vec<Vec<crate::format::cypher_typed::CypherCell>>,
+    )>,
 }
 
 impl CypherTransaction {
@@ -172,15 +173,15 @@ impl Fluree {
         if !view.has_staged() {
             let (base, _flakes) = view.into_parts();
             txn.state = base;
-            let return_envelope = match (&return_plan, &skolem_txn_id) {
+            let return_table = match (&return_plan, &skolem_txn_id) {
                 (Some(plan), Some(skolem)) => {
-                    Some(cypher_write::write_return_rows(plan, skolem, &txn.state).await?)
+                    Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
                 }
                 _ => None,
             };
             return Ok(CypherTxnWriteOutcome {
                 flake_count: 0,
-                return_envelope,
+                return_table,
             });
         }
 
@@ -231,15 +232,15 @@ impl Fluree {
         });
         txn.state = next_state;
 
-        let return_envelope = match (&return_plan, &skolem_txn_id) {
+        let return_table = match (&return_plan, &skolem_txn_id) {
             (Some(plan), Some(skolem)) => {
-                Some(cypher_write::write_return_rows(plan, skolem, &txn.state).await?)
+                Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
             }
             _ => None,
         };
         Ok(CypherTxnWriteOutcome {
             flake_count: receipt.flake_count,
-            return_envelope,
+            return_table,
         })
     }
 

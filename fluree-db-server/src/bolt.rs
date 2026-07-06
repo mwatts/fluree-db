@@ -320,8 +320,17 @@ async fn try_execute_txn_run(
         stats.insert("fluree-flakes", outcome.flake_count as i64);
         summary.insert("stats", stats);
 
-        let (fields, rows) = match &outcome.return_envelope {
-            Some(envelope) => envelope_to_rows(envelope),
+        let (fields, rows) = match outcome.return_table {
+            Some((columns, rows)) => (
+                columns,
+                rows.into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|c| typed_cell_to_bolt(c, version))
+                            .collect()
+                    })
+                    .collect(),
+            ),
             None => (Vec::new(), Default::default()),
         };
         return Ok(ResultStream {
@@ -380,7 +389,7 @@ async fn try_execute_run(
     let is_write = fluree_db_api::cypher_write::cypher_statement_is_write(&run.query)
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     if is_write {
-        execute_write(state, ledger_id, &run.query, params).await
+        execute_write(state, ledger_id, &run.query, params, version).await
     } else {
         execute_read(state, ledger_id, &run.query, params, version).await
     }
@@ -431,6 +440,7 @@ async fn execute_write(
     ledger_id: &str,
     query: &str,
     params: Option<fluree_db_api::CypherParamMap>,
+    version: BoltVersion,
 ) -> Result<ResultStream, RunFailure> {
     use fluree_db_api::{CommitOpts, TxnOpts};
     use fluree_db_consensus::{TransactionBody, TransactionRequest};
@@ -494,44 +504,23 @@ async fn execute_write(
     )
     .await
     .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
-    let envelope = fluree_db_api::cypher_write::write_return_rows(&plan, &skolem_id, &ledger_state)
-        .await
-        .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
-
-    let (fields, rows) = envelope_to_rows(&envelope);
+    let (fields, typed_rows) =
+        fluree_db_api::cypher_write::write_return_typed_rows(&plan, &skolem_id, &ledger_state)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?;
+    let rows = typed_rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|c| typed_cell_to_bolt(c, version))
+                .collect()
+        })
+        .collect();
     Ok(ResultStream {
         fields,
         rows,
         summary,
     })
-}
-
-/// Pull columns + rows out of the Cypher-JSON envelope
-/// (`{"results":[{"columns":[…],"data":[{"row":[…]},…]}]}`).
-fn envelope_to_rows(envelope: &JsonValue) -> (Vec<String>, std::collections::VecDeque<Vec<Value>>) {
-    let result = &envelope["results"][0];
-    let fields = result["columns"]
-        .as_array()
-        .map(|cols| {
-            cols.iter()
-                .filter_map(|c| c.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let rows = result["data"]
-        .as_array()
-        .map(|data| {
-            data.iter()
-                .map(|entry| {
-                    entry["row"]
-                        .as_array()
-                        .map(|cells| cells.iter().cloned().map(cell_to_bolt).collect())
-                        .unwrap_or_default()
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    (fields, rows)
 }
 
 /// Bolt RUN parameters (PackStream map) → the Cypher `$param` map the
@@ -1033,23 +1022,5 @@ mod tests {
             typed_cell_to_bolt(CypherCell::BigInt("12".into()), BoltVersion::V5_4),
             Value::Integer(12)
         );
-    }
-
-    #[test]
-    fn envelope_rows_extract() {
-        let envelope = json!({
-            "results": [{
-                "columns": ["n"],
-                "data": [
-                    {"row": ["http://example.org/u1"], "meta": [null]},
-                    {"row": [7], "meta": [null]}
-                ]
-            }]
-        });
-        let (fields, rows) = envelope_to_rows(&envelope);
-        assert_eq!(fields, vec!["n"]);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec![Value::String("http://example.org/u1".into())]);
-        assert_eq!(rows[1], vec![Value::Integer(7)]);
     }
 }

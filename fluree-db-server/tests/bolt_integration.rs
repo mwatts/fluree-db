@@ -390,7 +390,7 @@ async fn bolt_write_and_read_back() {
     let (records, _) = client.pull(-1).await;
     assert_eq!(records, vec![vec![Value::Integer(3)]]);
 
-    // Write with RETURN surfaces the created entity's rows.
+    // Write with RETURN surfaces the created entity as a typed Node.
     let run = client
         .run(
             r#"CREATE (n:Person {name: "Dave"}) RETURN n"#,
@@ -405,6 +405,22 @@ async fn bolt_write_and_read_back() {
     );
     let (records, summary) = client.pull(-1).await;
     assert_eq!(records.len(), 1, "one created entity row");
+    let Value::Structure(node) = &records[0][0] else {
+        panic!(
+            "write RETURN n must be a Node structure, got {:?}",
+            records[0][0]
+        )
+    };
+    assert_eq!(node.signature, SIG_NODE);
+    assert_eq!(
+        node.fields[1],
+        Value::List(vec![Value::String("Person".into())]),
+        "created node carries its labels"
+    );
+    let Value::Map(props) = &node.fields[2] else {
+        panic!()
+    };
+    assert_eq!(props.get_str("name"), Some("Dave"));
     summary.assert_success();
 }
 

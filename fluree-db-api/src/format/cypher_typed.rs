@@ -202,6 +202,23 @@ fn collect_subject_sids(binding: &Binding, out: &mut Vec<Sid>) {
     }
 }
 
+/// Hydrate a flat list of subjects into [`CypherNode`]s against `view`
+/// (prefetched with bounded concurrency). Used by the write-RETURN path,
+/// where the created-entity Sids are known without a query result.
+pub(crate) async fn hydrate_nodes(
+    view: &GraphDb,
+    compactor: &IriCompactor,
+    sids: &[Sid],
+) -> Result<Vec<CypherNode>> {
+    let mut hydrator = NodeHydrator::new(view, compactor);
+    hydrator.prefetch(sids.to_vec()).await?;
+    let mut nodes = Vec::with_capacity(sids.len());
+    for sid in sids {
+        nodes.push(hydrator.node(sid).await?);
+    }
+    Ok(nodes)
+}
+
 fn binding_cell<'a>(
     result: &'a QueryResult,
     binding: &'a Binding,
