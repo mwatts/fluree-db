@@ -1945,17 +1945,45 @@ pub fn build_where_operators_seeded_with_needed(
                         let mut best_idx: Option<usize> = None;
                         let mut best_est: f64 = f64::INFINITY;
                         for (idx, tp) in triples_for_exec.iter().enumerate().skip(1) {
-                            let has_bounds =
-                                tp.o.as_var()
-                                    .is_some_and(|v| pushdown.object_bounds.contains_key(&v));
-                            if !has_bounds {
+                            let bounds = tp.o.as_var().and_then(|v| pushdown.object_bounds.get(&v));
+                            let Some(bounds) = bounds else {
                                 continue;
-                            }
-                            let est = crate::planner::estimate_triple_row_count(
-                                tp,
-                                &bound_vars,
-                                stats_ref,
-                            );
+                            };
+                            // An EQUALITY bound pins the object to one value, so
+                            // the triple's effective cardinality is the per-value
+                            // row count (count/ndv) — the same estimate a
+                            // bound-object pattern gets — not the full property
+                            // scan the bare triple estimate assumes. Without
+                            // this, a handful of novelty rows on the bounded
+                            // predicate nudge its scan estimate past the class
+                            // anchor's and flip a point lookup (`WHERE n.id =
+                            // $id`) into a full-class probe join.
+                            let equality_value = match (&bounds.lower, &bounds.upper) {
+                                (Some((lo, true)), Some((hi, true))) if lo == hi => {
+                                    Some(lo.clone())
+                                }
+                                _ => None,
+                            };
+                            let est = match equality_value {
+                                Some(v) => {
+                                    let bound_tp = TriplePattern {
+                                        s: tp.s.clone(),
+                                        p: tp.p.clone(),
+                                        o: Term::Value(v),
+                                        dtc: tp.dtc.clone(),
+                                    };
+                                    crate::planner::estimate_triple_row_count(
+                                        &bound_tp,
+                                        &bound_vars,
+                                        stats_ref,
+                                    )
+                                }
+                                None => crate::planner::estimate_triple_row_count(
+                                    tp,
+                                    &bound_vars,
+                                    stats_ref,
+                                ),
+                            };
                             if est < best_est {
                                 best_est = est;
                                 best_idx = Some(idx);

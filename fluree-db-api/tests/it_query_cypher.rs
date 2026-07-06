@@ -7093,3 +7093,94 @@ async fn cypher_class_anchored_filtered_histogram_matches_pipeline() {
         assert_eq!(rows_of(&cj), vec![(json!(null), json!(1))], "{cj}");
     }
 }
+
+/// A specific-value lookup (`WHERE n.id = k`, equality object bounds) must
+/// stay a point seek under live novelty on the same predicate — seeking the
+/// index AND the overlay — and must decline the narrowed seek when the
+/// predicate holds mixed numeric types (cross-type equality would miss rows).
+#[tokio::test]
+async fn cypher_equality_seek_correct_under_predicate_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:eq-seek-novelty";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx_json = json!({"ex": "http://example.org/"});
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx_json,
+                "@graph": (1..=50).map(|i| json!({
+                    "@id": format!("ex:u{i}"), "@type": "ex:User", "ex:id": i
+                })).collect::<Vec<_>>()
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Live novelty on the SAME predicate: a new subject with a new id value
+    // and another with a duplicate of an existing value.
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload indexed ledger");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx_json,
+                "@graph": [
+                    {"@id": "ex:t1", "@type": "ex:UserTemp", "ex:id": 999},
+                    {"@id": "ex:t2", "@type": "ex:UserTemp", "ex:id": 7},
+                ]
+            }),
+        )
+        .await
+        .expect("novelty writes")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+
+    // Indexed value still found.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:User) WITH n WHERE n.id = 7 RETURN n")
+        .await
+        .expect("indexed value");
+    assert_eq!(r.row_count(), 1);
+
+    // Novelty-only value found through the narrowed seek (index ∪ overlay).
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:UserTemp) WITH n WHERE n.id = 999 RETURN n")
+        .await
+        .expect("novelty value");
+    assert_eq!(r.row_count(), 1);
+
+    // The novelty duplicate of an indexed value is also visible.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:UserTemp) WHERE n.id = 7 RETURN n")
+        .await
+        .expect("novelty duplicate");
+    assert_eq!(r.row_count(), 1);
+
+    // Mixed numeric types on the predicate: cross-type equality must still
+    // match (the narrowed seek declines; the decoded filter coerces).
+    let ledger = fluree.ledger(ledger_id).await.expect("reload for mixed dt");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx_json,
+                "@id": "ex:t3", "@type": "ex:UserTemp",
+                "ex:id": {"@value": "7", "@type": "http://www.w3.org/2001/XMLSchema#double"}
+            }),
+        )
+        .await
+        .expect("double id")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:UserTemp) WHERE n.id = 7 RETURN n")
+        .await
+        .expect("cross-type equality");
+    assert_eq!(r.row_count(), 2, "double 7.0 must match integer equality");
+}
