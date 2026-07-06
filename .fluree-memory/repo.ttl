@@ -1166,6 +1166,19 @@ mem:fact-01kww286deybnkjrnyxn4w55fe a mem:Fact ;
     mem:createdAt "2026-07-06T15:55:17.806942+00:00"^^xsd:dateTime ;
     mem:rationale "Converge on hydration.rs fetch_subject_properties (policy-aware) when Bolt auth lands; the engine-level batched gather (property_join-style) is the long-term fix if hydration still shows hot." .
 
+mem:fact-01kww2pyrz2rdf3tzgc72dhe4p a mem:Fact ;
+    mem:content "JSON-LD select-map hydration now bulk-prefetches wildcard roots: run_hydration_rows collects top-level subjects of wildcard hydration columns, fetches sorted + buffer_unordered(16) via fetch_subject_properties (policy/fuel semantics unchanged) into HydrationCaches.subject_flakes; the expansion body reads through that cache (also dedups repeat subjects across levels and nested refs). GUARDS: single-ledger only — dataset mode bypasses cache entirely because per-ledger Sids share an encoding space (Sid-keyed cache would be ambiguous); explicit projections keep narrowed per-predicate reads; cached flakes are POST-policy (one policy context per request, so per-request cache is sound)." ;
+    mem:tag "cache" ;
+    mem:tag "hydration" ;
+    mem:tag "jsonld" ;
+    mem:tag "performance" ;
+    mem:tag "select-map" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/hydration.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T16:03:21.503160+00:00"^^xsd:dateTime ;
+    mem:rationale "Anyone extending hydration caching to dataset mode must key by (ledger_alias, Sid); anyone changing policy contexts mid-request would invalidate the post-policy cache assumption." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
