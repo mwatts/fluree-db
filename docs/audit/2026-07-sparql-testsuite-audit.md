@@ -176,22 +176,50 @@ Ordered roughly by breadth of impact:
 | version | 6 | 3 | `VERSION` declaration |
 | rdf11 / expression / grouping / syntax | 0/0/0/0 | 3/1/1/2 | mixed |
 
-RDF-star engine support state (empirical, from harness probes):
+RDF-star engine support state (code-level sub-audit, confirmed):
 
-- The SPARQL parser has no triple-term syntax: 84 of the positive-syntax
-  tests fail at parse; the 26 that pass are the non-star cases. The negative
-  suite passes almost entirely "for free" (a parser without the syntax
-  rejects everything).
-- Turtle-star data files fail to load (`fluree-graph-turtle` has no `<< >>`
-  support), which alone blocks all 41 eval-triple-terms tests.
-- No evidence of a triple-term/quoted-triple representation in
-  `fluree-graph-ir` or the query engine — Phase D is parser + IR + storage
-  term-kind work, sized accordingly (design review required before
-  committing; term-kind changes touch index encodings, which are
-  perf-critical).
+Fluree implements RDF 1.2 via a deliberate **LPG-style edge-annotation /
+reified-edge model**, not first-class triple terms. Much more exists than
+the raw pass counts suggest:
+
+- **SPARQL parser: substantial support.** `<< >>` tokens exist (legacy
+  Fluree history form, `lower/rdf_star.rs`); RDF 1.2 triple-term `<<( )>>`
+  tokens are lexed and parsed (`parse/query/term.rs:690`) but deliberately
+  restricted to object-of-`rdf:reifies`; annotation `{| |}` and `~` lower to
+  `Pattern::EdgeAnnotation`/`AnnotationTarget` (`lower/annotation.rs`).
+- **Engine + storage: end-to-end.** Annotations execute through the normal
+  scan/join/policy pipeline (`execute/where_plan.rs:74`) with an arena
+  fast-path (`annotation_edge_probe.rs`); durable storage is ordinary flakes
+  under 7 reserved `f:reifies*` system predicates, novelty-overlaid and
+  sealed into an on-disk annotation arena. ~519 test fns cover this. No
+  feature flag — always on.
+- **The actual 1.2-suite gaps** (what the 84 positive-syntax + 41 eval
+  failures decompose into):
+  1. `TRIPLE`/`SUBJECT`/`PREDICATE`/`OBJECT`/`isTRIPLE` functions — no
+     tokens, no AST (deliberately deferred);
+  2. bare triple terms as values (outside `rdf:reifies` object position) —
+     conflicts with the no-first-class-triple-terms design choice; needs an
+     explicit decision: implement vs. register as documented divergence;
+  3. RDF-star **Turtle/N-Triples ingest** — `fluree-graph-turtle` has zero
+     star tokens/grammar (`lex/token.rs:47-178`), and `fluree-graph-ir::Term`
+     is `Iri|BlankNode|Literal` only; blocks all 41 eval-triple-terms tests
+     at data load. The JSON-LD `@annotation` path IS fully handled — but in
+     `fluree-db-transact/parse/edge_annotations.rs`, not the generic parser;
+     Turtle-star ingest should map onto that same reifier pipeline;
+  4. SPARQL `CONSTRUCT` projecting annotation metadata →
+     `UnsupportedFeature` (`lower/construct.rs:91-96`) — output
+     serialization only, matching works.
 - Independent mini-features in the 1.2 suite: `VERSION` declaration (3),
-  base-direction literals `@en--ltr` (10), codepoint escapes (6) — these are
-  parser-local and cheap relative to triple terms.
+  base-direction literals `@en--ltr` (10), codepoint escapes (6) —
+  parser-local and cheap.
+
+Related confirmations: UPDATE `Modify` **does** parse `WITH`/`USING`
+(`lower_sparql_update.rs:653`); the graph-management verbs are lexed as
+reserved keywords but have no AST (only 4 ops in `ast/update.rs:20-32`).
+SERVICE is parsed and executed but **Fluree-only** (`fluree:ledger:` /
+`fluree:remote:` — external endpoints explicitly rejected,
+`fluree-db-query/src/service.rs:487-491`), which is the durable rationale
+for the service-suite register.
 
 ### 4.4 Legitimately not-applicable (durable skip register with rationale)
 
@@ -292,10 +320,15 @@ C1 type-promotion + open-world equality + expr builtins cluster;
 C2 remaining eval mismatches (functions/subquery/exists/construct/aggregates);
 C3 property-path multiplicity; C4 dataset strategy (§5.3) + graph category.
 
-**Phase D — RDF-star/1.2** (scope set by the sub-audit): parser syntax first
-(syntax suites green), then Turtle-star loading, then engine term support for
-eval-triple-terms; lang-basedir/version/codepoint-escapes as independent
-mini-features.
+**Phase D — RDF-star/1.2** (scope per the §4.3 sub-audit): Fluree's
+edge-annotation model already covers parse→IR→match→storage. Work items:
+D1 Turtle/TriG-star ingest mapped onto the existing reifier pipeline (the
+same rewrite `edge_annotations.rs` does for JSON-LD `@annotation`);
+D2 triple-term functions (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE);
+D3 decision: bare triple-terms-as-values — implement vs. documented
+divergence register (design conflict with the no-first-class-terms model);
+D4 CONSTRUCT annotation projection; D5 mini-features (VERSION,
+lang-basedir, codepoint escapes).
 
 **Phase E — CI switch-on:** replace `--no-run` with the real run + both-way
 enforcement; docs update (`sparql-compliance.md`, Makefile "CI-safe" claim);
@@ -338,4 +371,7 @@ PRs, each shrinking skip lists in the same change that fixes the engine.
       registers it addresses; bench guardrails per §6).
 - [ ] Decide §5.3 dataset strategy when Phase C4 starts.
 - [ ] File tracking issues per §4.2 cluster (audit A2-style batch).
-- [ ] Deep code-level RDF-star audit before Phase D design.
+- [x] Deep code-level RDF-star audit — done, folded into §4.3 (2026-07-06).
+- [ ] Phase D3 design decision: bare triple-terms-as-values vs. documented
+      divergence (owner: engine team; blocks part of
+      syntax-triple-terms-positive / eval-triple-terms registers).
