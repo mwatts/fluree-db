@@ -289,18 +289,18 @@ impl Worker {
                         .await;
                 }
                 Err(WorkerError::Lagged(msg)) => {
-                    // The state machine left the entry at the queue
-                    // front: this worker staged on a local view
-                    // lagging the replicated head, and the staged
-                    // commit's `t` couldn't advance it. Refresh the
-                    // local cache against the replicated head and
-                    // re-stage the same entry. Unbounded — progress
-                    // resumes as soon as local apply and cache
-                    // reconciliation deliver the newer head, and
-                    // poisoning would fail a valid entry over a
-                    // node-local condition. The staging-attempt
-                    // budget resets: each lag retry starts a fresh
-                    // stage against a newer view.
+                    // The entry is still at the queue front: either
+                    // this worker staged on a local view lagging
+                    // the replicated head, or another ferry for the
+                    // same entry was in flight on the leader.
+                    // Refresh the local cache against the
+                    // replicated head and re-stage the same entry.
+                    // Unbounded — progress resumes as soon as the
+                    // newer head arrives or the competing ferry
+                    // resolves, and poisoning would fail a valid
+                    // entry over a node-local condition. The
+                    // staging-attempt budget resets: each lag retry
+                    // starts a fresh stage against a newer view.
                     attempt = 0;
                     warn!(
                         queue_id = entry.queue_id,
@@ -1565,14 +1565,15 @@ pub enum WorkerError {
     /// `snapshot_front` again.
     #[error("apply stale: {0}")]
     Stale(String),
-    /// The replicated apply rejected the staged commit because its
-    /// `commit_t` doesn't advance the replicated head — this worker
-    /// staged against a local view lagging the replicated state
-    /// (`DesyncReason::HeadNotMonotonic`). The entry is still at
-    /// the queue front: refresh the local view and re-stage the
-    /// same entry, rather than dropping the work ([`Self::Stale`])
-    /// or re-proposing the same staged commit ([`Self::Raft`]).
-    #[error("staged on lagging view: {0}")]
+    /// The publish arrived behind the current state of affairs:
+    /// the staged `commit_t` doesn't advance the replicated head
+    /// (this worker staged against a lagging local view), or
+    /// another ferry for the same entry was already in flight on
+    /// the leader. Either way the entry is still at the queue
+    /// front: refresh the local view and re-stage the same entry,
+    /// rather than dropping the work ([`Self::Stale`]) or
+    /// re-proposing the same staged commit ([`Self::Raft`]).
+    #[error("publish lagged behind current state: {0}")]
     Lagged(String),
 }
 

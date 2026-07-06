@@ -619,9 +619,12 @@ pub enum ApplyStagedCommitError {
     InvariantViolated(String),
     /// A receipt is already stashed under this `queue_id` on the
     /// leader — typically a second follower racing the first under
-    /// an ownership flap. The caller drops its install and lets
-    /// the in-flight ferry land; the entry is the same one either
-    /// way, so the outcome is correct.
+    /// an ownership flap. The in-flight ferry usually decides the
+    /// entry, but its handler can also be dropped between stash and
+    /// propose (TCP reset — the stash guard cleans up and no
+    /// propose happens), so the caller must retry rather than treat
+    /// the entry as decided: if the first ferry landed, the retry
+    /// resolves as a queue-front race and advances.
     #[error("a receipt is already stashed for queue_id {queue_id}")]
     AlreadyStashed { queue_id: u64 },
 }
@@ -1016,10 +1019,15 @@ fn map_propose_error<E: FromRaftWriteError>(
 ///   [`ApplyRejected`](NameServiceError::ApplyRejected). Terminal;
 ///   worker poisons with `PoisonReason::WorkerPanic`.
 /// - [`AlreadyStashed`](ApplyStagedCommitError::AlreadyStashed) →
-///   [`ApplyStale`](NameServiceError::ApplyStale). Another ferry
-///   for this `queue_id` is already in flight on the leader; the
-///   in-flight one will land. Worker drops its install and moves
-///   on — same drop-and-advance recovery as the queue-front race.
+///   [`ApplyLagged`](NameServiceError::ApplyLagged). Another ferry
+///   for this `queue_id` is in flight on the leader, but it isn't
+///   guaranteed to land — its handler can die between stash and
+///   propose, leaving the entry undecided. The worker retries
+///   after a backoff: a landed first ferry surfaces as a
+///   queue-front race on the retry (drop-and-advance), a dead one
+///   gets the entry decided by the retry itself. Drop-and-advance
+///   here instead would mark the possibly-undecided entry as
+///   committed and skip it forever.
 /// - [`NotLeader`](ApplyStagedCommitError::NotLeader),
 ///   [`RaftPropose`](ApplyStagedCommitError::RaftPropose) →
 ///   [`ProposeUnresolved`](NameServiceError::ProposeUnresolved).
@@ -1050,9 +1058,12 @@ fn classify_apply_staged_commit_outcome(
                 "apply_staged_commit invariant violated: {msg}"
             )))
         }
-        Err(ApplyStagedCommitError::AlreadyStashed { queue_id }) => Err(
-            NameServiceError::apply_stale(format!("queue_id {queue_id} already in flight")),
-        ),
+        Err(ApplyStagedCommitError::AlreadyStashed { queue_id }) => {
+            Err(NameServiceError::apply_lagged(format!(
+                "queue_id {queue_id} already has a ferry in flight on the leader; \
+                 retry after it resolves"
+            )))
+        }
         // NotLeader can't distinguish "stale leader lookup, nothing
         // submitted" from "stepped down mid-propose, entry may still
         // commit"; RaftPropose fatals can likewise strike after the
@@ -2612,19 +2623,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_already_stashed_is_apply_stale() {
-        // Duplicate ferry under an ownership flap: the in-flight
-        // first ferry will land, so the second's worker should drop
-        // its install and advance — same recovery shape as the
-        // queue-front race.
+    fn classify_outcome_already_stashed_is_apply_lagged() {
+        // Duplicate ferry under an ownership flap. The in-flight
+        // first ferry is NOT guaranteed to land — its leader-side
+        // handler can die between stash and propose (TCP reset),
+        // leaving the entry undecided. Mapping to ApplyStale
+        // (drop-and-advance) made the surviving owner mark the
+        // still-queued entry committed and skip it forever;
+        // ApplyLagged retries instead, and a landed first ferry
+        // simply surfaces as a queue-front race on the retry.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::AlreadyStashed { queue_id: 7 }),
             7,
         );
         let err = r.expect_err("already_stashed must be Err");
         assert!(
-            matches!(err, NameServiceError::ApplyStale(_)),
-            "expected ApplyStale, got {err:?}"
+            matches!(err, NameServiceError::ApplyLagged(_)),
+            "expected ApplyLagged, got {err:?}"
         );
         assert!(err.to_string().contains("queue_id 7"));
     }

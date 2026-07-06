@@ -56,14 +56,15 @@ pub enum NameServiceError {
     #[error("Apply observed stale state: {0}")]
     ApplyStale(String),
 
-    /// The replicated apply rejected the propose because it was
-    /// built on a view lagging the replicated state — the proposed
-    /// value doesn't advance the current head. The target work is
+    /// The propose arrived behind the current state of affairs —
+    /// it was built on a view lagging the replicated state (its
+    /// value doesn't advance the current head), or another attempt
+    /// at the same work was already in flight. The target work is
     /// still pending, so callers should refresh their local view
     /// and rebuild the propose. Distinguished from
     /// [`Self::ApplyStale`] (the work is gone; drop it) and
     /// [`Self::Storage`] (transient; retry the same propose).
-    #[error("Apply built on lagging view: {0}")]
+    #[error("Apply lagged behind current state: {0}")]
     ApplyLagged(String),
 
     /// A propose toward the replicated log ended without a
