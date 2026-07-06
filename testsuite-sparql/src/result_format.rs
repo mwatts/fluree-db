@@ -309,12 +309,10 @@ fn parse_tsv_term(raw: &str) -> Result<RdfTerm> {
         }
         _ => {}
     }
-    // Bare numeric literals in canonical form (TSV shorthand).
-    if raw
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
-        && raw.chars().any(|c| c.is_ascii_digit())
-    {
+    // Bare numeric literals in canonical form (TSV shorthand):
+    // an optional single leading sign followed by digits only.
+    let unsigned = raw.strip_prefix(['-', '+']).unwrap_or(raw);
+    if !unsigned.is_empty() && unsigned.chars().all(|c| c.is_ascii_digit()) {
         return Ok(RdfTerm::Literal {
             value: raw.to_string(),
             datatype: Some(format!("{XSD}integer")),

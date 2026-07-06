@@ -6,7 +6,7 @@
 # Model: `cargo test` runs EVERY registered W3C suite (no #[ignore]). A suite
 # is green when each test passes or appears in tests/registers/mod.rs, and
 # check_testsuite fails on unexpected failures AND stale register entries.
-# CI runs exactly `make ci`.
+# CI invokes `cargo test` directly (identical to `make ci`).
 
 CARGO := cargo
 RDF_TESTS := rdf-tests

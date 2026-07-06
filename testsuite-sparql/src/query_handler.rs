@@ -76,6 +76,23 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
         .clone()
         .context("UpdateEvaluationTest missing ut:request (update file URL)")?;
 
+    // Guard against a mis-parsed mf:result degrading to a trivially
+    // satisfiable "expected empty store": the result node must have exposed
+    // at least one recognized predicate (ut:data / ut:graphData / ut:result).
+    // A deliberate empty-store expectation always carries `ut:result
+    // ut:success` in the W3C manifests.
+    if test.result_data.is_none()
+        && test.result_graph_data.is_empty()
+        && !test.result_success
+        && test.result.is_none()
+    {
+        bail!(
+            "UpdateEvaluationTest mf:result parsed to an empty expectation \
+             (no ut:data, ut:graphData, or ut:result) — unrecognized result \
+             shape?\nTest: {test_id}"
+        );
+    }
+
     let descriptor = TestDescriptor::UpdateEval {
         test_id,
         request_url,
@@ -188,6 +205,10 @@ async fn fetch_state(fluree: &Fluree) -> Result<LedgerState> {
 /// TriG requires directives at document scope, so when wrapping a Turtle
 /// file's content in a `GRAPH { }` block its `@prefix`/`@base` lines must be
 /// hoisted out. W3C test data declares directives one per line.
+///
+/// ASSUMPTION: line-based detection. A multi-line string literal whose
+/// continuation line happens to start with `prefix`/`base` would be
+/// mis-hoisted; no W3C test data has that shape.
 fn split_turtle_directives(content: &str) -> (String, String) {
     let mut directives = String::new();
     let mut body = String::new();
@@ -283,12 +304,19 @@ async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<
     let SparqlResults::Solutions { solutions, .. } = results else {
         bail!("Graph enumeration returned non-SELECT results");
     };
+    // The engine currently binds `?g` as a plain string literal, not an IRI
+    // term, and also exposes the default graph under the ledger alias (both
+    // registered engine gaps — audit §8). Accept both term kinds so this
+    // enumeration keeps working when the engine is fixed, and exclude the
+    // alias-named default graph: only real named graphs count.
     Ok(solutions
         .into_iter()
         .filter_map(|sol| match sol.get("g") {
             Some(RdfTerm::Iri(iri)) => Some(iri.clone()),
+            Some(RdfTerm::Literal { value, .. }) => Some(value.clone()),
             _ => None,
         })
+        .filter(|name| name != TEST_LEDGER)
         .collect())
 }
 

@@ -35,6 +35,10 @@ pub struct Test {
     /// Expected named-graph state after an update: (graph_name, data_url)
     /// (`ut:graphData` on mf:result).
     pub result_graph_data: Vec<(String, String)>,
+    /// Whether the update result carried an explicit `ut:result` marker
+    /// (e.g. `ut:success`) — distinguishes "expected: empty store" declared
+    /// on purpose from an unrecognized/mis-parsed `mf:result` shape.
+    pub result_success: bool,
 }
 
 /// Iterator over W3C test cases, loading manifests lazily.
@@ -217,14 +221,15 @@ impl TestManifest {
         // blank node with ut:data / ut:graphData (update eval: expected
         // post-update graph store state).
         let result_term = self.object_for(&subject, mf::RESULT);
-        let (result, result_data, result_graph_data) = match result_term {
-            Some(term) if term.is_iri() => (term_to_string(term), None, vec![]),
+        let (result, result_data, result_graph_data, result_success) = match result_term {
+            Some(term) if term.is_iri() => (term_to_string(term), None, vec![], false),
             Some(term) if term.is_blank() => {
                 let result_data = self.object_for(term, ut::DATA).and_then(term_to_string);
                 let result_graph_data = self.get_graph_data(term, ut::GRAPH_DATA);
-                (None, result_data, result_graph_data)
+                let result_success = self.object_for(term, ut::RESULT).is_some();
+                (None, result_data, result_graph_data, result_success)
             }
-            _ => (None, None, vec![]),
+            _ => (None, None, vec![], false),
         };
 
         Ok(Some(Test {
@@ -240,6 +245,7 @@ impl TestManifest {
             update_request,
             result_data,
             result_graph_data,
+            result_success,
         }))
     }
 
