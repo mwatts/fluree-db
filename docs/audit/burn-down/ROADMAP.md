@@ -336,6 +336,25 @@ Combined: ≈−80 register entries once merged (integration re-baseline at merg
 time is authoritative). Merge order: PR #1437 → PR-H1 (owns the comment batch)
 → siblings in any order (trivial register-file textual conflicts against H1).
 
+**Wave 1 — implementation status (2026-07-07):** all four PRs implemented,
+review-accepted, on local branches (merge after the Wave-0 set):
+
+| Branch | Scope | Net register delta | Notes |
+|---|---|---|---|
+| `burndown/pr-2` | V3-V6 validation passes + 1.2 checks (9 commits, walkers written from scratch) | −28 | V5 forced into the parser (group-simplification AST ambiguity); D-4 fallout: `GROUP BY (expr)`+reprojection (the #1362 shape = W3C agg08) now rejected — alias the key; SPARQL grouped-list extension (= group06) removed from SPARQL, kept on JSON-LD with parity pins |
+| `burndown/pr-3` | V1 dot structure, V2 FILTER constraint, **API seam fix** (error diagnostics authoritative even when recovery yields an AST), EOF/trailing-token assertion (D-10a, #1438 guard, verified end-to-end) | −15 | unmasked and fixed 5 "green-by-recovery" tests; systemic caveat: every future reject-more PR will unmask more |
+| `burndown/pr-u1` | GRAPH in DELETE WHERE via Modify lowering; bnode-in-DELETE rejection (validator+lowering+JSON-LD surface, `_:fdb-` exempt) | −19 | JSON-LD delete-template rejection is a surface behavior change — in the migration note |
+| `burndown/pr-w2a` | RDF 1.2 reifier forms → `Pattern::EdgeAnnotation`; deferred positions lower to clean `not_implemented` (D-1) | −61 | STACKED ON `burndown/pr-1`; includes the 3 SPARQL12_VERSION entries |
+
+Combined Waves 0+1 ≈ −200 register entries (integration re-baseline at merge
+time is authoritative; expect ~340 remaining). Cross-PR coordination for
+mergers: `syntax-order-07` (pr-1 ∩ pr-3, byte-identical hunk) and
+`syntax-update-anonreifier-02` (pr-2 ∩ pr-3, two independent defenses) are
+double-claimed — whichever lands second drops its stale removal hunk (the
+both-way CI gate enforces this mechanically). Full merge order:
+PR #1437 → pr-h1 → {pr-1, pr-l1, pr-l2, pr-x1, pr-pp, pr-2, pr-3, pr-u1} in
+any order → pr-w2a (needs pr-1).
+
 **Post-implementation corrections to this roadmap:**
 
 - **`basic#list-1..4` do NOT green via PR-1** (contra §2's PR-1 row): Turtle
