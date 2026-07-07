@@ -287,8 +287,20 @@ impl super::Parser<'_> {
                 }
             }
         } else {
-            // Not a valid order condition
-            return None;
+            // Bare Constraint form: `OrderCondition ::= … | ( Constraint | Var )`
+            // where `Constraint ::= BrackettedExpression | BuiltInCall |
+            // FunctionCall` — so `ORDER BY str(?o)` (no parentheses) is valid.
+            // Mirrors `parse_group_condition`'s bare-call branch: the call is
+            // self-delimiting, and a non-expression token (LIMIT / OFFSET /
+            // VALUES, `}`, EOF, …) ends the condition loop via restore.
+            let pos = self.stream.position();
+            match parse_expression(self.stream) {
+                Ok(e) => OrderExpr::Expr(e),
+                Err(_) => {
+                    self.stream.restore(pos);
+                    return None;
+                }
+            }
         };
 
         let span = start.union(self.stream.previous_span());

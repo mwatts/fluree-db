@@ -533,9 +533,18 @@ impl super::Parser<'_> {
         let start = self.stream.current_span();
         self.stream.advance(); // consume VALUES
 
+        // Row shape follows the VAR-LIST shape, not the variable count:
+        //   InlineDataOneVar ::= Var '{' DataBlockValue* '}'
+        //   InlineDataFull   ::= ( NIL | '(' Var* ')' ) '{' ( '(' DataBlockValue* ')' | NIL )* '}'
+        // A parenthesized single-var list (`VALUES (?x) { (:b) }`) therefore
+        // takes parenthesized rows (W3C bindings#values7), and a bare var
+        // never does.
+        let parenthesized_vars =
+            self.stream.check(&TokenKind::LParen) || self.stream.check(&TokenKind::Nil);
+
         // Parse variable list
         let vars = self.parse_values_variables()?;
-        let multi_var = vars.len() > 1;
+        let multi_var = parenthesized_vars;
 
         // Expect opening brace for data block
         if !self.stream.match_token(&TokenKind::LBrace) {
@@ -746,6 +755,16 @@ impl super::Parser<'_> {
         // stops at the first non-modifier token (here, the closing `}`).
         let modifiers = self.parse_solution_modifiers();
 
+        // Optional trailing VALUES clause:
+        // `SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause`
+        // (same position as a top-level query's post-query VALUES;
+        // W3C bindings#inline2).
+        let values = if self.stream.check_keyword(TokenKind::KwValues) {
+            self.parse_values_pattern().map(Box::new)
+        } else {
+            None
+        };
+
         // Expect closing brace for the subquery
         if !self.stream.match_token(&TokenKind::RBrace) {
             self.stream
@@ -760,6 +779,7 @@ impl super::Parser<'_> {
             variables,
             pattern: Box::new(pattern),
             modifiers,
+            values,
             span,
         };
 

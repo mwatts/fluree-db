@@ -2722,3 +2722,70 @@ fn test_v2_filter_unparenthesized_operator_expression_rejected() {
         "FILTER requires a bracketted expression",
     );
 }
+
+// =========================================================================
+// Accepts-valid gaps unmasked by making parse errors authoritative:
+// bare ORDER BY constraints, VALUES row shape, sub-select VALUES clause
+// =========================================================================
+
+#[test]
+fn test_order_by_bare_builtin_and_function_call() {
+    // OrderCondition ::= ( 'ASC' | 'DESC' ) BrackettedExpression | ( Constraint | Var )
+    // W3C sort#dawg-sort-builtin / dawg-sort-function / syntax-order-06.
+    assert_parses("SELECT ?s WHERE { ?s ?p ?o . } ORDER BY str(?o)");
+    assert_parses(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT ?s WHERE { ?s ?p ?o . } ORDER BY xsd:integer(?o)",
+    );
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/ns#> \
+         SELECT * { ?s ?p ?o } ORDER BY DESC(?o+57) :func2(?o) ASC(?s)",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let order_by = q.modifiers.order_by.as_ref().expect("ORDER BY clause");
+        assert_eq!(order_by.conditions.len(), 3, "all three conditions kept");
+    } else {
+        panic!("expected SELECT");
+    }
+}
+
+#[test]
+fn test_values_parenthesized_single_var_takes_parenthesized_rows() {
+    // InlineDataFull row shape follows the var-LIST shape, not the count
+    // (W3C bindings#values7 / inline2).
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/> \
+         SELECT * { ?s ?p ?o } VALUES (?o) { (:b) (UNDEF) }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let values = q.values.as_ref().expect("post-query VALUES");
+        if let GraphPattern::Values { vars, data, .. } = values.as_ref() {
+            assert_eq!(vars.len(), 1);
+            assert_eq!(data.len(), 2);
+            assert!(data[0][0].is_some());
+            assert!(data[1][0].is_none(), "UNDEF row");
+        } else {
+            panic!("expected Values pattern");
+        }
+    }
+    // A bare (unparenthesized) var list still takes bare values.
+    assert_parses("PREFIX : <http://example.org/> SELECT * {{ ?s ?p ?o }} VALUES ?o { :b :c }");
+}
+
+#[test]
+fn test_subselect_trailing_values_clause() {
+    // SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause
+    // (W3C bindings#inline2).
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/> \
+         SELECT ?s ?o { { SELECT * WHERE { ?s ?p ?o . } VALUES (?o) { (:b) } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
+            let values = query.values.as_ref().expect("subselect VALUES clause");
+            assert!(matches!(values.as_ref(), GraphPattern::Values { .. }));
+        } else {
+            panic!("expected SubSelect, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
