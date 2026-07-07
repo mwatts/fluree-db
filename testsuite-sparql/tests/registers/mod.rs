@@ -136,6 +136,9 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
 
 pub const SPARQL11_BINDINGS: &[&str] = &[
     // result mismatch (1)
+    // #1442 fixed the ?g term kind / default-graph leak halves; the remaining
+    // blocker is empty-named-graph modeling (expected row g=<data-empty.ttl>
+    // — Fluree does not register empty named graphs; decision D-6)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph",
 ];
 
@@ -147,8 +150,12 @@ pub const SPARQL11_CONSTRUCT: &[&str] = &[
 ];
 
 pub const SPARQL11_EXISTS: &[&str] = &[
-    // result mismatch (2)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/exists/manifest#exists-graph-variable",
+    // result mismatch (1)
+    // (exists-graph-variable was greened by #1443: EncodedSid/EncodedLit `?g`
+    // extraction + per-row EXISTS for outer-correlated GRAPH vars)
+    // exists03: constant-GRAPH-IRI base expansion misses the registry key +
+    // EXISTS active-graph inheritance — second lander (PR-G1 landed /
+    // PR-BASE pending)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/exists/manifest#exists03",
 ];
 
@@ -173,20 +180,17 @@ pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/project-expression/manifest#projexp05",
 ];
 
-pub const SPARQL11_SUBQUERY: &[&str] = &[
-    // result mismatch (2)
-    // (subquery12 was greened by main's sub-SELECT set-operand fix, PR #1436
-    // — its "mismatch" was a bare-{SELECT} misparse executing through error
-    // recovery)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery04",
-];
+// (subquery12 was greened by main's sub-SELECT set-operand fix, PR #1436 —
+// its "mismatch" was a bare-{SELECT} misparse executing through error
+// recovery; subquery02/subquery04 were greened by #1442 — GRAPH-var
+// correlation into sub-SELECTs + no default-graph enumeration)
+pub const SPARQL11_SUBQUERY: &[&str] = &[];
 
 // Largest clusters: XSD type-promotion comparisons, open-world equality,
-// expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
-// binding typed as literal — audit §4.2.
+// expression builtins, FROM/FROM NAMED dataset construction — audit §4.2.
+// (the "GRAPH ?g binding typed as literal" cluster was fixed by #1442/#1443)
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (113)
+    // result mismatch (102)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
@@ -236,6 +240,8 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-2-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
+    // eq-graph-1/2/4: remaining blocker is FILTER `=` value-equality (D5) —
+    // second lander (PR-G1 landed / PR-X2 pending)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
@@ -246,18 +252,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#subtract-numbers-cast",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#unminus-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#unplus-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-03",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-04",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-09",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-10b",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-empty",
+    // (the rest of the /graph/ GRAPH-operator cluster was greened by
+    // #1442/#1443 — ?g as IRI term, no default-graph enumeration under
+    // unbound GRAPH ?g, graph-var join semantics. graph-exist remains:
+    // relative-IRI/BASE resolution of the constant graph name, owner PR-BASE)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-exist",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-optional",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-variable-join",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
@@ -702,6 +701,9 @@ pub const SPARQL12_VERSION: &[&str] = &[
 // multiplicity (`p1/p2` path counting vs `*`/`+` distinct nodes) — plus the
 // zero-variable `SELECT *` projection over a both-bound path (pp36).
 // Audit §4.2.7 (hot-operator semantics; fix must preserve `*`/`+` fast path).
+// pp34/pp35 are graph-cluster, not path-cardinality: constant `GRAPH <rel>`
+// base expansion misses the exact-key registry lookup — second lander
+// (PR-G1 landed / PR-BASE pending).
 pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp16",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp34",
