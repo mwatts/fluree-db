@@ -131,6 +131,13 @@ pub enum DiagCode {
     VariableInGroundData,
 
     // =========================================================================
+    // Semantic validation (V001-V099) - SPARQL spec semantic rules
+    // =========================================================================
+    /// Blank node label reused across basic graph patterns (SPARQL §19.6)
+    #[serde(rename = "V001")]
+    BlankNodeLabelCrossScope,
+
+    // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
     /// Feature lowering not yet implemented in Rust
@@ -177,6 +184,8 @@ impl DiagCode {
             Self::UnsupportedSelectReduced => "F007",
             Self::UnsupportedDistinctAggregate => "F008",
             Self::VariableInGroundData => "F009",
+            // Semantic validation
+            Self::BlankNodeLabelCrossScope => "V001",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

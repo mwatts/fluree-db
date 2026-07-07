@@ -28,6 +28,8 @@
 //! }
 //! ```
 
+mod bnode_scope;
+
 use crate::ast::path::PropertyPath;
 use crate::ast::pattern::{GraphPattern, TriplePattern};
 use crate::ast::query::{
@@ -100,22 +102,30 @@ impl<'a> Validator<'a> {
     }
 
     fn validate_select(&mut self, query: &SelectQuery) {
-        self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_query_where(&query.where_clause.pattern);
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
-        self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_query_where(&query.where_clause.pattern);
         // Template triples don't need ground validation (they use WHERE variables)
     }
 
     fn validate_ask(&mut self, query: &AskQuery) {
-        self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_query_where(&query.where_clause.pattern);
     }
 
     fn validate_describe(&mut self, query: &DescribeQuery) {
         if let Some(where_clause) = &query.where_clause {
-            self.validate_graph_pattern(&where_clause.pattern);
+            self.validate_query_where(&where_clause.pattern);
         }
+    }
+
+    /// Shared validation for a query form's WHERE pattern: the capability
+    /// walk plus the query-only semantic passes (blank-node label scope —
+    /// update operations have their own blank-node rules and are exempt).
+    fn validate_query_where(&mut self, pattern: &GraphPattern) {
+        self.validate_graph_pattern(pattern);
+        bnode_scope::check_blank_node_scopes(pattern, &mut self.diagnostics);
     }
 
     fn validate_update(&mut self, op: &UpdateOperation) {
@@ -665,6 +675,83 @@ mod tests {
         assert!(
             diags.iter().all(|d| !d.is_error()),
             "Expected no errors: {diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // V3 — blank-node label scope tests (SPARQL 1.1 §19.6)
+    // =========================================================================
+
+    fn has_code(diags: &[Diagnostic], code: DiagCode) -> bool {
+        diags.iter().any(|d| d.code == code && d.is_error())
+    }
+
+    #[test]
+    fn test_bnode_scope_same_bgp_valid() {
+        // Same label twice in one basic graph pattern is fine.
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v . _:a ex:q 1 }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnode_scope_across_filter_valid() {
+        // FILTER does not end a basic graph pattern (§18.2.2.5).
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v FILTER(?v > 1) _:a ex:q 1 }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnode_scope_across_optional_rejected() {
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v OPTIONAL { _:a ex:q 1 } }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_across_nested_group_rejected() {
+        let diags = validate_query("SELECT * WHERE { _:a ?p ?v . { _:a ?q 1 } }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_across_union_rejected() {
+        let diags =
+            validate_query("SELECT * WHERE { { _:a ex:p ?v } UNION { _:a ex:q 1 } }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_boundary_breaks_bgp_rejected() {
+        // Reuse in the SAME group but across a GRAPH boundary: the GRAPH
+        // pattern ends the first BGP, so the second `_:a` is a new BGP.
+        let diags = validate_query(
+            "SELECT * WHERE { _:a ?p ?v . GRAPH ?g { ?s ?p ?v } _:a ?q 1 }",
+        );
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_distinct_labels_valid() {
+        let diags =
+            validate_query("SELECT * WHERE { _:a ex:p ?v OPTIONAL { _:b ex:q 1 } }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnode_scope_anon_bnodes_valid() {
+        // `[]` anonymous blank nodes have no label and are never flagged.
+        let diags = validate_query("SELECT * WHERE { [] ex:p ?v OPTIONAL { [] ex:q 1 } }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
         );
     }
 
