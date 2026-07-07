@@ -337,7 +337,7 @@ fn for_each_subject_run(
 ) {
     let n = batch.row_count;
     for_each_wanted_run(&batch.s_id, 0, n, wanted, |target, i| {
-        visit(target, i, batch)
+        visit(target, i, batch);
     });
 }
 

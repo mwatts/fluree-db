@@ -476,7 +476,7 @@ fn leaflet_scan_plan(
 /// [`AggState`] over a POST overlay cursor that merges uncommitted novelty and
 /// honors `to_t`. Used when an overlay carries novelty or `to_t < max_t`, where
 /// the leaflet-metadata scan would be stale.
-fn scan_predicate_scalar_agg_overlay(
+pub(crate) fn scan_predicate_scalar_agg_overlay(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,

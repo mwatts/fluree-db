@@ -47,13 +47,20 @@
 //! plus one null-group row (`subjects − subj(P)` — the left join gives
 //! property-less subjects a single unbound-key row).
 //!
-//! The fold requires the strict metadata-lane gate ([`fast_path_store`]:
-//! single-ledger, root/no policy, no overlay, at HEAD). The whole-graph
-//! anchor additionally declines when the graph carries predicates the
-//! variable-predicate scan hides (`f:reifies*` anywhere, the `f:` namespace
-//! in the default graph) — those facts are invisible to `?n ?p ?o` but not
-//! to the SPOT directories; a class anchor reads only class stats, so it is
-//! immune.
+//! The directory-only [`compute_clean`] lane requires the strict metadata-lane
+//! gate ([`fast_path_store`]: single-ledger, root/no policy, no overlay, at
+//! HEAD). When uncommitted novelty is present the [`compute_overlay`] lane runs
+//! instead: it keeps the O(directory) base counts and reconciles them against a
+//! bounded O(novelty) pass — the subject universe via base lead-groups ± the
+//! overlay's net subject delta, and each predicate-scoped fold via an
+//! overlay-merging cursor (linear in the predicate's rows, not the graph's).
+//! The overlay lane covers the whole-graph anchor's scalar folds; class anchors
+//! and histograms under novelty still decline to the general pipeline.
+//!
+//! Both lanes decline when the graph carries predicates the variable-predicate
+//! scan hides (`f:reifies*` anywhere, the `f:` namespace in the default graph)
+//! — those facts are invisible to `?n ?p ?o` but not to the SPOT directories;
+//! a class anchor reads only class stats, so it is immune.
 
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
@@ -362,127 +369,512 @@ pub(crate) fn whole_graph_scalar_aggs_operator(
     fallback: Option<BoxedOperator>,
 ) -> FastPathOperator {
     let schema: Arc<[VarId]> = Arc::from(plan.schema.clone().into_boxed_slice());
+    let closure_schema = schema.clone();
     FastPathOperator::with_schema(
-        schema.clone(),
+        schema,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-
-            // Subject universe.
-            let subjects = match &plan.anchor {
-                Anchor::AllSubjects => {
-                    if graph_has_scan_hidden_predicates(ctx, store)? {
-                        return Ok(None);
-                    }
-                    // Distinct subjects from SPOT leaflet lead groups
-                    // (SPOT key layout: s_id(8) + …).
-                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?
-                }
-                Anchor::Class(class_sid) => {
-                    let Some(class) = class_stats(ctx, class_sid) else {
-                        return Ok(None);
-                    };
-                    class.count
-                }
-            };
-            if subjects == 0 {
-                // Empty universe: leave empty-input aggregate identities
-                // (COUNT 0 / unbound MIN) to the general pipeline.
-                return Ok(None);
+            // Clean HEAD read: every fold comes straight from index directories.
+            if let Some(store) = fast_path_store(ctx) {
+                return compute_clean(ctx, store, &plan, &closure_schema);
             }
-
-            let accessor = match &plan.accessor {
-                Some(pred) => {
-                    let pred_sid = normalize_pred_sid(store, pred)?;
-                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                        // Absent predicate: all-null accessor rows; the
-                        // fallback computes the null-heavy identities.
-                        return Ok(None);
-                    };
-                    let rows = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
-                    // Class anchor: property-derived folds are predicate-
-                    // scoped, so every P-bearing subject must be an instance
-                    // of the class. Equality of the per-(class, property)
-                    // flake count with the predicate's total row count proves
-                    // exactly that (both current-state-exact at HEAD).
-                    if let Anchor::Class(class_sid) = &plan.anchor {
-                        let Some(class) = class_stats(ctx, class_sid) else {
-                            return Ok(None);
-                        };
-                        let class_prop_rows: u64 = class
-                            .properties
-                            .iter()
-                            .find(|p| p.property_sid == pred_sid)
-                            .map(|p| p.datatypes.iter().map(|&(_, c)| c).sum())
-                            .unwrap_or(0);
-                        if class_prop_rows != rows {
-                            return Ok(None);
-                        }
-                    }
-                    let Some(with_prop) =
-                        count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id)?
-                    else {
-                        return Ok(None);
-                    };
-                    Some(AccessorCounts {
-                        pred: pred.clone(),
-                        p_id,
-                        rows,
-                        subjects_with: with_prop,
-                    })
-                }
-                None => None,
-            };
-
-            let batch = match &plan.kind {
-                FoldKind::Scalars(tasks) => {
-                    let mut row = Vec::with_capacity(tasks.len());
-                    for task in tasks {
-                        let Some(binding) = compute_task(
-                            *task,
-                            store,
-                            ctx.binary_g_id,
-                            subjects,
-                            accessor.as_ref(),
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        row.push(binding);
-                    }
-                    Batch::single_row(schema.clone(), row)
-                        .map_err(|e| QueryError::execution(format!("whole-graph agg batch: {e}")))?
-                }
-                FoldKind::Histogram {
-                    prop_col,
-                    count_col,
-                    filter,
-                } => {
-                    let Some(a) = accessor.as_ref() else {
-                        return Ok(None);
-                    };
-                    let Some(b) = compute_histogram(
-                        ctx,
-                        store,
-                        a,
-                        subjects,
-                        &schema,
-                        *prop_col,
-                        *count_col,
-                        filter.as_ref(),
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    b
-                }
-            };
-            Ok(Some(batch))
+            // Novelty present: reconcile the directory counts against a bounded
+            // overlay pass rather than declining to a whole-graph flake scan.
+            if overlay_lane_eligible(ctx) {
+                let store = ctx
+                    .binary_store
+                    .as_ref()
+                    .expect("overlay lane eligibility guarantees a binary store");
+                return compute_overlay(ctx, store, &plan, &closure_schema);
+            }
+            Ok(None)
         },
         fallback,
         "whole-graph scalar aggregates",
     )
+}
+
+/// Clean-HEAD fold: subject universe and every aggregate answered from index
+/// directories / predicate-scoped metadata scans (no overlay merge).
+fn compute_clean(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    plan: &WholeGraphAggPlan,
+    schema: &Arc<[VarId]>,
+) -> Result<Option<Batch>> {
+    // Subject universe.
+    let subjects = match &plan.anchor {
+        Anchor::AllSubjects => {
+            if graph_has_scan_hidden_predicates(ctx, store)? {
+                return Ok(None);
+            }
+            // Distinct subjects from SPOT leaflet lead groups
+            // (SPOT key layout: s_id(8) + …).
+            count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?
+        }
+        Anchor::Class(class_sid) => {
+            let Some(class) = class_stats(ctx, class_sid) else {
+                return Ok(None);
+            };
+            class.count
+        }
+    };
+    if subjects == 0 {
+        // Empty universe: leave empty-input aggregate identities
+        // (COUNT 0 / unbound MIN) to the general pipeline.
+        return Ok(None);
+    }
+
+    let accessor = match &plan.accessor {
+        Some(pred) => {
+            let pred_sid = normalize_pred_sid(store, pred)?;
+            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                // Absent predicate: all-null accessor rows; the
+                // fallback computes the null-heavy identities.
+                return Ok(None);
+            };
+            let rows = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
+            // Class anchor: property-derived folds are predicate-
+            // scoped, so every P-bearing subject must be an instance
+            // of the class. Equality of the per-(class, property)
+            // flake count with the predicate's total row count proves
+            // exactly that (both current-state-exact at HEAD).
+            if let Anchor::Class(class_sid) = &plan.anchor {
+                let Some(class) = class_stats(ctx, class_sid) else {
+                    return Ok(None);
+                };
+                let class_prop_rows: u64 = class
+                    .properties
+                    .iter()
+                    .find(|p| p.property_sid == pred_sid)
+                    .map(|p| p.datatypes.iter().map(|&(_, c)| c).sum())
+                    .unwrap_or(0);
+                if class_prop_rows != rows {
+                    return Ok(None);
+                }
+            }
+            let Some(with_prop) =
+                count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id)?
+            else {
+                return Ok(None);
+            };
+            Some(AccessorCounts {
+                pred: pred.clone(),
+                p_id,
+                rows,
+                subjects_with: with_prop,
+            })
+        }
+        None => None,
+    };
+
+    let batch = match &plan.kind {
+        FoldKind::Scalars(tasks) => {
+            let mut row = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                let Some(binding) =
+                    compute_task(*task, store, ctx.binary_g_id, subjects, accessor.as_ref())?
+                else {
+                    return Ok(None);
+                };
+                row.push(binding);
+            }
+            Batch::single_row(schema.clone(), row)
+                .map_err(|e| QueryError::execution(format!("whole-graph agg batch: {e}")))?
+        }
+        FoldKind::Histogram {
+            prop_col,
+            count_col,
+            filter,
+        } => {
+            let Some(a) = accessor.as_ref() else {
+                return Ok(None);
+            };
+            let Some(b) = compute_histogram(
+                ctx,
+                store,
+                a,
+                subjects,
+                schema,
+                *prop_col,
+                *count_col,
+                filter.as_ref(),
+            )?
+            else {
+                return Ok(None);
+            };
+            b
+        }
+    };
+    Ok(Some(batch))
+}
+
+// ===========================================================================
+// Overlay lane
+// ===========================================================================
+//
+// The clean lane reads only index directories, which are exact at the persisted
+// index `max_t`. Once uncommitted novelty is present, those directory counts go
+// stale and the whole operator would otherwise decline to a full-graph flake
+// scan (linear in graph size — catastrophic at scale for a single count). The
+// overlay lane keeps the O(directory) base counts and reconciles them with a
+// bounded O(novelty) pass: the subject universe via base lead-groups ± the
+// overlay's net subject delta, and every predicate-scoped fold via an
+// overlay-merging cursor (linear in the *predicate's* rows, not the graph's).
+
+/// Whether the overlay-aware lane may run: a single-ledger, policy-cleared read
+/// carrying novelty (the exact condition that makes the directory-only
+/// [`compute_clean`] lane stale). Pure historical reads (`to_t < max_t` with no
+/// novelty) are out of scope and fall through to the general pipeline.
+fn overlay_lane_eligible(ctx: &crate::context::ExecutionContext<'_>) -> bool {
+    ctx.binary_store.is_some()
+        && !ctx.is_multi_ledger()
+        && ctx.from_t.is_none()
+        && ctx.allow_unfiltered()
+        && crate::fast_path_common::overlay_has_novelty(ctx)
+}
+
+/// Overlay-aware fold: base directory counts reconciled with a bounded pass over
+/// the novelty overlay. Only the scalar shape over the whole-graph anchor is
+/// reconciled today; class anchors and histograms decline to the general
+/// pipeline.
+fn compute_overlay(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    plan: &WholeGraphAggPlan,
+    schema: &Arc<[VarId]>,
+) -> Result<Option<Batch>> {
+    let FoldKind::Scalars(tasks) = &plan.kind else {
+        return Ok(None); // histograms are not yet overlay-aware
+    };
+    // Class-anchored universes need overlay-aware class membership; only the
+    // whole-graph anchor is reconciled today.
+    let Anchor::AllSubjects = &plan.anchor else {
+        return Ok(None);
+    };
+
+    let Some(subjects) = overlay_all_subjects_count(ctx, store)? else {
+        return Ok(None);
+    };
+    if subjects == 0 {
+        return Ok(None);
+    }
+
+    let accessor = match &plan.accessor {
+        Some(pred) => match overlay_accessor_counts(ctx, store, pred)? {
+            Some(a) => Some(a),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+
+    let mut row = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let Some(binding) = compute_task_overlay(*task, ctx, store, subjects, accessor.as_ref())?
+        else {
+            return Ok(None);
+        };
+        row.push(binding);
+    }
+    let batch = Batch::single_row(schema.clone(), row)
+        .map_err(|e| QueryError::execution(format!("whole-graph agg overlay batch: {e}")))?;
+    Ok(Some(batch))
+}
+
+/// Distinct pipeline-visible subjects at `to_t`: the base SPOT lead-group count
+/// (exact at `max_t`) plus the net subject delta from the novelty overlay.
+///
+/// Declines (`Ok(None)`) when the fold cannot stay exact: scan-hidden predicates
+/// in the base or the overlay (invisible to `?n ?p ?o`), an overlay flake that
+/// fails ID translation, or an ambiguous retraction-only subject that may empty
+/// a base subject (a possible node deletion — the general pipeline counts it
+/// exactly).
+fn overlay_all_subjects_count(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+) -> Result<Option<u64>> {
+    use fluree_db_binary_index::read::types::{resolve_overlay_ops, sort_overlay_ops, OverlayOp};
+    use std::collections::HashMap;
+
+    if graph_has_scan_hidden_predicates(ctx, store)? {
+        return Ok(None);
+    }
+    let g_id = ctx.binary_g_id;
+    let base = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot, 8)?;
+
+    // Translate every novelty flake (all predicates) to V3 id space.
+    let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
+        Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
+    });
+    let mut ephemeral_preds: HashMap<Sid, u32> = HashMap::new();
+    let mut next_ep = store.predicate_count();
+    let mut ops: Vec<OverlayOp> = Vec::new();
+    let mut declined = false;
+    ctx.overlay().for_each_overlay_flake(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(RunSortOrder::Spot),
+        None,
+        None,
+        true,
+        ctx.to_t,
+        &mut |flake| {
+            if declined {
+                return;
+            }
+            // Mirror the pipeline's `?n ?p ?o` visibility: `f:reifies*` anywhere
+            // and the `f:` namespace in the default graph are invisible to the
+            // scan but present in SPOT — their subjects must not be counted.
+            if fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+                || (g_id == 0 && flake.p.namespace_code == fluree_vocab::namespaces::FLUREE_DB)
+            {
+                declined = true;
+                return;
+            }
+            match crate::binary_scan::translate_one_flake_v3_pub(
+                flake,
+                store,
+                Some(&dn),
+                ctx.runtime_small_dicts,
+                &mut ephemeral_preds,
+                &mut next_ep,
+                g_id,
+            ) {
+                Ok(op) => ops.push(op),
+                Err(_) => declined = true,
+            }
+        },
+    );
+    if declined {
+        return Ok(None);
+    }
+    if ops.is_empty() {
+        return Ok(Some(base));
+    }
+
+    sort_overlay_ops(&mut ops, RunSortOrder::Spot);
+    resolve_overlay_ops(&mut ops);
+
+    // Per touched subject: does a surviving assertion remain after resolution?
+    let mut has_assert: HashMap<u64, bool> = HashMap::new();
+    for op in &ops {
+        let e = has_assert.entry(op.s_id).or_insert(false);
+        *e |= op.op;
+    }
+
+    // Base-row existence for every touched subject (one galloping SPOT pass at
+    // the base index t). Novelty-only subjects simply have no base entry.
+    let mut touched: Vec<u64> = has_assert.keys().copied().collect();
+    touched.sort_unstable();
+    let base_rows = fluree_db_binary_index::batched_lookup_subject_properties(
+        store,
+        g_id,
+        &touched,
+        store.max_t(),
+    )
+    .map_err(|e| QueryError::Internal(format!("subject-existence lookup: {e}")))?;
+
+    let mut delta: i64 = 0;
+    for (s_id, assert) in &has_assert {
+        let base_exists = base_rows.get(s_id).is_some_and(|v| !v.is_empty());
+        if *assert {
+            // A surviving assertion means the subject exists after the overlay:
+            // +1 if it is new to the base, 0 if it was already present.
+            delta += 1 - base_exists as i64;
+        } else if base_exists {
+            // Retraction-only over an existing subject: whether it survives
+            // depends on which base rows were retracted (an `o_i`-precise
+            // question). Decline this rare (deletion) shape to the exact
+            // pipeline rather than risk a miscount.
+            return Ok(None);
+        }
+        // else: retraction-only over a subject with no base rows ⇒ Δ 0.
+    }
+
+    Ok(Some((base as i64 + delta).max(0) as u64))
+}
+
+/// Overlay-merged accessor predicate counts: live row count and distinct
+/// subjects carrying the predicate, from one PSOT overlay cursor pass (linear
+/// in the predicate's rows). Declines for a predicate absent from the persisted
+/// dictionary (possibly novelty-only).
+struct OverlayAccessorCounts {
+    pred: Ref,
+    pred_sid: Sid,
+    p_id: u32,
+    rows: u64,
+    subjects_with: u64,
+}
+
+fn overlay_accessor_counts(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred: &Ref,
+) -> Result<Option<OverlayAccessorCounts>> {
+    let pred_sid = normalize_pred_sid(store, pred)?;
+    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+        return Ok(None);
+    };
+    let Some(mut cursor) = crate::fast_path_common::build_psot_cursor_for_predicate(
+        ctx,
+        store,
+        ctx.binary_g_id,
+        pred_sid.clone(),
+        p_id,
+        crate::fast_path_common::projection_sid_only(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    // PSOT orders rows `(p_id, s_id, …)`, so a subject's rows are contiguous:
+    // a running `prev` counts distinct subjects without a set.
+    let mut rows: u64 = 0;
+    let mut subjects_with: u64 = 0;
+    let mut prev: Option<u64> = None;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("accessor PSOT cursor: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let s_id = batch.s_id.get(row);
+            rows += 1;
+            if prev != Some(s_id) {
+                subjects_with += 1;
+                prev = Some(s_id);
+            }
+        }
+    }
+    Ok(Some(OverlayAccessorCounts {
+        pred: pred.clone(),
+        pred_sid,
+        p_id,
+        rows,
+        subjects_with,
+    }))
+}
+
+fn compute_task_overlay(
+    task: AggTask,
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    subjects: u64,
+    accessor: Option<&OverlayAccessorCounts>,
+) -> Result<Option<Binding>> {
+    if task.needs_accessor() && accessor.is_none() {
+        return Ok(None);
+    }
+    let int = |v: u64| -> Result<Option<Binding>> {
+        Ok(Some(Binding::lit(
+            FlakeValue::Long(count_to_i64(v, "whole-graph aggregate")?),
+            Sid::xsd_integer(),
+        )))
+    };
+    match task {
+        AggTask::CountRows => match accessor {
+            Some(a) => int(subjects
+                .saturating_sub(a.subjects_with)
+                .saturating_add(a.rows)),
+            None => int(subjects),
+        },
+        AggTask::CountSubjects => int(subjects),
+        AggTask::CountProp => int(accessor.unwrap().rows),
+        AggTask::CountDistinctProp => {
+            let a = accessor.unwrap();
+            match crate::fast_predicate_scalar_agg::scan_predicate_scalar_agg_overlay(
+                ctx,
+                store,
+                ctx.binary_g_id,
+                &a.pred,
+                ScalarAggKind::CountDistinctObject,
+            )? {
+                Some(out) => Ok(Some(out.into_binding())),
+                None => Ok(None),
+            }
+        }
+        AggTask::MinProp | AggTask::MaxProp => {
+            let a = accessor.unwrap();
+            let mode = if task == AggTask::MinProp {
+                MinMaxMode::Min
+            } else {
+                MinMaxMode::Max
+            };
+            overlay_minmax_numeric(ctx, store, &a.pred_sid, a.p_id, mode)
+        }
+        AggTask::AvgProp | AggTask::SumProp => {
+            let a = accessor.unwrap();
+            let kind = if task == AggTask::AvgProp {
+                ScalarAggKind::AvgNumeric
+            } else {
+                ScalarAggKind::Sum(SumExprI64::Identity)
+            };
+            match crate::fast_predicate_scalar_agg::scan_predicate_scalar_agg_overlay(
+                ctx,
+                store,
+                ctx.binary_g_id,
+                &a.pred,
+                kind,
+            )? {
+                Some(out) => Ok(Some(out.into_binding())),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+/// Overlay-merged MIN/MAX over a homogeneous numeric predicate: scan the POST
+/// overlay cursor and keep the extreme `o_key` (order-preserving within one
+/// numeric `o_type`). Declines on any non-numeric or mixed `o_type` (mirroring
+/// the clean numeric-first path) and on an empty input (the fallback yields the
+/// unbound identity).
+fn overlay_minmax_numeric(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+    p_id: u32,
+    mode: MinMaxMode,
+) -> Result<Option<Binding>> {
+    let Some(mut cursor) = crate::fast_path_common::build_post_cursor_for_predicate(
+        ctx,
+        store,
+        ctx.binary_g_id,
+        pred_sid.clone(),
+        p_id,
+        crate::fast_path_common::projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let mut best: Option<(u16, u64)> = None;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("minmax POST cursor: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let o_type = batch.o_type.get_or(row, 0);
+            if !fluree_db_core::o_type::OType::from_u16(o_type).is_numeric() {
+                return Ok(None);
+            }
+            let o_key = batch.o_key.get(row);
+            match best {
+                None => best = Some((o_type, o_key)),
+                Some((bt, bk)) => {
+                    if bt != o_type {
+                        return Ok(None);
+                    }
+                    let better = match mode {
+                        MinMaxMode::Min => o_key < bk,
+                        MinMaxMode::Max => o_key > bk,
+                    };
+                    if better {
+                        best = Some((o_type, o_key));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(best
+        .map(|(ot, ok)| crate::fast_min_max_string::numeric_binding_from_otype_okey(store, ot, ok)))
 }
 
 /// The per-graph class stats entry for `class_sid`, if present.

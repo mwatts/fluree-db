@@ -177,6 +177,160 @@ async fn cypher_indexed_whole_graph_aggregates_match_pipeline() {
     assert_eq!(indexed, json!([4]), "fold count");
 }
 
+/// Run a whole-graph aggregate through the overlay fold and again behind a
+/// `WITH n` barrier (which blocks the fold, forcing the general pipeline), both
+/// on the same view. The two rows must agree.
+async fn fold_vs_barrier(
+    fluree: &fluree_db_api::Fluree,
+    db: &fluree_db_api::GraphDb,
+    ret: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let fold = format!("MATCH (n) RETURN {ret}");
+    let truth = format!("MATCH (n) WITH n RETURN {ret}");
+    let mut rows = Vec::new();
+    for q in [fold, truth] {
+        let cj = fluree
+            .query_cypher(db, &q)
+            .await
+            .expect("query")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        rows.push(cj["results"][0]["data"][0]["row"].clone());
+    }
+    let truth = rows.pop().unwrap();
+    let fold = rows.pop().unwrap();
+    (fold, truth)
+}
+
+/// The overlay lane: whole-graph aggregates on an INDEXED ledger that has
+/// accumulated post-index novelty (new nodes + a property update) must stay
+/// exact. Without the overlay reconciliation these declined to a full-graph
+/// flake scan; the fold now folds directory base counts against the novelty.
+#[tokio::test]
+async fn cypher_whole_graph_aggregates_overlay_matches_pipeline() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:full-scan-overlay";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "age": 30},
+                    {"@id": "bob",   "@type": "Person", "age": 40},
+                    {"@id": "carol", "@type": "Person", "age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Post-index novelty: a brand-new node (with age), and a property update
+    // on an existing node (retract 30 + assert 31 — a surviving assertion, so
+    // the subject universe is unchanged but avg/distinct shift).
+    let indexed = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    let after_insert = fluree
+        .insert(
+            indexed,
+            &json!({"@graph": [{"@id": "dave", "@type": "Person", "age": 50}]}),
+        )
+        .await
+        .expect("novelty insert")
+        .ledger;
+    fluree
+        .update(
+            after_insert,
+            &json!({
+                "delete": [{"@id": "alice", "age": 30}],
+                "insert": [{"@id": "alice", "age": 31}]
+            }),
+        )
+        .await
+        .expect("novelty update");
+    let db = fluree.db(ledger_id).await.expect("dirty view");
+
+    // Final state: alice(31), bob(40), carol(40), dave(50) — 4 subjects, 4 ages.
+    for ret in [
+        "count(n) AS c",
+        "count(n.age) AS ca",
+        "count(n) AS c, count(n.age) AS ca, count(DISTINCT n) AS cd",
+        "count(DISTINCT n.age) AS cda",
+        "min(n.age) AS mn, max(n.age) AS mx",
+        "sum(n.age) AS s",
+    ] {
+        let (fold, truth) = fold_vs_barrier(&fluree, &db, ret).await;
+        assert_eq!(fold, truth, "overlay fold vs pipeline for `{ret}`");
+    }
+
+    // avg renders as a double from the fold and a decimal-string from the
+    // pipeline; compare numerically. avg = (31+40+40+50)/4 = 40.25.
+    let (fold, truth) = fold_vs_barrier(&fluree, &db, "avg(n.age) AS av").await;
+    let num = |v: &serde_json::Value| -> f64 {
+        v[0].as_f64()
+            .or_else(|| v[0].as_str().and_then(|s| s.parse().ok()))
+            .expect("numeric avg")
+    };
+    assert!((num(&fold) - 40.25).abs() < 1e-9, "fold avg: {fold}");
+    assert!((num(&truth) - 40.25).abs() < 1e-9, "pipeline avg: {truth}");
+
+    // Spot-check the absolute values against hand-computed truth.
+    let (count, _) = fold_vs_barrier(&fluree, &db, "count(n) AS c, count(n.age) AS ca").await;
+    assert_eq!(count, json!([4, 4]), "count(n), count(n.age)");
+    let (sum, _) = fold_vs_barrier(&fluree, &db, "sum(n.age) AS s").await;
+    assert_eq!(sum, json!([161]), "sum = 31+40+40+50");
+    let (dd, _) = fold_vs_barrier(&fluree, &db, "count(DISTINCT n.age) AS d").await;
+    assert_eq!(dd, json!([3]), "distinct ages 31/40/50");
+}
+
+/// Deleting a node in post-index novelty leaves the subject universe ambiguous
+/// to the arithmetic reconciliation (a retraction-only, base-present subject),
+/// so the overlay lane declines to the exact pipeline — the count must still be
+/// correct.
+#[tokio::test]
+async fn cypher_whole_graph_count_overlay_deletion_declines_but_correct() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:full-scan-overlay-del";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "age": 30},
+                    {"@id": "bob",   "@type": "Person", "age": 40},
+                    {"@id": "carol", "@type": "Person", "age": 50},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Delete carol entirely (retract all her flakes, no assertion).
+    let indexed = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    fluree
+        .update(
+            indexed,
+            &json!({"delete": [{"@id": "carol", "@type": "Person", "age": 50}]}),
+        )
+        .await
+        .expect("delete node");
+    let db = fluree.db(ledger_id).await.expect("dirty view");
+
+    let (fold, truth) = fold_vs_barrier(&fluree, &db, "count(n) AS c").await;
+    assert_eq!(
+        fold, truth,
+        "deletion: fold declines but agrees with pipeline"
+    );
+    assert_eq!(fold, json!([2]), "alice + bob remain");
+}
+
 /// `f:reifies*` facts are hidden from the `?n ?p ?o` pipeline but present in
 /// the SPOT directories, so their presence must make the fold decline to the
 /// fallback — results stay identical to the novelty view either way.
