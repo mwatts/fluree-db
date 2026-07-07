@@ -655,8 +655,15 @@ impl FlureeServerBuilder {
         #[cfg(not(feature = "raft"))]
         let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config, None).await?;
 
-        #[allow(unused_mut)]
+        // Only the raft path below mutates `state_inner` (swapping in
+        // the queued committer + adapter wiring); a non-raft build
+        // leaves it untouched, so bind it `mut` only under `raft`.
+        #[cfg(feature = "raft")]
         let mut state_inner =
+            AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
+                .await?;
+        #[cfg(not(feature = "raft"))]
+        let state_inner =
             AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
                 .await?;
 
