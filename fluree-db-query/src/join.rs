@@ -51,7 +51,7 @@ const ADAPTIVE_FLUSH_GROWTH: usize = 8;
 /// sidecar bytes — the leaflet loop body destructures this and proceeds
 /// without repeating the fetch+decode dance at each site.
 struct LeafScan {
-    leaf_bytes: Vec<u8>,
+    leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
     header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
     dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
     leaf_id: u128,
@@ -127,7 +127,7 @@ fn prepare_leaf_for_scan(
     };
 
     let leaf_bytes = store
-        .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+        .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
         .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
     let sidecar_bytes: Option<Vec<u8>> = if need_replay {
         store

@@ -131,7 +131,14 @@ async fn main() {
         ("scalar_prop", "MATCH (n:User {id: 4112}) RETURN n.name"),
     ];
 
+    let only = std::env::var("PROBE_ONLY").ok();
+
     for (name, text) in statements {
+        if let Some(only) = &only {
+            if name != only {
+                continue;
+            }
+        }
         // Warmup.
         for _ in 0..20 {
             let r = fluree.query_cypher(&db, text).await.expect("warmup");

@@ -644,7 +644,7 @@ fn count_bound_object_v6(
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
         let header =
             decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
@@ -861,7 +861,7 @@ pub(crate) fn group_count_v6(
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
         let header =
             decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
