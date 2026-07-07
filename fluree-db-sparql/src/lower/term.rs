@@ -391,43 +391,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     pub(super) fn expand_iri(&self, iri: &Iri) -> Result<String> {
-        match &iri.value {
-            IriValue::Full(s) => {
-                // Check for common mistake: <prefix:local> instead of prefix:local
-                // This happens when users wrap a prefixed name in angle brackets.
-                // We detect this by checking if the IRI looks like "prefix:local"
-                // where "prefix" matches a declared PREFIX.
-                if !s.contains("://") {
-                    if let Some(colon_pos) = s.find(':') {
-                        let potential_prefix = &s[..colon_pos];
-                        if let Some(ns) = self.prefixes.get(potential_prefix) {
-                            let local = &s[colon_pos + 1..];
-                            let expanded = format!("{ns}{local}");
-                            return Err(LowerError::misused_prefix_syntax(
-                                s.to_string(),
-                                expanded,
-                                iri.span,
-                            ));
-                        }
-                    }
-                }
-
-                // Handle relative IRIs
-                if let Some(base) = &self.base {
-                    if !s.contains("://") && !s.starts_with('#') {
-                        return Ok(format!("{base}{s}"));
-                    }
-                }
-                Ok(s.to_string())
-            }
-            IriValue::Prefixed { prefix, local } => {
-                let ns = self
-                    .prefixes
-                    .get(prefix.as_ref())
-                    .ok_or_else(|| LowerError::undefined_prefix(prefix.clone(), iri.span))?;
-                Ok(format!("{ns}{local}"))
-            }
-        }
+        expand_iri_with(&self.prefixes, self.base.as_deref(), iri)
     }
 
     /// Convert a SPARQL term to a Binding (for VALUES rows).
@@ -495,6 +459,64 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // Blank nodes in VALUES treated as unbound
                 Ok(Binding::Unbound)
             }
+        }
+    }
+}
+
+/// Expand a SPARQL IRI (full or prefixed) to an absolute IRI string using a
+/// prologue environment (prefix map + optional BASE).
+///
+/// Free function so callers without a full [`LoweringContext`] (e.g. dataset
+/// clause resolution, which runs before/without an encoder) share the exact
+/// same expansion semantics:
+///
+/// - Prefixed names expand against `prefixes` (whose namespaces the caller
+///   must already have base-resolved — see `prologue_environment`).
+/// - Full IRI references resolve against `base` per RFC 3986 §5: `<>` → the
+///   base itself, `<#x>` → base + fragment, `<data.ttl>` → sibling of the
+///   base document. Absolute references (any valid scheme, including `urn:` /
+///   `did:` — not just `://` forms) pass through verbatim.
+/// - Without a BASE, relative references stay as written (Fluree accepts
+///   them as ledger-local names).
+pub(super) fn expand_iri_with(
+    prefixes: &std::collections::HashMap<Arc<str>, Arc<str>>,
+    base: Option<&str>,
+    iri: &Iri,
+) -> Result<String> {
+    match &iri.value {
+        IriValue::Full(s) => {
+            // Check for common mistake: <prefix:local> instead of prefix:local
+            // This happens when users wrap a prefixed name in angle brackets.
+            // We detect this by checking if the IRI looks like "prefix:local"
+            // where "prefix" matches a declared PREFIX.
+            if !s.contains("://") {
+                if let Some(colon_pos) = s.find(':') {
+                    let potential_prefix = &s[..colon_pos];
+                    if let Some(ns) = prefixes.get(potential_prefix) {
+                        let local = &s[colon_pos + 1..];
+                        let expanded = format!("{ns}{local}");
+                        return Err(LowerError::misused_prefix_syntax(
+                            s.to_string(),
+                            expanded,
+                            iri.span,
+                        ));
+                    }
+                }
+            }
+
+            // Resolve relative IRI references against the query BASE.
+            if let Some(base) = base {
+                if !fluree_vocab::iri::is_absolute_iri(s) {
+                    return Ok(fluree_vocab::iri::resolve_iri(base, s));
+                }
+            }
+            Ok(s.to_string())
+        }
+        IriValue::Prefixed { prefix, local } => {
+            let ns = prefixes
+                .get(prefix.as_ref())
+                .ok_or_else(|| LowerError::undefined_prefix(prefix.clone(), iri.span))?;
+            Ok(format!("{ns}{local}"))
         }
     }
 }
