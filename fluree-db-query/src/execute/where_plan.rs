@@ -329,6 +329,36 @@ pub(crate) enum ExistsFallbackReason {
     Uncorrelated,
     /// Inner references an outer var it doesn't produce, so it can't run standalone.
     OuterOnlyConsumed,
+    /// Inner contains a `GRAPH ?g { … }` whose graph variable is bound by the
+    /// outer schema. Standalone evaluation would enumerate every named graph
+    /// and bind `?g` as a raw `Binding::Iri`, whose hash key never matches the
+    /// outer scan's `Sid`/`EncodedSid` representation of the same IRI — and it
+    /// is also strictly more work than per-row seeding, which resolves the one
+    /// named graph the row's `?g` addresses (issue #1443).
+    GraphVarCorrelated,
+}
+
+/// True when any pattern (recursing through pattern containers) is a
+/// `GRAPH ?g { … }` whose graph variable appears in `outer`.
+fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::Graph { name, patterns } => {
+            matches!(name, crate::ir::GraphName::Var(v) if outer.contains(v))
+                || has_outer_correlated_graph_var(patterns, outer)
+        }
+        Pattern::Optional(inner)
+        | Pattern::Minus(inner)
+        | Pattern::Exists(inner)
+        | Pattern::NotExists(inner)
+        | Pattern::DefaultGraphSource { patterns: inner } => {
+            has_outer_correlated_graph_var(inner, outer)
+        }
+        Pattern::Union(branches) => branches
+            .iter()
+            .any(|b| has_outer_correlated_graph_var(b, outer)),
+        Pattern::Subquery(sq) => has_outer_correlated_graph_var(&sq.patterns, outer),
+        _ => false,
+    })
 }
 
 /// Pure decision: pick an [`ExistsStrategy`] from the outer schema and the
@@ -366,6 +396,14 @@ pub(crate) fn choose_exists_strategy(
     } else if key_vars.is_empty() {
         ExistsStrategy::Exists {
             reason: ExistsFallbackReason::Uncorrelated,
+        }
+    } else if has_outer_correlated_graph_var(inner_patterns, &outer_set) {
+        // A GRAPH graph-variable correlated with the outer must be seeded per
+        // row: the standalone inner would enumerate all named graphs and key
+        // `?g` as `Binding::Iri`, which can never hash-match the outer scan's
+        // encoded representation (see `ExistsFallbackReason::GraphVarCorrelated`).
+        ExistsStrategy::Exists {
+            reason: ExistsFallbackReason::GraphVarCorrelated,
         }
     } else {
         ExistsStrategy::Semijoin { key_vars }
