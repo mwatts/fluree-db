@@ -364,8 +364,7 @@ async fn connection_scoped_cypher_is_rejected() {
 }
 
 /// A trailing RETURN on a write answers with the created entities as a
-/// Cypher-JSON envelope (benchgraph `arango__single_vertex_write` /
-/// `arango__single_edge_write` round trips).
+/// Cypher-JSON envelope (single vertex / single edge write round trips).
 #[tokio::test]
 async fn cypher_http_write_with_return() {
     let (_tmp, state) = server_state().await;

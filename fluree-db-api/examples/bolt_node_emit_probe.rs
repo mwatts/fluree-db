@@ -30,7 +30,7 @@ async fn main() {
         .expect("fluree");
     let ledger = fluree.create_ledger("probe:main").await.expect("ledger");
 
-    // Pokec-ish rich nodes: 8 scalar properties + a couple of refs.
+    // Social-network-ish rich nodes: 8 scalar properties + a couple of refs.
     let graph: Vec<_> = (0..users)
         .map(|i| {
             json!({

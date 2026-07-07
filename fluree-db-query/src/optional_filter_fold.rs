@@ -31,9 +31,9 @@
 //! - Only **equality/IN with constants** folds — the folded triple is then a
 //!   near-unique anchor, so being ordered early is exactly right. A range or
 //!   string predicate (`?v >= 18`) would fold into a full property scan that
-//!   can hijack the anchor from a far more selective seed (measured: the
-//!   benchgraph `*_with_filter` expansions went from milliseconds to
-//!   timeouts when range filters folded).
+//!   can hijack the anchor from a far more selective seed (measured:
+//!   filtered expansion queries went from milliseconds to timeouts when
+//!   range filters folded).
 //! - Queries containing property-path / shortest-path patterns are skipped
 //!   entirely: paths anchor traversal order, and a folded accessor on the
 //!   path's endpoint can become the driving side, re-running the traversal

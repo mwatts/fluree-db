@@ -246,9 +246,9 @@ mod tests {
 
     #[test]
     fn decodes_bolt44_style_run() {
-        // RUN "RETURN 1 AS num" {} {"db": "pokec"}
+        // RUN "RETURN 1 AS num" {} {"db": "appdb"}
         let mut extra = MapValue::new();
-        extra.insert("db", "pokec");
+        extra.insert("db", "appdb");
         let payload = packstream::encode_to_vec(&Value::Structure(Structure {
             signature: RUN,
             fields: vec![

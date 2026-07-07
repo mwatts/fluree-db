@@ -1,9 +1,8 @@
 //! Point-lookup floor profiler: where do the fixed ~0.4 ms go on trivial
 //! MATCH statements against an **indexed** ledger?
 //!
-//! The benchgraph small-scale read floor (single_vertex_read,
-//! match__pattern_short/long/cycle) is dominated by a per-query fixed
-//! overhead. `query_cypher` already logs per-phase timings at info level
+//! Trivial point-lookup and short-pattern statements are dominated by a
+//! per-query fixed overhead. `query_cypher` already logs per-phase timings at info level
 //! (`cypher query phases`: parse_ms / plan_ms / exec_ms); this example
 //! runs the floor-shaped statements in a loop with that target enabled
 //! and reports medians per phase, plus the typed-format (hydration) and

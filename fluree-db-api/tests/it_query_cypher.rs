@@ -150,7 +150,7 @@ async fn cypher_untyped_undirected_hop_excludes_labels_and_data_properties() {
 async fn cypher_value_only_rel_var_matches_unreified_edges() {
     // A bound relationship variable used only for its value surface
     // (`RETURN e`, `type(e)`) must match plain-RDF edges that carry no
-    // `f:reifies*` bundle (benchgraph `match__pattern_*` on imported data).
+    // `f:reifies*` bundle (typed-pattern matches on imported data).
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:value-only-rel-var");
     let committed = fluree
@@ -850,9 +850,8 @@ async fn transact_cypher_unwind_map_param_batches_node_inserts() {
 
 #[tokio::test]
 async fn transact_cypher_unwind_inline_range_batches_node_inserts() {
-    // Inline constant UNWIND source on a write (`UNWIND range(1, 100) AS x`,
-    // benchgraph `arango__unwind_range_vertex_write`) — desugars through the
-    // same path as `UNWIND $list`.
+    // Inline constant UNWIND source on a write (`UNWIND range(1, 100) AS x`)
+    // — desugars through the same path as `UNWIND $list`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-range");
 
@@ -920,8 +919,8 @@ async fn transact_cypher_unwind_inline_list_batches_node_inserts() {
 
 #[tokio::test]
 async fn transact_cypher_create_return_node() {
-    // `CREATE (n:UserTemp {id: 1}) RETURN n` (benchgraph
-    // `arango__single_vertex_write`) — one row carrying the created node id.
+    // `CREATE (n:UserTemp {id: 1}) RETURN n` (single vertex write with
+    // RETURN) — one row carrying the created node id.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:create-return-node");
     let (result, rows) = fluree
@@ -949,8 +948,8 @@ async fn transact_cypher_create_return_node() {
 
 #[tokio::test]
 async fn transact_cypher_match_create_return_edge() {
-    // `MATCH (a),(b) CREATE (a)-[e:Temp]->(b) RETURN e` (benchgraph
-    // `arango__single_edge_write`) — one row per WHERE solution.
+    // `MATCH (a),(b) CREATE (a)-[e:Temp]->(b) RETURN e` (single edge write
+    // with RETURN) — one row per WHERE solution.
     let fluree = FlureeBuilder::memory().build_memory();
     let mut l = genesis_ledger(&fluree, "it/cypher:create-return-edge");
     for stmt in [
@@ -1018,7 +1017,7 @@ async fn transact_cypher_return_of_matched_var_is_rejected() {
 
 #[tokio::test]
 async fn transact_cypher_create_bare_anonymous_node() {
-    // `CREATE ()` (benchgraph `create__vertex`) — an anonymous propertyless
+    // `CREATE ()` (anonymous vertex create) — an anonymous propertyless
     // node commits (via the hidden db:Node marker) and stays invisible to
     // labeled matches.
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1029,7 +1028,7 @@ async fn transact_cypher_create_bare_anonymous_node() {
         .expect("bare CREATE ()");
     assert!(result.receipt.t >= 1, "committed");
 
-    // `CREATE ()-[:TempEdge]->()` (benchgraph `create__pattern`).
+    // `CREATE ()-[:TempEdge]->()` (anonymous pattern create).
     let result = fluree
         .transact_cypher(result.ledger, "CREATE ()-[:TempEdge]->()")
         .await
@@ -4872,7 +4871,7 @@ async fn cypher_var_length_rel_and_path_binding() {
 
 #[tokio::test]
 async fn cypher_shortest_path_untyped_wildcard() {
-    // Untyped shortestPath (benchgraph `arango__shortest_path`): follows any
+    // Untyped shortestPath: follows any
     // relationship type, skipping rdf:type and data properties. The chain
     // mixes KNOWS and LIKES edges, so a single-type search can't reach Dave.
     let fluree = FlureeBuilder::memory().build_memory();
@@ -4926,7 +4925,7 @@ async fn cypher_shortest_path_untyped_wildcard() {
         "typed-only search must not cross the LIKES hop"
     );
 
-    // allShortestPaths untyped (benchgraph `arango__allshortest_paths`).
+    // allShortestPaths untyped.
     assert_eq!(
         fluree
             .query_cypher(

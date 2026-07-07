@@ -32,7 +32,7 @@ async fn cypher_bare_match_full_scan_opt_in() {
     let db = graphdb_from_ledger(&committed.ledger);
 
     // count(n) counts distinct nodes (subjects), not triples; count(n.age)
-    // counts nodes carrying the property (benchgraph `aggregation__count`).
+    // counts nodes carrying the property (whole-graph count shape).
     let cj = fluree
         .query_cypher(&db, "MATCH (n) RETURN count(n) AS c, count(n.age) AS ca")
         .await
@@ -47,7 +47,7 @@ async fn cypher_bare_match_full_scan_opt_in() {
     assert_eq!(row[1], json!(2), "count(n.age): {cj}");
 
     // min/max/avg over a property through the scan
-    // (benchgraph `aggregation__min_max_avg`).
+    // (whole-graph min/max/avg shape).
     let cj = fluree
         .query_cypher(
             &db,

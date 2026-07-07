@@ -513,8 +513,8 @@ fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]
     // that holds none of the wanted ids costs ~3 µs (decode-cache hit +
     // galloped no-op) and a descent ~4 µs; at ~1k subjects per leaflet the
     // break-even gap is a few thousand ids. An aggressive threshold (64)
-    // measurably hurt dense-ish sets (pokec node-emit ~2x: ~8 µs descent
-    // per near-point-seek, nothing saved); no threshold at all makes a
+    // measurably hurt dense-ish sets (node-emit hydration ~2x: ~8 µs
+    // descent per near-point-seek, nothing saved); no threshold at all makes a
     // scattered BFS frontier sweep every leaflet between its members.
     const MAX_GAP: u64 = 4096;
 

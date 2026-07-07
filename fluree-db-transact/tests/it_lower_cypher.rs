@@ -282,7 +282,7 @@ fn match_set_property_emits_update_with_optional_old_value() {
 #[test]
 fn match_set_property_to_negative_literal() {
     // `-1` is unary minus over a literal; the parser folds it so write
-    // lowering sees a plain literal (benchgraph `update__vertex_on_property`).
+    // lowering sees a plain literal (single-property update shape).
     let txn = lower(r#"MATCH (n:Person {name: "Alice"}) SET n.property = -1"#);
     assert_eq!(txn.insert_templates.len(), 1);
     match &txn.insert_templates[0].object {
