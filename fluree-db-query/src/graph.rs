@@ -176,8 +176,10 @@ impl GraphOperator {
 
     /// Extract a graph IRI from a bound `?g`. Handles the IRI-typed forms a
     /// normal query produces — `<iri>` lowered to a `Sid` (decoded against the
-    /// active snapshot), a raw `Iri`, or a cross-ledger `IriMatch` — and also a
-    /// plain string literal for back-compat.
+    /// active snapshot), a raw `Iri`, or a cross-ledger `IriMatch` — plus the
+    /// late-materialized `EncodedSid`/`EncodedLit` forms a binary-index scan
+    /// binds (issue #1443: `?s :p ?g . FILTER EXISTS { GRAPH ?g { … } }`), and
+    /// also a plain string literal for back-compat.
     fn extract_graph_iri_from_binding(
         ctx: &ExecutionContext<'_>,
         binding: &Binding,
@@ -191,6 +193,22 @@ impl GraphOperator {
                 val: FlakeValue::String(s),
                 ..
             } => Some(Arc::from(s.as_str())),
+            // Late-materialized bindings from the binary index: decode against
+            // the active graph view, then extract from the decoded form. This
+            // runs per parent row of a correlated GRAPH, only in the bound-var
+            // arm — never on a scan hot path. (Subject/string dictionaries are
+            // store-global, so decoding against the outer view is sound.)
+            Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
+                let gv = ctx.graph_view()?;
+                match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
+                    Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(&sid).map(Arc::from),
+                    Binding::Lit {
+                        val: FlakeValue::String(s),
+                        ..
+                    } => Some(Arc::from(s.as_str())),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }

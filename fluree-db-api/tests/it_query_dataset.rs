@@ -1999,6 +1999,50 @@ async fn fql_single_db_graph_variable_join_inner_use() {
     );
 }
 
+/// JSON-LD parity for BUG-5 (issue #1443): a `?g` bound by a triple scan and
+/// consumed by a GRAPH pattern inside EXISTS (the late-materialized shape —
+/// a top-level scan-bound `?g` is eagerly resolved and passed even before the
+/// fix) resolves the named graph.
+#[tokio::test]
+async fn fql_single_db_graph_variable_bound_from_scan_exists() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger0 = genesis_ledger(&fluree, "ngscan:main");
+    // Default graph points at the named graph; the named graph has content.
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:doc ex:inGraph <urn:probegraph> .
+
+        GRAPH <urn:probegraph> {
+            ex:bob schema:name "Bob" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": "?doc",
+        "where": [
+            {"@id": "?doc", "ex:inGraph": "?g"},
+            ["exists", ["graph", "?g", {"@id": "?s", "schema:name": "?name"}]]
+        ]
+    });
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(jsonld, json!(["ex:doc"]));
+}
+
 #[tokio::test]
 async fn dataset_multi_ledger_time_travel_parsing() {
     assert_index_defaults();
