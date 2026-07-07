@@ -38,7 +38,7 @@ pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
 // Dominated by the missing UPDATE graph-management grammar
 // (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD, SILENT variants) — audit §4.2.1.
 pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
-    // parser rejects valid input (27)
+    // parser rejects valid input (24)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_1",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_10",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_11",
@@ -57,10 +57,7 @@ pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_3",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_36",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_37",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_38",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_39",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_4",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_40",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_5",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_6",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_7",
@@ -348,7 +345,7 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#load-silent",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#move-silent",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#move-to-default-silent",
-    // parser rejects valid input (27)
+    // parser rejects valid input (24)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_1",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_10",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_11",
@@ -367,10 +364,7 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_3",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_36",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_37",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_38",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_39",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_4",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_40",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_5",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_6",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_7",
@@ -388,16 +382,14 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_50",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_51",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_52",
-    // multi-operation (';') request rejected loudly by the D-10a interim
-    // guard (#1438) instead of silently executing only the first operation;
-    // greens with PR-U2's request-level multi-op support (1)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-insert/manifest#dawg-delete-insert-01b",
-    // update eval: resulting graph-store state differs (7)
+    // multi-op requests now parse and stage sequentially (PR-U2/#1438),
+    // but these end in DROP GRAPH — a graph-management verb the parser
+    // does not know yet; they fail at parse until PR-U3 lands (4)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-05a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-data-same-bnode",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-where-same-bnode",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-where-same-bnode2",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-insert/manifest#dawg-delete-insert-01c",
+    // update eval: resulting graph-store state differs (2)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-02a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-06a",
     // engine: GRAPH blocks in DELETE WHERE unsupported (3)
@@ -590,10 +582,6 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-03",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-04",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-05",
-    // multi-operation (';') request rejected loudly by the D-10a interim
-    // guard (#1438) instead of silently parsing only the first operation;
-    // greens with PR-U2's request-level multi-op support (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-reifier-08",
 ];
 
 // Blocked on Turtle-star data loading and engine triple-term support —
