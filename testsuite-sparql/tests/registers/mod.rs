@@ -482,53 +482,28 @@ pub const SPARQL12_GROUPING: &[&str] = &[
 pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[
-    // parser accepts invalid input (missing validation) (1)
+    // parser accepts invalid input: anonymous annotation blocks in
+    // INSERT DATA / DELETE DATA need a validation pass — owned by
+    // burn-down PR-2 (wave-1 semantic validation; ROADMAP §2), NOT by
+    // PR-W2A. (The sibling `syntax-update-anonreifier-01` DELETE-
+    // template case is kept rejected by PR-W2A's
+    // `reject_anonymous_annotations_in_delete` validator.) (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-negative/manifest#syntax-update-anonreifier-02",
 ];
 
-// RDF-star / SPARQL 1.2 triple-term syntax (<<( )>> and related) is not
-// yet in the parser — audit §4.3 / Phase D.
+// SPARQL 1.2 triple-term *value* syntax (bare `<<( )>>` outside the
+// object-of-rdf:reifies position, and the TRIPLE/SUBJECT/PREDICATE/
+// OBJECT/isTRIPLE builtins). The reifier forms (buckets A/D) were
+// greened by burn-down PR-W2A; the 27 entries below are buckets B/C,
+// owned by sibling PR-W2BC under decision D-1 (accept-then-defer) —
+// see docs/audit/burn-down/ROADMAP.md §2/§4 and
+// docs/audit/burn-down/sparql12-wave2-triple-terms.md §1.2/§1.3.
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
-    // parser rejects valid input (85)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-06",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-multiple-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-multiple-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-multiple-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-anonreifier-multiple-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-06",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-05",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-07",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-08",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-09",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#annotation-reifier-multiple-10",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-07",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-08",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-09",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-10",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-11",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-12",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-anonreifier-13",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-06",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-07",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-08",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-09",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-10",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-11",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-12",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-reifier-13",
+    // bucket B — triple-term builtins not in the lexer/AST (3)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-03",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-04",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-05",
+    // bucket C — parser rejects bare triple-term values (24)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-01",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-02",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-03",
@@ -536,41 +511,19 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-05",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-06",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-07",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-reifier-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-reifier-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-reifier-03",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-tripleterm-01",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-tripleterm-02",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-tripleterm-03",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-all",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-anonreifier",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-reifier",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-tripleterm",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-tripleterm-subject",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-05",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-06",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-anonreifier-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-anonreifier-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-reifier-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-reifier-02",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-tripleterm-01",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-tripleterm-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-anonreifier-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-reifier-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-reifier-02",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-tripleterm-01",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-tripleterm-02",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#subject-tripleterm",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-anonreifier-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-anonreifier-05",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-reifier-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-reifier-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-reifier-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-reifier-05",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-reifier-07",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-01",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-03",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-04",
@@ -660,13 +613,10 @@ pub const SPARQL12_SYNTAX: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#nested-aggregate-functions",
 ];
 
-// VERSION declaration support — audit §4.3.
-pub const SPARQL12_VERSION: &[&str] = &[
-    // parser rejects valid input (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-05",
-];
+// VERSION already lexed/parsed before wave 2; version-01/02/05 failed only
+// on the bare `<< s p o >>` reified-triple patterns in their bodies, which
+// burn-down PR-W2A greened (ROADMAP §6.1 comment correction).
+pub const SPARQL12_VERSION: &[&str] = &[];
 
 // Path cardinality / duplicate semantics — sequence-path results differ in
 // multiplicity (`p1/p2` path counting vs `*`/`+` distinct nodes) — plus the
