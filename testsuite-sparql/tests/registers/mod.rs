@@ -74,23 +74,11 @@ pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
 ];
 
 pub const SPARQL10_SYNTAX: &[&str] = &[
-    // parser accepts invalid input (missing validation) (24)
+    // parser accepts invalid input (missing validation) (12)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#blabel-cross-graph-bad",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#blabel-cross-optional-bad",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#blabel-cross-union-bad",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#filter-missing-parens",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-02",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-03",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-05",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-09",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-10",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-12",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-13",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-14",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-34",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-35",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-36",

@@ -73,6 +73,16 @@ impl super::Parser<'_> {
         let mut patterns: Vec<GraphPattern> = Vec::new();
         let mut current_triples: Vec<crate::ast::TriplePattern> = Vec::new();
 
+        // SPARQL grammar:
+        //   GroupGraphPatternSub ::= TriplesBlock? ( GraphPatternNotTriples '.'? TriplesBlock? )*
+        // A '.' at group level is legal ONLY as the single optional separator
+        // immediately after a GraphPatternNotTriples (OPTIONAL, UNION group,
+        // MINUS, GRAPH, SERVICE, FILTER, BIND, VALUES). Separator dots inside
+        // a TriplesBlock are owned by `parse_triples_block`, which consumes
+        // its own single optional trailing dot. Every other dot — leading,
+        // doubled, or standalone — is a syntax error (W3C syn-bad-05..14).
+        let mut dot_allowed = false;
+
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
             // Safety: track position to detect sub-parsers that return None
             // without advancing. If we make no progress, force-advance to
@@ -86,6 +96,7 @@ impl super::Parser<'_> {
                 if let Some(optional) = self.parse_optional_pattern() {
                     patterns.push(optional);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwUnion) {
                 // UNION requires a preceding pattern
                 self.stream.error_at_current("UNION must follow a pattern");
@@ -112,12 +123,14 @@ impl super::Parser<'_> {
                         span,
                     });
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwFilter) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(filter) = self.parse_filter_pattern() {
                     patterns.push(filter);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwGraph) {
                 // GRAPH pattern - GRAPH <iri>|?var { ... }
                 super::flush_current_triples(&mut current_triples, &mut patterns);
@@ -125,24 +138,28 @@ impl super::Parser<'_> {
                 if let Some(graph) = self.parse_graph_pattern() {
                     patterns.push(graph);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwService) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(service) = self.parse_service_pattern() {
                     patterns.push(service);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwBind) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(bind) = self.parse_bind_pattern() {
                     patterns.push(bind);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwValues) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(values) = self.parse_values_pattern() {
                     patterns.push(values);
                 }
+                dot_allowed = true;
             } else if self.stream.check(&TokenKind::LBrace) {
                 // Nested group or sub-SELECT.
                 super::flush_current_triples(&mut current_triples, &mut patterns);
@@ -166,6 +183,7 @@ impl super::Parser<'_> {
                         patterns.push(inner);
                     }
                 }
+                dot_allowed = true;
             } else if self.stream.is_term_start() {
                 // Parse triple patterns (may include path patterns)
                 if let Some(block_patterns) = self.parse_triples_block() {
@@ -186,9 +204,23 @@ impl super::Parser<'_> {
                         }
                     }
                 }
+                // `parse_triples_block` already consumed the TriplesBlock's own
+                // optional trailing dot; another dot here would be doubled.
+                dot_allowed = false;
             } else if self.stream.check(&TokenKind::Dot) {
-                // Skip dots between patterns
-                self.stream.advance();
+                if dot_allowed {
+                    // The single optional '.' after a GraphPatternNotTriples.
+                    self.stream.advance();
+                    dot_allowed = false;
+                } else {
+                    // Leading, doubled, or standalone dot: forbidden by
+                    // GroupGraphPatternSub (V1 dot-structure validation).
+                    self.stream.error_at_current(
+                        "unexpected '.': a dot may only follow a triple pattern or a \
+                         graph pattern (OPTIONAL, FILTER, GRAPH, BIND, VALUES, ...)",
+                    );
+                    self.stream.advance();
+                }
             } else {
                 // Unknown token
                 self.stream

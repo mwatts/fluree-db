@@ -560,8 +560,16 @@ impl super::Parser<'_> {
             });
         }
 
-        // Optional dot at end
-        self.stream.match_token(&TokenKind::Dot);
+        // TriplesBlock ::= TriplesSameSubjectPath ( '.' TriplesBlock? )?
+        // The '.' separating two same-subject blocks is mandatory: after this
+        // block, a new subject term may only follow a consumed '.' (the group
+        // loop re-enters `parse_triples_block` for it). The dot itself stays
+        // optional before '}' or a GraphPatternNotTriples keyword (V1
+        // dot-structure validation, W3C syn-bad-02/03).
+        if !self.stream.match_token(&TokenKind::Dot) && self.stream.is_term_start() {
+            self.stream
+                .error_at_current("expected '.' between triple patterns");
+        }
 
         Some(patterns)
     }

@@ -2607,3 +2607,63 @@ fn test_pragma_in_trailing_comment_honored() {
     let ast = assert_parses("SELECT * WHERE { } # PRAGMA reasoning: rdfs");
     assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
 }
+
+// =========================================================================
+// V1: dot structure inside group graph patterns (W3C syn-bad-02..14)
+// =========================================================================
+
+#[test]
+fn test_v1_legal_dot_usage_still_parses() {
+    // Trailing dot after the last triple is optional but legal.
+    assert_parses("SELECT * WHERE { ?s ?p ?o . }");
+    // Mandatory dot between two same-subject blocks.
+    assert_parses("SELECT * WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 . }");
+    // One optional dot may follow a GraphPatternNotTriples.
+    assert_parses("SELECT * WHERE { OPTIONAL { ?s ?p ?o } . ?a ?b ?c }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o . FILTER(?o) . }");
+    assert_parses("SELECT * WHERE { BIND(1 AS ?x) . ?s ?p ?x }");
+    assert_parses("SELECT * WHERE { { ?s ?p ?o } . ?a ?b ?c }");
+    assert_parses("SELECT * WHERE { GRAPH ?g { ?s ?p ?o } . ?a ?b ?c }");
+    // No dot needed between a TriplesBlock and a keyword pattern.
+    assert_parses("SELECT * WHERE { ?s ?p ?o OPTIONAL { ?a ?b ?c } }");
+}
+
+#[test]
+fn test_v1_standalone_dot_rejected() {
+    // syn-bad-05 / syn-bad-06
+    assert_parse_error("SELECT * WHERE { . }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { . . }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_leading_dot_rejected() {
+    // syn-bad-07 / syn-bad-14
+    assert_parse_error("SELECT * WHERE { . ?s ?p ?o }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { . FILTER(?x) }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_doubled_dot_rejected() {
+    // syn-bad-08..13
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o . . }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o .. }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o . . ?s1 ?p1 ?o1 }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o .. ?s1 ?p1 ?o1 }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o . ?s1 ?p1 ?o1 .. }", "unexpected '.'");
+    // A doubled dot after a GraphPatternNotTriples: only ONE optional dot.
+    assert_parse_error("SELECT * WHERE { OPTIONAL { ?s ?p ?o } . . }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_missing_dot_between_triples_rejected() {
+    // syn-bad-02 / syn-bad-03
+    assert_parse_error(
+        "PREFIX : <http://example/ns#> SELECT * { :s1 :p1 :o1 :s2 :p2 :o2 . }",
+        "expected '.' between triple patterns",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o ?s2 ?p2 ?o2 }",
+        "expected '.' between triple patterns",
+    );
+}
