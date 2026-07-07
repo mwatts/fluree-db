@@ -9,7 +9,13 @@
 //! Key semantics:
 //! - GraphOperator is a **correlated operator** (like EXISTS/Subquery)
 //! - For each parent row, inner patterns are executed in the appropriate graph context
-//! - ?g is bound as an IRI term (`Binding::Iri`)
+//! - ?g is bound as an IRI term (`Binding::Iri`). Per the SPARQL algebra the
+//!   `{?g → graph}` binding is JOINED with the inner solutions: an inner
+//!   occurrence of `?g` bound to a different term drops the row, and `?g` is
+//!   NOT in scope inside the group otherwise (`GRAPH ?g { FILTER(BOUND(?g)) }`
+//!   is empty — W3C graph-variable-scope). As a join-equivalent optimization
+//!   the value is seeded into the inner subplan when the inner *always* binds
+//!   `?g` (a required top-level triple/path/sub-SELECT), narrowing the scan.
 //! - Graph-not-found produces empty result (not an error)
 //!
 //! # Single-DB Mode
@@ -96,6 +102,15 @@ pub struct GraphOperator {
     /// under a GRAPH wrapper (notably an R2RML graph source) can early-terminate
     /// instead of draining the whole table into `result_buffer`.
     row_budget: Option<usize>,
+    /// Plan-time decision: seed the enumerated graph variable into the inner
+    /// subplan. True only when the inner patterns bind the graph var in EVERY
+    /// solution (required top-level triple / property path / slice-free
+    /// sub-SELECT — `self_produced_vars`), where seeding merely filters and is
+    /// therefore equivalent to the SPARQL `{?g → graph}` join while strictly
+    /// narrowing the inner scan. When false, the join is enforced at merge
+    /// time instead, preserving `?g`-not-in-scope semantics for FILTER-only /
+    /// OPTIONAL / UNION references (W3C graph-variable-scope).
+    seed_graph_var: bool,
 }
 
 impl GraphOperator {
@@ -138,6 +153,13 @@ impl GraphOperator {
         schema_vec.extend(&new_vars);
         let schema = Arc::from(schema_vec.into_boxed_slice());
 
+        // Plan-time: seeding the graph var is join-equivalent only when the
+        // inner always binds it (see the field doc on `seed_graph_var`).
+        let seed_graph_var = match &graph_name {
+            GraphName::Var(v) => crate::subquery::self_produced_vars(&inner_patterns).contains(v),
+            GraphName::Iri(_) => false,
+        };
+
         Self {
             child,
             graph_name,
@@ -148,6 +170,7 @@ impl GraphOperator {
             buffer_pos: 0,
             planning,
             row_budget: None,
+            seed_graph_var,
         }
     }
 
@@ -256,8 +279,28 @@ impl GraphOperator {
             std::borrow::Cow::Borrowed(&self.inner_patterns)
         };
 
-        // Build seed operator from parent row (like EXISTS/Subquery)
-        let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
+        // Build seed operator from parent row (like EXISTS/Subquery). When this
+        // enumeration binds the graph variable AND the inner subplan is
+        // guaranteed to bind it in every solution (`seed_graph_var`, decided at
+        // plan time), seed it as an IRI term so inner occurrences of `?g` — a
+        // triple position, a sub-SELECT projecting `?g` — are constrained to
+        // the active graph's name instead of scanning free and being joined
+        // away at merge time. Join-equivalent by construction; strictly
+        // narrows the inner scan. All other shapes rely on the merge-time
+        // `{?g → graph}` join below.
+        let seed = match bind_graph_var {
+            Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
+                let mut schema_vec = parent_batch.schema().to_vec();
+                schema_vec.push(var);
+                let mut row: Vec<Binding> = parent_batch
+                    .row_view(row_idx)
+                    .expect("row_idx must be valid for batch")
+                    .to_vec();
+                row.push(Binding::iri(graph_iri.clone()));
+                SeedOperator::from_row(Arc::from(schema_vec.into_boxed_slice()), row)
+            }
+            _ => SeedOperator::from_batch_row(parent_batch, row_idx),
+        };
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &patterns_to_execute,
@@ -297,6 +340,25 @@ impl GraphOperator {
 
             // Merge each inner result with parent row
             for inner_row_idx in 0..batch.len() {
+                // SPARQL algebra: the `{?g → graph}` binding is JOINED with
+                // the inner solutions. A row whose inner `?g` is bound to a
+                // different term than the active graph's name is incompatible
+                // and is dropped — never overwritten (W3C graph-optional /
+                // graph-variable-join). Runs only when the enumeration binds a
+                // graph var the inner body actually carries; when the value
+                // was seeded (`seed_graph_var`) it short-circuits on the
+                // `Binding::Iri` fast path.
+                if let Some(gvar) = bind_graph_var {
+                    if let Some(b) = batch.get(inner_row_idx, gvar) {
+                        if !matches!(b, Binding::Unbound | Binding::Poisoned)
+                            && Self::extract_graph_iri_from_binding(&graph_ctx, b).as_deref()
+                                != Some(graph_iri.as_ref())
+                        {
+                            continue;
+                        }
+                    }
+                }
+
                 let mut merged_row = Vec::with_capacity(self.schema.len());
 
                 // Copy parent bindings first
@@ -314,7 +376,10 @@ impl GraphOperator {
                     // Check if this is the graph variable we need to bind
                     if bind_graph_var == Some(*var) {
                         // Bind ?g to the graph name as an IRI term (SPARQL
-                        // requires an IRI, not a string literal).
+                        // requires an IRI, not a string literal). The inner
+                        // subplan was seeded with the same value, so this is
+                        // consistent with — not an overwrite of — any inner
+                        // occurrence of the variable.
                         merged_row.push(Binding::iri(graph_iri.clone()));
                     } else {
                         // Get from inner batch

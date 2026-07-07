@@ -1953,6 +1953,52 @@ async fn fql_single_db_graph_variable_excludes_default_binds_iri() {
     assert!(saw_g, "expected at least one ?g row");
 }
 
+/// JSON-LD parity for BUG-3 (issue #1442): the graph variable is seeded into
+/// the inner subplan, so an inner occurrence of `?g` is CONSTRAINED to the
+/// active graph's name (one variable, SPARQL-style unification) instead of
+/// scanning free and being overwritten at merge time.
+#[tokio::test]
+async fn fql_single_db_graph_variable_join_inner_use() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger0 = genesis_ledger(&fluree, "ngjoin:main");
+    // Named graph <urn:g1> holds two triples; only ONE has the graph's own
+    // name as its subject. `["graph","?g",{"@id":"?g",...}]` must return only
+    // that one (mirror of W3C graph-variable-join).
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+
+        GRAPH <urn:g1> {
+            <urn:g1> ex:p "in-g1" .
+            ex:other ex:p "other" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?g", "?o"],
+        "where": [
+            ["graph", "?g", {"@id": "?g", "ex:p": "?o"}]
+        ]
+    });
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["urn:g1", "in-g1"]]))
+    );
+}
+
 #[tokio::test]
 async fn dataset_multi_ledger_time_travel_parsing() {
     assert_index_defaults();
