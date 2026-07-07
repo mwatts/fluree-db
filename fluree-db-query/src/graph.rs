@@ -2,12 +2,14 @@
 //!
 //! Implements SPARQL GRAPH semantics:
 //! - `GRAPH <iri> { ... }`: Execute inner patterns against a specific named graph
-//! - `GRAPH ?g { ... }`: If ?g is bound, use that graph; if unbound, iterate all named graphs
+//! - `GRAPH ?g { ... }`: If ?g is bound, use that graph; if unbound, iterate
+//!   the **named graphs only** (per SPARQL 1.1 §13.3 the default graph is not
+//!   part of the range of `?g`)
 //!
 //! Key semantics:
 //! - GraphOperator is a **correlated operator** (like EXISTS/Subquery)
 //! - For each parent row, inner patterns are executed in the appropriate graph context
-//! - ?g is bound as `Binding::Lit { val: FlakeValue::String(...), dtc: Explicit(xsd:string) }`
+//! - ?g is bound as an IRI term (`Binding::Iri`)
 //! - Graph-not-found produces empty result (not an error)
 //!
 //! # Single-DB Mode
@@ -15,11 +17,14 @@
 //! In single-db mode (no dataset) every graph of the ledger lives in one
 //! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
 //! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
-//! explicit `FROM NAMED` (issue #1279); the ledger alias addresses the default
-//! graph, and reserved system graphs (txn-meta, config) stay private.
+//! explicit `FROM NAMED` (issue #1279); the ledger alias EXPLICITLY addresses
+//! the default graph, and reserved system graphs (txn-meta, config) stay private.
 //! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
 //!   the ledger alias, or an R2RML graph source; otherwise empty
-//! - unbound `GRAPH ?g`: binds ?g to each registered user graph and the alias
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph. The ledger
+//!   alias (default graph) is NOT enumerated — W3C-conformant since issue
+//!   #1442 (decision D-2); the #1279 implicit default-graph enumeration was
+//!   dropped, while explicit alias addressing above is retained
 //!
 //! # Architecture
 //!
@@ -31,7 +36,7 @@
 //! 5. Merges results with parent row (like SubqueryOperator)
 
 use crate::binding::{Batch, Binding};
-use crate::context::{ExecutionContext, WellKnownDatatypes};
+use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
@@ -41,7 +46,6 @@ use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
@@ -77,8 +81,6 @@ pub struct GraphOperator {
     graph_name: GraphName,
     /// Inner patterns to execute within the graph context
     inner_patterns: Vec<Pattern>,
-    /// Well-known datatypes for binding ?g as xsd:string
-    well_known: WellKnownDatatypes,
     /// Output schema (parent schema + any new vars from inner patterns)
     schema: Arc<[VarId]>,
     /// Operator state
@@ -140,7 +142,6 @@ impl GraphOperator {
             child,
             graph_name,
             inner_patterns,
-            well_known: WellKnownDatatypes::new(),
             schema,
             state: OperatorState::Created,
             result_buffer: Vec::new(),
@@ -312,15 +313,9 @@ impl GraphOperator {
                 for (_i, var) in self.schema.iter().enumerate().skip(parent_len) {
                     // Check if this is the graph variable we need to bind
                     if bind_graph_var == Some(*var) {
-                        // Bind ?g to graph IRI using xsd:string
-                        let binding = Binding::Lit {
-                            val: FlakeValue::String(graph_iri.to_string()),
-                            dtc: DatatypeConstraint::Explicit(self.well_known.xsd_string.clone()),
-                            t: None,
-                            op: None,
-                            p_id: None,
-                        };
-                        merged_row.push(binding);
+                        // Bind ?g to the graph name as an IRI term (SPARQL
+                        // requires an IRI, not a string literal).
+                        merged_row.push(Binding::iri(graph_iri.clone()));
                     } else {
                         // Get from inner batch
                         let binding = batch
@@ -684,9 +679,14 @@ impl Operator for GraphOperator {
                                     .await?;
                                 }
                             } else {
-                                // Single-db: bind ?g to each registered user graph
-                                // (empty graphs emit no rows), then to the ledger
-                                // alias for the default graph.
+                                // Single-db: bind ?g to each registered user
+                                // graph (empty graphs emit no rows). The ledger
+                                // alias (default graph) is NOT enumerated: per
+                                // SPARQL 1.1, `GRAPH ?g` ranges over named
+                                // graphs only (D-2 / issue #1442 dropped the
+                                // #1279 implicit enumeration). The default
+                                // graph remains explicitly addressable via
+                                // `GRAPH <alias>` in the arms above.
                                 for iri in ctx.single_db_user_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,
@@ -697,16 +697,6 @@ impl Operator for GraphOperator {
                                     )
                                     .await?;
                                 }
-                                let alias_iri: Arc<str> =
-                                    Arc::from(ctx.active_snapshot.ledger_id.as_str());
-                                self.execute_in_graph(
-                                    ctx,
-                                    &parent_batch,
-                                    row_idx,
-                                    alias_iri,
-                                    Some(*var),
-                                )
-                                .await?;
                             }
                         }
                     }
@@ -738,7 +728,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::var_registry::VarRegistry;
-    use fluree_db_core::{LedgerSnapshot, Sid};
+    use fluree_db_core::{DatatypeConstraint, LedgerSnapshot, Sid};
 
     // Helper test struct for creating operators with specific schemas
     struct TestChildOperator {

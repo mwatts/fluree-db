@@ -1586,16 +1586,19 @@ async fn sparql_single_db_graph_non_matching_alias() {
     assert_eq!(jsonld, json!([]));
 }
 
-/// GRAPH ?g with unbound variable binds to db alias (single-db mode)
+/// Unbound `GRAPH ?g` ranges over NAMED graphs only (W3C semantics, decision
+/// D-2 / issue #1442): with no user named graphs registered, the default
+/// graph is NOT enumerated under the ledger alias, so the result is empty.
+/// (Until #1442 this pinned the #1279 extension that bound ?g to the alias.)
 #[tokio::test]
 async fn sparql_single_db_graph_variable_unbound() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    // Create a ledger with data
+    // Create a ledger with data (default graph only, no user named graphs)
     let ledger = seed_people_ledger(&fluree, "people:main").await;
 
-    // Query using GRAPH ?g - should bind ?g to db alias
+    // Query using GRAPH ?g — must NOT bind ?g to the ledger alias
     let sparql = r"
         PREFIX schema: <http://schema.org/>
         SELECT ?g ?name
@@ -1612,20 +1615,10 @@ async fn sparql_single_db_graph_variable_unbound() {
 
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    // Should return results with ?g bound to "people:main"
-    let normalized = normalize_rows(&jsonld);
-    assert_eq!(normalized.len(), 2);
-
-    // Check that ?g is bound to the alias (first element of each row)
-    for row in &normalized {
-        // row is Vec<serde_json::Value> which is stored as serde_json::Value::Array
-        let first_elem = &row[0];
-        assert_eq!(
-            first_elem,
-            &json!("people:main"),
-            "?g should be bound to db alias"
-        );
-    }
+    // No named graphs registered → GRAPH ?g matches nothing. The default
+    // graph stays reachable explicitly: see
+    // `sparql_single_db_graph_matching_alias` (GRAPH <people:main>).
+    assert_eq!(jsonld, json!([]));
 }
 
 /// GRAPH ?g with bound matching value works (single-db mode)
@@ -1745,9 +1738,10 @@ async fn sparql_single_db_graph_user_named_concrete() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
 }
 
-/// `GRAPH ?g` discovers user-registered named graphs (plus the ledger alias for
-/// the default graph) and EXCLUDES system graphs txn-meta/config (issue #1279
-/// reproducer, step 4 + open decision #1).
+/// `GRAPH ?g` discovers user-registered named graphs ONLY — not the ledger
+/// alias/default graph (W3C semantics, decision D-2 / issue #1442 resolved
+/// #1279's open decision #1 by dropping the implicit enumeration) — and
+/// EXCLUDES system graphs txn-meta/config (issue #1279 reproducer, step 4).
 #[tokio::test]
 async fn sparql_single_db_graph_variable_discovers_user_graphs() {
     assert_index_defaults();
@@ -1765,19 +1759,16 @@ async fn sparql_single_db_graph_variable_discovers_user_graphs() {
         .expect("query should succeed");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let mut graphs: Vec<String> = normalize_rows(&jsonld)
+    let graphs: Vec<String> = normalize_rows(&jsonld)
         .into_iter()
         .map(|row| row[0].as_str().expect("?g is a string").to_string())
         .collect();
-    graphs.sort();
 
-    // The user named graph and the ledger alias (default graph), and nothing
-    // else — the reserved txn-meta (g_id=1) / config (g_id=2) graphs are not
+    // The user named graph only — the default graph (ledger alias) is not
+    // enumerated (it stays explicitly addressable as GRAPH <ngquirk:main>),
+    // and the reserved txn-meta (g_id=1) / config (g_id=2) graphs are not
     // auto-exposed.
-    assert_eq!(
-        graphs,
-        vec!["ngquirk:main".to_string(), "urn:probegraph".to_string()]
-    );
+    assert_eq!(graphs, vec!["urn:probegraph".to_string()]);
 }
 
 /// Bound `GRAPH ?g` to a user named graph resolves without `FROM NAMED`.
@@ -1914,6 +1905,52 @@ async fn fql_single_db_graph_user_named_concrete() {
         .expect("query should succeed");
 
     assert_eq!(jsonld, json!(["Bob"]));
+}
+
+/// JSON-LD parity for BUG-1 + BUG-2 (issue #1442 / D-2): unbound
+/// `["graph", "?g", {...}]` ranges over user NAMED graphs only — the default
+/// graph (ledger alias) is not enumerated — and `?g` is bound as an IRI term
+/// (`Binding::Iri`), not a string literal. Same `GraphOperator` as SPARQL.
+#[tokio::test]
+async fn fql_single_db_graph_variable_excludes_default_binds_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    // Alice in the default graph, Bob in named graph <urn:probegraph>.
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "select": ["?g", "?name"],
+        "where": [
+            ["graph", "?g", {"@id": "?s", "schema:name": "?name"}]
+        ]
+    });
+
+    // Formatted: only the named-graph row; no ("ngquirk:main", "Alice") row.
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["urn:probegraph", "Bob"]]))
+    );
+
+    // Term kind: ?g is an IRI binding, not an xsd:string literal.
+    let raw = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+    let mut saw_g = false;
+    for batch in &raw.batches {
+        for row in 0..batch.len() {
+            let b = batch.get_by_col(row, 0); // select order: ?g first
+            assert!(
+                matches!(b, fluree_db_query::binding::Binding::Iri(iri) if iri.as_ref() == "urn:probegraph"),
+                "?g must be an IRI term binding, got {b:?}"
+            );
+            saw_g = true;
+        }
+    }
+    assert!(saw_g, "expected at least one ?g row");
 }
 
 #[tokio::test]
