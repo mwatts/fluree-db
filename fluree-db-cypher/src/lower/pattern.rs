@@ -594,9 +594,25 @@ fn lower_var_length_rel<E: IriEncoder>(
     path_var: Option<&Variable>,
 ) -> Result<()> {
     if rel.props.is_some() {
-        return Err(LowerError::unsupported(
-            "property filters on a variable-length relationship are deferred",
-        ));
+        // Only the bounded single-typed directed chain expansion can filter
+        // per hop (each hop's annotation carries the property values).
+        let bounded_typed_directed = rel.types.len() == 1
+            && rel.length.as_ref().is_some_and(|l| l.max.is_some())
+            && rel.length.as_ref().map_or(1, |l| l.min.unwrap_or(1)) >= 1
+            && !matches!(rel.direction, Direction::Either);
+        if !bounded_typed_directed {
+            return Err(LowerError::unsupported(
+                "property filters on a variable-length relationship are supported only on \
+                 bounded single-typed directed ranges (`-[:T*1..3 {p: v}]->`) in v1",
+            ));
+        }
+        if rel.var.is_some() || path_var.is_some() {
+            return Err(LowerError::unsupported(
+                "binding a relationship/path variable on a property-filtered \
+                 variable-length range is deferred — filter via WHERE on the bound \
+                 relationships instead",
+            ));
+        }
     }
     if rel.types.is_empty() {
         // Untyped wildcard paths with a rel/path binding enumerate (the
@@ -716,8 +732,15 @@ fn lower_var_length_rel<E: IriEncoder>(
 
             let mut chains: Vec<Vec<Pattern>> = Vec::with_capacity((hi - lo + 1) as usize);
             for k in lo..=hi {
-                let (mut chain, nodes) =
-                    build_fixed_chain(ctx, &left_ref, &right_ref, k, &type_iri, rel.direction)?;
+                let (mut chain, nodes) = build_fixed_chain(
+                    ctx,
+                    &left_ref,
+                    &right_ref,
+                    k,
+                    &type_iri,
+                    rel.direction,
+                    rel.props.as_ref(),
+                )?;
                 if let Some(pred) = &pred_sid {
                     if let Some(rv) = rel_var_id {
                         chain.push(Pattern::Bind {
@@ -936,6 +959,7 @@ fn build_fixed_chain<E: IriEncoder>(
     k: u32,
     type_iri: &str,
     direction: Direction,
+    props: Option<&MapLit>,
 ) -> Result<(Vec<Pattern>, Vec<Ref>)> {
     let mut chain = Vec::new();
     let mut nodes: Vec<Ref> = vec![s.clone()];
@@ -946,13 +970,30 @@ fn build_fixed_chain<E: IriEncoder>(
         } else {
             Ref::Var(ctx.fresh_synth())
         };
-        push_hop(
-            &prev,
-            &next,
-            ctx.iri_ref(type_iri.to_string()),
-            direction,
-            &mut chain,
-        );
+        if let Some(props) = props {
+            // A property-filtered hop matches only edges whose annotation
+            // carries the values (one row per matching annotation).
+            let (gs, go) = match direction {
+                Direction::Outgoing => (prev.clone(), next.clone()),
+                Direction::Incoming => (next.clone(), prev.clone()),
+                Direction::Either => unreachable!("rejected by the props gate"),
+            };
+            let ann = Ref::Var(ctx.fresh_synth());
+            let body = build_annotation_body(ctx, &ann, Some(props))?;
+            chain.push(Pattern::EdgeAnnotation {
+                edge: TriplePattern::new(gs, ctx.iri_ref(type_iri.to_string()), go.into()),
+                annotation: ann,
+                body,
+            });
+        } else {
+            push_hop(
+                &prev,
+                &next,
+                ctx.iri_ref(type_iri.to_string()),
+                direction,
+                &mut chain,
+            );
+        }
         nodes.push(next.clone());
         prev = next;
     }

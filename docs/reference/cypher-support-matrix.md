@@ -81,7 +81,7 @@ These shape everything below; read them first.
 | Undirected **unbounded** path `-[:T*]-` | ◑ | With a rel/path binding: enumerates. Without one, use a bounded range (reachability operator is single-direction). |
 | Free path value `MATCH p = (...)` | ◑ | A single relationship segment — fixed or variable-length (bounded via per-branch construction, unbounded via enumeration) — or a **multi-hop chain of fixed single-typed directed hops** (`p = (a)-[:R1]->(b)<-[:R2]-(c)`; the path value interleaves the bound nodes with per-hop relationship values in stored orientation). Deferred: a variable-length or undirected segment inside a multi-hop path value. |
 | Zero-length *typed* bounded path `-[:T*0..M]->` | ◑ | With a rel/path binding: enumerates (the zero-length path binds the end to the start with an empty rel list). Without a binding, use `*1..M`. |
-| Property filter on a var-length / `shortestPath` relationship | ⏳ | |
+| Property filter on a var-length / `shortestPath` relationship | ◑ | Bounded single-typed directed ranges (`-[:T*1..3 {p: v}]->`) filter per hop on the edge-annotation values. Deferred: unbounded/untyped/undirected ranges, combining the filter with a rel/path binding, and `shortestPath` relationships. |
 
 ## Expressions & operators
 

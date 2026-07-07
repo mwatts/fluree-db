@@ -5847,6 +5847,55 @@ async fn cypher_multi_hop_fixed_path_value() {
 }
 
 #[tokio::test]
+async fn cypher_var_length_property_filter_on_bounded_range() {
+    // `-[:T*1..2 {p: v}]->` matches per hop on the edge annotation values.
+    // A -[w:1]-> B -[w:1]-> C, plus A -[w:2]-> C directly.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:varlen-props");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:V {name: "A"}), (:V {name: "B"}), (:V {name: "C"});
+               MATCH (a:V {name: "A"}), (b:V {name: "B"}) CREATE (a)-[:E {w: 1}]->(b);
+               MATCH (b:V {name: "B"}), (c:V {name: "C"}) CREATE (b)-[:E {w: 1}]->(c);
+               MATCH (a:V {name: "A"}), (c:V {name: "C"}) CREATE (a)-[:E {w: 2}]->(c);"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Only w:1 hops qualify: A→B (1 hop) and A→B→C (2 hops); the direct
+    // A→C edge (w:2) is filtered out.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:V {name: "A"})-[:E*1..2 {w: 1}]->(x)
+               RETURN x.name AS dst ORDER BY dst"#,
+        )
+        .await
+        .expect("filtered var-length")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["B"], ["C"]]), "{out}");
+
+    // Unbounded / binding combinations stay deferred with clear errors.
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (a:V)-[:E* {w: 1}]->(x) RETURN x"#)
+        .await
+        .expect_err("unbounded with props")
+        .to_string();
+    assert!(msg.contains("bounded"), "{msg}");
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (a:V)-[r:E*1..2 {w: 1}]->(x) RETURN x"#)
+        .await
+        .expect_err("binding with props")
+        .to_string();
+    assert!(msg.contains("WHERE"), "{msg}");
+}
+
+#[tokio::test]
 async fn cypher_shortest_path_optional_null_for_missing() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:sp-optional").await;

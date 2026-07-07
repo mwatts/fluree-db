@@ -286,7 +286,7 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
             // MakePathHops(node0, rel1, node1, rel2, node2, …) → Path. Nodes
             // and per-hop relationship values interleave; each rel already
             // carries the stored edge orientation.
-            if args.len() < 3 || args.len() % 2 == 0 {
+            if args.len() < 3 || args.len().is_multiple_of(2) {
                 return Err(QueryError::InvalidFilter(
                     "MakePathHops expects interleaved node, rel, node, … arguments".to_string(),
                 ));
