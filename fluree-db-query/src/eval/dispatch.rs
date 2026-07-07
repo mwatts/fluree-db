@@ -213,6 +213,7 @@ impl Function {
             | Function::Relationships
             | Function::MakeRel
             | Function::MakePath
+            | Function::MakePathHops
             | Function::Split
             | Function::Labels
             | Function::Keys

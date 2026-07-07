@@ -130,9 +130,12 @@ ORDER BY / SKIP / LIMIT
     bound end, or a type.
 
   A **fixed** single hop also takes a path variable
-  (`MATCH p = (a)-[:T]->(b)` is a `*1..1` path). Deferred: multi-hop path
-  values (`p = (a)-[:T]->(b)-[:U]->(c)`), binding over a type alternation,
-  and property filters on a var-length relationship.
+  (`MATCH p = (a)-[:T]->(b)` is a `*1..1` path), as does a **multi-hop chain**
+  of fixed single-typed directed hops (`p = (a)-[:R1]->(b)<-[:R2]-(c)`) — the
+  path value is built from the bound nodes and per-hop relationship values.
+  Deferred: a variable-length or undirected segment inside a multi-hop path
+  value, binding over a type alternation, and property filters on a
+  var-length relationship.
 - **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the

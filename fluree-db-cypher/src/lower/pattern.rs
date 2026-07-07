@@ -69,11 +69,10 @@ fn lower_part<E: IriEncoder>(
     // p unbound.
     let single_var_length = part.tail.len() == 1 && part.tail[0].0.length.is_some();
     let single_fixed_hop = part.tail.len() == 1 && part.tail[0].0.length.is_none();
+    // A multi-hop chain of fixed single-typed directed hops builds its path
+    // value from the interleaved node refs and per-hop relationship values.
     if part.path_var.is_some() && !single_var_length && !single_fixed_hop {
-        return Err(LowerError::unsupported(
-            "a path variable (`p = …`) is supported for shortestPath and a single \
-             relationship segment in v1 (multi-hop path values are deferred)",
-        ));
+        return lower_multi_hop_path(ctx, part, out);
     }
     // `p = (a)-[:T]->(b)`: a fixed hop is a `*1..1` path — reuse the
     // variable-length machinery to build the path value.
@@ -448,6 +447,82 @@ fn build_rel_hop<E: IriEncoder>(
 
     push_rel_triple(ctx, &rel.var, &rel.props, pred, s, o, &mut out)?;
     Ok(out)
+}
+
+/// Lower `p = (a)-[:R1]->(b)-[:R2]->(c)` — a multi-hop chain of FIXED
+/// single-typed directed hops — binding `p` via `MakePathHops(node0, rel1,
+/// node1, rel2, node2, …)`. Hops lower as ordinary relationship patterns
+/// first (so labels/props/rel vars behave normally); the path value is a
+/// pure expression over the bound node refs. The caller has already lowered
+/// the head node. Variable-length or undirected segments in a multi-hop
+/// path value stay deferred.
+fn lower_multi_hop_path<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    part: &PatternPart,
+    out: &mut Vec<Pattern>,
+) -> Result<()> {
+    let path_var = part
+        .path_var
+        .as_ref()
+        .expect("caller checked path_var.is_some()");
+    for (rel, _) in &part.tail {
+        if rel.length.is_some() {
+            return Err(LowerError::unsupported(
+                "a variable-length segment inside a multi-hop path value \
+                 (`p = (a)-[:T*]->(b)-[:U]->(c)`) is deferred — bind the segments separately",
+            ));
+        }
+        if rel.types.len() != 1 {
+            return Err(LowerError::unsupported(
+                "multi-hop path values need single-typed hops (`-[:T]->`) in v1",
+            ));
+        }
+        if matches!(rel.direction, Direction::Either) {
+            return Err(LowerError::unsupported(
+                "multi-hop path values need directed hops (`->` or `<-`) in v1",
+            ));
+        }
+    }
+
+    let node_expr = |ctx: &mut LoweringContext<'_, E>, node: &NodePattern| {
+        ref_to_expr(&lookup_node_ref(ctx, node)).ok_or_else(|| {
+            LowerError::unsupported(
+                "an IRI-anchored node in a multi-hop path value is deferred — bind it \
+                 to a variable first",
+            )
+        })
+    };
+
+    let mut args: Vec<Expression> = Vec::with_capacity(part.tail.len() * 2 + 1);
+    args.push(node_expr(ctx, &part.head)?);
+    let mut prev = part.head.clone();
+    for (rel, next) in &part.tail {
+        lower_node(ctx, next, out)?;
+        lower_rel(ctx, &prev, rel, next, out, None)?;
+        let s_ref = lookup_node_ref(ctx, &prev);
+        let o_ref = lookup_node_ref(ctx, next);
+        // Stored edge orientation for the hop's relationship value.
+        let (es, eo) = match rel.direction {
+            Direction::Outgoing => (&s_ref, &o_ref),
+            Direction::Incoming => (&o_ref, &s_ref),
+            Direction::Either => unreachable!("rejected above"),
+        };
+        let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
+        let Some(rel_expr) = make_rel_expr(ctx, &Ref::Iri(type_iri.as_str().into()), es, eo) else {
+            // The type never entered the dictionary — no such edges exist, so
+            // the whole path matches nothing.
+            out.push(empty_path_result(&lookup_node_ref(ctx, &part.head), &o_ref));
+            return Ok(());
+        };
+        args.push(rel_expr);
+        args.push(node_expr(ctx, next)?);
+        prev = next.clone();
+    }
+    out.push(Pattern::Bind {
+        var: ctx.intern_var(&path_var.name),
+        expr: Expression::call(Function::MakePathHops, args),
+    });
+    Ok(())
 }
 
 /// `MakeRel(start, pred, end)` for a value-only relationship variable, or

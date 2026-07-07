@@ -389,8 +389,8 @@ fn plain_fixed_path_value_lowers_as_single_hop() {
         "single fixed hop path value lowers"
     );
     assert!(
-        lower_res("MATCH p = (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN p").is_err(),
-        "multi-hop path value stays deferred"
+        lower_res("MATCH p = (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN p").is_ok(),
+        "multi-hop fixed path value lowers (MakePathHops)"
     );
 }
 

@@ -282,6 +282,37 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                 .collect();
             Ok(Some(Binding::Path { nodes, edges }))
         }
+        Function::MakePathHops => {
+            // MakePathHops(node0, rel1, node1, rel2, node2, …) → Path. Nodes
+            // and per-hop relationship values interleave; each rel already
+            // carries the stored edge orientation.
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Err(QueryError::InvalidFilter(
+                    "MakePathHops expects interleaved node, rel, node, … arguments".to_string(),
+                ));
+            }
+            let Some(ctx) = ctx else {
+                return Ok(Some(Binding::Unbound));
+            };
+            let mut nodes = Vec::with_capacity(args.len() / 2 + 1);
+            let mut edges = Vec::with_capacity(args.len() / 2);
+            for (i, a) in args.iter().enumerate() {
+                if i % 2 == 0 {
+                    match arg_to_sid(a, row, ctx)? {
+                        Some(sid) => nodes.push(sid),
+                        None => return Ok(Some(Binding::Unbound)),
+                    }
+                } else {
+                    match resolve_arg_binding(a, row, Some(ctx))? {
+                        Some(Binding::Rel(rel)) => {
+                            edges.push((rel.start, rel.predicate, rel.end));
+                        }
+                        _ => return Ok(Some(Binding::Unbound)),
+                    }
+                }
+            }
+            Ok(Some(Binding::Path { nodes, edges }))
+        }
         Function::Relationships => {
             // One relationship value per hop of a path: Rel(node[i], pred[i], node[i+1]).
             // Path edges are plain triples, so `reifier` is None (properties(r) on

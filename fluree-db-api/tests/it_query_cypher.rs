@@ -5793,6 +5793,60 @@ async fn cypher_path_enumeration_undirected_binding() {
 }
 
 #[tokio::test]
+async fn cypher_multi_hop_fixed_path_value() {
+    // `p = (a)-[:T]->(b)-[:T]->(c)` — a multi-hop fixed chain builds the
+    // path value from interleaved nodes and per-hop relationship values.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:multi-hop-path").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+               RETURN length(p) AS len,
+                      [n IN nodes(p) | n.name] AS names,
+                      [r IN relationships(p) | type(r)] AS types"#,
+        )
+        .await
+        .expect("multi-hop path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[2, ["Alice", "Bob", "Carol"], ["KNOWS", "KNOWS"]]]),
+        "{out}"
+    );
+
+    // Incoming hops keep the STORED edge orientation in relationships(p).
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (c:Person {name: "Carol"})<-[:KNOWS]-(b)<-[:KNOWS]-(a)
+               RETURN [n IN nodes(p) | n.name] AS names,
+                      startNode(relationships(p)[0]) = b AS first_starts_at_b"#,
+        )
+        .await
+        .expect("incoming multi-hop path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([[["Carol", "Bob", "Alice"], true]]), "{out}");
+
+    // A variable-length segment inside a multi-hop path value stays deferred.
+    let msg = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b)-[:KNOWS]->(c) RETURN p"#,
+        )
+        .await
+        .expect_err("mixed var-length multi-hop")
+        .to_string();
+    assert!(msg.contains("variable-length segment"), "{msg}");
+}
+
+#[tokio::test]
 async fn cypher_shortest_path_optional_null_for_missing() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:sp-optional").await;
