@@ -135,6 +135,50 @@ impl super::Parser<'_> {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(bind) = self.parse_bind_pattern() {
+                    // SPARQL 1.1 §10.1 / grammar note 12 (V5): the variable
+                    // assigned by BIND must not already be in scope in this
+                    // group graph pattern *up to this point* (`patterns` =
+                    // the preceding siblings of this group only — a nested
+                    // `{ BIND ... }` group starts a fresh scope, which is
+                    // why this check lives HERE and not in `validate()`:
+                    // after the single-pattern group simplification below,
+                    // `{ ... { BIND(e AS ?v) } }` (legal) and
+                    // `{ ... BIND(e AS ?v) }` (illegal) produce identical
+                    // ASTs, so only the parser can tell them apart.
+                    //
+                    // `parse_sparql` refuses to produce an AST when this
+                    // diagnostic fires (D-4: reject-more errors must prevent
+                    // AST production; recovered-error ASTs would otherwise
+                    // execute through the API's diagnostic-swallowing path).
+                    if let GraphPattern::Bind { var, span, .. } = &bind {
+                        let mut in_scope = Vec::new();
+                        for preceding in &patterns {
+                            preceding.add_in_scope_variables(&mut in_scope);
+                        }
+                        if let Some(first) = in_scope.iter().find(|v| v.name == var.name) {
+                            self.stream.add_diagnostic(
+                                Diagnostic::error(
+                                    DiagCode::BindTargetAlreadyInScope,
+                                    format!(
+                                        "BIND target variable ?{} is already in scope \
+                                         in this group",
+                                        var.name
+                                    ),
+                                    *span,
+                                )
+                                .with_label(crate::diag::Label::new(
+                                    first.span,
+                                    "already bound here",
+                                ))
+                                .with_help(
+                                    "The variable assigned by BIND(expr AS ?v) must not \
+                                     be used earlier in the same group graph pattern \
+                                     (SPARQL 1.1 §10.1). Bind to a fresh variable, or \
+                                     wrap the BIND in its own { } group.",
+                                ),
+                            );
+                        }
+                    }
                     patterns.push(bind);
                 }
             } else if self.stream.check_keyword(TokenKind::KwValues) {

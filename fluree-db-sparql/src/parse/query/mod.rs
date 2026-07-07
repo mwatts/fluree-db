@@ -67,7 +67,23 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
     match parser.parse_query() {
         Some(mut ast) => {
             ast.pragmas = extract_pragmas(&comments);
-            ParseOutput::with_diagnostics(Some(ast), stream.take_diagnostics())
+            let diagnostics = stream.take_diagnostics();
+            // Parse-time *semantic* rejections (currently the V5 BIND-scope
+            // check) must prevent AST production: unlike recovered syntax
+            // errors — where returning a best-effort AST keeps diagnostics
+            // flowing for IDE/LSP use — these describe a query that parsed
+            // completely but is spec-invalid, and callers that only check
+            // for an AST (e.g. the API's parse-then-validate path) would
+            // otherwise execute it (roadmap D-4: hard errors, no
+            // diagnostic-swallowing).
+            let semantic_reject = diagnostics
+                .iter()
+                .any(|d| d.code == DiagCode::BindTargetAlreadyInScope && d.is_error());
+            if semantic_reject {
+                ParseOutput::with_diagnostics(None, diagnostics)
+            } else {
+                ParseOutput::with_diagnostics(Some(ast), diagnostics)
+            }
         }
         None => ParseOutput::with_diagnostics(None, stream.take_diagnostics()),
     }

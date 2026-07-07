@@ -2672,3 +2672,122 @@ fn test_pragma_in_trailing_comment_honored() {
     let ast = assert_parses("SELECT * WHERE { } # PRAGMA reasoning: rdfs");
     assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
 }
+
+// =============================================================================
+// V5 — BIND scope (SPARQL 1.1 §10.1 / grammar note 12)
+//
+// This check is parse-time by necessity: the single-pattern group
+// simplification makes `{ ... { BIND } }` and `{ ... BIND }` produce
+// identical ASTs, so `validate()` cannot distinguish them.
+// =============================================================================
+
+fn assert_bind_scope_rejected(input: &str) {
+    let result = parse(input);
+    assert!(
+        result.ast.is_none(),
+        "expected AST production to be refused: {input}"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagCode::BindTargetAlreadyInScope && d.is_error()),
+        "expected BindTargetAlreadyInScope: {:?}",
+        result.diagnostics
+    );
+}
+
+fn assert_bind_scope_accepted(input: &str) {
+    let result = parse(input);
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagCode::BindTargetAlreadyInScope),
+        "unexpected BindTargetAlreadyInScope: {:?}",
+        result.diagnostics
+    );
+    assert!(result.ast.is_some(), "expected AST: {input}");
+}
+
+#[test]
+fn test_bind_scope_prior_triple_rejected() {
+    // W3C syntax-BINDscope6 (test_60): ?o1 bound by a preceding triple in
+    // the same group.
+    assert_bind_scope_rejected(
+        "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . :s :q ?o1 . BIND((1+?o) AS ?o1) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_nested_group_propagates_rejected() {
+    // W3C syntax-BINDscope7 (test_61a): in-scope propagates out of a
+    // nested group to the BIND in the outer group.
+    assert_bind_scope_rejected(
+        "PREFIX : <http://example.org/> SELECT * WHERE { { :s :p ?o . :s :q ?o1 . } BIND((1+?o) AS ?o1) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_union_branch_propagates_rejected() {
+    // W3C syntax-BINDscope8 (test_62a): a UNION contributes both branches'
+    // in-scope variables.
+    assert_bind_scope_rejected(
+        "PREFIX : <http://example.org/> SELECT * { { { :s :p ?Y } UNION { :s :p ?Z } } BIND(1 AS ?Y) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_use_after_bind_accepted() {
+    // W3C syntax-BINDscope1 (positive, test_55): only elements BEFORE the
+    // BIND count.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . BIND((1+?o) AS ?o1) :s :q ?o1 }",
+    );
+}
+
+#[test]
+fn test_bind_scope_braced_bind_accepted() {
+    // W3C syntax-BINDscope2/3 (positive): a `{ BIND ... }` group is its own
+    // scope — the outer group's earlier triples don't apply.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . :s :q ?o1 { BIND((1+?o) AS ?o1) } }",
+    );
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { { :s :p ?o . :s :q ?o1 } { BIND((1+?o) AS ?o1) } }",
+    );
+}
+
+#[test]
+fn test_bind_scope_union_branches_independent_accepted() {
+    // W3C syntax-BINDscope4/5 (positive): UNION branches are separate
+    // groups.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * { { BIND(1 AS ?Y) } UNION { :s :p ?Y } }",
+    );
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * { { :s :p ?Y } UNION { BIND(1 AS ?Y) } }",
+    );
+}
+
+#[test]
+fn test_bind_scope_values_rejected() {
+    // VALUES contributes its variables to the in-scope set.
+    assert_bind_scope_rejected("SELECT * WHERE { VALUES ?x { 1 2 } BIND(3 AS ?x) }");
+}
+
+#[test]
+fn test_bind_scope_minus_right_not_in_scope_accepted() {
+    // MINUS's right side does not project variables out (§18.2.1).
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { ?s :p ?o MINUS { ?s :q ?m } BIND(1 AS ?m) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_filter_var_not_in_scope_accepted() {
+    // FILTER contributes nothing to the in-scope set.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { ?s :p ?o FILTER(?f) BIND(1 AS ?f) }",
+    );
+}

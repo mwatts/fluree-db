@@ -28,6 +28,9 @@
 //! }
 //! ```
 
+mod bnode_scope;
+mod projection;
+
 use crate::ast::path::PropertyPath;
 use crate::ast::pattern::{GraphPattern, TriplePattern};
 use crate::ast::query::{
@@ -100,22 +103,51 @@ impl<'a> Validator<'a> {
     }
 
     fn validate_select(&mut self, query: &SelectQuery) {
-        self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_query_where(&query.where_clause.pattern);
+        projection::check_projection_scope(
+            &query.select.variables,
+            query.modifiers.group_by.as_ref(),
+            query.select.span,
+            &mut self.diagnostics,
+        );
+        projection::check_select_aliases(
+            &query.select.variables,
+            &query.where_clause.pattern,
+            &mut self.diagnostics,
+        );
+        projection::check_nested_aggregates(
+            &query.select.variables,
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
+        // The post-query VALUES clause shares the Values pattern arm
+        // (duplicate-variable check).
+        if let Some(values) = &query.values {
+            self.validate_graph_pattern(values);
+        }
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
-        self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_query_where(&query.where_clause.pattern);
         // Template triples don't need ground validation (they use WHERE variables)
     }
 
     fn validate_ask(&mut self, query: &AskQuery) {
-        self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_query_where(&query.where_clause.pattern);
     }
 
     fn validate_describe(&mut self, query: &DescribeQuery) {
         if let Some(where_clause) = &query.where_clause {
-            self.validate_graph_pattern(&where_clause.pattern);
+            self.validate_query_where(&where_clause.pattern);
         }
+    }
+
+    /// Shared validation for a query form's WHERE pattern: the capability
+    /// walk plus the query-only semantic passes (blank-node label scope —
+    /// update operations have their own blank-node rules and are exempt).
+    fn validate_query_where(&mut self, pattern: &GraphPattern) {
+        self.validate_graph_pattern(pattern);
+        bnode_scope::check_blank_node_scopes(pattern, &mut self.diagnostics);
     }
 
     fn validate_update(&mut self, op: &UpdateOperation) {
@@ -136,13 +168,61 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate INSERT DATA - triples must be ground (no variables).
+    ///
+    /// Annotation tails minting anonymous reifiers are deliberately
+    /// ALLOWED here: they are Fluree's committed SPARQL 1.2 transact
+    /// surface for edge annotations (a fresh blank reifier is minted at
+    /// lowering, like a bnode subject would be) — a reviewed divergence
+    /// from the W3C negative-syntax reading. DELETE DATA differs; see
+    /// [`Validator::validate_delete_data`].
     fn validate_insert_data(&mut self, insert: &InsertData) {
         self.validate_ground_quad_data(&insert.data, "INSERT DATA");
     }
 
-    /// Validate DELETE DATA - triples must be ground (no variables).
+    /// Validate DELETE DATA - triples must be ground (no variables), and
+    /// annotation tails must not mint anonymous reifiers (a `{| ... |}`
+    /// block or bare `~` with no explicit reifier id): an anonymous
+    /// reifier has no addressable identity to delete (SPARQL 1.1 §3.1.3
+    /// blank-node rule extended to RDF 1.2 reifiers; W3C sparql12
+    /// syntax-update-anonreifier-02). Mirrors the existing lowering-time
+    /// rejection in fluree-db-transact so the query never produces an AST
+    /// the API would act on.
     fn validate_delete_data(&mut self, delete: &DeleteData) {
         self.validate_ground_quad_data(&delete.data, "DELETE DATA");
+        for el in &delete.data.quads {
+            match el {
+                QuadPatternElement::Triple(triple) => {
+                    self.check_delete_data_annotation(triple);
+                }
+                QuadPatternElement::Graph { triples, .. } => {
+                    for triple in triples {
+                        self.check_delete_data_annotation(triple);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reject an annotation tail that mints an anonymous reifier inside
+    /// DELETE DATA (see [`Validator::validate_delete_data`]).
+    fn check_delete_data_annotation(&mut self, triple: &TriplePattern) {
+        if let Some(annotation) = &triple.annotation {
+            if annotation.reifier.is_none() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        DiagCode::AnonymousAnnotationInGroundData,
+                        "anonymous annotation block ({| |}) in DELETE DATA — \
+                         no addressable identity to delete",
+                        annotation.span,
+                    )
+                    .with_help(
+                        "Name the reifier explicitly (s p o ~ <reifier> {| ... |}) \
+                         so the annotation to delete is addressable, or use \
+                         DELETE WHERE.",
+                    ),
+                );
+            }
+        }
     }
 
     /// Validate DELETE WHERE - patterns can have variables.
@@ -347,8 +427,27 @@ impl<'a> Validator<'a> {
             GraphPattern::Bind { .. } => {
                 // Expression validation could be added here
             }
-            GraphPattern::Values { .. } => {
-                // Values are ground by construction
+            GraphPattern::Values { vars, .. } => {
+                // Values terms are ground by construction; the variable
+                // list, however, must not repeat a variable (SPARQL 1.2
+                // negative-syntax rule; also implied by SPARQL 1.1 §10.2's
+                // "must all be distinct" data-block contract).
+                let mut seen = std::collections::HashSet::new();
+                for var in vars {
+                    if !seen.insert(var.name.as_ref()) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                DiagCode::DuplicateValuesVariable,
+                                format!(
+                                    "variable ?{} is listed more than once in VALUES",
+                                    var.name
+                                ),
+                                var.span,
+                            )
+                            .with_help("Each variable in a VALUES clause must be distinct."),
+                        );
+                    }
+                }
             }
             GraphPattern::Graph { pattern, .. } => {
                 self.validate_graph_pattern(pattern);
@@ -356,8 +455,24 @@ impl<'a> Validator<'a> {
             GraphPattern::Service { pattern, .. } => {
                 self.validate_graph_pattern(pattern);
             }
-            GraphPattern::SubSelect { query, .. } => {
+            GraphPattern::SubSelect { query, span } => {
                 self.validate_graph_pattern(&query.pattern);
+                projection::check_projection_scope(
+                    &query.variables,
+                    query.modifiers.group_by.as_ref(),
+                    *span,
+                    &mut self.diagnostics,
+                );
+                projection::check_select_aliases(
+                    &query.variables,
+                    &query.pattern,
+                    &mut self.diagnostics,
+                );
+                projection::check_nested_aggregates(
+                    &query.variables,
+                    &query.modifiers,
+                    &mut self.diagnostics,
+                );
             }
             GraphPattern::Path { path, span, .. } => {
                 self.validate_property_path(path, *span);
@@ -665,6 +780,322 @@ mod tests {
         assert!(
             diags.iter().all(|d| !d.is_error()),
             "Expected no errors: {diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // V3 — blank-node label scope tests (SPARQL 1.1 §19.6)
+    // =========================================================================
+
+    fn has_code(diags: &[Diagnostic], code: DiagCode) -> bool {
+        diags.iter().any(|d| d.code == code && d.is_error())
+    }
+
+    #[test]
+    fn test_bnode_scope_same_bgp_valid() {
+        // Same label twice in one basic graph pattern is fine.
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v . _:a ex:q 1 }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnode_scope_across_filter_valid() {
+        // FILTER does not end a basic graph pattern (§18.2.2.5).
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v FILTER(?v > 1) _:a ex:q 1 }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnode_scope_across_optional_rejected() {
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v OPTIONAL { _:a ex:q 1 } }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_across_nested_group_rejected() {
+        let diags = validate_query("SELECT * WHERE { _:a ?p ?v . { _:a ?q 1 } }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_across_union_rejected() {
+        let diags = validate_query("SELECT * WHERE { { _:a ex:p ?v } UNION { _:a ex:q 1 } }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_boundary_breaks_bgp_rejected() {
+        // Reuse in the SAME group but across a GRAPH boundary: the GRAPH
+        // pattern ends the first BGP, so the second `_:a` is a new BGP.
+        let diags = validate_query("SELECT * WHERE { _:a ?p ?v . GRAPH ?g { ?s ?p ?v } _:a ?q 1 }");
+        assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
+    }
+
+    #[test]
+    fn test_bnode_scope_distinct_labels_valid() {
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v OPTIONAL { _:b ex:q 1 } }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnode_scope_anon_bnodes_valid() {
+        // `[]` anonymous blank nodes have no label and are never flagged.
+        let diags = validate_query("SELECT * WHERE { [] ex:p ?v OPTIONAL { [] ex:q 1 } }");
+        assert!(
+            !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+            "{diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // V4 — GROUP BY / aggregate projection-scope tests (SPARQL 1.1 §11)
+    // =========================================================================
+
+    #[test]
+    fn test_projection_star_with_group_by_rejected() {
+        let diags = validate_query("SELECT * { ?s ?p ?o } GROUP BY ?s");
+        assert!(has_code(&diags, DiagCode::SelectStarWithGroupBy));
+    }
+
+    #[test]
+    fn test_projection_ungrouped_var_rejected() {
+        let diags = validate_query("SELECT ?o { ?s ?p ?o } GROUP BY ?s");
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_group_key_and_aggregate_valid() {
+        let diags = validate_query("SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s");
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_implicit_group_ungrouped_var_rejected() {
+        // agg10 shape: an aggregate in the projection groups implicitly;
+        // ?p is then neither a key nor aggregated.
+        let diags = validate_query("SELECT ?p (COUNT(?o) AS ?c) WHERE { ?s ?p ?o }");
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_expression_key_vars_not_licensed() {
+        // agg08 shape: GROUP BY (?a + ?b) — the *expression* is the key,
+        // not its variables.
+        let diags = validate_query(
+            "SELECT ((?a + ?b) AS ?ab) (COUNT(?a) AS ?c) WHERE { ?s ?p ?a, ?b } GROUP BY (?a + ?b)",
+        );
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_bracketed_var_key_valid() {
+        // GROUP BY (?s) — a bracketed bare variable counts as the key ?s.
+        let diags = validate_query("SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY (?s)");
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_group_by_alias_valid() {
+        let diags = validate_query(
+            "SELECT ?key (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY (STR(?s) AS ?key)",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_earlier_alias_usable_in_later_expression() {
+        let diags = validate_query(
+            "SELECT (SUM(?x) AS ?sum) ((?sum + 1) AS ?sump) WHERE { ?s ?p ?x } GROUP BY ?s",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_ungrouped_query_unaffected() {
+        let diags = validate_query("SELECT ?s ?o WHERE { ?s ?p ?o }");
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection)
+                && !has_code(&diags, DiagCode::SelectStarWithGroupBy),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_subselect_checked() {
+        let diags =
+            validate_query("SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }");
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    // =========================================================================
+    // V6 — SELECT alias tests (SPARQL 1.1 §19.8 note 13)
+    // =========================================================================
+
+    #[test]
+    fn test_select_alias_duplicate_rejected() {
+        // W3C syn-bad-03 (test_45).
+        let diags = validate_query("SELECT (1 AS ?X) (1 AS ?X) {}");
+        assert!(has_code(&diags, DiagCode::SelectAliasAlreadyBound));
+    }
+
+    #[test]
+    fn test_select_alias_in_scope_via_subselect_rejected() {
+        // W3C syntax-SELECTscope2 (test_65): the sub-SELECT projects ?X
+        // into the outer WHERE pattern's scope.
+        let diags = validate_query("SELECT (1 AS ?X) { SELECT (2 AS ?X) {} }");
+        assert!(has_code(&diags, DiagCode::SelectAliasAlreadyBound));
+    }
+
+    #[test]
+    fn test_select_alias_in_scope_via_pattern_rejected() {
+        let diags = validate_query("SELECT ((?x + 1) AS ?y) WHERE { ?x ex:p ?y }");
+        assert!(has_code(&diags, DiagCode::SelectAliasAlreadyBound));
+    }
+
+    #[test]
+    fn test_select_alias_fresh_variable_valid() {
+        let diags = validate_query("SELECT ((?x + 1) AS ?y) WHERE { ?x ex:p ?o }");
+        assert!(
+            !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_alias_parallel_subselects_valid() {
+        // W3C syntax-SELECTscope1/3 (positive): each sub-SELECT clause is
+        // checked against its own (empty) pattern; the outer SELECT * makes
+        // no assignments.
+        let diags =
+            validate_query("SELECT * WHERE { { SELECT (1 AS ?X) {} } { SELECT (1 AS ?X) {} } }");
+        assert!(
+            !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_alias_chained_use_valid() {
+        // Later expressions may USE an earlier alias — only re-ASSIGNMENT
+        // is an error.
+        let diags = validate_query("SELECT (1 AS ?x) ((?x + 1) AS ?y) WHERE {}");
+        assert!(
+            !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // SPARQL 1.2 — nested aggregates + duplicated VALUES variables
+    // =========================================================================
+
+    #[test]
+    fn test_nested_aggregate_rejected() {
+        // W3C sparql12 nested-aggregate-functions.
+        let diags = validate_query("SELECT (COUNT(COUNT(*)) AS ?c) WHERE {}");
+        assert!(has_code(&diags, DiagCode::NestedAggregate));
+    }
+
+    #[test]
+    fn test_nested_aggregate_under_arithmetic_rejected() {
+        let diags = validate_query("SELECT (SUM(1 + MAX(?x)) AS ?c) WHERE { ?s ?p ?x }");
+        assert!(has_code(&diags, DiagCode::NestedAggregate));
+    }
+
+    #[test]
+    fn test_flat_aggregates_valid() {
+        let diags = validate_query(
+            "SELECT (COUNT(?x) AS ?c) ((MIN(?x) + MAX(?x)) AS ?range) WHERE { ?s ?p ?x }",
+        );
+        assert!(!has_code(&diags, DiagCode::NestedAggregate), "{diags:?}");
+    }
+
+    #[test]
+    fn test_nested_aggregate_in_having_rejected() {
+        let diags =
+            validate_query("SELECT ?s WHERE { ?s ?p ?x } GROUP BY ?s HAVING (SUM(AVG(?x)) > 1)");
+        assert!(has_code(&diags, DiagCode::NestedAggregate));
+    }
+
+    #[test]
+    fn test_duplicate_values_variable_rejected() {
+        // W3C sparql12 duplicated-values-variable.
+        let diags = validate_query("SELECT * WHERE { VALUES (?a ?a) { (1 1) } }");
+        assert!(has_code(&diags, DiagCode::DuplicateValuesVariable));
+    }
+
+    #[test]
+    fn test_duplicate_values_variable_postclause_rejected() {
+        let diags = validate_query("SELECT * WHERE { ?s ?p ?o } VALUES (?a ?a) { (1 1) }");
+        assert!(has_code(&diags, DiagCode::DuplicateValuesVariable));
+    }
+
+    #[test]
+    fn test_distinct_values_variables_valid() {
+        let diags = validate_query("SELECT * WHERE { VALUES (?a ?b) { (1 1) } }");
+        assert!(
+            !has_code(&diags, DiagCode::DuplicateValuesVariable),
+            "{diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // Anonymous annotation in DELETE DATA (SPARQL 1.2 negative update syntax)
+    // =========================================================================
+
+    #[test]
+    fn test_delete_data_anonymous_annotation_rejected() {
+        // W3C sparql12 syntax-update-anonreifier-02 (first operation).
+        let diags = validate_query(
+            "PREFIX : <http://example.com/ns#> DELETE DATA { :s :p :o1 {| :added 'Test' |} }",
+        );
+        assert!(has_code(&diags, DiagCode::AnonymousAnnotationInGroundData));
+    }
+
+    #[test]
+    fn test_delete_data_named_reifier_annotation_valid() {
+        // An explicit IRI reifier is addressable — allowed.
+        let diags = validate_query(
+            "PREFIX : <http://example.com/ns#> DELETE DATA { :s :p :o1 ~ :r {| :added 'Test' |} }",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::AnonymousAnnotationInGroundData),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_data_anonymous_annotation_still_allowed() {
+        // Fluree's committed SPARQL 1.2 transact surface (reviewed
+        // divergence): anonymous annotation blocks mint a fresh reifier in
+        // INSERT DATA.
+        let diags = validate_query(
+            "PREFIX : <http://example.com/ns#> INSERT DATA { :s :p :o2 {| :added 'Test' |} }",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::AnonymousAnnotationInGroundData),
+            "{diags:?}"
         );
     }
 

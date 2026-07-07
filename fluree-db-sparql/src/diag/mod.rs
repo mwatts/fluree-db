@@ -131,6 +131,41 @@ pub enum DiagCode {
     VariableInGroundData,
 
     // =========================================================================
+    // Semantic validation (V001-V099) - SPARQL spec semantic rules
+    // =========================================================================
+    /// Blank node label reused across basic graph patterns (SPARQL §19.6)
+    #[serde(rename = "V001")]
+    BlankNodeLabelCrossScope,
+
+    /// SELECT * is not allowed with GROUP BY (SPARQL §11)
+    #[serde(rename = "V002")]
+    SelectStarWithGroupBy,
+
+    /// Projected variable is neither a group key nor aggregated (SPARQL §11 / §18.2.4)
+    #[serde(rename = "V003")]
+    UngroupedVariableInProjection,
+
+    /// BIND target variable already in scope in the group (SPARQL §10.1)
+    #[serde(rename = "V004")]
+    BindTargetAlreadyInScope,
+
+    /// SELECT (expr AS ?v) alias assigned twice or already in scope (SPARQL §19.8 note 13)
+    #[serde(rename = "V005")]
+    SelectAliasAlreadyBound,
+
+    /// Aggregate call nested inside another aggregate's argument
+    #[serde(rename = "V006")]
+    NestedAggregate,
+
+    /// Variable listed more than once in a VALUES clause
+    #[serde(rename = "V007")]
+    DuplicateValuesVariable,
+
+    /// Annotation minting an anonymous reifier in ground DATA (DELETE DATA)
+    #[serde(rename = "V008")]
+    AnonymousAnnotationInGroundData,
+
+    // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
     /// Feature lowering not yet implemented in Rust
@@ -177,6 +212,15 @@ impl DiagCode {
             Self::UnsupportedSelectReduced => "F007",
             Self::UnsupportedDistinctAggregate => "F008",
             Self::VariableInGroundData => "F009",
+            // Semantic validation
+            Self::BlankNodeLabelCrossScope => "V001",
+            Self::SelectStarWithGroupBy => "V002",
+            Self::UngroupedVariableInProjection => "V003",
+            Self::BindTargetAlreadyInScope => "V004",
+            Self::SelectAliasAlreadyBound => "V005",
+            Self::NestedAggregate => "V006",
+            Self::DuplicateValuesVariable => "V007",
+            Self::AnonymousAnnotationInGroundData => "V008",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

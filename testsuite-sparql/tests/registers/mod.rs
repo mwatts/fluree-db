@@ -15,17 +15,7 @@
 //! Baseline: rdf-tests submodule @ efccbc6b8, 2026-07-06.
 
 pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
-    // parser accepts invalid input (missing validation) (7)
-    // (test_65 formerly failed to parse for the wrong reason; PR #1436 made
-    // it parse, so it now needs the SELECT-scope validation pass — burn-down
-    // PR-2 V4/V5 territory)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_43",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_44",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_45",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_60",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_61a",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_62a",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_65",
+    // fully green: PR-1 (accept-more) + PR-2 (V3-V6 validation) + main's #1436
 ];
 
 // Dominated by the missing UPDATE graph-management grammar
@@ -75,10 +65,11 @@ pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
 ];
 
 pub const SPARQL10_SYNTAX: &[&str] = &[
-    // parser accepts invalid input (missing validation) (24)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#blabel-cross-graph-bad",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#blabel-cross-optional-bad",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#blabel-cross-union-bad",
+    // parser accepts invalid input (missing validation) (13)
+    // All remaining entries are V1 (load-bearing dots) / V2 (FILTER
+    // Constraint) grammar-tightening territory — burn-down PR-3, not the
+    // PR-2 semantic-validation passes (which cleared the V3 blabel/
+    // breaks-BGP class).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#filter-missing-parens",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-02",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-03",
@@ -92,23 +83,9 @@ pub const SPARQL10_SYNTAX: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-12",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-13",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql3/manifest#syn-bad-14",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-34",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-35",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-36",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-37",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-38",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-GRAPH-breaks-BGP",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-OPT-breaks-BGP",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/syntax-sparql4/manifest#syn-bad-UNION-breaks-BGP",
 ];
 
 pub const SPARQL11_AGGREGATES: &[&str] = &[
-    // parser accepts invalid input (missing validation) (5)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg08",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg09",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg10",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg11",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg12",
     // graph cluster: COUNT over an (empty) named graph — needs enumerable
     // empty named graphs; gated on decision D-6, expected to remain
     // registered after PR-G1 (1)
@@ -155,11 +132,7 @@ pub const SPARQL11_FUNCTIONS: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
 ];
 
-pub const SPARQL11_GROUPING: &[&str] = &[
-    // parser accepts invalid input (missing validation) (2)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/grouping/manifest#group06",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/grouping/manifest#group07",
-];
+pub const SPARQL11_GROUPING: &[&str] = &[];
 
 pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[];
 
@@ -489,10 +462,7 @@ pub const SPARQL12_GROUPING: &[&str] = &[
 
 pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[];
 
-pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[
-    // parser accepts invalid input (missing validation) (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-negative/manifest#syntax-update-anonreifier-02",
-];
+pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[];
 
 // RDF-star / SPARQL 1.2 triple-term syntax (<<( )>> and related) is not
 // yet in the parser — audit §4.3 / Phase D.
@@ -666,11 +636,7 @@ pub const SPARQL12_LANG_BASEDIR: &[&str] = &[
 
 pub const SPARQL12_RDF11: &[&str] = &[];
 
-pub const SPARQL12_SYNTAX: &[&str] = &[
-    // parser accepts invalid input (missing validation) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#duplicated-values-variable",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#nested-aggregate-functions",
-];
+pub const SPARQL12_SYNTAX: &[&str] = &[];
 
 // VERSION itself already lexes and parses; these three fail on the bare
 // `<< >>` reifier patterns in their query bodies (wave-2 triple-term
