@@ -95,7 +95,11 @@ impl<'a> Validator<'a> {
             QueryBody::Construct(query) => self.validate_construct(query),
             QueryBody::Ask(query) => self.validate_ask(query),
             QueryBody::Describe(query) => self.validate_describe(query),
-            QueryBody::Update(op) => self.validate_update(op),
+            QueryBody::Update(request) => {
+                for op in &request.operations {
+                    self.validate_update(&op.operation);
+                }
+            }
         }
     }
 
@@ -143,6 +147,47 @@ impl<'a> Validator<'a> {
     /// Validate DELETE DATA - triples must be ground (no variables).
     fn validate_delete_data(&mut self, delete: &DeleteData) {
         self.validate_ground_quad_data(&delete.data, "DELETE DATA");
+        self.validate_delete_data_annotations(&delete.data);
+    }
+
+    /// Reject anonymous RDF 1.2 annotations in DELETE DATA.
+    ///
+    /// `:s :p :o {| :q :v |}` without an explicit reifier means "mint a
+    /// fresh reifier" — a fresh blank node. DELETE DATA must be ground: a
+    /// freshly-minted node can never name the existing reifier to delete,
+    /// so the form is invalid (W3C sparql12 negative test
+    /// `syntax-update-anonreifier-02`). An explicit reifier
+    /// (`:s :p :o ~ :r {| :q :v |}`) remains valid.
+    fn validate_delete_data_annotations(&mut self, data: &QuadData) {
+        fn check_triple(triple: &TriplePattern, diagnostics: &mut Vec<Diagnostic>) {
+            if let Some(annotation) = &triple.annotation {
+                if annotation.reifier.is_none() {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagCode::VariableInGroundData,
+                            "anonymous annotation (no explicit reifier) not allowed in \
+                             DELETE DATA",
+                            annotation.span,
+                        )
+                        .with_help(
+                            "Name the reifier explicitly: `:s :p :o ~ :r {| ... |}` — an \
+                             anonymous annotation would mint a fresh blank node, which can \
+                             never match the existing reifier to delete.",
+                        ),
+                    );
+                }
+            }
+        }
+        for el in &data.quads {
+            match el {
+                QuadPatternElement::Triple(triple) => check_triple(triple, &mut self.diagnostics),
+                QuadPatternElement::Graph { triples, .. } => {
+                    for triple in triples {
+                        check_triple(triple, &mut self.diagnostics);
+                    }
+                }
+            }
+        }
     }
 
     /// Validate DELETE WHERE - patterns can have variables.
