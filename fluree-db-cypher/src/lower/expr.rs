@@ -56,6 +56,14 @@ pub fn lower_expr<E: IriEncoder>(
             if !matches!(target.as_ref(), Expr::Var(_)) {
                 if let Some(func) = temporal_field_function(key) {
                     let inner = lower_expr(ctx, target, aux)?;
+                    // A temporal-constant target (a folded constructor like
+                    // `date('2024-01-15').month`) folds the component too —
+                    // the runtime extractor needs a variable argument.
+                    if let Expression::Const(v) = &inner {
+                        if let Some(component) = fold_temporal_component(v, key) {
+                            return Ok(Expression::Const(FlakeValue::Long(component)));
+                        }
+                    }
                     return Ok(Expression::call(func, vec![inner]));
                 }
             }
@@ -325,6 +333,12 @@ pub fn lower_expr<E: IriEncoder>(
                     }
                     return Ok(Expression::call(Function::Str, args));
                 }
+                // Temporal constructors: a constant lexical argument folds to
+                // a typed value at lowering time; zero-arg date()/datetime()
+                // evaluate at runtime (current date / instant).
+                "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration" => {
+                    return lower_temporal_constructor(&name, args);
+                }
                 _ => {}
             }
 
@@ -386,6 +400,36 @@ pub fn lower_expr<E: IriEncoder>(
     }
 }
 
+/// Lower a temporal constructor. `date('2024-01-01')` / `datetime('…')` /
+/// `time('…')` / `duration('P1D')` with a constant string fold to a typed
+/// constant at lowering time; zero-arg `datetime()` / `date()` map to the
+/// runtime `NOW` / `TODAY` functions. Non-constant arguments are deferred.
+fn lower_temporal_constructor(name: &str, args: Vec<Expression>) -> Result<Expression> {
+    match args.as_slice() {
+        [] => match name {
+            "datetime" => Ok(Expression::call(Function::Now, args)),
+            "date" => Ok(Expression::call(Function::Today, args)),
+            _ => Err(LowerError::unsupported(format!(
+                "zero-argument {name}() is deferred — use datetime() or date(), \
+                 or pass a literal string"
+            ))),
+        },
+        [Expression::Const(FlakeValue::String(s))] => {
+            match fluree_db_core::temporal::cypher_temporal_constructor(name, s) {
+                Some(Ok(value)) => Ok(Expression::Const(value)),
+                Some(Err(e)) => Err(LowerError::unsupported(format!(
+                    "invalid {name}() literal `{s}`: {e}"
+                ))),
+                None => unreachable!("caller matched a temporal constructor name"),
+            }
+        }
+        _ => Err(LowerError::unsupported(format!(
+            "{name}() takes a literal string in v1 (e.g. {name}('2024-01-15')) \
+             or, for date()/datetime(), no argument"
+        ))),
+    }
+}
+
 /// Lower Cypher `substring(s, start[, len])` (0-indexed) to the engine's
 /// `Substr` (1-based) by shifting the start position by `+1`.
 fn lower_substring(args: Vec<Expression>) -> Result<Expression> {
@@ -425,6 +469,37 @@ fn lower_list_predicate_kind(kind: ListPredicateKind) -> IrListPredicateKind {
         ListPredicateKind::Any => IrListPredicateKind::Any,
         ListPredicateKind::None => IrListPredicateKind::None,
         ListPredicateKind::Single => IrListPredicateKind::Single,
+    }
+}
+
+/// Extract a temporal component from a constant date/dateTime/time value
+/// (lowering-time fold of `date('…').month` etc.). Seconds truncate to the
+/// whole-second count, matching the accessor's integer surface.
+fn fold_temporal_component(v: &FlakeValue, key: &str) -> Option<i64> {
+    let key = key.to_ascii_lowercase();
+    match v {
+        FlakeValue::DateTime(dt) => Some(match key.as_str() {
+            "year" => i64::from(dt.year()),
+            "month" => i64::from(dt.month()),
+            "day" => i64::from(dt.day()),
+            "hour" => i64::from(dt.hours()),
+            "minute" => i64::from(dt.minutes()),
+            "second" => dt.seconds() as i64,
+            _ => return None,
+        }),
+        FlakeValue::Date(d) => Some(match key.as_str() {
+            "year" => i64::from(d.year()),
+            "month" => i64::from(d.month()),
+            "day" => i64::from(d.day()),
+            _ => return None,
+        }),
+        FlakeValue::Time(t) => Some(match key.as_str() {
+            "hour" => i64::from(t.hours()),
+            "minute" => i64::from(t.minutes()),
+            "second" => t.seconds() as i64,
+            _ => return None,
+        }),
+        _ => None,
     }
 }
 

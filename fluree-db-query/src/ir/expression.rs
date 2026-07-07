@@ -822,6 +822,9 @@ pub enum Function {
     // DateTime functions
     // =========================================================================
     Now,
+    /// Current UTC calendar date (Cypher's zero-arg `date()`; no SPARQL
+    /// builtin maps here).
+    Today,
     Year,
     Month,
     Day,

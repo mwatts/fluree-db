@@ -184,6 +184,13 @@ ORDER BY / SKIP / LIMIT
   `d.minute`, `d.second` extract a component of a date/dateTime-valued property
   as an integer (e.g. `WHERE p.birthDate.year < 1990`). This is the one
   property-accessor chain that is *not* rejected.
+- Temporal constructors — `date('2024-01-15')`, `datetime('2024-01-15T10:00:00Z')`,
+  `time('10:00:00')`, `duration('P1D')` fold a constant lexical argument to a
+  typed value, usable in comparisons (`WHERE e.at > datetime('…')`) and as
+  write property values (`SET n.created = datetime()`). Zero-arg `datetime()` /
+  `date()` are the current instant / date; in a write statement every zero-arg
+  constructor sees the same instant. Component maps (`date({year: 2024})`),
+  non-constant arguments, and duration arithmetic are deferred.
 - ORDER BY (variable, property-accessor, or general expression keys —
   e.g. `ORDER BY toInteger(n.id)`), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding, and

@@ -150,6 +150,9 @@ struct CypherLowering<'a> {
     /// time — when `a` has no `var`, the second occurrence reuses the
     /// span of the first.
     node_subject_cache: std::collections::HashMap<(usize, usize), TemplateTerm>,
+    /// Lazily-captured statement timestamp: every zero-arg `datetime()` /
+    /// `date()` in one statement folds to the same instant.
+    stmt_now: Option<fluree_db_core::temporal::DateTime>,
 }
 
 impl<'a> CypherLowering<'a> {
@@ -170,6 +173,7 @@ impl<'a> CypherLowering<'a> {
             rel_var_edges: std::collections::HashMap::new(),
             created_rel_vars: std::collections::HashSet::new(),
             node_subject_cache: std::collections::HashMap::new(),
+            stmt_now: None,
         }
     }
 
@@ -1658,9 +1662,67 @@ impl<'a> CypherLowering<'a> {
             // column, or a MATCH-bound value) fires the property template per
             // solution. Unbound on a given row → that flake is skipped.
             Expr::Var(v) => Ok(self.var_term(&v.name)),
+            // Temporal constructors fold to typed constants at lowering time:
+            // a literal argument parses; zero-arg datetime()/date() take the
+            // statement timestamp (one instant per statement).
+            Expr::Call(call) => self
+                .fold_temporal_constructor(call)?
+                .map(TemplateTerm::Value)
+                .ok_or_else(|| {
+                    LowerCypherError::unsupported(
+                        "CREATE property values must be literals, bound variables, or \
+                         temporal constructors (date/datetime/time/duration) in v1",
+                    )
+                }),
             _ => Err(LowerCypherError::unsupported(
                 "CREATE property values must be literals or bound variables in v1",
             )),
+        }
+    }
+
+    /// Fold a temporal constructor call to a typed value. `Ok(None)` when the
+    /// call is not a temporal constructor (the caller reports its own error).
+    fn fold_temporal_constructor(
+        &mut self,
+        call: &fluree_db_cypher::ast::FuncCall,
+    ) -> Result<Option<FlakeValue>, LowerCypherError> {
+        use fluree_db_core::temporal::{cypher_temporal_constructor, DateTime};
+        let name = call.name.to_ascii_lowercase();
+        match (name.as_str(), call.args.as_slice()) {
+            ("datetime" | "date", []) => {
+                let now = self
+                    .stmt_now
+                    .get_or_insert_with(DateTime::now_utc)
+                    .to_string();
+                let value = match name.as_str() {
+                    "datetime" => cypher_temporal_constructor("datetime", &now),
+                    // The date part of the statement timestamp.
+                    _ => cypher_temporal_constructor("date", &now[..10]),
+                };
+                match value {
+                    Some(Ok(v)) => Ok(Some(v)),
+                    _ => Err(LowerCypherError::unsupported(
+                        "internal: statement timestamp did not parse",
+                    )),
+                }
+            }
+            (
+                "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration",
+                [Expr::Lit(Literal::String(s, _))],
+            ) => match cypher_temporal_constructor(&name, s) {
+                Some(Ok(v)) => Ok(Some(v)),
+                Some(Err(e)) => Err(LowerCypherError::unsupported(format!(
+                    "invalid {name}() literal `{s}`: {e}"
+                ))),
+                None => Ok(None),
+            },
+            ("date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration", _) => {
+                Err(LowerCypherError::unsupported(format!(
+                    "{name}() takes a literal string in v1 (e.g. {name}('2024-01-15')) \
+                     or, for date()/datetime(), no argument"
+                )))
+            }
+            _ => Ok(None),
         }
     }
 

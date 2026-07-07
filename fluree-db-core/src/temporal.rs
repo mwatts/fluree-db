@@ -1986,6 +1986,53 @@ fn parse_seconds_to_micros(s: &str) -> Result<i64, String> {
     }
 }
 
+impl DateTime {
+    /// The current UTC instant at millisecond precision — what Cypher's
+    /// zero-arg `datetime()` and SPARQL's `NOW()` return.
+    pub fn now_utc() -> Self {
+        let formatted = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Self::parse(&formatted).expect("RFC3339 UTC timestamp parses")
+    }
+}
+
+impl Date {
+    /// The current UTC calendar date — what Cypher's zero-arg `date()` returns.
+    pub fn today_utc() -> Self {
+        let formatted = Utc::now().format("%Y-%m-%d").to_string();
+        Self::parse(&formatted).expect("UTC date parses")
+    }
+}
+
+/// Fold a Cypher temporal constructor with a constant lexical argument into a
+/// typed value: `date('2024-01-01')`, `datetime('…')`, `localdatetime('…')`,
+/// `time('…')`, `duration('P1D')`. Returns `None` when `func` (expected
+/// lowercased) is not a temporal constructor, `Some(Err)` on a bad lexical
+/// form. A duration folds to the narrowest totally-orderable XSD type
+/// (dayTimeDuration / yearMonthDuration), falling back to the mixed
+/// xsd:duration.
+pub fn cypher_temporal_constructor(
+    func: &str,
+    lexical: &str,
+) -> Option<Result<crate::value::FlakeValue, String>> {
+    use crate::value::FlakeValue;
+    let v = match func {
+        "date" => Date::parse(lexical).map(|d| FlakeValue::Date(Box::new(d))),
+        "datetime" | "localdatetime" => {
+            DateTime::parse(lexical).map(|d| FlakeValue::DateTime(Box::new(d)))
+        }
+        "time" | "localtime" => Time::parse(lexical).map(|t| FlakeValue::Time(Box::new(t))),
+        "duration" => DayTimeDuration::parse(lexical)
+            .map(|d| FlakeValue::DayTimeDuration(Box::new(d)))
+            .or_else(|_| {
+                YearMonthDuration::parse(lexical)
+                    .map(|d| FlakeValue::YearMonthDuration(Box::new(d)))
+            })
+            .or_else(|_| Duration::parse(lexical).map(|d| FlakeValue::Duration(Box::new(d)))),
+        _ => return None,
+    };
+    Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

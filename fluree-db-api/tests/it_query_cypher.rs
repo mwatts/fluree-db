@@ -7737,3 +7737,139 @@ async fn cypher_backticked_names_round_trip_without_splitting() {
         "colon names round-trip via the split"
     );
 }
+
+// ============================================================================
+// Temporal constructors — date() / datetime() / time() / duration()
+// ============================================================================
+
+#[tokio::test]
+async fn cypher_temporal_constructors_in_return_and_where() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-read");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Thing {name: "x"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Constant constructors fold at lowering; temporal accessors read back.
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Thing)
+               RETURN datetime('2020-05-06T10:00:00Z').year, date('2024-01-15').month"#,
+        )
+        .await
+        .expect("constructor fold")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[2020, 1]]), "{res}");
+}
+
+#[tokio::test]
+async fn cypher_temporal_constructors_write_and_compare() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-write");
+
+    // Constructors as property values in CREATE.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Event {name: "a", at: datetime("2024-03-04T05:06:07Z"),
+                               on: date("2024-03-04"), took: duration("PT2H")}),
+                      (:Event {name: "b", at: datetime("2019-01-01T00:00:00Z")})"#,
+        )
+        .await
+        .expect("create with temporal values")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Typed comparison against a constructor constant in WHERE.
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (e:Event) WHERE e.at > datetime("2024-01-01T00:00:00Z")
+               RETURN e.name, e.at.year"#,
+        )
+        .await
+        .expect("where compare")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([["a", 2024]]), "{res}");
+
+    // The duration value persisted and reads back.
+    let took = fluree
+        .query_cypher(&db, r#"MATCH (e:Event {name: "a"}) RETURN e.took"#)
+        .await
+        .expect("duration read");
+    assert_eq!(took.row_count(), 1, "duration value present");
+
+    // SET with a constructor value.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (e:Event {name: "b"}) SET e.on = date("2019-01-01")"#,
+        )
+        .await
+        .expect("set temporal")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let res = fluree
+        .query_cypher(&db, r#"MATCH (e:Event {name: "b"}) RETURN e.on.year"#)
+        .await
+        .expect("set read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[2019]]), "{res}");
+}
+
+#[tokio::test]
+async fn cypher_zero_arg_datetime_and_date_write_statement_timestamp() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-now");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Tick {n: 1, at: datetime(), on: date()})"#)
+        .await
+        .expect("create with now")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Both folded to real temporal values at write time.
+    let res = fluree
+        .query_cypher(
+            &db,
+            "MATCH (t:Tick) WHERE t.at.year >= 2026 AND t.on.year >= 2026 RETURN t.n",
+        )
+        .await
+        .expect("read back now")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[1]]), "{res}");
+
+    // Zero-arg constructors also evaluate on the read path.
+    let now_rows = fluree
+        .query_cypher(&db, "MATCH (t:Tick) WHERE t.at <= datetime() RETURN t.n")
+        .await
+        .expect("read-side now");
+    assert_eq!(now_rows.row_count(), 1, "stored instant is before now()");
+}
+
+#[tokio::test]
+async fn cypher_temporal_constructor_bad_literal_errors() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-bad");
+    let err = fluree
+        .transact_cypher(l, r#"CREATE (:E {at: datetime("not-a-date")})"#)
+        .await;
+    let msg = format!("{err:?}");
+    assert!(err.is_err(), "bad literal must error");
+    assert!(
+        msg.contains("datetime"),
+        "error names the constructor: {msg}"
+    );
+}
