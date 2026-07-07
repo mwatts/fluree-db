@@ -4596,6 +4596,160 @@ async fn cypher_shortest_path_length_directed() {
 }
 
 #[tokio::test]
+async fn cypher_shortest_path_batched_lane_respects_novelty() {
+    // The raw-id shortestPath lane reads base index rows for clean nodes and
+    // must fall back per node wherever novelty touches an expansion side:
+    // novelty shortcut edges shorten the path, novelty retracts of base
+    // edges break it, and novelty-only endpoints join the search.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:sp-novelty";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "a", "@type": "Person", "name": "A", "KNOWS": {"@id": "b"}},
+                    {"@id": "b", "@type": "Person", "name": "B", "KNOWS": {"@id": "c"}},
+                    {"@id": "c", "@type": "Person", "name": "C", "KNOWS": {"@id": "d"}},
+                    {"@id": "d", "@type": "Person", "name": "D", "KNOWS": {"@id": "e"}},
+                    {"@id": "e", "@type": "Person", "name": "E"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed chain");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let l = fluree.ledger(ledger_id).await.expect("reload");
+    let db = graphdb_from_ledger(&l);
+
+    let sp_len = |db: fluree_db_api::GraphDb, q: &'static str| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .query_cypher(&db, q)
+                .await
+                .expect("shortestPath query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld")[0][0]
+                .clone()
+        }
+    };
+    const A_TO_E: &str = r#"MATCH (a:Person {name: "A"}), (e:Person {name: "E"})
+        MATCH p = shortestPath((a)-[:KNOWS*]->(e)) RETURN length(p) AS len"#;
+
+    // Fully indexed, clean overlay: pure batched lane.
+    assert_eq!(
+        sp_len(graphdb_from_ledger(&l), A_TO_E).await,
+        json!(4),
+        "indexed chain A→E is 4 hops"
+    );
+
+    // Novelty shortcut B→D: B is now a dirty subject (its base out-edges are
+    // incomplete), D a dirty object. Path must shorten through the fallback.
+    let l = fluree
+        .insert(l, &json!({"@id": "b", "KNOWS": {"@id": "d"}}))
+        .await
+        .expect("novelty shortcut")
+        .ledger;
+    assert_eq!(
+        sp_len(graphdb_from_ledger(&l), A_TO_E).await,
+        json!(3),
+        "novelty shortcut B→D shortens A→E to 3"
+    );
+
+    // Same answer on the wildcard (untyped) expansion lanes.
+    assert_eq!(
+        sp_len(
+            graphdb_from_ledger(&l),
+            r#"MATCH (a:Person {name: "A"}), (e:Person {name: "E"})
+               MATCH p = shortestPath((a)-[*..15]->(e)) RETURN length(p) AS len"#,
+        )
+        .await,
+        json!(3),
+        "wildcard shortestPath sees the novelty shortcut"
+    );
+
+    // Novelty retract of the BASE edge C→D: the original chain is broken,
+    // so the only route is the shortcut.
+    let l = fluree
+        .update(
+            l,
+            &json!({
+                "delete": {"@id": "c", "KNOWS": {"@id": "d"}}
+            }),
+        )
+        .await
+        .expect("retract base edge")
+        .ledger;
+    assert_eq!(
+        sp_len(graphdb_from_ledger(&l), A_TO_E).await,
+        json!(3),
+        "retracting C→D leaves the shortcut route"
+    );
+
+    // Retract the shortcut too: no path remains — the match yields no row.
+    let l = fluree
+        .update(
+            l,
+            &json!({
+                "delete": {"@id": "b", "KNOWS": {"@id": "d"}}
+            }),
+        )
+        .await
+        .expect("retract shortcut")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "A"}), (e:Person {name: "E"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(e)) RETURN count(p) AS n"#,
+        )
+        .await
+        .expect("count")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out[0][0],
+        json!(0),
+        "no path once both routes are retracted: {out}"
+    );
+
+    // Novelty-only endpoint: a brand-new node X hanging off E joins the
+    // search without a persisted id. C→D (retracted from base above) is
+    // re-asserted in novelty, so the C→X route crosses a re-asserted base
+    // edge, base edges, and a novelty-only edge.
+    let l = fluree
+        .insert(
+            l,
+            &json!({"@graph": [
+                {"@id": "c", "KNOWS": {"@id": "d"}},
+                {"@id": "e", "KNOWS": {"@id": "x"}},
+                {"@id": "x", "@type": "Person", "name": "X"}
+            ]}),
+        )
+        .await
+        .expect("novelty endpoint")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (c:Person {name: "C"}), (x:Person {name: "X"})
+               MATCH p = shortestPath((c)-[:KNOWS*]->(x)) RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("novelty endpoint path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(3), "C→D→E→X spans base and novelty: {out}");
+}
+
+#[tokio::test]
 async fn cypher_relationships_of_path() {
     // relationships(p) yields one relationship value per hop; type/startNode/
     // endNode work off each. Alice -> Bob -> Carol -> Dave.
