@@ -14,11 +14,12 @@ use fluree_db_core::FlakeValue;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::ir::ConstructTemplate;
-use fluree_db_query::Batch;
+use fluree_db_query::{Batch, VarId};
 use fluree_graph_format::{format_jsonld, JsonLdFormatConfig};
 use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term as IrTerm, Triple};
 use fluree_vocab::{geo, rdf, xsd};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Format CONSTRUCT query results as JSON-LD graph
@@ -76,9 +77,21 @@ pub(super) fn instantiate_construct_graph(
 
     let mut graph = Graph::new();
 
+    // Monotonic counter for minting fresh per-solution template blank-node
+    // labels; shared across all rows so the labels are globally distinct.
+    let mut bnode_counter: usize = 0;
+
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
-            instantiate_row(result, template, batch, row_idx, compactor, &mut graph)?;
+            instantiate_row(
+                result,
+                template,
+                batch,
+                row_idx,
+                compactor,
+                &mut graph,
+                &mut bnode_counter,
+            )?;
         }
     }
 
@@ -93,12 +106,34 @@ fn instantiate_row(
     row_idx: usize,
     compactor: &IriCompactor,
     graph: &mut Graph,
+    bnode_counter: &mut usize,
 ) -> Result<()> {
+    // Fresh blank node per template blank-node variable for THIS solution row:
+    // minted lazily on first use, shared by every template triple in the row,
+    // and — via the row-global `bnode_counter` — distinct from every other
+    // row's blanks. Empty (and never touched) for templates with no blank nodes.
+    let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
+
     for pattern in &template.patterns {
-        // Resolve template terms with bindings (all IRIs are EXPANDED)
-        let subject = resolve_subject_term(result, &pattern.s, batch, row_idx, compactor)?;
+        // Resolve template terms with bindings (all IRIs are EXPANDED). Subject
+        // and object positions redirect template blank-node vars to this row's
+        // freshly-minted blanks instead of the (absent) bindings; predicates can
+        // never be blank nodes, so they always resolve normally.
+        let subject =
+            match &pattern.s {
+                Ref::Var(v) if template.bnode_vars.contains(v) => Some(IrTerm::BlankNode(
+                    row_blank(*v, &mut row_bnodes, bnode_counter),
+                )),
+                s => resolve_subject_term(result, s, batch, row_idx, compactor)?,
+            };
         let predicate = resolve_predicate_term(result, &pattern.p, batch, row_idx, compactor)?;
-        let object = resolve_object_term(result, &pattern.o, batch, row_idx, compactor)?;
+        let object =
+            match &pattern.o {
+                Term::Var(v) if template.bnode_vars.contains(v) => Some(IrTerm::BlankNode(
+                    row_blank(*v, &mut row_bnodes, bnode_counter),
+                )),
+                o => resolve_object_term(result, o, batch, row_idx, compactor)?,
+            };
 
         // Skip if any term is unbound (incomplete triple)
         let (Some(s), Some(p), Some(o)) = (subject, predicate, object) else {
@@ -109,6 +144,26 @@ fn instantiate_row(
     }
 
     Ok(())
+}
+
+/// Mint (or reuse) the fresh blank node bound to a template blank-node variable
+/// within the current solution row.
+///
+/// The first time a given variable is seen in a row it takes the next global
+/// counter value (so blanks are distinct across rows); later uses in the same
+/// row reuse it (so `[ :p ?a ; :q ?b ]` links both triples to a single node).
+fn row_blank(
+    var_id: VarId,
+    row_bnodes: &mut HashMap<VarId, BlankId>,
+    bnode_counter: &mut usize,
+) -> BlankId {
+    if let Some(existing) = row_bnodes.get(&var_id) {
+        return existing.clone();
+    }
+    let blank = BlankId::new(format!("b{}", *bnode_counter));
+    *bnode_counter += 1;
+    row_bnodes.insert(var_id, blank.clone());
+    blank
 }
 
 /// Resolve a Ref to an IR Term for subject position
