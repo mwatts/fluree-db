@@ -304,9 +304,8 @@ surface as the same edge with the same `role` metadata — see
 
 ## See also
 
-- [Cypher (concept)](../query/cypher.md) — supported surface and RDF mapping.
-- [openCypher support matrix](../reference/cypher-support-matrix.md) — per-feature
-  status, including what's not yet supported.
+- [Cypher (concept)](../query/cypher.md) — supported surface, RDF mapping, and
+  [differences from Neo4j](../query/cypher.md#differences-from-neo4j).
 - [Edge annotations](../concepts/edge-annotations.md) — the storage model behind
   Cypher relationships.
 - [Query patterns](cookbook-query-patterns.md) — the generic operators

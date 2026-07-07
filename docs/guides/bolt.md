@@ -163,7 +163,7 @@ works everywhere).
   writes (Raft) or is a peer; use autocommit queries.
 - **Numbers look different from the JSON API** — `xsd:decimal` is
   rendered as Float over Bolt (Neo4j parity); the JSON transport keeps
-  exact decimal strings. See the
-  [support matrix](../reference/cypher-support-matrix.md#bolt-protocol-neo4j-drivers).
+  exact decimal strings. See
+  [Bolt value mapping](../api/bolt.md#value-mapping).
 - **Bare `MATCH (n)` rejected** — whole-graph scans are opt-in via
   `FLUREE_CYPHER_ALLOW_FULL_SCAN=1`, same as over HTTP.

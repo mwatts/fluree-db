@@ -10,9 +10,8 @@ The same database is queryable through JSON-LD, SPARQL, and Cypher at once — o
 underlying store, no separate copy or sync step, so data written through any
 surface is immediately visible to the others. Because each surface is its own
 query language over that shared data, there are some subtle differences to be
-aware of. For a feature-by-feature
-status view — supported, divergent-by-design, or deferred — see the
-[openCypher support matrix](../reference/cypher-support-matrix.md).
+aware of — see [Differences from Neo4j](#differences-from-neo4j) at the end for
+the model divergences and the handful of deferred forms.
 
 [opencypher]: https://opencypher.org/resources/
 
@@ -607,6 +606,46 @@ and requires backticking (`` AS `count` ``) — backticked identifiers are
 also accepted. The dedicated meanings win where a keyword is followed by
 its delimiter: `count(*)`, `exists { … }`, and `all(x IN … )` still
 parse as their constructs.
+
+## Differences from Neo4j
+
+Fluree implements the openCypher 9 surface faithfully — the common clause,
+pattern, and expression set works as specified, and anything unsupported
+returns a **clear error, never a silently wrong result**. A few differences are
+worth knowing, and they fall into two kinds.
+
+**Divergent by design** — inherent to running Cypher over an RDF store, and
+here to stay:
+
+- **Nodes are durable subjects, not opaque LPG nodes.** `labels(n)` are
+  `rdf:type` assertions; node identity is the subject's stored name (a plain
+  name by default, a full IRI in `@vocab` mode — see
+  [Names, and opting into IRIs](#names-and-opting-into-iris)).
+- **Relationships are edge annotations.** `-[r:T]->` reifies the base triple
+  `(s, p, o)` into an `f:reifies*` node (the edge identity). Fluree does not
+  implement RDF-star triple terms — see
+  [How Cypher maps to RDF](#how-cypher-maps-to-rdf).
+- **`id(n)` / `elementId(n)` return the identity string**, not an integer — RDF
+  subjects have no integer element id. Over Bolt, `xsd:decimal` renders as
+  Float (Neo4j parity, precision loss); integer division yields decimals, so
+  this shows on ordinary `a / b`.
+- **No implicit per-statement transaction id.** Immutability and time-travel
+  (`f:t`, history queries) replace those semantics.
+
+**Deferred (fringe / on request)** — rejected with a clear error until a use
+case pulls them in; each has a workaround:
+
+- Bounded type-alternation var-length `-[:A|B*1..3]->` — use the unbounded form
+  `-[:A|B*]->`.
+- Spatial `point()` / `distance()`, and `duration` arithmetic (`date + duration`).
+- Chained property access `n.a.b` (except temporal field chains like
+  `x.date.month`) and mixing `.*` with named selectors in a map projection.
+- `ORDER BY` over a list/map value, and `neo4j://` cluster routing (use
+  `bolt://` direct).
+
+Everything else — the full clause/pattern/expression surface, the write path,
+procedures, and Bolt driver support — works; when in doubt, try it and read the
+error, which names the unsupported form and its workaround.
 
 ## See also
 

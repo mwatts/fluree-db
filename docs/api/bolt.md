@@ -4,8 +4,9 @@ Fluree speaks the Bolt protocol — Neo4j's binary wire protocol — against
 its [openCypher surface](../query/cypher.md). Official Neo4j drivers
 (Python, JavaScript, Java, Go, .NET) and most Bolt-compatible tooling
 connect unmodified. For setup and driver examples see the
-[Bolt guide](../guides/bolt.md); for per-feature semantics see the
-[support matrix's Bolt section](../reference/cypher-support-matrix.md#bolt-protocol-neo4j-drivers).
+[Bolt guide](../guides/bolt.md); the [value mapping](#value-mapping) and
+[protocol surface](#protocol-surface) sections below give the per-feature
+semantics.
 
 ## Protocol surface
 

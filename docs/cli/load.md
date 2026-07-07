@@ -138,4 +138,4 @@ to bootstrap a ledger from a node/relationship CSV export. See
 - [update](update.md) — Cypher / SPARQL / JSON-LD writes
 - [create](create.md) — Bulk CSV & Cypher import into a new ledger
 - [query](query.md) — Query a ledger
-- [Cypher support matrix](../reference/cypher-support-matrix.md) — `MERGE`, `UNWIND`, and per-row upsert semantics
+- [Cypher](../query/cypher.md) — `MERGE`, `UNWIND`, and per-row upsert semantics (see the Writes section)
