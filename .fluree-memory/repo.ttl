@@ -1345,6 +1345,23 @@ mem:fact-01kwwxbbtehrj3nrk2r9wykj8h a mem:Fact ;
     mem:branch "feature/cypher-import" ;
     mem:createdAt "2026-07-06T23:48:53.198165+00:00"^^xsd:dateTime .
 
+mem:fact-01kwx4dgvp4p8pnsc5wq52fp5s a mem:Fact ;
+    mem:content "Cypher gap round 1 LANDED (feature/cypher-import): MERGE upsert — trailing SET folds into both conditional branches (MergeSet variant); SET n += $props whole-map param = reserved empty-key MapLit entry expanded at substitution. Temporal constructors — const-fold via core::temporal::cypher_temporal_constructor; zero-arg datetime()/date() = Function::Now/Today (reads) + per-statement fold (writes). Schema DDL no-ops — Statement::Schema; CREATE/DROP INDEX|CONSTRAINT → empty Update-typed Txn (zero-effect return; Insert-typed empties throw EmptyTransaction); SHOW → zero-row InlineRows. DEFERRED: LOAD CSV / CALL IN TRANSACTIONS. NEXT: CALL proc() YIELD shims (db.labels etc.) via synthesized queries; watch the full-scan gate." ;
+    mem:tag "cypher" ;
+    mem:tag "ddl" ;
+    mem:tag "gaps" ;
+    mem:tag "merge" ;
+    mem:tag "procedures" ;
+    mem:tag "temporal" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/reference/cypher-support-matrix.md" ;
+    mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
+    mem:artifactRef "fluree-db-core/src/temporal.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/mod.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-07T01:52:23.926306+00:00"^^xsd:dateTime .
+
 mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:content "Default context: per-ledger JSON prefix map auto-applied to queries/transactions that omit @context. Stored in CAS keyed by ContentId; pointer in ConfigPayload.default_context via nameservice.\n\nPopulation: bulk import captures @prefix + builtins; API set_default_context(); HTTP PUT /v1/fluree/context/*ledger; CLI fluree context set.\n\nPrecedence: Query @context/PREFIX > ledger default > built-in (rdf, rdfs, xsd, owl, sh, geo).\n\nUpdates use CAS via ConfigPublisher::push_config() with retry; disconnect_ledger() evicts cache after update. ProxyNameService does NOT implement ConfigPublisher — context writes only on tx server." ;
     mem:tag "api" ;
