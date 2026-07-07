@@ -153,6 +153,14 @@ pub enum DiagCode {
     #[serde(rename = "V005")]
     SelectAliasAlreadyBound,
 
+    /// Aggregate call nested inside another aggregate's argument
+    #[serde(rename = "V006")]
+    NestedAggregate,
+
+    /// Variable listed more than once in a VALUES clause
+    #[serde(rename = "V007")]
+    DuplicateValuesVariable,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -206,6 +214,8 @@ impl DiagCode {
             Self::UngroupedVariableInProjection => "V003",
             Self::BindTargetAlreadyInScope => "V004",
             Self::SelectAliasAlreadyBound => "V005",
+            Self::NestedAggregate => "V006",
+            Self::DuplicateValuesVariable => "V007",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

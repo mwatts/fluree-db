@@ -18,7 +18,9 @@ use std::collections::HashSet;
 
 use crate::ast::expr::Expression;
 use crate::ast::pattern::GraphPattern;
-use crate::ast::query::{GroupByClause, GroupCondition, SelectVariable, SelectVariables};
+use crate::ast::query::{
+    GroupByClause, GroupCondition, OrderExpr, SelectVariable, SelectVariables, SolutionModifiers,
+};
 use crate::diag::{DiagCode, Diagnostic, Label};
 use crate::span::SourceSpan;
 
@@ -170,6 +172,68 @@ pub(super) fn check_select_aliases(
             );
         }
         assigned.insert(alias.name.as_ref());
+    }
+}
+
+/// SPARQL 1.2 negative-syntax rule: an aggregate call may not appear
+/// inside another aggregate's argument (`COUNT(COUNT(*))`). Checked over
+/// the SELECT projection and the GROUP BY / HAVING / ORDER BY expressions
+/// of a (sub-)query.
+pub(super) fn check_nested_aggregates(
+    variables: &SelectVariables,
+    modifiers: &SolutionModifiers,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut check = |expr: &Expression| {
+        expr.walk(&mut |e| {
+            if let Expression::Aggregate {
+                expr: Some(arg),
+                span,
+                ..
+            } = e
+            {
+                if arg.contains_aggregate() {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagCode::NestedAggregate,
+                            "aggregate function calls cannot be nested",
+                            *span,
+                        )
+                        .with_help(
+                            "Compute the inner aggregate in a sub-SELECT and \
+                             aggregate over its result instead.",
+                        ),
+                    );
+                }
+            }
+        });
+    };
+
+    if let SelectVariables::Explicit(items) = variables {
+        for item in items {
+            if let SelectVariable::Expr { expr, .. } = item {
+                check(expr);
+            }
+        }
+    }
+    if let Some(group_by) = &modifiers.group_by {
+        for condition in &group_by.conditions {
+            if let GroupCondition::Expr { expr, .. } = condition {
+                check(expr);
+            }
+        }
+    }
+    if let Some(having) = &modifiers.having {
+        for condition in &having.conditions {
+            check(condition);
+        }
+    }
+    if let Some(order_by) = &modifiers.order_by {
+        for condition in &order_by.conditions {
+            if let OrderExpr::Expr(expr) = &condition.expr {
+                check(expr);
+            }
+        }
     }
 }
 

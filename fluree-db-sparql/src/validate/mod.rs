@@ -115,6 +115,16 @@ impl<'a> Validator<'a> {
             &query.where_clause.pattern,
             &mut self.diagnostics,
         );
+        projection::check_nested_aggregates(
+            &query.select.variables,
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
+        // The post-query VALUES clause shares the Values pattern arm
+        // (duplicate-variable check).
+        if let Some(values) = &query.values {
+            self.validate_graph_pattern(values);
+        }
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
@@ -369,8 +379,29 @@ impl<'a> Validator<'a> {
             GraphPattern::Bind { .. } => {
                 // Expression validation could be added here
             }
-            GraphPattern::Values { .. } => {
-                // Values are ground by construction
+            GraphPattern::Values { vars, .. } => {
+                // Values terms are ground by construction; the variable
+                // list, however, must not repeat a variable (SPARQL 1.2
+                // negative-syntax rule; also implied by SPARQL 1.1 §10.2's
+                // "must all be distinct" data-block contract).
+                let mut seen = std::collections::HashSet::new();
+                for var in vars {
+                    if !seen.insert(var.name.as_ref()) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                DiagCode::DuplicateValuesVariable,
+                                format!(
+                                    "variable ?{} is listed more than once in VALUES",
+                                    var.name
+                                ),
+                                var.span,
+                            )
+                            .with_help(
+                                "Each variable in a VALUES clause must be distinct.",
+                            ),
+                        );
+                    }
+                }
             }
             GraphPattern::Graph { pattern, .. } => {
                 self.validate_graph_pattern(pattern);
@@ -389,6 +420,11 @@ impl<'a> Validator<'a> {
                 projection::check_select_aliases(
                     &query.variables,
                     &query.pattern,
+                    &mut self.diagnostics,
+                );
+                projection::check_nested_aggregates(
+                    &query.variables,
+                    &query.modifiers,
                     &mut self.diagnostics,
                 );
             }
@@ -930,6 +966,62 @@ mod tests {
         let diags = validate_query("SELECT (1 AS ?x) ((?x + 1) AS ?y) WHERE {}");
         assert!(
             !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // SPARQL 1.2 — nested aggregates + duplicated VALUES variables
+    // =========================================================================
+
+    #[test]
+    fn test_nested_aggregate_rejected() {
+        // W3C sparql12 nested-aggregate-functions.
+        let diags = validate_query("SELECT (COUNT(COUNT(*)) AS ?c) WHERE {}");
+        assert!(has_code(&diags, DiagCode::NestedAggregate));
+    }
+
+    #[test]
+    fn test_nested_aggregate_under_arithmetic_rejected() {
+        let diags = validate_query("SELECT (SUM(1 + MAX(?x)) AS ?c) WHERE { ?s ?p ?x }");
+        assert!(has_code(&diags, DiagCode::NestedAggregate));
+    }
+
+    #[test]
+    fn test_flat_aggregates_valid() {
+        let diags = validate_query(
+            "SELECT (COUNT(?x) AS ?c) ((MIN(?x) + MAX(?x)) AS ?range) WHERE { ?s ?p ?x }",
+        );
+        assert!(!has_code(&diags, DiagCode::NestedAggregate), "{diags:?}");
+    }
+
+    #[test]
+    fn test_nested_aggregate_in_having_rejected() {
+        let diags = validate_query(
+            "SELECT ?s WHERE { ?s ?p ?x } GROUP BY ?s HAVING (SUM(AVG(?x)) > 1)",
+        );
+        assert!(has_code(&diags, DiagCode::NestedAggregate));
+    }
+
+    #[test]
+    fn test_duplicate_values_variable_rejected() {
+        // W3C sparql12 duplicated-values-variable.
+        let diags = validate_query("SELECT * WHERE { VALUES (?a ?a) { (1 1) } }");
+        assert!(has_code(&diags, DiagCode::DuplicateValuesVariable));
+    }
+
+    #[test]
+    fn test_duplicate_values_variable_postclause_rejected() {
+        let diags =
+            validate_query("SELECT * WHERE { ?s ?p ?o } VALUES (?a ?a) { (1 1) }");
+        assert!(has_code(&diags, DiagCode::DuplicateValuesVariable));
+    }
+
+    #[test]
+    fn test_distinct_values_variables_valid() {
+        let diags = validate_query("SELECT * WHERE { VALUES (?a ?b) { (1 1) } }");
+        assert!(
+            !has_code(&diags, DiagCode::DuplicateValuesVariable),
             "{diags:?}"
         );
     }

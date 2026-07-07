@@ -656,11 +656,7 @@ pub const SPARQL12_RDF11: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-same",
 ];
 
-pub const SPARQL12_SYNTAX: &[&str] = &[
-    // parser accepts invalid input (missing validation) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#duplicated-values-variable",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#nested-aggregate-functions",
-];
+pub const SPARQL12_SYNTAX: &[&str] = &[];
 
 // VERSION declaration support — audit §4.3.
 pub const SPARQL12_VERSION: &[&str] = &[
