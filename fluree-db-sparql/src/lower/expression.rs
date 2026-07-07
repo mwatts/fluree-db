@@ -327,10 +327,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         };
 
-        let lowered_args: Vec<Expression> = args
+        let mut lowered_args: Vec<Expression> = args
             .iter()
             .map(|a| self.lower_expression(a))
             .collect::<Result<Vec<_>>>()?;
+
+        // IRI()/URI() resolve relative arguments against the query BASE
+        // (SPARQL 1.1 §17.4.2.8). Constant-fold at lowering time so the eval
+        // path stays base-free (zero per-row cost): a constant string argument
+        // is rewritten to its resolved absolute form here. Variable/computed
+        // arguments are not resolved (no per-row resolution by design).
+        if matches!(func, Function::Iri) {
+            if let (Some(base), Some(Expression::Const(FlakeValue::String(s)))) =
+                (&self.base, lowered_args.first())
+            {
+                if !fluree_vocab::iri::is_absolute_iri(s) {
+                    let resolved = fluree_vocab::iri::resolve_iri(base, s);
+                    lowered_args[0] = Expression::Const(FlakeValue::String(resolved));
+                }
+            }
+        }
 
         Ok(Expression::call(func, lowered_args))
     }

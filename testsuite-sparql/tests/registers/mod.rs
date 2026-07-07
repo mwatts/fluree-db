@@ -111,6 +111,9 @@ pub const SPARQL11_FUNCTIONS: &[&str] = &[
     // result mismatch (3)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri01",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#in01",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#notin01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
 ];
 
@@ -203,7 +206,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-10b",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-11",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-empty",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-exist",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-optional",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-variable-join",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
@@ -578,6 +580,7 @@ pub const SPARQL12_VERSION: &[&str] = &[
 // (residual-eval.md §2.2).
 pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp34",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp16",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
 ];
 
