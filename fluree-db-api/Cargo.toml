@@ -285,6 +285,10 @@ harness = false
 name = "query_hot_bsbm_bi"
 harness = false
 
+[[bench]]
+name = "query_hot_property_path"
+harness = false
+
 [lints]
 workspace = true
 

@@ -682,21 +682,15 @@ pub const SPARQL12_VERSION: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/version/manifest#version-05",
 ];
 
-// Hot-operator territory; any fix must preserve the `*`/`+` fast path
-// (audit §4.2.7, burn-down residual-eval.md §3.2).
+// Not path-cardinality defects: pp34/pp35 are graph-cluster tests mis-filed
+// under property-path (`GRAPH <ng-01.ttl> { ?s :p1* ?t }` — constant GRAPH IRI
+// base-expansion vs exact-key registry miss, and `?g` bound as a literal).
+// Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
+// already produces the expected `[a,b,b]` bag once the GRAPH block matches
+// (residual-eval.md §2.2).
 pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
-    // zero-length-path closure misses parts of the node universe (terms
-    // appearing only off the path predicate, and literal nodes) — NOT a
-    // multiplicity bug — PR-PP
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp16",
-    // graph cluster, NOT path cardinality: pp34 = constant GRAPH IRI misses
-    // the registry on base-expansion (exact-key lookup); pp35 = GRAPH ?g
-    // binds the graph name as a plain literal — PR-BASE + PR-G1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp34",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
-    // empty-schema `Batch::new` len-collapse inside PropertyPathOperator
-    // (zero-variable SELECT * over a both-bound path) — NOT projection — PR-PP
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp36",
 ];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
