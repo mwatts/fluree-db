@@ -149,6 +149,10 @@ pub enum DiagCode {
     #[serde(rename = "V004")]
     BindTargetAlreadyInScope,
 
+    /// SELECT (expr AS ?v) alias assigned twice or already in scope (SPARQL §19.8 note 13)
+    #[serde(rename = "V005")]
+    SelectAliasAlreadyBound,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -201,6 +205,7 @@ impl DiagCode {
             Self::SelectStarWithGroupBy => "V002",
             Self::UngroupedVariableInProjection => "V003",
             Self::BindTargetAlreadyInScope => "V004",
+            Self::SelectAliasAlreadyBound => "V005",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

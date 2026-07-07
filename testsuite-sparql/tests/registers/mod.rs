@@ -22,11 +22,6 @@ pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_36a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_63",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_pp_coll",
-    // parser accepts invalid input (missing validation) (2)
-    // test_45 (duplicate AS alias) / test_65 (SELECT alias in scope) —
-    // burn-down PR-2 V6 pass.
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_45",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_65",
 ];
 
 // Dominated by the missing UPDATE graph-management grammar

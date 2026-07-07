@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 
 use crate::ast::expr::Expression;
+use crate::ast::pattern::GraphPattern;
 use crate::ast::query::{GroupByClause, GroupCondition, SelectVariable, SelectVariables};
 use crate::diag::{DiagCode, Diagnostic, Label};
 use crate::span::SourceSpan;
@@ -103,6 +104,72 @@ pub(super) fn check_projection_scope(
                 allowed.insert(alias.name.as_ref());
             }
         }
+    }
+}
+
+/// V6 — SELECT `AS` alias validity (SPARQL 1.1 §19.8 grammar note 13).
+///
+/// The variable assigned in `(expr AS ?v)` must not be (a) assigned by an
+/// earlier item in the same SELECT clause, nor (b) already in scope in the
+/// query's WHERE pattern (§18.2.1 in-scope definition — this is what makes
+/// `SELECT (1 AS ?X) { SELECT (2 AS ?X) {} }` illegal: the sub-SELECT
+/// projects `?X` into the outer pattern's scope).
+pub(super) fn check_select_aliases(
+    variables: &SelectVariables,
+    pattern: &GraphPattern,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let SelectVariables::Explicit(items) = variables else {
+        return; // SELECT * assigns nothing.
+    };
+    if !items
+        .iter()
+        .any(|item| matches!(item, SelectVariable::Expr { .. }))
+    {
+        return; // No AS assignments — skip the in-scope walk.
+    }
+
+    let mut in_scope_vars = Vec::new();
+    pattern.add_in_scope_variables(&mut in_scope_vars);
+    let in_scope: HashSet<&str> = in_scope_vars.iter().map(|v| v.name.as_ref()).collect();
+
+    let mut assigned: HashSet<&str> = HashSet::new();
+    for item in items {
+        let SelectVariable::Expr { alias, .. } = item else {
+            continue;
+        };
+        if assigned.contains(alias.name.as_ref()) {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagCode::SelectAliasAlreadyBound,
+                    format!(
+                        "variable ?{} is assigned more than once in the SELECT clause",
+                        alias.name
+                    ),
+                    alias.span,
+                )
+                .with_help(
+                    "Each (expr AS ?v) in a SELECT clause must assign a distinct \
+                     variable (SPARQL 1.1 §19.8).",
+                ),
+            );
+        } else if in_scope.contains(alias.name.as_ref()) {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagCode::SelectAliasAlreadyBound,
+                    format!(
+                        "SELECT alias ?{} is already in scope in the WHERE pattern",
+                        alias.name
+                    ),
+                    alias.span,
+                )
+                .with_help(
+                    "The variable assigned in (expr AS ?v) must not already be \
+                     in scope (SPARQL 1.1 §19.8). Alias to a fresh variable name.",
+                ),
+            );
+        }
+        assigned.insert(alias.name.as_ref());
     }
 }
 

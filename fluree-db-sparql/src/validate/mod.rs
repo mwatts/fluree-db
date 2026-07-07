@@ -110,6 +110,11 @@ impl<'a> Validator<'a> {
             query.select.span,
             &mut self.diagnostics,
         );
+        projection::check_select_aliases(
+            &query.select.variables,
+            &query.where_clause.pattern,
+            &mut self.diagnostics,
+        );
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
@@ -379,6 +384,11 @@ impl<'a> Validator<'a> {
                     &query.variables,
                     query.modifiers.group_by.as_ref(),
                     *span,
+                    &mut self.diagnostics,
+                );
+                projection::check_select_aliases(
+                    &query.variables,
+                    &query.pattern,
                     &mut self.diagnostics,
                 );
             }
@@ -863,6 +873,65 @@ mod tests {
             "SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }",
         );
         assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    // =========================================================================
+    // V6 — SELECT alias tests (SPARQL 1.1 §19.8 note 13)
+    // =========================================================================
+
+    #[test]
+    fn test_select_alias_duplicate_rejected() {
+        // W3C syn-bad-03 (test_45).
+        let diags = validate_query("SELECT (1 AS ?X) (1 AS ?X) {}");
+        assert!(has_code(&diags, DiagCode::SelectAliasAlreadyBound));
+    }
+
+    #[test]
+    fn test_select_alias_in_scope_via_subselect_rejected() {
+        // W3C syntax-SELECTscope2 (test_65): the sub-SELECT projects ?X
+        // into the outer WHERE pattern's scope.
+        let diags = validate_query("SELECT (1 AS ?X) { SELECT (2 AS ?X) {} }");
+        assert!(has_code(&diags, DiagCode::SelectAliasAlreadyBound));
+    }
+
+    #[test]
+    fn test_select_alias_in_scope_via_pattern_rejected() {
+        let diags = validate_query("SELECT ((?x + 1) AS ?y) WHERE { ?x ex:p ?y }");
+        assert!(has_code(&diags, DiagCode::SelectAliasAlreadyBound));
+    }
+
+    #[test]
+    fn test_select_alias_fresh_variable_valid() {
+        let diags = validate_query("SELECT ((?x + 1) AS ?y) WHERE { ?x ex:p ?o }");
+        assert!(
+            !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_alias_parallel_subselects_valid() {
+        // W3C syntax-SELECTscope1/3 (positive): each sub-SELECT clause is
+        // checked against its own (empty) pattern; the outer SELECT * makes
+        // no assignments.
+        let diags = validate_query(
+            "SELECT * WHERE { { SELECT (1 AS ?X) {} } { SELECT (1 AS ?X) {} } }",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_alias_chained_use_valid() {
+        // Later expressions may USE an earlier alias — only re-ASSIGNMENT
+        // is an error.
+        let diags = validate_query("SELECT (1 AS ?x) ((?x + 1) AS ?y) WHERE {}");
+        assert!(
+            !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
+            "{diags:?}"
+        );
     }
 
     // =========================================================================
