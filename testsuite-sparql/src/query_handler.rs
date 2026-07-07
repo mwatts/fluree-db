@@ -77,19 +77,21 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
         .context("UpdateEvaluationTest missing ut:request (update file URL)")?;
 
     // Guard against a mis-parsed mf:result degrading to a trivially
-    // satisfiable "expected empty store": the result node must have exposed
-    // at least one recognized predicate (ut:data / ut:graphData / ut:result).
-    // A deliberate empty-store expectation always carries `ut:result
-    // ut:success` in the W3C manifests.
-    if test.result_data.is_none()
+    // satisfiable "expected empty store". The distinguishing signal is whether
+    // an `mf:result` node was PRESENT at all: a bare `mf:result []` (no
+    // ut:data/ut:graphData/ut:result) is a deliberate empty-store expectation
+    // used by the W3C graph-management tests (`DROP ALL`, `update-silent/*`),
+    // whereas a completely ABSENT `mf:result` on an UpdateEvaluationTest means
+    // the manifest parse dropped it. Fire only on the latter.
+    if !test.result_present
+        && test.result_data.is_none()
         && test.result_graph_data.is_empty()
         && !test.result_success
         && test.result.is_none()
     {
         bail!(
-            "UpdateEvaluationTest mf:result parsed to an empty expectation \
-             (no ut:data, ut:graphData, or ut:result) — unrecognized result \
-             shape?\nTest: {test_id}"
+            "UpdateEvaluationTest has no mf:result node at all — unrecognized \
+             manifest shape or dropped result?\nTest: {test_id}"
         );
     }
 
