@@ -475,7 +475,47 @@ fn try_parse_keyword_expr(tokens: &mut TokenStream) -> Result<Option<Expression>
         }));
     }
 
+    // SPARQL 1.2 triple-term builtins (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE).
+    // These are contextual function-call identifiers (not reserved keywords):
+    // the lexer emits a `TripleTermFn` token carrying the name, and we resolve
+    // + arity-validate it here. Lowering rejects them with `not_implemented`
+    // (burn-down decision D-1, accept-then-defer).
+    if let Some((name, _span)) = tokens.consume_triple_term_fn() {
+        let func_name = FunctionName::parse(&name)
+            .expect("lexer only emits TripleTermFn for known builtin names");
+        let args = parse_expression_list(tokens)?;
+        let arity = triple_term_fn_arity(&func_name);
+        if args.len() != arity {
+            return Err(format!(
+                "{name} expects {arity} argument{}, got {}",
+                if arity == 1 { "" } else { "s" },
+                args.len()
+            ));
+        }
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Some(Expression::FunctionCall {
+            name: func_name,
+            args,
+            distinct: false,
+            span,
+        }));
+    }
+
     Ok(None)
+}
+
+/// Fixed arity of a SPARQL 1.2 triple-term builtin. `TRIPLE(s,p,o)` takes
+/// three arguments; `SUBJECT`/`PREDICATE`/`OBJECT`/`isTRIPLE` each take one.
+fn triple_term_fn_arity(name: &FunctionName) -> usize {
+    match name {
+        FunctionName::Triple => 3,
+        FunctionName::Subject
+        | FunctionName::Predicate
+        | FunctionName::Object
+        | FunctionName::IsTriple => 1,
+        // Not reachable: only the five triple-term builtins are passed here.
+        _ => 1,
+    }
 }
 
 /// Check if current token is an aggregate keyword.

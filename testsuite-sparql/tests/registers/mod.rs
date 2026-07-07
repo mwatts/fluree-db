@@ -402,18 +402,14 @@ pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[];
 
-// SPARQL 1.2 triple-term *value* syntax (bare `<<( )>>` outside the
-// object-of-rdf:reifies position, and the TRIPLE/SUBJECT/PREDICATE/
-// OBJECT/isTRIPLE builtins). The reifier forms (buckets A/D) were
-// greened by burn-down PR-W2A; the 27 entries below are buckets B/C,
-// owned by sibling PR-W2BC under decision D-1 (accept-then-defer) —
-// see docs/audit/burn-down/ROADMAP.md §2/§4 and
+// SPARQL 1.2 triple-term *value* syntax: bare `<<( )>>` outside the
+// object-of-rdf:reifies position. The reifier forms (buckets A/D) were
+// greened by burn-down PR-W2A and the TRIPLE/SUBJECT/PREDICATE/OBJECT/
+// isTRIPLE builtins (bucket B) by PR-W2BC; the 24 entries below are the
+// remaining bucket C, owned by PR-W2BC under decision D-1
+// (accept-then-defer) — see docs/audit/burn-down/ROADMAP.md §2/§4 and
 // docs/audit/burn-down/sparql12-wave2-triple-terms.md §1.2/§1.3.
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
-    // bucket B — triple-term builtins not in the lexer/AST (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-05",
     // bucket C — parser rejects bare triple-term values (24)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-01",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-02",
