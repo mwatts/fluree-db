@@ -145,6 +145,10 @@ pub enum DiagCode {
     #[serde(rename = "V003")]
     UngroupedVariableInProjection,
 
+    /// BIND target variable already in scope in the group (SPARQL §10.1)
+    #[serde(rename = "V004")]
+    BindTargetAlreadyInScope,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -196,6 +200,7 @@ impl DiagCode {
             Self::BlankNodeLabelCrossScope => "V001",
             Self::SelectStarWithGroupBy => "V002",
             Self::UngroupedVariableInProjection => "V003",
+            Self::BindTargetAlreadyInScope => "V004",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings
