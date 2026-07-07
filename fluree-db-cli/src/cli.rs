@@ -531,6 +531,44 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
+    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher template.
+    ///
+    /// Reads the CSV locally and streams it to the ledger — local or remote —
+    /// as batched `UNWIND $batch AS row <template>` transactions (the `LOAD
+    /// CSV` analog). Each row is a map keyed by CSV column; all values are
+    /// strings, so cast in the template with `toInteger()` / `toFloat()`.
+    /// Empty cells are `null`.
+    ///
+    /// Examples:
+    ///   fluree load people --from people.csv \
+    ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
+    ///   fluree load people --from people.csv --remote origin \
+    ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.age = toInteger(row.age)'
+    Load {
+        /// Ledger name (defaults to the active ledger).
+        ledger: Option<String>,
+
+        /// CSV file to read.
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Per-row Cypher, using `row` (wrapped in `UNWIND $batch AS row …`).
+        #[arg(long)]
+        cypher: String,
+
+        /// Rows per transaction (one commit each).
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+
+        /// CSV field delimiter (a single character).
+        #[arg(long, default_value = ",")]
+        field_terminator: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin").
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
     /// Query a ledger
     ///
     /// Examples:

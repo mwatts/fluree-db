@@ -239,6 +239,28 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             .await
         }
 
+        Commands::Load {
+            ledger,
+            from,
+            cypher,
+            batch_size,
+            field_terminator,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::load::run(
+                ledger.as_deref(),
+                &from,
+                &cypher,
+                batch_size,
+                &field_terminator,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
+        }
+
         Commands::Upsert {
             args,
             ledger,

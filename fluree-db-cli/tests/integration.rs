@@ -2719,3 +2719,82 @@ fn validate_rejects_unknown_fail_on() {
         .code(2)
         .stderr(predicate::str::contains("unknown --fail-on"));
 }
+
+#[test]
+fn load_csv_upserts_via_cypher_template() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    let csv_path = tmp.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n1,Alice\n2,Bob\n").unwrap();
+
+    // First load: create both people from CSV via a per-row MERGE template.
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded 2 rows"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+
+    // Second load upserts: id 1 updates in place, id 3 is new — no duplicates.
+    std::fs::write(&csv_path, "id,name\n1,Alice2\n3,Carol\n").unwrap();
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice2"))
+        .stdout(predicate::str::contains("Carol"));
+}
