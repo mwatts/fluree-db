@@ -159,8 +159,8 @@ pub use ledger_manager::{
 pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
-    AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
-    MergePreview, MergePreviewOpts,
+    AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
+    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, DEFAULT_MAX_CHANGES,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
