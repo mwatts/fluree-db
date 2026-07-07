@@ -22,9 +22,8 @@ use fluree_db_core::{
 use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::{compute_delta_keys, compute_delta_keys_and_changes};
 use futures::{stream, StreamExt, TryStreamExt};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -672,14 +671,21 @@ fn build_change_summary(
         });
     };
 
-    // Group by full subject IRI; BTreeMap gives the deterministic subject
-    // order that pagination cursors rely on.
-    let mut by_subject: BTreeMap<String, Vec<Flake>> = BTreeMap::new();
+    // Group by Sid first — a cheap Arc-clone key with no IRI resolution — so
+    // each distinct subject is decoded exactly once rather than once per flake.
+    // Sorting by the decoded IRI then gives the deterministic subject order
+    // that pagination cursors rely on.
+    let mut by_sid: FxHashMap<fluree_db_core::Sid, Vec<Flake>> = FxHashMap::default();
     for f in net_flakes {
-        let subject = compactor.decode_sid(&f.s)?;
-        by_subject.entry(subject).or_default().push(f);
+        by_sid.entry(f.s.clone()).or_default().push(f);
     }
-    let subject_count = by_subject.len();
+    let subject_count = by_sid.len();
+
+    let mut by_subject: Vec<(String, Vec<Flake>)> = by_sid
+        .into_iter()
+        .map(|(sid, flakes)| Ok((compactor.decode_sid(&sid)?, flakes)))
+        .collect::<Result<_>>()?;
+    by_subject.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let mut entries = Vec::new();
     let mut emitted_flakes = 0usize;
