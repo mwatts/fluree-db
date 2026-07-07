@@ -14,7 +14,7 @@ use fluree_db_tabular::FieldType;
 use crate::emit::diagnostic::DiagCode;
 use crate::emit::fixtures::enterprise_dw_tables;
 use crate::emit::input::{EmitColumn, EmitColumnStats, EmitTableSchema, TypedBound};
-use crate::emit::{emit_r2rml, EmitOptions, EmitOutput, TableKey, TableOverride};
+use crate::emit::{emit_r2rml, EmitOptions, EmitOutput, SubjectStrategy, TableKey, TableOverride};
 
 // =============================================================================
 // Synthetic-input helpers (for focused FK-heuristic unit tests)
@@ -49,6 +49,60 @@ fn sc(field_id: i32, name: &str, ft: FieldType) -> EmitColumn {
         nested: false,
         doc: None,
         stats: EmitColumnStats::default(),
+    }
+}
+
+/// The scale-0 decimal type of a Snowflake `NUMBER(38,0)` surrogate key — the
+/// live shape that arrives as Iceberg `decimal(38,0)`, NOT `long`.
+const DEC38_0: FieldType = FieldType::Decimal {
+    precision: 38,
+    scale: 0,
+};
+
+/// A `decimal(38,0)` key column with an explicit `[min, max]` range.
+fn dk(field_id: i32, name: &str, min: i64, max: i64, required: bool) -> EmitColumn {
+    EmitColumn {
+        field_id,
+        name: name.to_string(),
+        iceberg_type: "decimal(38,0)".to_string(),
+        field_type: DEC38_0,
+        required,
+        nested: false,
+        doc: None,
+        stats: EmitColumnStats {
+            null_fraction: if required { Some(0.0) } else { None },
+            min: Some(TypedBound::Int(min)),
+            max: Some(TypedBound::Int(max)),
+        },
+    }
+}
+
+/// A `decimal(38,0)` key column with NO min/max bounds — the common Snowflake
+/// case where the manifest supplies no integer bounds. `required` still drives
+/// null-freeness (a `required` no-bounds key is a valid, indexable subject PK).
+fn dk_nobounds(field_id: i32, name: &str, required: bool) -> EmitColumn {
+    EmitColumn {
+        field_id,
+        name: name.to_string(),
+        iceberg_type: "decimal(38,0)".to_string(),
+        field_type: DEC38_0,
+        required,
+        nested: false,
+        doc: None,
+        stats: EmitColumnStats {
+            null_fraction: if required { Some(0.0) } else { None },
+            min: None,
+            max: None,
+        },
+    }
+}
+
+/// `EmitOptions::default()` with the strict `Identifier` subject strategy (the
+/// pre-change subject-key behavior).
+fn strict_opts() -> EmitOptions {
+    EmitOptions {
+        subject_strategy: SubjectStrategy::Identifier,
+        ..EmitOptions::default()
     }
 }
 
@@ -147,8 +201,10 @@ fn subject_key_name_fallback_is_unverified() {
 }
 
 #[test]
-fn subject_key_fallback_rejects_nullable_key() {
-    // A name-matching key that is nullable fails the gate → NoSafeSubjectKey.
+fn subject_key_fallback_rejects_nullable_key_under_strict_strategy() {
+    // Under the strict `Identifier` strategy, a name-matching key that is nullable
+    // fails the gate → NoSafeSubjectKey, no subject. (Under the default `Auto`
+    // strategy it is emitted anyway; see `auto_name_fallback_emits_unverified_subject`.)
     let t = tbl(
         "DIM_WIDGET",
         vec![],
@@ -157,7 +213,7 @@ fn subject_key_fallback_rejects_nullable_key() {
             sc(2, "NAME", FieldType::String),
         ],
     );
-    let out = emit_r2rml(&[t], &EmitOptions::default());
+    let out = emit_r2rml(&[t], &strict_opts());
     assert!(out.structured.table_mappings[0].subject_template.is_empty());
     assert!(!diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
 }
@@ -254,13 +310,16 @@ fn identifier_with_unknown_null_fraction_from_partial_stats_is_not_safe() {
 }
 
 #[test]
-fn no_safe_subject_key_emits_no_subject_and_never_invents_one() {
+fn no_safe_subject_key_emits_no_subject_under_strict_strategy() {
+    // Under the strict `Identifier` strategy a keyless table emits no subject and
+    // never invents a surrogate row id. (Under `Auto` it synthesizes a composite;
+    // see `auto_keyless_table_synthesizes_composite_subject`.)
     let t = tbl(
         "WEIRD",
         vec![],
         vec![sc(1, "A", FieldType::String), sc(2, "B", FieldType::Int64)],
     );
-    let out = emit_r2rml(&[t], &EmitOptions::default());
+    let out = emit_r2rml(&[t], &strict_opts());
     assert!(out.structured.table_mappings[0].subject_template.is_empty());
     let codes: Vec<_> = out.diagnostics.iter().map(|d| d.code).collect();
     assert!(codes.contains(&DiagCode::NoSafeSubjectKey));
@@ -281,6 +340,210 @@ fn composite_subject_key_uses_multi_placeholder_template() {
     assert!(out.structured.table_mappings[0]
         .subject_template
         .ends_with("/{LEFT_KEY}/{RIGHT_KEY}"));
+}
+
+// =============================================================================
+// Subject-key strategy — Auto fallback (always emit) vs Identifier (strict)
+// =============================================================================
+
+#[test]
+fn auto_name_fallback_emits_unverified_subject() {
+    // The live Snowflake case: no identifier_field_ids, and a WIDGET_KEY that is
+    // required=false with unknown null_fraction (NOT provably non-null). Under the
+    // default Auto strategy the emitter USES it — SubjectKeyUnverified, downgraded
+    // from NoSafeSubjectKey — so the table is saveable, and keeps it
+    // join-compatible (indexed as an FK parent).
+    let parent = tbl(
+        "DIM_WIDGET",
+        vec![], // no identifier_field_ids
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, false), // not provably non-null
+            sc(2, "NAME", FieldType::String),
+        ],
+    );
+    let child = tbl(
+        "FACT_USE",
+        vec![1],
+        vec![
+            ik(1, "USE_KEY", 1, 100, true),
+            ik(2, "WIDGET_KEY", 1, 100, false),
+        ],
+    );
+    let out = emit_r2rml(&[parent, child], &EmitOptions::default());
+
+    let widget = out.structured.table_mapping("DW.DIM_WIDGET").unwrap();
+    assert!(
+        widget.subject_template.ends_with("/{WIDGET_KEY}"),
+        "Auto must emit a subject on the unverified name key, got {}",
+        widget.subject_template
+    );
+    assert!(diag_cols(&out, DiagCode::SubjectKeyUnverified)
+        .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
+    // Join-compatible: the child's WIDGET_KEY resolves to the unverified parent PK.
+    assert!(resolved_fks(&out).contains(&(
+        "DW.FACT_USE".to_string(),
+        "WIDGET_KEY".to_string(),
+        "DW.DIM_WIDGET".to_string(),
+        "WIDGET_KEY".to_string(),
+    )));
+}
+
+#[test]
+fn auto_keyless_table_synthesizes_composite_subject() {
+    // Auto default + a table with NO key-like column → a deterministic composite
+    // subject over all columns (SubjectKeySynthesized), never a fabricated rownum.
+    let weird = tbl(
+        "WEIRD",
+        vec![],
+        vec![sc(1, "A", FieldType::String), sc(2, "B", FieldType::Int64)],
+    );
+    let out = emit_r2rml(&[weird], &EmitOptions::default());
+    let tm = &out.structured.table_mappings[0];
+    assert!(
+        tm.subject_template.ends_with("/{A}/{B}"),
+        "keyless table must get a composite subject, got {}",
+        tm.subject_template
+    );
+    assert!(out.diagnostics.iter().any(
+        |d| d.code == DiagCode::SubjectKeySynthesized && d.table.as_deref() == Some("DW.WEIRD")
+    ));
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
+}
+
+#[test]
+fn auto_synthesized_composite_is_not_an_fk_parent() {
+    // A synthesized composite must NOT be indexed as an FK parent (it is not a
+    // unique key) — even when it happens to be a single column.
+    let weird = tbl("WEIRD", vec![], vec![ik(1, "B", 1, 100, false)]);
+    let child = tbl(
+        "FACT_C",
+        vec![1],
+        vec![ik(1, "C_KEY", 1, 100, true), ik(2, "B", 1, 100, false)],
+    );
+    let out = emit_r2rml(&[weird, child], &EmitOptions::default());
+    // WEIRD is saveable (got a subject)...
+    assert!(!out
+        .structured
+        .table_mapping("DW.WEIRD")
+        .unwrap()
+        .subject_template
+        .is_empty());
+    // ...but is never an FK parent for the child's B column.
+    assert!(!resolved_fks(&out)
+        .iter()
+        .any(|(ct, cc, _, _)| ct == "DW.FACT_C" && cc == "B"));
+}
+
+#[test]
+fn composite_override_subject_key_renders() {
+    // A per-table override may now carry a COMPOSITE (multi-column) subject key —
+    // the only prior blocker was the override being a single `Option<String>`.
+    let t = tbl(
+        "BRIDGE",
+        vec![1],
+        vec![
+            ik(1, "LEFT_KEY", 1, 100, true),
+            ik(2, "RIGHT_KEY", 1, 100, true),
+            sc(3, "V", FieldType::String),
+        ],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "BRIDGE",
+        TableOverride {
+            primary_key: Some(vec!["LEFT_KEY".to_string(), "RIGHT_KEY".to_string()]),
+            class_name: None,
+            subject_strategy: None,
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+    let tm = &out.structured.table_mappings[0];
+    assert!(
+        tm.subject_template.ends_with("/{LEFT_KEY}/{RIGHT_KEY}"),
+        "composite override must render both placeholders, got {}",
+        tm.subject_template
+    );
+    // Both key columns are marked isSubjectId; each earns a SubjectKeyUnverified.
+    assert_eq!(
+        diag_cols(&out, DiagCode::SubjectKeyUnverified),
+        BTreeSet::from([
+            ("DW.BRIDGE".to_string(), "LEFT_KEY".to_string()),
+            ("DW.BRIDGE".to_string(), "RIGHT_KEY".to_string()),
+        ])
+    );
+    let subj_id_cols: BTreeSet<&str> = tm
+        .columns
+        .iter()
+        .filter(|c| c.is_subject_id)
+        .map(|c| c.column_name.as_str())
+        .collect();
+    assert_eq!(subj_id_cols, BTreeSet::from(["LEFT_KEY", "RIGHT_KEY"]));
+}
+
+#[test]
+fn composite_override_key_is_not_indexed_as_single_pk() {
+    // A composite override subject key must NOT be indexed as a single-column FK
+    // parent — a child matching one member must not resolve to this table.
+    let bridge = tbl(
+        "BRIDGE",
+        vec![1],
+        vec![
+            ik(1, "LEFT_KEY", 1, 100, true),
+            ik(2, "RIGHT_KEY", 1, 100, true),
+        ],
+    );
+    let child = tbl(
+        "FACT_C",
+        vec![1],
+        vec![
+            ik(1, "C_KEY", 1, 100, true),
+            ik(2, "LEFT_KEY", 1, 100, false),
+        ],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "BRIDGE",
+        TableOverride {
+            primary_key: Some(vec!["LEFT_KEY".to_string(), "RIGHT_KEY".to_string()]),
+            class_name: None,
+            subject_strategy: None,
+        },
+    );
+    let out = emit_r2rml(&[bridge, child], &opts);
+    assert!(!resolved_fks(&out)
+        .iter()
+        .any(|(ct, cc, _, _)| ct == "DW.FACT_C" && cc == "LEFT_KEY"));
+}
+
+#[test]
+fn per_table_identifier_strategy_overrides_global_auto() {
+    // Global strategy is Auto, but a per-table subject_strategy=Identifier forces
+    // strict behavior for that table: a nullable name key → NoSafeSubjectKey.
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![],
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, false), // not provably non-null
+            sc(2, "NAME", FieldType::String),
+        ],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "DIM_WIDGET",
+        TableOverride {
+            primary_key: None,
+            class_name: None,
+            subject_strategy: Some(SubjectStrategy::Identifier),
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+    assert!(
+        out.structured.table_mappings[0].subject_template.is_empty(),
+        "per-table Identifier override must restore strict (no subject)"
+    );
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+        .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
 }
 
 // =============================================================================
@@ -451,8 +714,11 @@ fn fk_join_locals_disambiguate_across_joins_not_just_literals() {
 }
 
 #[test]
-fn fk_range_out_of_bounds_rejected() {
-    // Name + type match, but the child range ⊄ parent range → no join.
+fn fk_single_parent_resolves_even_when_range_incompatible() {
+    // INTENTIONAL behavior change: range-containment is a DISAMBIGUATOR, not a
+    // hard gate. A single name+type parent joins on name∧type ALONE, even when
+    // the child range ⊄ parent range (Snowflake often supplies no usable bounds,
+    // and requiring them blocked correct joins).
     let parent = tbl(
         "DIM_PARENT",
         vec![1],
@@ -468,11 +734,52 @@ fn fk_range_out_of_bounds_rejected() {
     );
     let out = emit_r2rml(&[parent, child], &EmitOptions::default());
     assert!(
-        !resolved_fks(&out)
-            .iter()
-            .any(|(ct, cc, _, _)| ct == "DW.FACT_CHILD" && cc == "PARENT_KEY"),
-        "range-incompatible FK must not resolve"
+        resolved_fks(&out).contains(&(
+            "DW.FACT_CHILD".to_string(),
+            "PARENT_KEY".to_string(),
+            "DW.DIM_PARENT".to_string(),
+            "PARENT_KEY".to_string(),
+        )),
+        "a single name+type parent must resolve without range-containment"
     );
+}
+
+#[test]
+fn fk_range_disambiguates_between_same_named_parents() {
+    // TWO parents share the PK name PARENT_KEY (name+type ambiguous). Range
+    // containment is used ONLY to disambiguate: the child range ⊆ exactly one
+    // parent → that parent is chosen; the other is excluded.
+    let in_range = tbl("DIM_A", vec![1], vec![ik(1, "PARENT_KEY", 1, 100, true)]);
+    let out_of_range = tbl(
+        "DIM_B",
+        vec![1],
+        vec![ik(1, "PARENT_KEY", 1000, 2000, true)],
+    );
+    let child = tbl(
+        "FACT_CHILD",
+        vec![1],
+        vec![
+            ik(1, "CHILD_KEY", 1, 100_000, true),
+            ik(2, "PARENT_KEY", 1, 100, false), // ⊆ DIM_A only
+        ],
+    );
+    let out = emit_r2rml(&[in_range, out_of_range, child], &EmitOptions::default());
+    assert!(
+        resolved_fks(&out).contains(&(
+            "DW.FACT_CHILD".to_string(),
+            "PARENT_KEY".to_string(),
+            "DW.DIM_A".to_string(),
+            "PARENT_KEY".to_string(),
+        )),
+        "range-containment must disambiguate to the in-range parent"
+    );
+    // Never to the out-of-range parent.
+    assert!(!resolved_fks(&out).contains(&(
+        "DW.FACT_CHILD".to_string(),
+        "PARENT_KEY".to_string(),
+        "DW.DIM_B".to_string(),
+        "PARENT_KEY".to_string(),
+    )));
 }
 
 #[test]
@@ -542,6 +849,111 @@ fn nested_column_is_skipped() {
     assert!(tm.columns.iter().all(|c| c.column_name != "PAYLOAD"));
     assert!(diag_cols(&out, DiagCode::NestedColumnSkipped)
         .contains(&("DW.DIM_THING".to_string(), "PAYLOAD".to_string())));
+}
+
+// =============================================================================
+// FK heuristic — decimal keys, bounds-free joins, non-key-type skip
+// =============================================================================
+
+#[test]
+fn fk_decimal_scale0_child_resolves_to_decimal_parent() {
+    // Snowflake NUMBER(38,0) surrogate keys arrive as decimal(38,0), NOT long.
+    // FACT_ORDER.CUSTOMER_KEY (decimal(38,0)) → DIM_CUSTOMER.CUSTOMER_KEY must
+    // resolve — the integer-only candidacy gate used to drop it silently.
+    let dim = tbl(
+        "DIM_CUSTOMER",
+        vec![1],
+        vec![dk(1, "CUSTOMER_KEY", 1, 100_000, true)],
+    );
+    let fact = tbl(
+        "FACT_ORDER",
+        vec![1],
+        vec![
+            dk(1, "ORDER_KEY", 1, 500_000, true),
+            dk(2, "CUSTOMER_KEY", 1, 100_000, false),
+        ],
+    );
+    let out = emit_r2rml(&[dim, fact], &EmitOptions::default());
+    assert!(
+        resolved_fks(&out).contains(&(
+            "DW.FACT_ORDER".to_string(),
+            "CUSTOMER_KEY".to_string(),
+            "DW.DIM_CUSTOMER".to_string(),
+            "CUSTOMER_KEY".to_string(),
+        )),
+        "a decimal(38,0) child key must resolve to a decimal(38,0) parent PK"
+    );
+}
+
+#[test]
+fn fk_exact_name_type_resolves_with_no_bounds_present() {
+    // Neither side supplies min/max bounds (the common Snowflake case). A single
+    // name+type match must still join — on name∧type ALONE, no range needed.
+    let dim = tbl(
+        "DIM_CUSTOMER",
+        vec![1],
+        vec![dk_nobounds(1, "CUSTOMER_KEY", true)],
+    );
+    let fact = tbl(
+        "FACT_ORDER",
+        vec![1],
+        vec![
+            dk_nobounds(1, "ORDER_KEY", true),
+            dk_nobounds(2, "CUSTOMER_KEY", false),
+        ],
+    );
+    let out = emit_r2rml(&[dim, fact], &EmitOptions::default());
+    assert!(
+        resolved_fks(&out).contains(&(
+            "DW.FACT_ORDER".to_string(),
+            "CUSTOMER_KEY".to_string(),
+            "DW.DIM_CUSTOMER".to_string(),
+            "CUSTOMER_KEY".to_string(),
+        )),
+        "an exact name+type match must resolve with no bounds present"
+    );
+}
+
+#[test]
+fn fk_key_named_non_key_type_emits_diagnostic() {
+    // A `*_KEY`-named column whose TYPE is not key-like (here a VARCHAR) is
+    // excluded from FK inference — but with a visible NonKeyTypeSkipped diagnostic
+    // instead of a silent drop, and never a fabricated join.
+    let dim = tbl(
+        "DIM_CUSTOMER",
+        vec![1],
+        vec![ik(1, "CUSTOMER_KEY", 1, 100, true)],
+    );
+    let fact = tbl(
+        "FACT_ORDER",
+        vec![1],
+        vec![
+            ik(1, "ORDER_KEY", 1, 500, true),
+            sc(2, "CUSTOMER_KEY", FieldType::String), // key-named, non-key type
+        ],
+    );
+    let out = emit_r2rml(&[dim, fact], &EmitOptions::default());
+    assert!(diag_cols(&out, DiagCode::NonKeyTypeSkipped)
+        .contains(&("DW.FACT_ORDER".to_string(), "CUSTOMER_KEY".to_string())));
+    assert!(!resolved_fks(&out)
+        .iter()
+        .any(|(ct, cc, _, _)| ct == "DW.FACT_ORDER" && cc == "CUSTOMER_KEY"));
+
+    // A SCALED decimal `*_KEY` (money-like, scale > 0) is likewise non-key-typed.
+    let mut scaled = dk(3, "AMOUNT_KEY", 1, 100, false);
+    scaled.field_type = FieldType::Decimal {
+        precision: 18,
+        scale: 2,
+    };
+    scaled.iceberg_type = "decimal(18,2)".to_string();
+    let t = tbl(
+        "FACT_X",
+        vec![1],
+        vec![ik(1, "X_KEY", 1, 100, true), scaled],
+    );
+    let out2 = emit_r2rml(&[t], &EmitOptions::default());
+    assert!(diag_cols(&out2, DiagCode::NonKeyTypeSkipped)
+        .contains(&("DW.FACT_X".to_string(), "AMOUNT_KEY".to_string())));
 }
 
 // =============================================================================
@@ -981,8 +1393,9 @@ fn override_primary_key_replaces_identifier_field_ids() {
         "DW",
         "DIM_WIDGET",
         TableOverride {
-            primary_key: Some("ALT_KEY".to_string()),
+            primary_key: Some(vec!["ALT_KEY".to_string()]),
             class_name: None,
+            subject_strategy: None,
         },
     );
     let out = emit_r2rml(&[t], &opts);
@@ -1033,8 +1446,9 @@ fn override_primary_key_failing_null_gate_yields_no_safe_subject_key() {
         "DW",
         "DIM_WIDGET",
         TableOverride {
-            primary_key: Some("NULLABLE_COL".to_string()),
+            primary_key: Some(vec!["NULLABLE_COL".to_string()]),
             class_name: None,
+            subject_strategy: None,
         },
     );
     let out = emit_r2rml(&[t], &opts);
@@ -1063,8 +1477,9 @@ fn override_primary_key_gate_passes_via_null_fraction_zero() {
         "DW",
         "DIM_WIDGET",
         TableOverride {
-            primary_key: Some("PROVEN_COL".to_string()),
+            primary_key: Some(vec!["PROVEN_COL".to_string()]),
             class_name: None,
+            subject_strategy: None,
         },
     );
     let out = emit_r2rml(&[t], &opts);
@@ -1091,8 +1506,9 @@ fn override_primary_key_on_missing_column_is_clean_diagnostic_not_panic() {
         "DW",
         "DIM_WIDGET",
         TableOverride {
-            primary_key: Some("DOES_NOT_EXIST".to_string()),
+            primary_key: Some(vec!["DOES_NOT_EXIST".to_string()]),
             class_name: None,
+            subject_strategy: None,
         },
     );
     let out = emit_r2rml(&[t], &opts);
@@ -1125,6 +1541,7 @@ fn override_class_name_changes_class_and_slug_only() {
         TableOverride {
             primary_key: None,
             class_name: Some("Gadget".to_string()),
+            subject_strategy: None,
         },
     );
     let out = emit_r2rml(&[t], &opts);
@@ -1168,8 +1585,9 @@ fn empty_and_unmatched_overrides_are_byte_identical_to_pre_change_golden() {
         "DW",
         "NOT_A_REAL_TABLE",
         TableOverride {
-            primary_key: Some("X".to_string()),
+            primary_key: Some(vec!["X".to_string()]),
             class_name: Some("Y".to_string()),
+            subject_strategy: None,
         },
     );
     let unmatched_out = emit_r2rml(&enterprise_dw_tables(), &opts);

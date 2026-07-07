@@ -38,7 +38,9 @@ use crate::Result;
 
 // Re-export the emitter's wire types that appear in this module's public API, so
 // callers (and the HTTP route) can name them straight off `fluree_db_api`.
-pub use fluree_db_r2rml::emit::{Diagnostic, StructuredR2rmlMapping, TableOverride};
+pub use fluree_db_r2rml::emit::{
+    Diagnostic, StructuredR2rmlMapping, SubjectStrategy, TableOverride,
+};
 
 // =============================================================================
 // Request / response
@@ -62,6 +64,11 @@ pub struct GenerateOptions {
     /// (pushdown-friendly). Defaults to `true`.
     #[serde(default = "default_true")]
     pub keep_fk_keys_as_literals: bool,
+    /// Subject-key strategy: `auto` (the DEFAULT — always emit a saveable subject,
+    /// falling back to an unverified name key or a deterministic composite) or
+    /// `identifier` (strict; emit no subject when no verified key exists).
+    #[serde(default)]
+    pub subject_strategy: SubjectStrategy,
 }
 
 fn default_true() -> bool {
@@ -74,6 +81,7 @@ impl Default for GenerateOptions {
             xsd_long_as_integer: true,
             emit_fk_joins: true,
             keep_fk_keys_as_literals: true,
+            subject_strategy: SubjectStrategy::Auto,
         }
     }
 }
@@ -125,13 +133,29 @@ pub struct GenerateR2rmlResponse {
 
 /// Map one column's JSON `min`/`max` bound to a comparable [`TypedBound`].
 ///
-/// FK candidacy is integer-only (surrogate `*_KEY` spaces), so only JSON integer
-/// bounds become `TypedBound::Int`; every non-integer bound (float, string date,
-/// absent, or out-of-`i64`-range) becomes `None` — an unbounded column the
-/// range-containment FK check simply cannot confirm a join for.
+/// Surrogate `*_KEY` spaces are integer-valued, so an integer bound becomes
+/// `TypedBound::Int`. Two JSON shapes carry one:
+///
+/// - a JSON integer (`long`/`int` stats), via `as_i64`; and
+/// - an **integer-valued decimal string** (`"12345"`). Snowflake `NUMBER(38,0)`
+///   surrogate keys arrive as Iceberg `decimal(38,0)`, and scale-0 decimal stats
+///   serialize as a plain-digit string (`stats::format_decimal(unscaled, 0)` —
+///   no `.`), so they would otherwise be dropped. A scaled decimal string
+///   (`"123.45"`) is NOT integer-valued and stays `None`.
+///
+/// Every other bound (float, ISO date string, absent, or out-of-`i64`-range)
+/// becomes `None` — an unbounded column. FK inference no longer HARD-gates on
+/// range-containment (it disambiguates only), so a `None` bound never blocks a
+/// single, exact name+type match.
 fn json_to_typed_bound(value: Option<&serde_json::Value>) -> Option<TypedBound> {
+    let value = value?;
+    if let Some(i) = value.as_i64() {
+        return Some(TypedBound::Int(i));
+    }
+    // Integer-valued decimal string (scale-0 decimal key bounds), e.g. "12345".
     value
-        .and_then(serde_json::Value::as_i64)
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
         .map(TypedBound::Int)
 }
 
@@ -205,6 +229,7 @@ fn build_emit_options(req: &GenerateR2rmlRequest) -> EmitOptions {
         xsd_long_as_integer: req.options.xsd_long_as_integer,
         emit_fk_joins: req.options.emit_fk_joins,
         keep_fk_keys_as_literals: req.options.keep_fk_keys_as_literals,
+        subject_strategy: req.options.subject_strategy,
         per_table_overrides,
         ..EmitOptions::new(&req.base_namespace)
     }
@@ -391,6 +416,36 @@ mod tests {
         }
     }
 
+    /// A `decimal(38,0)` surrogate-key column (Snowflake `NUMBER(38,0)`) carrying
+    /// decimal-STRING `[min, max]` bounds — scale-0 decimal stats serialize as
+    /// integer-valued strings, not JSON numbers.
+    fn dec_key_col(field_id: i32, name: &str, required: bool, min: i64, max: i64) -> ColumnInfo {
+        ColumnInfo {
+            field_id,
+            name: name.to_string(),
+            iceberg_type: "decimal(38, 0)".to_string(),
+            field_type: Some(FieldType::Decimal {
+                precision: 38,
+                scale: 0,
+            }),
+            xsd_type: Some("xsd:decimal".to_string()),
+            required,
+            nested: false,
+            doc: None,
+            stats: Some(ColumnStats {
+                null_count: None,
+                value_count: None,
+                null_fraction: if required { Some(0.0) } else { None },
+                nan_count: None,
+                min: Some(serde_json::json!(min.to_string())),
+                max: Some(serde_json::json!(max.to_string())),
+                on_disk_bytes: None,
+                distinct_count: None,
+                bounds_truncated: false,
+            }),
+        }
+    }
+
     fn preview(
         ns: &str,
         name: &str,
@@ -446,7 +501,7 @@ mod tests {
     // ---- min/max JSON → TypedBound ----
 
     #[test]
-    fn json_bounds_map_integers_only() {
+    fn json_bounds_map_integers_and_integer_valued_decimal_strings() {
         assert_eq!(
             json_to_typed_bound(Some(&serde_json::json!(42))),
             Some(TypedBound::Int(42))
@@ -455,7 +510,22 @@ mod tests {
             json_to_typed_bound(Some(&serde_json::json!(-7))),
             Some(TypedBound::Int(-7))
         );
-        // Non-integer bounds (float, string date) are not FK-usable → None.
+        // Scale-0 decimal (Snowflake NUMBER(38,0)) key bounds serialize as an
+        // integer-valued decimal STRING — parse those so range-containment works.
+        assert_eq!(
+            json_to_typed_bound(Some(&serde_json::json!("12345"))),
+            Some(TypedBound::Int(12345))
+        );
+        assert_eq!(
+            json_to_typed_bound(Some(&serde_json::json!("-7"))),
+            Some(TypedBound::Int(-7))
+        );
+        // A SCALED decimal string ("123.45") is not integer-valued → None.
+        assert_eq!(
+            json_to_typed_bound(Some(&serde_json::json!("123.45"))),
+            None
+        );
+        // Other non-integer bounds (float, ISO date string) are not FK-usable → None.
         assert_eq!(json_to_typed_bound(Some(&serde_json::json!(3.5))), None);
         assert_eq!(
             json_to_typed_bound(Some(&serde_json::json!("2021-01-01"))),
@@ -563,8 +633,9 @@ mod tests {
         overrides.insert(
             id.clone(),
             TableOverride {
-                primary_key: Some("ALT_KEY".to_string()),
+                primary_key: Some(vec!["ALT_KEY".to_string()]),
                 class_name: None,
+                subject_strategy: None,
             },
         );
         let req = base_req(vec![id.clone()], overrides);
@@ -688,6 +759,51 @@ mod tests {
             .compile()
             .expect("emitted turtle must compile");
         assert_eq!(compiled.len(), resp.structured.table_mappings.len());
+    }
+
+    // ---- decimal(38,0) surrogate keys resolve through the full pipeline ----
+
+    #[test]
+    fn decimal_surrogate_keys_resolve_fk_through_full_pipeline() {
+        // The live ENTERPRISE_DEMO.DW shape: NUMBER(38,0) keys arrive as
+        // decimal(38,0) with decimal-STRING min/max bounds. FACT_ORDER.CUSTOMER_KEY
+        // → DIM_CUSTOMER.CUSTOMER_KEY must resolve end-to-end (the integer-only
+        // candidacy gate used to drop the decimal key before the name match).
+        let previews = vec![
+            preview(
+                "DW",
+                "DIM_CUSTOMER",
+                vec![1],
+                vec![
+                    dec_key_col(1, "CUSTOMER_KEY", true, 1, 100_000),
+                    scalar_col(2, "FULL_NAME", FieldType::String),
+                ],
+            ),
+            preview(
+                "DW",
+                "FACT_ORDER",
+                vec![1],
+                vec![
+                    dec_key_col(1, "ORDER_KEY", true, 1, 500_000),
+                    dec_key_col(2, "CUSTOMER_KEY", false, 1, 100_000),
+                ],
+            ),
+        ];
+        let ids: Vec<TableIdentifier> = previews.iter().map(|(id, _)| id.clone()).collect();
+        let resp = assemble_generate_response(&previews, &base_req(ids, HashMap::new())).unwrap();
+
+        let fact = resp
+            .structured
+            .table_mapping("DW.FACT_ORDER")
+            .expect("fact mapping");
+        let fk = fact
+            .columns
+            .iter()
+            .find_map(|c| c.foreign_key.as_ref())
+            .expect("decimal CUSTOMER_KEY must resolve to a join");
+        assert_eq!(fk.target_table, "DW.DIM_CUSTOMER");
+        assert_eq!(fk.child_column, "CUSTOMER_KEY");
+        assert_eq!(fk.parent_column, "CUSTOMER_KEY");
     }
 
     // ---- wire shape: camelCase StructuredR2rmlMapping, not Vec<TriplesMap> ----

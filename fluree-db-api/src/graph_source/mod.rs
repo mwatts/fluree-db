@@ -145,7 +145,7 @@ pub use iceberg_catalog::{
 #[cfg(feature = "iceberg")]
 pub use iceberg_generate::{
     Diagnostic, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse,
-    StructuredR2rmlMapping, TableOverride,
+    StructuredR2rmlMapping, SubjectStrategy, TableOverride,
 };
 
 #[cfg(feature = "iceberg")]

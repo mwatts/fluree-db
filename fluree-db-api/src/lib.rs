@@ -198,8 +198,8 @@ pub use graph_source::{
     GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
     IcebergCreateConfig, IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig,
     R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo,
-    StatsCompleteness, StatsTier, StructuredR2rmlMapping, TableIdentifier, TableOverride,
-    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    StatsCompleteness, StatsTier, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier,
+    TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 pub use bm25_worker::{

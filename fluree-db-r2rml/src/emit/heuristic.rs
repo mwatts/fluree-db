@@ -23,7 +23,7 @@ use crate::emit::ir::{
     ColumnMapping, ForeignKey, PrefixDecl, StructuredR2rmlMapping, TableMapping,
 };
 use crate::emit::naming;
-use crate::emit::EmitOptions;
+use crate::emit::{EmitOptions, SubjectStrategy};
 use crate::vocab::R2RML;
 
 /// The XSD namespace IRI (for the `xsd:` prefix declaration).
@@ -149,9 +149,14 @@ fn build_table_draft(
 
     // Subject key selection. A per-table `primary_key` override REPLACES
     // `identifier_field_ids` as the subject key (validated + always unverified).
+    // The effective strategy is the per-table override's, else the global.
+    let strategy = table_override
+        .and_then(|o| o.subject_strategy)
+        .unwrap_or(opts.subject_strategy);
     let subject_key = select_subject_key(
         table,
         table_override.and_then(|o| o.primary_key.as_deref()),
+        strategy,
         diagnostics,
     );
     let subject_key_columns: HashSet<String> = subject_key.columns.iter().cloned().collect();
@@ -173,8 +178,10 @@ fn build_table_draft(
         )
     };
 
-    // Index a single-column PK for the FK pass.
-    if subject_key.columns.len() == 1 {
+    // Index a single-column, join-eligible PK for the FK pass. A synthesized
+    // composite fallback (`index_as_pk == false`) is never a unique key, so it
+    // must not become an FK parent even when it happens to be one column.
+    if subject_key.columns.len() == 1 && subject_key.index_as_pk {
         let pk_name = &subject_key.columns[0];
         if let Some(col) = table.columns.iter().find(|c| &c.name == pk_name) {
             pk_index.push(PkEntry {
@@ -231,40 +238,151 @@ fn build_table_draft(
 
 /// Choose the subject key.
 ///
-/// A per-table `primary_key` override (`override_primary_key`), when present,
-/// REPLACES `identifier_field_ids`: the named column must exist and pass the
-/// `required` / null-free gate (else `NoSafeSubjectKey`, no subject), and — because
-/// uniqueness is unprovable metadata-only — it ALWAYS earns a `SubjectKeyUnverified`
-/// diagnostic. Never fabricate a surrogate.
+/// Precedence: a per-table `primary_key` override → Iceberg `identifier_field_ids`
+/// → a `<STEM>_KEY`/`<STEM>_ID` name fallback → (strategy-dependent) either a
+/// synthesized composite subject or no subject.
 ///
-/// Otherwise: prefer `identifier_field_ids` (each member gated on the same
-/// `required` / null-free check and, since uniqueness is unverifiable
-/// metadata-only, flagged `SubjectKeyUnverified`); else a `required` / null-free
-/// `<STEM>_KEY` / `<STEM>_ID` fallback (`SubjectKeyUnverified`); else
-/// `NoSafeSubjectKey` (no subject; never invent a surrogate row id).
+/// The override and identifier paths are validated STRICTLY under both
+/// strategies (a missing / nullable column earns `NoSafeSubjectKey` and no
+/// subject): an explicit override is the caller's assertion, and a nullable
+/// Iceberg identifier is a schema contradiction that must not be silently
+/// indexed as an FK parent. The [`SubjectStrategy`] governs ONLY the
+/// name-fallback / keyless tail:
+///
+/// - [`SubjectStrategy::Auto`] (default): a name-fallback column that is not
+///   *provably* non-null is USED anyway — downgraded from `NoSafeSubjectKey` to
+///   a non-blocking `SubjectKeyUnverified`, kept join-compatible (indexed as an
+///   FK parent) — and a table with no key-like column at all gets a
+///   deterministic COMPOSITE subject (`SubjectKeySynthesized`) so it stays
+///   saveable.
+/// - [`SubjectStrategy::Identifier`] (strict, the pre-change behavior): a
+///   nullable name key or a keyless table yields `NoSafeSubjectKey`, no subject.
+///
+/// Never fabricates a surrogate row id (Iceberg exposes no stable logical row id).
 fn select_subject_key(
     table: &EmitTableSchema,
-    override_primary_key: Option<&str>,
+    override_primary_key: Option<&[String]>,
+    strategy: SubjectStrategy,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SubjectKey {
     // -- Per-table `primary_key` override: replaces identifier_field_ids. --
-    if let Some(pk_name) = override_primary_key {
-        let col = match table.columns.iter().find(|c| c.name == pk_name) {
+    if let Some(pk_cols) = override_primary_key {
+        return select_override_subject_key(table, pk_cols, diagnostics);
+    }
+
+    // -- Iceberg identifier_field_ids (strict under both strategies). --
+    if !table.identifier_field_ids.is_empty() {
+        return select_identifier_subject_key(table, diagnostics);
+    }
+
+    // -- Name fallback: a `<STEM>_KEY` / `<STEM>_ID` column. --
+    let marker_stem = naming::strip_table_marker(table.stem());
+    let candidates = [format!("{marker_stem}_KEY"), format!("{marker_stem}_ID")];
+    if let Some(col) = table
+        .columns
+        .iter()
+        .find(|c| candidates.iter().any(|cand| cand == &c.name))
+    {
+        // A proven-non-null name key is safe under both strategies (only its
+        // uniqueness is unverifiable).
+        if col.is_non_null() {
+            push_subject_key_unverified(
+                table,
+                col,
+                "chosen by name+required fallback",
+                diagnostics,
+            );
+            return SubjectKey::single(col.name.clone());
+        }
+        // Not provably non-null: the strategy decides.
+        return match strategy {
+            SubjectStrategy::Auto => {
+                // Use it anyway — DOWNGRADE NoSafeSubjectKey → SubjectKeyUnverified,
+                // and keep it join-compatible (indexed as an FK parent) so FK joins
+                // TO this table still resolve.
+                diagnostics.push(Diagnostic::new(
+                    Severity::Warning,
+                    DiagCode::SubjectKeyUnverified,
+                    table.qualified_name(),
+                    Some(col.name.clone()),
+                    format!(
+                        "subject key '{}' chosen by name fallback; NOT provably non-null \
+                         (no `required`, no null_fraction==0) and uniqueness is unverifiable \
+                         metadata-only — emitted so the table is saveable",
+                        col.name
+                    ),
+                ));
+                SubjectKey::single(col.name.clone())
+            }
+            SubjectStrategy::Identifier => {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Error,
+                    DiagCode::NoSafeSubjectKey,
+                    table.qualified_name(),
+                    Some(col.name.clone()),
+                    format!(
+                        "candidate subject key '{}' is nullable; no safe subject key",
+                        col.name
+                    ),
+                ));
+                SubjectKey::none()
+            }
+        };
+    }
+
+    // -- No key-like column at all: the strategy decides. --
+    match strategy {
+        SubjectStrategy::Auto => synthesize_composite_subject_key(table, diagnostics),
+        SubjectStrategy::Identifier => {
+            diagnostics.push(Diagnostic::new(
+                Severity::Error,
+                DiagCode::NoSafeSubjectKey,
+                table.qualified_name(),
+                None,
+                "no identifier_field_ids and no required <STEM>_KEY/<STEM>_ID column; \
+                 emitting no subject (never inventing a surrogate row id)"
+                    .to_string(),
+            ));
+            SubjectKey::none()
+        }
+    }
+}
+
+/// Per-table `primary_key` override handling (one or more columns), validated
+/// strictly under both strategies. A single column is a simple key (indexed as
+/// an FK parent); multiple columns are a composite subject template.
+fn select_override_subject_key(
+    table: &EmitTableSchema,
+    pk_cols: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> SubjectKey {
+    if pk_cols.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            Severity::Error,
+            DiagCode::NoSafeSubjectKey,
+            table.qualified_name(),
+            None,
+            "per-table primary_key override is an empty column list; no safe subject key"
+                .to_string(),
+        ));
+        return SubjectKey::none();
+    }
+    let mut columns = Vec::with_capacity(pk_cols.len());
+    for pk_name in pk_cols {
+        let col = match table.columns.iter().find(|c| &c.name == pk_name) {
             Some(col) => col,
             None => {
                 diagnostics.push(Diagnostic::new(
                     Severity::Error,
                     DiagCode::NoSafeSubjectKey,
                     table.qualified_name(),
-                    Some(pk_name.to_string()),
+                    Some(pk_name.clone()),
                     format!(
                         "per-table primary_key override '{pk_name}' is not a column of the \
                          table; no safe subject key"
                     ),
                 ));
-                return SubjectKey {
-                    columns: Vec::new(),
-                };
+                return SubjectKey::none();
             }
         };
         if !col.is_non_null() {
@@ -279,143 +397,165 @@ fn select_subject_key(
                     col.name
                 ),
             ));
-            return SubjectKey {
-                columns: Vec::new(),
-            };
+            return SubjectKey::none();
         }
-        diagnostics.push(Diagnostic::new(
-            Severity::Warning,
-            DiagCode::SubjectKeyUnverified,
-            table.qualified_name(),
-            Some(col.name.clone()),
-            format!(
-                "subject key '{}' set by per-table override; uniqueness is unverifiable \
-                 metadata-only (NDV deferred)",
-                col.name
-            ),
-        ));
-        return SubjectKey {
-            columns: vec![col.name.clone()],
-        };
+        push_subject_key_unverified(table, col, "set by per-table override", diagnostics);
+        columns.push(col.name.clone());
     }
+    // A single-column override is a simple key (indexed as an FK parent); a
+    // composite (len > 1) is a subject template that is never indexed.
+    let index_as_pk = columns.len() == 1;
+    SubjectKey {
+        columns,
+        index_as_pk,
+    }
+}
 
-    if !table.identifier_field_ids.is_empty() {
-        let mut columns = Vec::new();
-        for &fid in &table.identifier_field_ids {
-            let col = match table.column_by_field_id(fid) {
-                Some(col) => col,
-                None => {
-                    diagnostics.push(Diagnostic::new(
-                        Severity::Error,
-                        DiagCode::NoSafeSubjectKey,
-                        table.qualified_name(),
-                        None,
-                        format!("identifier_field_ids references unknown field id {fid}"),
-                    ));
-                    return SubjectKey {
-                        columns: Vec::new(),
-                    };
-                }
-            };
-            // Non-null gate. Iceberg requires identifier fields to be `required`,
-            // but a non-conforming writer (e.g. Snowflake-managed Iceberg) can
-            // populate `identifier_field_ids` without marking the column required.
-            // A nullable identifier yields an unsafe subject template (silent row
-            // loss at query time) and, in the single-column case, would be indexed
-            // as a valid FK parent — so gate it exactly like the override and
-            // `<STEM>_KEY`/`_ID` paths, emitting no subject when it cannot be
-            // confirmed non-null.
-            if !col.is_non_null() {
+/// Iceberg `identifier_field_ids` subject-key handling (strict; the pre-change
+/// behavior, unchanged by [`SubjectStrategy`]).
+fn select_identifier_subject_key(
+    table: &EmitTableSchema,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> SubjectKey {
+    let mut columns = Vec::new();
+    for &fid in &table.identifier_field_ids {
+        let col = match table.column_by_field_id(fid) {
+            Some(col) => col,
+            None => {
                 diagnostics.push(Diagnostic::new(
                     Severity::Error,
                     DiagCode::NoSafeSubjectKey,
                     table.qualified_name(),
-                    Some(col.name.clone()),
-                    format!(
-                        "identifier_field_ids column '{}' is nullable (fails required / \
-                         null_fraction==0); no safe subject key",
-                        col.name
-                    ),
+                    None,
+                    format!("identifier_field_ids references unknown field id {fid}"),
                 ));
-                return SubjectKey {
-                    columns: Vec::new(),
-                };
+                return SubjectKey::none();
             }
-            // Parity with the override / <STEM>_KEY-_ID branches: even a declared
-            // identifier's uniqueness is unverifiable metadata-only (NDV deferred),
-            // so flag it. One diagnostic per key column (composite keys included).
+        };
+        // Non-null gate. Iceberg requires identifier fields to be `required`,
+        // but a non-conforming writer (e.g. Snowflake-managed Iceberg) can
+        // populate `identifier_field_ids` without marking the column required.
+        // A nullable identifier yields an unsafe subject template (silent row
+        // loss at query time) and, in the single-column case, would be indexed
+        // as a valid FK parent — so gate it, emitting no subject when it cannot
+        // be confirmed non-null. This stays STRICT under both strategies.
+        if !col.is_non_null() {
             diagnostics.push(Diagnostic::new(
-                Severity::Warning,
-                DiagCode::SubjectKeyUnverified,
+                Severity::Error,
+                DiagCode::NoSafeSubjectKey,
                 table.qualified_name(),
                 Some(col.name.clone()),
                 format!(
-                    "subject key '{}' from Iceberg identifier_field_ids; uniqueness is \
-                     unverifiable metadata-only (NDV deferred)",
+                    "identifier_field_ids column '{}' is nullable (fails required / \
+                     null_fraction==0); no safe subject key",
                     col.name
                 ),
             ));
-            columns.push(col.name.clone());
+            return SubjectKey::none();
         }
-        return SubjectKey { columns };
+        // Even a declared identifier's uniqueness is unverifiable metadata-only
+        // (NDV deferred), so flag it. One diagnostic per key column.
+        push_subject_key_unverified(table, col, "from Iceberg identifier_field_ids", diagnostics);
+        columns.push(col.name.clone());
     }
+    let index_as_pk = columns.len() == 1;
+    SubjectKey {
+        columns,
+        index_as_pk,
+    }
+}
 
-    // Fallback: a required / null-free column matching <STEM>_KEY or <STEM>_ID.
-    let marker_stem = naming::strip_table_marker(table.stem());
-    let candidates = [format!("{marker_stem}_KEY"), format!("{marker_stem}_ID")];
-    if let Some(col) = table
+/// Synthesize a deterministic COMPOSITE subject over the row's columns when no
+/// key-like column exists (Auto strategy only). The column set is every
+/// non-nested column in `field_id` order — the closest stable approximation of
+/// row identity without a hash (R2RML templates cannot hash). It is NEVER
+/// indexed as an FK parent (it is not a unique key). Emits `SubjectKeySynthesized`.
+fn synthesize_composite_subject_key(
+    table: &EmitTableSchema,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> SubjectKey {
+    let columns: Vec<String> = table
         .columns
         .iter()
-        .find(|c| candidates.iter().any(|cand| cand == &c.name))
-    {
-        if col.is_non_null() {
-            diagnostics.push(Diagnostic::new(
-                Severity::Warning,
-                DiagCode::SubjectKeyUnverified,
-                table.qualified_name(),
-                Some(col.name.clone()),
-                format!(
-                    "subject key '{}' chosen by name+required fallback; uniqueness is \
-                     unverifiable metadata-only (NDV deferred)",
-                    col.name
-                ),
-            ));
-            return SubjectKey {
-                columns: vec![col.name.clone()],
-            };
-        }
+        .filter(|c| !c.nested)
+        .map(|c| c.name.clone())
+        .collect();
+    if columns.is_empty() {
+        // Degenerate: nothing flat to key on (all columns nested).
         diagnostics.push(Diagnostic::new(
             Severity::Error,
             DiagCode::NoSafeSubjectKey,
             table.qualified_name(),
-            Some(col.name.clone()),
-            format!(
-                "candidate subject key '{}' is nullable; no safe subject key",
-                col.name
-            ),
+            None,
+            "no key-like column and no flat columns to synthesize a composite subject from; \
+             emitting no subject"
+                .to_string(),
         ));
-        return SubjectKey {
-            columns: Vec::new(),
-        };
+        return SubjectKey::none();
     }
-
     diagnostics.push(Diagnostic::new(
-        Severity::Error,
-        DiagCode::NoSafeSubjectKey,
+        Severity::Warning,
+        DiagCode::SubjectKeySynthesized,
         table.qualified_name(),
         None,
-        "no identifier_field_ids and no required <STEM>_KEY/<STEM>_ID column; \
-         emitting no subject (never inventing a surrogate row id)"
-            .to_string(),
+        format!(
+            "no key-like column; synthesized a deterministic composite subject over all {} \
+             flat columns so the table is saveable — the subject is neither unique nor an FK \
+             parent, and rows identical across all columns collapse (verify before relying on it)",
+            columns.len()
+        ),
     ));
     SubjectKey {
-        columns: Vec::new(),
+        columns,
+        index_as_pk: false,
     }
+}
+
+/// Emit the standard `SubjectKeyUnverified` warning (uniqueness is unprovable
+/// metadata-only — NDV deferred) for a chosen key column.
+fn push_subject_key_unverified(
+    table: &EmitTableSchema,
+    col: &EmitColumn,
+    origin: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(Diagnostic::new(
+        Severity::Warning,
+        DiagCode::SubjectKeyUnverified,
+        table.qualified_name(),
+        Some(col.name.clone()),
+        format!(
+            "subject key '{}' {origin}; uniqueness is unverifiable metadata-only (NDV deferred)",
+            col.name
+        ),
+    ));
 }
 
 /// Selected subject key (empty `columns` ⇒ no safe subject key).
 struct SubjectKey {
     columns: Vec<String>,
+    /// Whether this key may be indexed as a single-column FK parent PK: true for
+    /// a genuine single-column key (identifier / single override / name
+    /// fallback), false for a synthesized composite (not a unique key).
+    index_as_pk: bool,
+}
+
+impl SubjectKey {
+    /// A single-column genuine key — indexed as an FK parent.
+    fn single(column: String) -> Self {
+        Self {
+            columns: vec![column],
+            index_as_pk: true,
+        }
+    }
+
+    /// No safe subject key — the table emits no subject.
+    fn none() -> Self {
+        Self {
+            columns: Vec::new(),
+            index_as_pk: false,
+        }
+    }
 }
 
 /// Phase 2 for a single table: returns the join mappings and the set of child
@@ -434,82 +574,122 @@ fn infer_foreign_keys(
     let mut emitted_join_locals: HashSet<String> = HashSet::new();
 
     for col in &table.columns {
-        // FK candidacy: non-nested, integer-typed, non-subject-key columns only.
-        if col.nested || !col.is_integer() || draft.subject_key_columns.contains(&col.name) {
+        // FK candidacy: non-nested, non-subject-key columns only.
+        if col.nested || draft.subject_key_columns.contains(&col.name) {
             continue;
         }
-
-        let survivors = candidate_parents(table, col, pk_index);
-
-        match survivors.as_slice() {
-            [parent] => {
-                let fk = ForeignKey {
-                    target_table: parent.table_name.clone(),
-                    child_column: col.name.clone(),
-                    parent_column: parent.pk_column.clone(),
-                };
-                let predicate_iri =
-                    join_predicate(&col.name, draft, &mut emitted_join_locals, opts);
-                joins.push(ColumnMapping::join(col.name.clone(), predicate_iri, fk));
-                resolved.insert(col.name.clone());
-
-                // Child-fact → hub advisory: both sides fact, joining on the
-                // parent's PK (always true here — we only ever join to a PK).
-                if table.is_fact() && parent.is_fact {
-                    diagnostics.push(Diagnostic::new(
-                        Severity::Advisory,
-                        DiagCode::FactHubJoinAdvisory,
-                        table.qualified_name(),
-                        Some(col.name.clone()),
-                        format!(
-                            "child-fact→hub join '{}' → {}.{} is a bounded PK point-lookup; \
-                             emitted, but flagged as a perf advisory",
-                            col.name, parent.table_name, parent.pk_column
-                        ),
-                    ));
-                }
-            }
-            [] => {
-                if col.is_key_like() {
-                    diagnostics.push(Diagnostic::new(
-                        Severity::Warning,
-                        DiagCode::UnresolvedFkCandidate,
-                        table.qualified_name(),
-                        Some(col.name.clone()),
-                        format!(
-                            "'{}' looks like a key but matches no known PK by name∧type∧range; \
-                             kept literal, no join fabricated",
-                            col.name
-                        ),
-                    ));
-                }
-                // Non-key-like integer: an ordinary measure — no diagnostic.
-            }
-            _ => {
-                let parents: Vec<String> = survivors
-                    .iter()
-                    .map(|p| format!("{}.{}", p.table_name, p.pk_column))
-                    .collect();
+        // A key-NAMED column whose TYPE is not key-like (not an integer or
+        // scale-0 decimal) would be silently dropped before the name match —
+        // surface it so the miss is explainable, then skip it.
+        if !col.is_key_type() {
+            if col.is_key_like() {
                 diagnostics.push(Diagnostic::new(
                     Severity::Warning,
-                    DiagCode::AmbiguousFk,
+                    DiagCode::NonKeyTypeSkipped,
                     table.qualified_name(),
                     Some(col.name.clone()),
                     format!(
-                        "'{}' matches multiple candidate parents ({}); kept literal, no join \
-                         fabricated",
-                        col.name,
-                        parents.join(", ")
+                        "'{}' is named like a key but its type ('{}') is not key-like (not an \
+                         integer or scale-0 decimal); excluded from FK inference",
+                        col.name, col.iceberg_type
                     ),
                 ));
             }
+            continue;
         }
+
+        // Parents matching on NAME ∧ TYPE. A single match joins on name∧type
+        // ALONE (Snowflake often supplies no integer bounds); multiple matches
+        // are DISAMBIGUATED by range-containment (never a hard gate).
+        let name_type = candidate_parents(table, col, pk_index);
+        let chosen: Option<&PkEntry> = match name_type.as_slice() {
+            [] => None,
+            [only] => Some(only),
+            many => {
+                let contained: Vec<&PkEntry> = many
+                    .iter()
+                    .copied()
+                    .filter(|pk| range_contained(col.stats.min, col.stats.max, pk.min, pk.max))
+                    .collect();
+                // Range disambiguates only when it narrows to EXACTLY one parent.
+                match contained.as_slice() {
+                    [one] => Some(*one),
+                    _ => None,
+                }
+            }
+        };
+
+        if let Some(parent) = chosen {
+            let fk = ForeignKey {
+                target_table: parent.table_name.clone(),
+                child_column: col.name.clone(),
+                parent_column: parent.pk_column.clone(),
+            };
+            let predicate_iri = join_predicate(&col.name, draft, &mut emitted_join_locals, opts);
+            joins.push(ColumnMapping::join(col.name.clone(), predicate_iri, fk));
+            resolved.insert(col.name.clone());
+
+            // Child-fact → hub advisory: both sides fact, joining on the parent's
+            // PK (always true here — we only ever join to a PK).
+            if table.is_fact() && parent.is_fact {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Advisory,
+                    DiagCode::FactHubJoinAdvisory,
+                    table.qualified_name(),
+                    Some(col.name.clone()),
+                    format!(
+                        "child-fact→hub join '{}' → {}.{} is a bounded PK point-lookup; \
+                         emitted, but flagged as a perf advisory",
+                        col.name, parent.table_name, parent.pk_column
+                    ),
+                ));
+            }
+        } else if name_type.len() >= 2 {
+            // Multiple name∧type parents that range-containment could not narrow
+            // to one — ambiguous, never fabricated.
+            let parents: Vec<String> = name_type
+                .iter()
+                .map(|p| format!("{}.{}", p.table_name, p.pk_column))
+                .collect();
+            diagnostics.push(Diagnostic::new(
+                Severity::Warning,
+                DiagCode::AmbiguousFk,
+                table.qualified_name(),
+                Some(col.name.clone()),
+                format!(
+                    "'{}' matches multiple candidate parents ({}) and range-containment could \
+                     not disambiguate; kept literal, no join fabricated",
+                    col.name,
+                    parents.join(", ")
+                ),
+            ));
+        } else if col.is_key_like() {
+            // No name∧type match at all for a key-named column.
+            diagnostics.push(Diagnostic::new(
+                Severity::Warning,
+                DiagCode::UnresolvedFkCandidate,
+                table.qualified_name(),
+                Some(col.name.clone()),
+                format!(
+                    "'{}' looks like a key but matches no known PK by name∧type; kept literal, \
+                     no join fabricated",
+                    col.name
+                ),
+            ));
+        }
+        // A non-key-like key-typed column with no match is an ordinary numeric
+        // measure — no diagnostic.
     }
 
     (joins, resolved)
 }
 
-/// Collect the parents surviving name ∧ type ∧ range-containment for `col`.
+/// Collect the parents matching `col` on NAME ∧ TYPE.
+///
+/// Range-containment is deliberately NOT applied here: it is a DISAMBIGUATOR the
+/// caller uses only when more than one parent survives. Requiring it as a hard
+/// gate blocks correct joins whenever Snowflake supplies no integer min/max
+/// bounds, so an exact name+type match on a single parent joins on its own.
 fn candidate_parents<'a>(
     table: &EmitTableSchema,
     col: &EmitColumn,
@@ -528,14 +708,26 @@ fn candidate_parents<'a>(
             if pk.table_name == table.qualified_name() && pk.pk_column == col.name {
                 return false;
             }
-            // (2) Type-match.
-            if col.field_type != pk.field_type {
-                return false;
-            }
-            // (3) Range-containment: child [min,max] ⊆ parent [min,max].
-            range_contained(col.stats.min, col.stats.max, pk.min, pk.max)
+            // (2) Type-match (integers exact; scale-0 decimals mutually).
+            key_types_match(col.field_type, pk.field_type)
         })
         .collect()
+}
+
+/// Whether a child column and a parent PK have compatible KEY types.
+///
+/// Integers match integers of the same width (preserving the pre-change exact
+/// `FieldType` equality); any two scale-0 decimals match regardless of precision
+/// (`decimal(38,0)` ↔ `decimal(18,0)`, i.e. Snowflake `NUMBER(n,0)` surrogate
+/// keys); integers and decimals never cross-match (conservative — avoids
+/// fabricating joins across a mixed-type schema).
+fn key_types_match(child: FieldType, parent: FieldType) -> bool {
+    match (child, parent) {
+        (FieldType::Decimal { scale: cs, .. }, FieldType::Decimal { scale: ps, .. }) => {
+            cs == 0 && ps == 0
+        }
+        (c, p) => c == p,
+    }
 }
 
 /// True iff `child [min,max] ⊆ parent [min,max]`. Any missing bound ⇒ cannot
