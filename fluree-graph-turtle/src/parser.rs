@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_vocab::iri::is_absolute_iri;
 use fluree_vocab::rdf;
 use rustc_hash::FxHashMap;
 
@@ -862,23 +863,12 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     }
 
     /// Resolve a potentially relative IRI against the base (RFC 3986 §5).
+    ///
+    /// Delegates to the shared resolver in `fluree_vocab::iri`; this wrapper
+    /// only supplies the Turtle-specific "relative IRI without base" error.
     fn resolve_iri(&self, reference: &str) -> Result<String> {
-        // Absolute IRI reference (carries a valid scheme) — returned verbatim,
-        // fragment included; resolution does not apply.
-        if let Some(colon_pos) = reference.find(':') {
-            let potential_scheme = &reference[..colon_pos];
-            if !potential_scheme.is_empty()
-                && potential_scheme
-                    .chars()
-                    .next()
-                    .unwrap()
-                    .is_ascii_alphabetic()
-                && potential_scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-            {
-                return Ok(reference.to_string());
-            }
+        if is_absolute_iri(reference) {
+            return Ok(reference.to_string());
         }
 
         let base = match &self.base {
@@ -890,89 +880,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
         };
 
-        // RFC 3986 §5.2.1: split the reference into its fragment and everything
-        // before it. The fragment is the portion after the FIRST `#`. Per
-        // §5.2.2 the resolved fragment is ALWAYS the reference's fragment and is
-        // never inherited from the base, so scheme/authority/path/query are
-        // resolved against the fragment-less portion and the reference fragment
-        // is re-attached during recomposition (§5.3).
-        let (ref_no_fragment, ref_fragment) = match reference.find('#') {
-            Some(pos) => (&reference[..pos], Some(&reference[pos + 1..])),
-            None => (reference, None),
-        };
-
-        let (base_scheme, base_authority, base_path, base_query) = parse_iri_components(base);
-
-        let (scheme, authority, path, query) = if ref_no_fragment.is_empty() {
-            // Same-document reference (`<>` or `<#frag>`): the reference has an
-            // empty path and no query, so the target inherits the base path and
-            // query (RFC 3986 §5.2.2). The base's own fragment is dropped because
-            // `parse_iri_components` never returns it.
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                base_path.to_string(),
-                base_query.map(std::string::ToString::to_string),
-            )
-        } else if let Some(rest) = ref_no_fragment.strip_prefix("//") {
-            let (ref_authority, ref_path, ref_query) = parse_hier_part(rest);
-            (
-                base_scheme.to_string(),
-                Some(ref_authority),
-                remove_dot_segments(&ref_path),
-                ref_query,
-            )
-        } else if ref_no_fragment.starts_with('/') {
-            let (ref_path, ref_query) = split_path_query(ref_no_fragment);
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                remove_dot_segments(ref_path),
-                ref_query.map(std::string::ToString::to_string),
-            )
-        } else if let Some(query_rest) = ref_no_fragment.strip_prefix('?') {
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                base_path.to_string(),
-                Some(query_rest.to_string()),
-            )
-        } else {
-            let (ref_path, ref_query) = split_path_query(ref_no_fragment);
-            let merged = if base_authority.is_some() && base_path.is_empty() {
-                format!("/{ref_path}")
-            } else {
-                let base_dir = match base_path.rfind('/') {
-                    Some(pos) => &base_path[..=pos],
-                    None => "",
-                };
-                format!("{base_dir}{ref_path}")
-            };
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                remove_dot_segments(&merged),
-                ref_query.map(std::string::ToString::to_string),
-            )
-        };
-
-        let mut result = scheme;
-        result.push(':');
-        if let Some(auth) = authority {
-            result.push_str("//");
-            result.push_str(&auth);
-        }
-        result.push_str(&path);
-        if let Some(q) = query {
-            result.push('?');
-            result.push_str(&q);
-        }
-        if let Some(fragment) = ref_fragment {
-            result.push('#');
-            result.push_str(fragment);
-        }
-
-        Ok(result)
+        Ok(fluree_vocab::iri::resolve_iri(base, reference))
     }
 
     /// Expand a prefixed name to a full IRI.
@@ -1001,96 +909,6 @@ fn unescape_pn_local(local: &str) -> String {
         }
     }
     result
-}
-
-#[inline]
-fn is_absolute_iri(reference: &str) -> bool {
-    if let Some(colon_pos) = reference.find(':') {
-        let potential_scheme = &reference[..colon_pos];
-        !potential_scheme.is_empty()
-            && potential_scheme
-                .chars()
-                .next()
-                .unwrap()
-                .is_ascii_alphabetic()
-            && potential_scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    } else {
-        false
-    }
-}
-
-// =============================================================================
-// RFC3986 IRI Resolution Helpers
-// =============================================================================
-
-fn parse_iri_components(iri: &str) -> (&str, Option<&str>, &str, Option<&str>) {
-    let (scheme, rest) = match iri.find(':') {
-        Some(pos) => (&iri[..pos], &iri[pos + 1..]),
-        None => return ("", None, iri, None),
-    };
-
-    let (authority, path_query) = if let Some(after_slashes) = rest.strip_prefix("//") {
-        let auth_end = after_slashes
-            .find(['/', '?', '#'])
-            .unwrap_or(after_slashes.len());
-        (Some(&after_slashes[..auth_end]), &after_slashes[auth_end..])
-    } else {
-        (None, rest)
-    };
-
-    let (path, query) = split_path_query(path_query);
-
-    (scheme, authority, path, query)
-}
-
-fn parse_hier_part(s: &str) -> (String, String, Option<String>) {
-    let auth_end = s.find(['/', '?', '#']).unwrap_or(s.len());
-    let authority = s[..auth_end].to_string();
-    let rest = &s[auth_end..];
-
-    let (path, query) = split_path_query(rest);
-    (
-        authority,
-        path.to_string(),
-        query.map(std::string::ToString::to_string),
-    )
-}
-
-fn split_path_query(s: &str) -> (&str, Option<&str>) {
-    let s = match s.find('#') {
-        Some(pos) => &s[..pos],
-        None => s,
-    };
-
-    match s.find('?') {
-        Some(pos) => (&s[..pos], Some(&s[pos + 1..])),
-        None => (s, None),
-    }
-}
-
-fn remove_dot_segments(path: &str) -> String {
-    let mut output: Vec<&str> = Vec::new();
-
-    for segment in path.split('/') {
-        match segment {
-            "." => {}
-            ".." => {
-                output.pop();
-            }
-            s => {
-                output.push(s);
-            }
-        }
-    }
-
-    let result = output.join("/");
-    if path.starts_with('/') && !result.starts_with('/') {
-        format!("/{result}")
-    } else {
-        result
-    }
 }
 
 /// Parse a Turtle document into GraphSink events.
