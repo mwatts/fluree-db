@@ -1238,7 +1238,7 @@ mem:fact-01kww61y9crayg5pqd2ghnawt5 a mem:Fact ;
     mem:rationale "The hydrator is the pattern for any format-time raw-SPOT read under policy; the txn governance pinning and probe wrap must be preserved by future Bolt/txn work." .
 
 mem:fact-01kwwddyea3x6nyqmysg11vqvf a mem:Fact ;
-    mem:content "Bound-edge annotation probe gate (pattern_long/cycle 2.2-2.8x fix): value-only rel vars' per-hop OPTIONAL EdgeAnnotation probe is gated by LoweringContext.reified_edges_possible, computed in api helpers with three conservative tiers: (1) f:reifiesSubject absent from dict — useless alone since built-in vocab passes on ~every ledger (the old sole gate); (2) snapshot.stats.properties count for f:reifiesSubject; (3) overlay PSOT walk cached on content_version. Probe: 2-hop pattern 3.04→0.54ms. ALSO: a bound rel var on a reified edge binds the ANNOTATION SUBJECT Sid (coalesce(ann, MakeRel)) — cypher_typed subject cells detect f:reifies* rows and render Relationship not Node, in both hydration lanes." ;
+    mem:content "Bound-edge annotation probe gate (multi-hop typed patterns were 2.2-2.8x slower without it): value-only rel vars' per-hop OPTIONAL EdgeAnnotation probe is gated by LoweringContext.reified_edges_possible, computed in api helpers with three conservative tiers: (1) f:reifiesSubject absent from dict — useless alone since built-in vocab passes on ~every ledger (the old sole gate); (2) snapshot.stats.properties count for f:reifiesSubject; (3) overlay PSOT walk cached on content_version. Probe: 2-hop pattern 3.04→0.54ms. ALSO: a bound rel var on a reified edge binds the ANNOTATION SUBJECT Sid (coalesce(ann, MakeRel)) — cypher_typed subject cells detect f:reifies* rows and render Relationship not Node, in both hydration lanes." ;
     mem:tag "bolt" ;
     mem:tag "cypher" ;
     mem:tag "edge-annotation" ;
@@ -1253,22 +1253,6 @@ mem:fact-01kwwddyea3x6nyqmysg11vqvf a mem:Fact ;
     mem:createdAt "2026-07-06T19:10:40.586531+00:00"^^xsd:dateTime ;
     mem:rationale "Future annotation writes must keep the gate honest (stats/overlay reflect new f:reifies facts before queries run) or bound edge vars silently drop annotation bindings; bolt_reified_edge_gate_reopens_for_novelty_annotations pins this." .
 
-mem:fact-01kwwf09dhmhae0cq0xxjj293m a mem:Fact ;
-    mem:content "shortestPath batched-frontier rebuild was REVERTED (77088689e) after bench proof: level-batched expansion regressed pokec medium 4.77→23ms because shortestPath is an EARLY-TERMINATING search — a bidirectional meet touches ~hundreds of nodes, and any level-batched read fetches ahead of the meet. Batched levels fit EXHAUSTIVE traversals only (expansion_4 reachability, hydration); per-node point reads fit early-exit searches. The toy probe misled twice: clustered ids (no scan amplification) and an unreachable pair (accidentally exhaustive). KEPT: FLUREE_PATH_MAX_VISITED cap unification (expansion_4 completes at medium, ties Memgraph 931/938ms, rows exact); gap-aware chunk_subjects (gap>64 splits — scattered sets become point-seeks); per-chunk membership filter fixing boundary-row duplication in all three batched lookups (latent: leaflet spillover + global set = rows collected twice)." ;
-    mem:tag "cypher" ;
-    mem:tag "frontier" ;
-    mem:tag "novelty" ;
-    mem:tag "performance" ;
-    mem:tag "shortest-path" ;
-    mem:tag "traversal" ;
-    mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-binary-index/src/read/batched_lookup.rs" ;
-    mem:artifactRef "fluree-db-query/src/property_path.rs" ;
-    mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
-    mem:branch "feature/bolt" ;
-    mem:createdAt "2026-07-06T19:38:10.225712+00:00"^^xsd:dateTime ;
-    mem:rationale "shortest_path_merges_novelty_over_index pins delta semantics; bounded_qualifying/exact_length modes still use per-node neighbors(), property-path traversals unconverted — the expander is the shared primitive for both." .
-
 mem:fact-01kwwpw1xptfx0aspa02chhrvx a mem:Fact ;
     mem:content "NS-0 Cypher default LANDED: LoweringContext.vocab + CypherLowerOpts.vocab are Option<String>, None default; extract_cypher_iri_mapping only returns Some when ledger context has @vocab. iri_ref/iri_term: strict-encode fail + vocab None + name has no ':' → Sid(EMPTY, name); scheme-ful strings keep Ref::Iri fallback (NoEncoder/rdf:type must not collapse into NS-0). Write side needs no special-casing: sid_for_iri canonical_splits bare names to the pre-registered \"\" prefix (code 0). GOTCHAS: policy identity resolution uses STRICT encode → bare token identities never match (use DIDs/full IRIs); encode_iri_strict rejects EMPTY by design; bare JSON-LD @id/@type/keys with no vocab also land in NS-0, so both surfaces converge on bare names." ;
     mem:tag "cypher" ;
@@ -1281,6 +1265,20 @@ mem:fact-01kwwpw1xptfx0aspa02chhrvx a mem:Fact ;
     mem:artifactRef "fluree-db-transact/src/lower_cypher_update.rs" ;
     mem:branch "feature/bolt" ;
     mem:createdAt "2026-07-06T21:55:40.086415+00:00"^^xsd:dateTime .
+
+mem:fact-01kwx8z7tx43vecccdww6w19j9 a mem:Fact ;
+    mem:content "shortestPath runs a raw-id lane (813e535c6) when the view allows: bidirectional BFS keyed by persisted s_id (PathNode::Id|Novel), each frontier level expanded by ONE galloping batched-lookup sweep per side, neighbors taken from IRI_REF o_keys; dict touched only at endpoints + final path. Overlay correctness is per-node: overlay_dirty_ids collects touched subjects AND ref-objects (retracts stamp both) per content_version; dirty/novelty-only nodes expand via the Sid fallback. Lane declines (falls back to the Sid search) on: no binary store, active policy, or unsummarizable overlay. chunk_subjects gap threshold is the measured break-even (4096 ids) — 64 hurt dense sets, none made scattered frontiers sweep every leaflet in span." ;
+    mem:tag "batched-lookup" ;
+    mem:tag "cypher" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "shortest-path" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/batched_lookup.rs" ;
+    mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-07T03:11:58.813517+00:00"^^xsd:dateTime ;
+    mem:rationale "Supersedes the earlier reverted-batched-frontier memory: the revert's conclusion (per-node reads fit early-exit searches) held only on the old substrate; with shared mmaps + cascaded seeks + galloping lookups, batched level expansion wins at every scale. Novelty semantics pinned by cypher_shortest_path_batched_lane_respects_novelty." .
 
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
@@ -2173,7 +2171,7 @@ mem:fact-01ktys13s07fm2mphwxqnr339h a mem:Fact ;
     mem:rationale "46 panel-confirmed findings from a 260-agent audit; fixing engine lanes is pointless until ingestion stops corrupting values — any future decimal work should start from DECIMAL_AUDIT.md's priority list." .
 
 mem:fact-01kwstgh1vshsahk63r0dzdkdt a mem:Fact ;
-    mem:content "Cypher bound rel var `-[e]->` is now dual-mode (benchgraph D1 fix): a statement-wide scan (fluree-db-cypher lower/annotation_use.rs) classifies vars; value-only vars (no e.prop/properties/keys/map-projection anywhere) lower to plain base triple + OPTIONAL EdgeAnnotation + Bind e=coalesce(ann, MakeRel(s,p,o)) so unreified edges match while reified parallel edges keep per-annotation rows; property-reading vars keep annotation-only lowering. The OPTIONAL probe is skipped entirely when encode_iri(f:reifiesSubject) fails (no reified edge exists in the ledger). Engine prereq: Coalesce got a binding-path arm in eval/list.rs eval_list_fn_to_binding — the scalar ComparableValue path collapses Rel/List/Map to Unbound." ;
+    mem:content "Cypher bound rel var `-[e]->` is now dual-mode: a statement-wide scan (fluree-db-cypher lower/annotation_use.rs) classifies vars; value-only vars (no e.prop/properties/keys/map-projection anywhere) lower to plain base triple + OPTIONAL EdgeAnnotation + Bind e=coalesce(ann, MakeRel(s,p,o)) so unreified edges match while reified parallel edges keep per-annotation rows; property-reading vars keep annotation-only lowering. The OPTIONAL probe is skipped entirely when encode_iri(f:reifiesSubject) fails (no reified edge exists in the ledger). Engine prereq: Coalesce got a binding-path arm in eval/list.rs eval_list_fn_to_binding — the scalar ComparableValue path collapses Rel/List/Map to Unbound." ;
     mem:tag "coalesce" ;
     mem:tag "cypher" ;
     mem:tag "edge-annotation" ;
@@ -2187,7 +2185,7 @@ mem:fact-01kwstgh1vshsahk63r0dzdkdt a mem:Fact ;
     mem:createdAt "2026-07-05T19:01:33.371634+00:00"^^xsd:dateTime .
 
 mem:fact-01kwstgvy9sfntgk0w8vydzkyf a mem:Fact ;
-    mem:content "Untyped shortestPath/allShortestPaths (benchgraph F2): ShortestPathPattern.predicate is now Option<Sid> — None = wildcard edge-set (Ref objects only, excludes rdf:type + f:reifies* via property_path::is_reserved_edge_predicate, now pub(crate)). Wildcard backward hops probe OPST (POST needs a predicate prefix). Per-hop predicates for relationships(p) are NOT threaded through BFS — build_edges resolves each found hop post-hoc via a SPOT probe (hop_predicate), trying both orientations under Either. JSON-LD lowering wraps Some(pred); the sparql firewall (lower/mod.rs) guards Some only." ;
+    mem:content "Untyped shortestPath/allShortestPaths: ShortestPathPattern.predicate is now Option<Sid> — None = wildcard edge-set (Ref objects only, excludes rdf:type + f:reifies* via property_path::is_reserved_edge_predicate, now pub(crate)). Wildcard backward hops probe OPST (POST needs a predicate prefix). Per-hop predicates for relationships(p) are NOT threaded through BFS — build_edges resolves each found hop post-hoc via a SPOT probe (hop_predicate), trying both orientations under Either. JSON-LD lowering wraps Some(pred); the sparql firewall (lower/mod.rs) guards Some only." ;
     mem:tag "cypher" ;
     mem:tag "property-path" ;
     mem:tag "query" ;
@@ -2201,10 +2199,10 @@ mem:fact-01kwstgvy9sfntgk0w8vydzkyf a mem:Fact ;
     mem:createdAt "2026-07-05T19:01:44.521231+00:00"^^xsd:dateTime .
 
 mem:fact-01kwsthd6k6xagy4tdtre2ncew a mem:Fact ;
-    mem:content "Benchgraph gap fixes round 1 (2026-07-05): B2 unary-minus folded at parse (parse_unary); B1 untyped single-hop --> gets edge-set filter (pred != rdf:type AND isIri||isBlank(o)) in push_rel_triple; F3 bare MATCH (n) opt-in via FLUREE_CYPHER_ALLOW_FULL_SCAN env → uncorrelated SELECT DISTINCT subject subquery; F4 bare CREATE () asserts hidden rdf:type db:Node marker (fluree_vocab::fluree::NODE, filtered from labels()); F5 inline UNWIND range()/[list] before writes folds to a synthetic $param (inline_constant_unwind, 10k cap)." ;
-    mem:tag "benchgraph" ;
+    mem:content "Cypher surface-gap fixes (2026-07-05): unary-minus folded at parse (parse_unary); untyped single-hop --> gets edge-set filter (pred != rdf:type AND isIri||isBlank(o)) in push_rel_triple; bare MATCH (n) opt-in via FLUREE_CYPHER_ALLOW_FULL_SCAN env → uncorrelated SELECT DISTINCT subject subquery; bare CREATE () asserts hidden rdf:type db:Node marker (fluree_vocab::fluree::NODE, filtered from labels()); inline UNWIND range()/[list] before writes folds to a synthetic $param (inline_constant_unwind, 10k cap)." ;
     mem:tag "cypher" ;
     mem:tag "full-scan" ;
+    mem:tag "parser" ;
     mem:tag "unwind" ;
     mem:tag "write-path" ;
     mem:scope mem:repo ;
@@ -2216,7 +2214,7 @@ mem:fact-01kwsthd6k6xagy4tdtre2ncew a mem:Fact ;
     mem:createdAt "2026-07-05T19:02:02.195415+00:00"^^xsd:dateTime .
 
 mem:fact-01kwsthhc6fkb931xyd6anfjye a mem:Fact ;
-    mem:content "Cypher RETURN-on-write (benchgraph F1) LANDED (fce28d8e9, on feature/bolt lineage): caller pre-supplies txn_id via TxnOpts.skolem_txn_id — plan_write_return_source validates the RETURN shape pre-submission, fresh_skolem_txn_id ships with the TransactionRequest, and write_return_rows reconstructs created-node Sids statelessly post-commit (Sid::new(BLANK_NODE, \"fdb-{txn_id}-{solution}-{label}\")) then answers the cypher-json envelope. Both the HTTP route (routes/transact.rs execute_cypher_transact) and the Bolt glue (server src/bolt.rs execute_write) use this path." ;
+    mem:content "Cypher RETURN-on-write LANDED (fce28d8e9, on feature/bolt lineage): caller pre-supplies txn_id via TxnOpts.skolem_txn_id — plan_write_return_source validates the RETURN shape pre-submission, fresh_skolem_txn_id ships with the TransactionRequest, and write_return_rows reconstructs created-node Sids statelessly post-commit (Sid::new(BLANK_NODE, \"fdb-{txn_id}-{solution}-{label}\")) then answers the cypher-json envelope. Both the HTTP route (routes/transact.rs execute_cypher_transact) and the Bolt glue (server src/bolt.rs execute_write) use this path." ;
     mem:tag "consensus" ;
     mem:tag "cypher" ;
     mem:tag "design" ;
