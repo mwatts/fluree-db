@@ -528,6 +528,21 @@ pub fn cypher_to_jsonld(text: &str, opts: &CypherImportOptions) -> Result<Vec<Va
 // Statement splitting + parsing
 // ---------------------------------------------------------------------------
 
+/// Split an in-memory Cypher script into its statements (same rules as
+/// [`for_each_statement`]). A single statement — with or without a trailing
+/// `;` — yields a one-element vec. Used by `Fluree::transact_cypher_returning`
+/// to accept `;`-separated scripts.
+pub(crate) fn split_statements(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // Reading from an in-memory slice cannot fail, and the callback is
+    // infallible.
+    let _ = for_each_statement(script.as_bytes(), |_, stmt| {
+        out.push(stmt.to_string());
+        Ok(())
+    });
+    out
+}
+
 /// Split a `.cypher` script into `;`-terminated statements, respecting
 /// string literals (`'…'`, `"…"` with backslash escapes), backticked
 /// identifiers, and `//` / `/* */` comments. Invokes `f(start_line, stmt)`

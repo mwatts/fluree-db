@@ -434,6 +434,24 @@ let committed = fluree.transact_cypher(ledger, cypher).await?;
 let (committed, rows) = fluree.transact_cypher_returning(ledger, cypher, None).await?;
 ```
 
+The transact API also accepts a semicolon-separated **script** of write
+statements, executed sequentially with one commit per statement — later
+statements see earlier ones' effects, and only the final statement may carry
+a `RETURN` (cypher-shell autocommit semantics; a failure aborts the remainder
+but keeps prior commits — use an explicit Bolt transaction for atomicity):
+
+```rust
+let committed = fluree
+    .transact_cypher(
+        ledger,
+        r#"CREATE (:Person {name: "Alice"});
+           CREATE (:Person {name: "Bob"});
+           MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+           CREATE (a)-[:KNOWS]->(b);"#,
+    )
+    .await?;
+```
+
 Writes default to LPG mode, where every relationship reifies (carries an
 annotation identity). See [Edge annotations](../concepts/edge-annotations.md) for the RDF
 vs. LPG modes and the retraction semantics that follow from them.

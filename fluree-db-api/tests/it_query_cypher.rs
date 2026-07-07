@@ -4376,6 +4376,103 @@ async fn transact_cypher_merge_relationship_trailing_set_applies_on_both_branche
     );
 }
 
+// ============================================================================
+// Multi-statement scripts (semicolon-separated, sequential autocommit)
+// ============================================================================
+
+#[tokio::test]
+async fn transact_cypher_script_executes_statements_sequentially() {
+    // cypher-shell semantics: one commit per statement, later statements see
+    // earlier ones' effects (the MATCH in statement 3 binds nodes created by
+    // statements 1–2).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:script");
+    let t0 = l.t();
+
+    let script = r#"
+        CREATE (:Person {name: "Alice; the first"}); // ; inside a string
+        CREATE (:Person {name: "Bob"});
+        MATCH (a:Person {name: "Alice; the first"}), (b:Person {name: "Bob"})
+        CREATE (a)-[:KNOWS {since: 2020}]->(b);
+    "#;
+    let l = fluree
+        .transact_cypher(l, script)
+        .await
+        .expect("script")
+        .ledger;
+    assert_eq!(l.t(), t0 + 3, "one commit per statement");
+
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, r.since, b.name"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([["Alice; the first", 2020, "Bob"]]),
+        "the semicolon inside the string did not split the statement"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_accepts_trailing_semicolon() {
+    // A single statement terminated with `;` (the cypher-shell habit) is one
+    // statement, not a rejected multi-statement script.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:trailing-semi");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Person {name: "Ada"});"#)
+        .await
+        .expect("trailing semicolon accepted")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_script_return_on_last_statement_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:script-return");
+
+    // RETURN on the final statement answers rows.
+    let (result, rows) = fluree
+        .transact_cypher_returning(
+            l,
+            r#"CREATE (:P {id: 1}); CREATE (n:P {id: 2}) RETURN n;"#,
+            None,
+        )
+        .await
+        .expect("script with final RETURN");
+    assert!(rows.is_some(), "final RETURN answered");
+
+    // A read anywhere before the end is rejected with the statement number.
+    let msg = fluree
+        .transact_cypher(
+            result.ledger,
+            r#"MATCH (n:P) RETURN n; CREATE (:P {id: 3});"#,
+        )
+        .await
+        .expect_err("mid-script read")
+        .to_string();
+    assert!(
+        msg.contains("statement 1") && msg.contains("read"),
+        "error names the offending statement: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn transact_cypher_delete_relationship_removes_edge() {
     // `DELETE r` retracts the relationship's base edge; the reifier cascade

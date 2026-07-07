@@ -58,7 +58,7 @@ These shape everything below; read them first.
 | `LOAD CSV` | ⏳ | Bulk CSV import exists via the CLI (`fluree create --from *.csv` / `*.cypher`), not the `LOAD CSV` clause. |
 | `CREATE / DROP INDEX \| CONSTRAINT` | ⟂ | Accepted as **no-op writes** (commits nothing): Fluree indexes everything and has no user-managed index/constraint catalog. Keeps framework migrations (spring-data, neo4j-migrations) from crashing at startup. |
 | `SHOW INDEXES / SHOW CONSTRAINTS` | ⟂ | Answer **zero rows** (shared Neo4j column heads), for the same reason. |
-| Multi-statement (`;`) | ⏳ | One statement per request. |
+| Multi-statement (`;`) | ◑ | The transact API (`transact_cypher*`) accepts `;`-separated write scripts: sequential autocommit, one commit per statement, later statements see earlier effects, final statement may `RETURN` (cypher-shell semantics; for atomicity use an explicit Bolt transaction). A lone trailing `;` on any statement is accepted. Transports stay one statement per Bolt `RUN` / query request (Neo4j parity — drivers and Browser split client-side). |
 
 ## Patterns & paths
 
