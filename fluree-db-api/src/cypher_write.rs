@@ -742,9 +742,12 @@ pub fn fresh_skolem_txn_id() -> String {
 /// dispatch on this. Parses through the process-wide AST cache; parse
 /// errors surface with full diagnostics.
 pub fn cypher_statement_is_write(cypher: &str) -> crate::Result<bool> {
+    use fluree_db_cypher::ast::{SchemaCommandKind, Statement};
     let ast = crate::query::helpers::parse_cypher_ast_cached(cypher)?;
-    Ok(matches!(
-        ast.statement,
-        fluree_db_cypher::ast::Statement::Update(_)
-    ))
+    Ok(match &ast.statement {
+        Statement::Update(_) => true,
+        Statement::Query(_) => false,
+        // CREATE/DROP INDEX|CONSTRAINT route as (no-op) writes; SHOW reads.
+        Statement::Schema(cmd) => !matches!(cmd.kind, SchemaCommandKind::ShowSchema),
+    })
 }

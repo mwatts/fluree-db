@@ -3,7 +3,8 @@
 use crate::ast::{
     CallSubqueryClause, CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection,
     OrderItem, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause,
-    SetClause, SetItem, Statement, UnionTail, UnwindClause, Update, WithClause, WriteClause,
+    SchemaCommand, SchemaCommandKind, SetClause, SetItem, Statement, UnionTail, UnwindClause,
+    Update, WithClause, WriteClause,
 };
 use crate::ast::{Expr, MapLit, ParamRef, Variable};
 use crate::diag::{DiagCode, Diagnostic};
@@ -27,6 +28,10 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
 
 fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
     let start = s.peek_span();
+
+    if let Some(cmd) = parse_schema_command(s)? {
+        return Ok(Statement::Schema(cmd));
+    }
 
     // Categorize by first token. Queries start with MATCH / OPTIONAL /
     // WITH / UNWIND / RETURN. Writes start with CREATE / MERGE /
@@ -147,7 +152,7 @@ fn parse_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
     // (and so the AST depth that Drop / param substitution recurse over).
     let right = match parse_statement(s)? {
         Statement::Query(q) => q,
-        Statement::Update(_) => {
+        Statement::Update(_) | Statement::Schema(_) => {
             return Err(s.error(
                 DiagCode::UnexpectedToken,
                 "UNION cannot combine write statements — both sides must be read queries",
@@ -526,6 +531,55 @@ fn parse_set_items(s: &mut TokenStream) -> Result<Vec<SetItem>, Diagnostic> {
         }
     }
     Ok(items)
+}
+
+/// Detect a schema DDL statement head: `CREATE [OR REPLACE] INDEX|CONSTRAINT`,
+/// `DROP INDEX|CONSTRAINT`, `SHOW INDEX[ES]|CONSTRAINT[S]`. Fluree has no
+/// user-managed index/constraint catalog (everything is indexed), so these
+/// are accepted for tooling compatibility; the body is consumed without
+/// detailed parsing. Returns `None` for every other statement head.
+fn parse_schema_command(s: &mut TokenStream) -> Result<Option<SchemaCommand>, Diagnostic> {
+    fn ident_at(s: &TokenStream, off: usize, words: &[&str]) -> bool {
+        matches!(s.peek_at(off), TokenKind::Ident(w)
+            if words.iter().any(|x| w.eq_ignore_ascii_case(x)))
+    }
+    let start = s.peek_span();
+    let kind = match s.peek_kind() {
+        TokenKind::Create
+            if ident_at(s, 1, &["index", "constraint"])
+                || (ident_at(s, 1, &["or"]) && ident_at(s, 2, &["replace"])) =>
+        {
+            SchemaCommandKind::CreateSchema
+        }
+        TokenKind::Ident(w)
+            if w.eq_ignore_ascii_case("drop") && ident_at(s, 1, &["index", "constraint"]) =>
+        {
+            SchemaCommandKind::DropSchema
+        }
+        TokenKind::Ident(w)
+            if w.eq_ignore_ascii_case("show")
+                && ident_at(s, 1, &["indexes", "index", "constraints", "constraint"]) =>
+        {
+            SchemaCommandKind::ShowSchema
+        }
+        _ => return Ok(None),
+    };
+    // Swallow the command body; keep the one-statement-per-request rule.
+    while !s.is_eof() {
+        if matches!(s.peek_kind(), TokenKind::Semicolon) {
+            return Err(s.error(
+                DiagCode::DeferredMultiStatement,
+                "multi-statement scripts (semicolon-separated) are deferred; \
+                 submit one statement per request",
+            ));
+        }
+        s.advance();
+    }
+    let end = s.peek_span();
+    Ok(Some(SchemaCommand {
+        kind,
+        span: start.union(end),
+    }))
 }
 
 /// The map side of `SET n = …` / `SET n += …`: an inline `{k: v, …}` literal,

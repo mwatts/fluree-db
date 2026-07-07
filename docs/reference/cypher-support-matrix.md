@@ -55,7 +55,9 @@ These shape everything below; read them first.
 | `DELETE` / `DETACH DELETE` | ✅ | |
 | `FOREACH` | ⏳ | |
 | `CALL proc(...) YIELD` | ⏳ | Stored/builtin procedures (distinct from `CALL { … }`). |
-| `LOAD CSV` | ⏳ | Bulk CSV import exists via the CLI, not the `LOAD CSV` clause. |
+| `LOAD CSV` | ⏳ | Bulk CSV import exists via the CLI (`fluree create --from *.csv` / `*.cypher`), not the `LOAD CSV` clause. |
+| `CREATE / DROP INDEX \| CONSTRAINT` | ⟂ | Accepted as **no-op writes** (commits nothing): Fluree indexes everything and has no user-managed index/constraint catalog. Keeps framework migrations (spring-data, neo4j-migrations) from crashing at startup. |
+| `SHOW INDEXES / SHOW CONSTRAINTS` | ⟂ | Answer **zero rows** (shared Neo4j column heads), for the same reason. |
 | Multi-statement (`;`) | ⏳ | One statement per request. |
 
 ## Patterns & paths

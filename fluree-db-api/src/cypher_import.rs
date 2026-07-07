@@ -661,6 +661,10 @@ fn parse_update(stmt: &str, line: usize) -> Result<fluree_db_cypher::ast::Update
     match ast.statement {
         Statement::Update(u) => Ok(u),
         Statement::Query(_) => Err(unsupported(line, "read-only statement in an import script")),
+        Statement::Schema(_) => Err(unsupported(
+            line,
+            "schema command in an import script (Fluree needs no index/constraint DDL)",
+        )),
     }
 }
 

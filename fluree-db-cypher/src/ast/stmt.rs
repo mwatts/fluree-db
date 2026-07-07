@@ -5,15 +5,37 @@ use crate::span::SourceSpan;
 use super::expr::{Expr, Variable};
 use super::pattern::{MapLit, Pattern};
 
-/// A Cypher statement is either a read query (terminating in RETURN)
-/// or an update (terminating in CREATE/SET/REMOVE/DELETE/MERGE without
-/// a final RETURN).
+/// A Cypher statement is either a read query (terminating in RETURN),
+/// an update (terminating in CREATE/SET/REMOVE/DELETE/MERGE without
+/// a final RETURN), or a schema DDL command (accepted as a no-op).
 ///
 /// v1 supports exactly one statement per request body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
     Query(Query),
     Update(Update),
+    Schema(SchemaCommand),
+}
+
+/// A schema DDL command. Fluree indexes everything and has no user-managed
+/// index/constraint catalog, so these are accepted for tooling compatibility
+/// (framework migrations run them at startup): CREATE/DROP are no-op writes,
+/// SHOW answers zero rows. The command body is consumed without detailed
+/// parsing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchemaCommand {
+    pub kind: SchemaCommandKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaCommandKind {
+    /// `CREATE [OR REPLACE] INDEX … / CONSTRAINT …` — no-op write.
+    CreateSchema,
+    /// `DROP INDEX … / CONSTRAINT …` — no-op write.
+    DropSchema,
+    /// `SHOW INDEXES / CONSTRAINTS …` — zero rows.
+    ShowSchema,
 }
 
 /// A read-shaped Cypher statement.

@@ -105,6 +105,17 @@ pub fn lower_cypher_update(
     let update = match &ast.statement {
         Statement::Update(u) => u,
         Statement::Query(_) => return Err(LowerCypherError::NotAnUpdate),
+        // Schema DDL (CREATE/DROP INDEX|CONSTRAINT) is a no-op: Fluree
+        // indexes everything. An empty Update-typed Txn rides the ordinary
+        // staging path and takes the zero-effect early return (Insert-typed
+        // empties are rejected as EmptyTransaction).
+        Statement::Schema(_) => {
+            let mut lower = CypherLowering::new(ns, opts, cypher_opts);
+            lower.txn_type = TxnType::Update;
+            let mut txn = lower.finish();
+            txn.namespace_delta = ns.delta().clone();
+            return Ok(txn);
+        }
     };
 
     let mut lower = CypherLowering::new(ns, opts, cypher_opts);

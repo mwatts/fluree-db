@@ -7873,3 +7873,75 @@ async fn cypher_temporal_constructor_bad_literal_errors() {
         "error names the constructor: {msg}"
     );
 }
+
+// ============================================================================
+// Schema DDL no-ops — CREATE/DROP INDEX|CONSTRAINT, SHOW INDEXES|CONSTRAINTS
+// ============================================================================
+
+#[tokio::test]
+async fn cypher_schema_ddl_is_a_noop_write() {
+    // Framework migrations (spring-data, neo4j-migrations) run index /
+    // constraint DDL at startup. Fluree indexes everything: accept as no-ops.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:schema-ddl");
+    let t0 = l.t();
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            "CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name)",
+        )
+        .await
+        .expect("create index accepted")
+        .ledger;
+    let l = fluree
+        .transact_cypher(
+            l,
+            "CREATE CONSTRAINT person_id_unique FOR (n:Person) REQUIRE n.id IS UNIQUE",
+        )
+        .await
+        .expect("create constraint accepted")
+        .ledger;
+    let l = fluree
+        .transact_cypher(l, "DROP INDEX person_name IF EXISTS")
+        .await
+        .expect("drop index accepted")
+        .ledger;
+
+    assert_eq!(l.t(), t0, "schema DDL commits nothing");
+
+    // Data writes still work after the DDL no-ops.
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Person {name: "Ada"})"#)
+        .await
+        .expect("data write")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn cypher_show_indexes_and_constraints_answer_zero_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:show-schema");
+    let db = graphdb_from_ledger(&l);
+
+    for stmt in [
+        "SHOW INDEXES",
+        "SHOW CONSTRAINTS",
+        "SHOW INDEXES YIELD name",
+    ] {
+        let res = fluree
+            .query_cypher(&db, stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+        assert_eq!(res.row_count(), 0, "{stmt} answers zero rows");
+    }
+}

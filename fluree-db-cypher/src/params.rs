@@ -990,6 +990,8 @@ fn subst_statement(s: &mut Statement, p: &ParamMap) -> Result<(), ParamError> {
     match s {
         Statement::Query(q) => subst_query(q, p),
         Statement::Update(u) => subst_update(u, p),
+        // A schema no-op carries no expressions.
+        Statement::Schema(_) => Ok(()),
     }
 }
 
