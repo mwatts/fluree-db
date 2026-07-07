@@ -304,7 +304,16 @@ impl<'a> Parser<'a> {
                 break;
             }
             match &self.stream.peek().kind {
-                TokenKind::KwInsert | TokenKind::KwDelete | TokenKind::KwWith => {
+                TokenKind::KwInsert
+                | TokenKind::KwDelete
+                | TokenKind::KwWith
+                | TokenKind::KwLoad
+                | TokenKind::KwClear
+                | TokenKind::KwDrop
+                | TokenKind::KwCreate
+                | TokenKind::KwAdd
+                | TokenKind::KwCopy
+                | TokenKind::KwMove => {
                     let operation = self.parse_update_operation()?;
 
                     // Cross-op bnode-label scope validation.

@@ -185,6 +185,7 @@ impl<'a> CypherLowering<'a> {
             txn_meta: Vec::new(),
             graph_delta: Default::default(),
             namespace_delta: std::collections::HashMap::new(),
+            graph_mgmt: None,
         }
     }
 

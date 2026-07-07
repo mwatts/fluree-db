@@ -18,43 +18,15 @@ pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
     // fully green: PR-1 (accept-more) + PR-2 (V3-V6 validation) + main's #1436
 ];
 
-// Dominated by the missing UPDATE graph-management grammar
-// (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD, SILENT variants) — audit §4.2.1.
-// NOTE: every test here is double-registered (also inside SPARQL11_UPDATE);
-// a fix PR must delete BOTH register lines per test.
-pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[
-    // parser rejects valid input: graph-management grammar (23) — PR-U3
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_1",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_10",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_11",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_12",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_13",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_14",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_15",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_16",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_17",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_18",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_19",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_2",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_20",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_21",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_22",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_3",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_37",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_4",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_5",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_6",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_7",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_8",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_9",
-    // parser rejects valid input: validator rejects GRAPH inside DELETE WHERE
-    // (update class D, NOT graph-management grammar) (1) — PR-U1
-    // parser rejects valid input: empty / prologue-only request must be a
-    // valid no-op (update class C, NOT graph-management grammar) (3) — PR-U2
-    // parser accepts invalid input (missing validation) (3) — PR-U1
-    // parser accepts invalid input: cross-operation blank-node label reuse in
-    // a multi-op `;` request (update class B validation) (1) — PR-U2
-];
+// SPARQL 1.1 UPDATE syntax (syntax-update-1). Fully green:
+// - the graph-management grammar (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD +
+//   SILENT/INTO/DEFAULT/NAMED/ALL) now parses (PR-U3);
+// - GRAPH-in-DELETE-WHERE (class D) was fixed by PR-U1;
+// - empty / prologue-only requests (class C) and cross-operation blank-node
+//   scope (class B) were fixed by PR-U2.
+// These 23 graph-management tests were double-registered (also inside
+// SPARQL11_UPDATE); PR-U3 removed both copies.
+pub const SPARQL11_SYNTAX_UPDATE_1: &[&str] = &[];
 
 pub const SPARQL10_SYNTAX: &[&str] = &[
     // parser accepts invalid input (missing validation) (13)
@@ -65,9 +37,17 @@ pub const SPARQL10_SYNTAX: &[&str] = &[
 ];
 
 pub const SPARQL11_AGGREGATES: &[&str] = &[
-    // graph cluster: COUNT over an (empty) named graph — needs enumerable
-    // empty named graphs; gated on decision D-6, expected to remain
-    // registered after PR-G1 (1)
+    // DOCUMENTED DIVERGENCE (decision D-6, second half — resolved by PR-U3):
+    // this test requires enumerating a named graph that has ZERO triples
+    // (`GRAPH ?g { SELECT (COUNT(*)...) }` must bind the empty `<empty.ttl>`
+    // graph and return count 0). Fluree models a graph as a reserved g_id that
+    // exists iff at least one flake carries it, so an empty named graph is
+    // unrepresentable and non-enumerable — the same model fact that makes
+    // DROP ≡ CLEAR harness-indistinguishable. Making empty graphs enumerable
+    // would require a graph-existence record decoupled from flakes across
+    // storage/commit/query-enumeration; deliberately NOT built (a query/
+    // dataset-model concern orthogonal to the UPDATE verbs). Permanent
+    // divergence. (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
     // expression/aggregate cluster (2) — PR-X2: agg-err-01 = aggregate must
     // poison (unbind) on non-numeric group members; agg02 = COUNT(?var)
@@ -81,8 +61,11 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
 ];
 
 pub const SPARQL11_BINDINGS: &[&str] = &[
-    // graph cluster: requires enumerable empty named graphs; stays
-    // registered after PR-G1, gated on decision D-6 (1)
+    // DOCUMENTED DIVERGENCE (decision D-6, second half — resolved by PR-U3):
+    // requires enumerable empty named graphs, which Fluree does not model (a
+    // graph exists iff a flake carries its g_id). See the fuller rationale on
+    // `agg-empty-group-count-graph` in SPARQL11_AGGREGATES above. Permanent
+    // divergence. (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph",
 ];
 
@@ -227,96 +210,13 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // time); its lexer half lands in PR-1 (1)
 ];
 
-// Clusters: graph-management ops missing from the UPDATE grammar,
-// GRAPH blocks in DELETE WHERE, USING + GRAPH scoping, and multi-operation
-// `;` requests silently executing only their first operation (#1438) —
-// audit §4.2.1, burn-down update-completeness.md. The syntax-update-1 tests
-// are double-registered (see SPARQL11_SYNTAX_UPDATE_1); fix PRs must delete
-// both register lines per test.
+// Remaining cluster: USING + explicit GRAPH scoping (class F). The
+// graph-management grammar (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD + SILENT), the
+// same-bnode multi-op requests, and the double-registered syntax-update-1
+// tests were all greened by PR-U3 (building on PR-U1's DELETE-WHERE-GRAPH and
+// PR-U2's multi-operation `;` support) — audit §4.2.1, burn-down
+// update-completeness.md.
 pub const SPARQL11_UPDATE: &[&str] = &[
-    // update grammar: graph-management op not parsed (41)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add03",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add04",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add05",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add06",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add07",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/add/manifest#add08",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/clear/manifest#dawg-clear-all-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/clear/manifest#dawg-clear-default-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/clear/manifest#dawg-clear-graph-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/clear/manifest#dawg-clear-named-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/copy/manifest#copy01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/copy/manifest#copy02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/copy/manifest#copy03",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/copy/manifest#copy04",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/copy/manifest#copy06",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/copy/manifest#copy07",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/drop/manifest#dawg-drop-all-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/drop/manifest#dawg-drop-default-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/drop/manifest#dawg-drop-graph-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/drop/manifest#dawg-drop-named-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/move/manifest#move01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/move/manifest#move02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/move/manifest#move03",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/move/manifest#move04",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/move/manifest#move06",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/move/manifest#move07",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#add-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#add-to-default-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#clear-default-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#clear-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#copy-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#copy-to-default-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#create-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#drop-default-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#drop-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#load-into-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#load-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#move-silent",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/update-silent/manifest#move-to-default-silent",
-    // parser rejects valid input: graph-management grammar (23) — PR-U3
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_1",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_10",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_11",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_12",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_13",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_14",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_15",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_16",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_17",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_18",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_19",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_2",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_20",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_21",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_22",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_3",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_37",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_4",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_5",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_6",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_7",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_8",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-update-1/manifest#test_9",
-    // parser rejects valid input: validator rejects GRAPH inside DELETE WHERE
-    // (update class D, NOT graph-management grammar) (1) — PR-U1
-    // parser rejects valid input: empty / prologue-only request must be a
-    // valid no-op (update class C, NOT graph-management grammar) (3) — PR-U2
-    // parser accepts invalid input (missing validation) (11) — PR-U1
-    // parser accepts invalid input: cross-operation blank-node label reuse in
-    // a multi-op `;` request (update class B validation) (1) — PR-U2
-    // update eval: multi-operation `;` request executes only its first
-    // operation (class B truncation, #1438) — NOT "INSERT into a
-    // not-yet-existing named graph loses triples" and NOT "combined
-    // DELETE/INSERT WHERE skips the deletes"; each single operation works
-    // (5) — PR-U2 (+PR-U3 for the graph-management ops the same-bnode
-    // requests also contain)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-05a",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-data-same-bnode",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-where-same-bnode",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/basic-update/manifest#insert-where-same-bnode2",
     // update eval: USING + explicit GRAPH over-deletes from the default
     // graph (class F scoping) (2) — PR-U6, sequenced after PR-G1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-02a",
@@ -549,9 +449,8 @@ pub const SPARQL12_VERSION: &[&str] = &[
 // Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
 // already produces the expected `[a,b,b]` bag once the GRAPH block matches
 // (residual-eval.md §2.2).
-pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
-];
+pub const SPARQL11_PROPERTY_PATH: &[&str] =
+    &["http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35"];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
 // test environment cannot provide. Revisit with an in-process mock endpoint

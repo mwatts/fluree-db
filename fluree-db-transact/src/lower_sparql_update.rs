@@ -46,16 +46,20 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri,
-    IriValue, Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue,
-    PropertyPath, QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst,
-    SubjectTerm, Term, TriplePattern, UpdateOperation,
+    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphMgmtRef, GraphOrDefault,
+    GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
+    LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
+    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
+    TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 
-use crate::ir::{SparqlWhereClause, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{
+    GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateTerm, TripleTemplate, Txn,
+    TxnOpts, TxnType,
+};
 use crate::namespace::NamespaceRegistry;
 use fluree_vocab::{fluree, xsd};
 
@@ -837,6 +841,23 @@ pub fn lower_sparql_update(
         UpdateOperation::Modify(modify) => {
             lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
+        // Graph-management verbs. CLEAR/DROP/ADD/COPY/MOVE lower to a
+        // graph-management directive executed by whole-graph scan at staging
+        // time; CREATE and SILENT LOAD lower to an empty no-op transaction;
+        // non-SILENT remote LOAD is a documented divergence (D-5).
+        UpdateOperation::Clear(gm) | UpdateOperation::Drop(gm) => {
+            lower_clear_drop(gm, prologue, opts)?
+        }
+        UpdateOperation::Create(_) => {
+            // Fluree cannot represent an empty named graph (roadmap D-6), and
+            // the harness cannot observe one, so CREATE — of a fresh graph
+            // (unobservable) or an existing one (a spec no-op) — is a no-op.
+            Txn::update().with_opts(opts)
+        }
+        UpdateOperation::Add(t) => lower_transfer(t, prologue, TransferMode::Add, opts)?,
+        UpdateOperation::Copy(t) => lower_transfer(t, prologue, TransferMode::Copy, opts)?,
+        UpdateOperation::Move(t) => lower_transfer(t, prologue, TransferMode::Move, opts)?,
+        UpdateOperation::Load(load) => lower_load(load, opts)?,
     };
     // Hand off the lowering registry's allocations so `stage_transaction_from_txn`
     // can merge them into its own snapshot-derived registry. Without this, the
@@ -846,6 +867,115 @@ pub fn lower_sparql_update(
     // the predicate IRI back to the same Sid.
     txn.namespace_delta = ns.delta().clone();
     Ok(txn)
+}
+
+/// Which of the three transfer verbs is being lowered.
+#[derive(Clone, Copy)]
+enum TransferMode {
+    /// `ADD`: copy source into destination, destination untouched otherwise.
+    Add,
+    /// `COPY`: clear destination, then copy source into it.
+    Copy,
+    /// `MOVE`: clear destination, copy source into it, then clear source.
+    Move,
+}
+
+/// Resolve a `CLEAR`/`DROP` target to an IR [`GraphTarget`], expanding a named
+/// graph's IRI through the prologue.
+fn graph_ref_all_to_target(
+    target: &GraphRefAll,
+    prologue: &Prologue,
+) -> Result<GraphTarget, LowerError> {
+    Ok(match target {
+        GraphRefAll::Default => GraphTarget::Default,
+        GraphRefAll::Named => GraphTarget::Named,
+        GraphRefAll::All => GraphTarget::All,
+        GraphRefAll::Graph(iri) => GraphTarget::Graph(expand_iri(iri, prologue)?),
+    })
+}
+
+/// Resolve an `ADD`/`COPY`/`MOVE` endpoint to an IR [`GraphSel`], expanding a
+/// named graph's IRI through the prologue.
+fn graph_or_default_to_sel(
+    g: &GraphOrDefault,
+    prologue: &Prologue,
+) -> Result<GraphSel, LowerError> {
+    Ok(match g {
+        GraphOrDefault::Default => GraphSel::Default,
+        GraphOrDefault::Graph(iri) => GraphSel::Graph(expand_iri(iri, prologue)?),
+    })
+}
+
+/// Lower `CLEAR`/`DROP` to a graph-management retract-all directive.
+///
+/// `DROP ≡ CLEAR` in Fluree's model (roadmap D-6): the graph registry is
+/// additive-only and an emptied graph is indistinguishable from a dropped one.
+fn lower_clear_drop(
+    gm: &GraphMgmtRef,
+    prologue: &Prologue,
+    opts: TxnOpts,
+) -> Result<Txn, LowerError> {
+    let target = graph_ref_all_to_target(&gm.target, prologue)?;
+    Ok(Txn::graph_mgmt(GraphMgmtOp::Clear(target)).with_opts(opts))
+}
+
+/// Lower `ADD`/`COPY`/`MOVE` to a graph-management transfer directive.
+///
+/// Composes over the CLEAR primitive: COPY/MOVE clear the destination first,
+/// MOVE additionally clears the source afterward. A destination named graph is
+/// recorded in `graph_delta` so the commit envelope registers it even when it
+/// did not previously exist (COPY/ADD into a fresh graph).
+fn lower_transfer(
+    t: &GraphTransfer,
+    prologue: &Prologue,
+    mode: TransferMode,
+    opts: TxnOpts,
+) -> Result<Txn, LowerError> {
+    let from = graph_or_default_to_sel(&t.from, prologue)?;
+    let to = graph_or_default_to_sel(&t.to, prologue)?;
+    let (clear_dest, clear_src) = match mode {
+        TransferMode::Add => (false, false),
+        TransferMode::Copy => (true, false),
+        TransferMode::Move => (true, true),
+    };
+    let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+        from,
+        to: to.clone(),
+        clear_dest,
+        clear_src,
+    })
+    .with_opts(opts);
+    // Register a (possibly-new) destination named graph so the commit envelope
+    // persists its g_id. `apply_delta` skips already-registered IRIs, so this
+    // is harmless when the destination already exists. The txn-local key is
+    // arbitrary — `apply_delta`/`provisional_ids` re-derive the ledger g_id
+    // deterministically from the IRI.
+    if let GraphSel::Graph(iri) = &to {
+        txn.graph_delta.insert(
+            fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
+            iri.clone(),
+        );
+    }
+    Ok(txn)
+}
+
+/// Lower `LOAD`.
+///
+/// The embedded transact path has no HTTP client, so a remote `LOAD` cannot
+/// fetch. `SILENT` swallows the failure (a no-op, leaving the store unchanged);
+/// a non-`SILENT` `LOAD` is a documented divergence (roadmap D-5) surfaced as a
+/// clear error. No W3C eval test requires a real fetch.
+fn lower_load(load: &Load, opts: TxnOpts) -> Result<Txn, LowerError> {
+    if load.silent {
+        Ok(Txn::update().with_opts(opts))
+    } else {
+        Err(LowerError::UnsupportedFeature {
+            feature: "remote LOAD of an external RDF document — the embedded SPARQL UPDATE \
+                      path has no HTTP client (documented divergence, roadmap D-5). Use \
+                      `LOAD SILENT` for a no-op, or ingest the document via the insert API",
+            span: load.span,
+        })
+    }
 }
 
 /// Lower INSERT DATA operation.
@@ -897,6 +1027,7 @@ fn lower_insert_data(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -948,6 +1079,7 @@ fn lower_delete_data(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1048,6 +1180,7 @@ fn lower_delete_where(
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1109,6 +1242,7 @@ fn lower_delete_where_with_graphs(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1354,6 +1488,7 @@ fn lower_modify(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 

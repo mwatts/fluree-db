@@ -178,6 +178,16 @@ impl<'a> Validator<'a> {
             UpdateOperation::Modify(modify) => {
                 self.validate_modify(modify);
             }
+            // Graph-management verbs reference only graph IRIs (and a source
+            // IRI for LOAD) — there are no templates, variables, or blank
+            // nodes to validate. Grammar acceptance is the whole check.
+            UpdateOperation::Load(_)
+            | UpdateOperation::Clear(_)
+            | UpdateOperation::Drop(_)
+            | UpdateOperation::Create(_)
+            | UpdateOperation::Add(_)
+            | UpdateOperation::Copy(_)
+            | UpdateOperation::Move(_) => {}
         }
     }
 
