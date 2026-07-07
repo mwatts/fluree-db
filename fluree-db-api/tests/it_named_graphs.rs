@@ -1919,7 +1919,10 @@ async fn count_in_graph(
         .await
         .expect("graph count query");
     let v = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    v.as_array().map(|a| a.len()).unwrap_or(0)
+    match v.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    }
 }
 
 /// PR-U3 query-surface parity (compliance case 2): the SPARQL 1.1 Update
