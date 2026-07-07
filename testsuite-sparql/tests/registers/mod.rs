@@ -15,21 +15,24 @@
 //! Baseline: rdf-tests submodule @ efccbc6b8, 2026-07-06.
 
 pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
-    // parser rejects valid input (7)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_21",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_23",
+    // parser rejects valid input (4)
+    // (test_21/test_23/test_64 were greened by main's sub-SELECT set-operand
+    // fix, PR #1436)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_35a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_36a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_63",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_64",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_pp_coll",
-    // parser accepts invalid input (missing validation) (6)
+    // parser accepts invalid input (missing validation) (7)
+    // (test_65 formerly failed to parse for the wrong reason; PR #1436 made
+    // it parse, so it now needs the SELECT-scope validation pass — burn-down
+    // PR-2 V4/V5 territory)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_43",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_44",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_45",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_60",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_61a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_62a",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_65",
 ];
 
 // Dominated by the missing UPDATE graph-management grammar
@@ -171,10 +174,12 @@ pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[
 ];
 
 pub const SPARQL11_SUBQUERY: &[&str] = &[
-    // result mismatch (3)
+    // result mismatch (2)
+    // (subquery12 was greened by main's sub-SELECT set-operand fix, PR #1436
+    // — its "mismatch" was a bare-{SELECT} misparse executing through error
+    // recovery)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery02",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery04",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/subquery/manifest#subquery12",
 ];
 
 // Largest clusters: XSD type-promotion comparisons, open-world equality,
