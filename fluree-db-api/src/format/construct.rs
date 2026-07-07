@@ -160,7 +160,14 @@ fn row_blank(
     if let Some(existing) = row_bnodes.get(&var_id) {
         return existing.clone();
     }
-    let blank = BlankId::new(format!("b{}", *bnode_counter));
+    // Reserved `cst` (construct-solution-template) prefix keeps minted labels
+    // provably disjoint from every other blank-node producer — stored/import
+    // blanks (`fdb-…`), BNODE() output (`b{hex}`), and SERVICE passthrough — so a
+    // mixed template (`[ :p ?dataBlank ]`) can never silently merge a minted
+    // blank with a data blank. The W3C CONSTRUCT suite compares by graph
+    // isomorphism and so cannot catch such a merge; the disjoint namespace is the
+    // guarantee.
+    let blank = BlankId::new(format!("cst{}", *bnode_counter));
     *bnode_counter += 1;
     row_bnodes.insert(var_id, blank.clone());
     blank
