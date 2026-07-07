@@ -2296,6 +2296,10 @@ fn test_service_fluree_ledger_endpoint() {
 const RDF_PREFIX: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 const EX_PREFIX: &str = "PREFIX ex: <http://example.org/> ";
 
+fn unit(ann: &crate::ast::Annotation) -> &crate::ast::AnnotationUnit {
+    ann.single_unit().expect("a single annotation unit")
+}
+
 fn first_bgp(ast: &SparqlAst) -> &Vec<crate::ast::TriplePattern> {
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern {
@@ -2351,8 +2355,11 @@ fn annotation_block_anonymous_parses_and_attaches_to_triple() {
         .annotation
         .as_ref()
         .expect("annotation tail should be attached to the triple");
-    assert!(ann.reifier.is_none(), "anonymous form has no reifier id");
-    let block = ann.block.as_ref().expect("block should be present");
+    assert!(
+        unit(ann).reifier.is_none(),
+        "anonymous form has no reifier id"
+    );
+    let block = unit(ann).block.as_ref().expect("block should be present");
     assert_eq!(block.entries.len(), 1);
 }
 
@@ -2363,13 +2370,13 @@ fn annotation_block_with_named_blank_reifier() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    match ann.reifier.as_ref().expect("reifier id") {
+    match unit(ann).reifier.as_ref().expect("reifier id") {
         crate::ast::ReifierId::BlankNode(b) => {
             assert!(matches!(b.value, BlankNodeValue::Labeled(ref l) if l.as_ref() == "ann"));
         }
         other => panic!("expected blank-node reifier, got {other:?}"),
     }
-    assert!(ann.block.is_some());
+    assert!(unit(ann).block.is_some());
 }
 
 #[test]
@@ -2379,7 +2386,10 @@ fn annotation_block_with_named_iri_reifier() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    matches!(ann.reifier.as_ref(), Some(crate::ast::ReifierId::Iri(_)));
+    matches!(
+        unit(ann).reifier.as_ref(),
+        Some(crate::ast::ReifierId::Iri(_))
+    );
 }
 
 #[test]
@@ -2389,7 +2399,10 @@ fn annotation_block_with_var_reifier() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    matches!(ann.reifier.as_ref(), Some(crate::ast::ReifierId::Var(_)));
+    matches!(
+        unit(ann).reifier.as_ref(),
+        Some(crate::ast::ReifierId::Var(_))
+    );
 }
 
 #[test]
@@ -2399,8 +2412,8 @@ fn bare_tilde_reifier_no_block_parses() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    assert!(ann.reifier.is_some());
-    assert!(ann.block.is_none(), "bare reifier carries no block");
+    assert!(unit(ann).reifier.is_some());
+    assert!(unit(ann).block.is_none(), "bare reifier carries no block");
 }
 
 #[test]
@@ -2410,7 +2423,7 @@ fn empty_annotation_block_parses() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    let block = ann.block.as_ref().expect("block");
+    let block = unit(ann).block.as_ref().expect("block");
     assert_eq!(block.entries.len(), 0);
 }
 
@@ -2420,7 +2433,8 @@ fn annotation_block_with_multiple_predicate_object_pairs() {
         "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"Engineer\" ; ex:since \"2024\" |}} . }}"
     ));
     let bgp = first_bgp(&ast);
-    let block = bgp[0].annotation.as_ref().unwrap().block.as_ref().unwrap();
+    let ann = bgp[0].annotation.as_ref().unwrap();
+    let block = unit(ann).block.as_ref().unwrap();
     assert_eq!(block.entries.len(), 2);
 }
 
@@ -2560,23 +2574,55 @@ fn nested_annotation_in_block_is_rejected() {
 }
 
 #[test]
-fn duplicate_reifier_in_tail_is_rejected() {
-    assert_parse_error(
-        &format!(
-            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?a ~ ?b {{| ex:role \"x\" |}} . }}"
-        ),
-        "at most one reifier",
-    );
+fn multiple_reifiers_in_tail_group_into_units() {
+    // RDF 1.2: each `~ reifier` starts a new reification unit; the
+    // block attaches to the immediately preceding reifier (`?b` here).
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?a ~ ?b {{| ex:role \"x\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert_eq!(ann.units.len(), 2);
+    assert!(matches!(
+        ann.units[0].reifier,
+        Some(crate::ast::ReifierId::Var(ref v)) if v.name.as_ref() == "a"
+    ));
+    assert!(ann.units[0].block.is_none());
+    assert!(matches!(
+        ann.units[1].reifier,
+        Some(crate::ast::ReifierId::Var(ref v)) if v.name.as_ref() == "b"
+    ));
+    assert!(ann.units[1].block.is_some(), "block attaches to `~ ?b`");
 }
 
 #[test]
-fn duplicate_block_in_tail_is_rejected() {
-    assert_parse_error(
-        &format!(
-            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"x\" |}} {{| ex:since \"y\" |}} . }}"
-        ),
-        "at most one annotation block",
-    );
+fn multiple_blocks_in_tail_mint_fresh_reifiers() {
+    // Two blocks with no preceding reifiers = two fresh reifiers
+    // (W3C annotation-anonreifier-multiple-01).
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"x\" |}} {{| ex:since \"y\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert_eq!(ann.units.len(), 2);
+    assert!(ann.units.iter().all(|u| u.reifier.is_none()));
+    assert!(ann.units.iter().all(|u| u.block.is_some()));
+}
+
+#[test]
+fn interleaved_reifiers_and_blocks_follow_attachment_rule() {
+    // `~ :r1 ~ :r2 {| b1 |} {| b2 |} ~ :r3 {| b3 |}` →
+    // [r1], [r2+b1], [fresh+b2], [r3+b3] (annotation-reifier-multiple-05).
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?s ?p ?o ~ ex:r1 ~ ex:r2 {{| ex:a \"1\" |}} {{| ex:b \"2\" |}} ~ ex:r3 {{| ex:c \"3\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert_eq!(ann.units.len(), 4);
+    assert!(ann.units[0].reifier.is_some() && ann.units[0].block.is_none());
+    assert!(ann.units[1].reifier.is_some() && ann.units[1].block.is_some());
+    assert!(ann.units[2].reifier.is_none() && ann.units[2].block.is_some());
+    assert!(ann.units[3].reifier.is_some() && ann.units[3].block.is_some());
 }
 
 // ----- Existing legacy `<< s p ?o >> f:t ?t` form regression check ---------
@@ -2619,6 +2665,96 @@ fn legacy_quoted_triple_in_subject_position_still_parses() {
     assert_eq!(bgp.len(), 1);
     // The subject should be a QuotedTriple, NOT confused with a triple term.
     assert!(matches!(&bgp[0].subject, SubjectTerm::QuotedTriple(_)));
+}
+
+// ----- PR-W2A: RDF 1.2 reified-triple forms ---------------------------------
+
+#[test]
+fn reified_triple_in_object_position_parses() {
+    // W3C basic-anonreifier-02: `:s :p << :a :b "c" >> .`
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:s ex:p << ex:a ex:b \"c\" >> . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    assert_eq!(bgp.len(), 1);
+    assert!(matches!(&bgp[0].object, crate::ast::Term::QuotedTriple(_)));
+}
+
+#[test]
+fn reifier_inside_quoted_triple_parses() {
+    // W3C basic-reifier-02: `:s :p << :a :b "c" ~ :iri >> .`
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:s ex:p << ex:a ex:b \"c\" ~ ex:iri >> . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let crate::ast::Term::QuotedTriple(qt) = &bgp[0].object else {
+        panic!("expected reified-triple object");
+    };
+    let reifier = qt.reifier.as_ref().expect("in-triple reifier");
+    assert!(matches!(reifier.id, Some(crate::ast::ReifierId::Iri(_))));
+}
+
+#[test]
+fn standalone_reified_triple_desugars_to_annotation_target() {
+    // W3C basic-anonreifier-08: `<< ?s ?p ?o >> .` standalone —
+    // desugars to `_:r rdf:reifies <<( ?s ?p ?o )>>`.
+    let ast = assert_parses("SELECT * WHERE { << ?s ?p ?o >> . }");
+    assert_eq!(first_pattern_kinds(&ast), vec!["AnnotationTarget"]);
+}
+
+#[test]
+fn nested_reified_triple_parses() {
+    // W3C basic-anonreifier-10 / basic-reifier-10.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ << ex:s ex:p << ?s ex:p2 ex:o2 ~ ex:iri2 >> ~ ex:iri1 >> . }}"
+    ));
+}
+
+#[test]
+fn annotation_block_with_path_verb_parses() {
+    // W3C annotation-anonreifier-06: `{| :r/:q 'ABC' |}`.
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?s ?p ?o {{| ex:r/ex:q 'ABC' |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    let block = unit(ann).block.as_ref().expect("block");
+    assert!(matches!(
+        block.entries[0].verb,
+        crate::ast::AnnotationVerb::Path(_)
+    ));
+}
+
+#[test]
+fn standalone_triple_term_still_rejected() {
+    // W3C NEGATIVE tripleterm-separate-01: `<<( ?s ?p ?o )>> .` — a
+    // bare triple term is a value, not a statement (contrast the
+    // standalone REIFIED triple, which is valid).
+    assert_parse_error("SELECT * WHERE { <<( ?s ?p ?o )>> . }", "unexpected token");
+}
+
+#[test]
+fn annotation_on_path_verb_still_rejected() {
+    // W3C NEGATIVE annotated-anonreifier-path: annotation tails attach
+    // to simple-verb triples only, never to path patterns.
+    assert_parse_error(
+        &format!("{EX_PREFIX}SELECT * WHERE {{ ?s ex:p/ex:q ?o {{| ?pp ?oo |}} . }}"),
+        "unexpected token",
+    );
+}
+
+#[test]
+fn version_long_string_rejected() {
+    // W3C NEGATIVE version-bad-01/02: VersionSpecifier is a SHORT
+    // quoted string only.
+    assert_parse_error(
+        "VERSION \"\"\"1.2\"\"\" SELECT * WHERE { }",
+        "short quoted string",
+    );
+    assert_parse_error(
+        "VERSION \'\'\'1.2\'\'\' SELECT * WHERE { }",
+        "short quoted string",
+    );
 }
 
 #[test]

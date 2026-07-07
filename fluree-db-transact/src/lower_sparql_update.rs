@@ -46,10 +46,10 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    Annotation, BlankNode, BlankNodeValue, GraphPattern, Iri, IriValue, Literal,
-    LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue, QuadData, QuadPattern,
-    QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term, TriplePattern,
-    UpdateOperation,
+    Annotation, AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri,
+    IriValue, Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue,
+    PropertyPath, QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst,
+    SubjectTerm, Term, TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use rustc_hash::FxHashMap;
@@ -161,7 +161,7 @@ impl AnnotationExpansionMode {
     }
 }
 
-/// Resolve the reifier for a SPARQL annotation tail under a given
+/// Resolve the reifier for one SPARQL annotation unit under a given
 /// expansion mode. Returns the `SubjectTerm` representing the
 /// reifier — to be used as the subject of the `f:reifies*` and body
 /// triples that the expansion emits.
@@ -171,7 +171,7 @@ impl AnnotationExpansionMode {
 /// where blank nodes are allowed. Rejects the relevant per-mode shapes
 /// per the M4.4 contract.
 fn resolve_reifier(
-    annotation: &Annotation,
+    annotation: &AnnotationUnit,
     mode: AnnotationExpansionMode,
     bnodes: &mut BlankNodeCounter,
 ) -> Result<SubjectTerm, LowerError> {
@@ -299,10 +299,11 @@ fn expand_annotated_triples(
             });
         }
 
-        // Reify the base edge and emit base + bundle + body. The base
-        // triple stripped of its annotation goes through unchanged.
+        // Reify the base edge and emit base + per-unit bundle + body.
+        // The base triple stripped of its annotation goes through
+        // unchanged; each annotation unit (`~ r? {| … |}?`) contributes
+        // its own reifier bundle.
         let span = tp.span;
-        let reifier = resolve_reifier(&annotation, mode, bnodes)?;
 
         // Base triple (without annotation)
         out.push(TriplePattern::new(
@@ -312,63 +313,79 @@ fn expand_annotated_triples(
             span,
         ));
 
-        // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT, and (for a
-        // language-tagged object) LANG. f:reifiesGraph is omitted
-        // (default graph only) — WITH-scoped templates are rejected
-        // upstream by `reject_with_scoped_annotations` so this default
-        // identity never gets graph-stamped. f:reifiesDatatype rides on
-        // the f:reifiesObject flake's flake-level dt (the decoder derives
-        // it), and f:reifiesListIndex is deferred (v1).
-        let pred_iri =
-            |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
-        out.push(TriplePattern::new(
-            reifier.clone(),
-            pred_iri(reifies_iris::SUBJECT),
-            subject_to_object(&tp.subject),
-            span,
-        ));
-        out.push(TriplePattern::new(
-            reifier.clone(),
-            pred_iri(reifies_iris::PREDICATE),
-            predicate_to_object(&tp.predicate),
-            span,
-        ));
-        out.push(TriplePattern::new(
-            reifier.clone(),
-            pred_iri(reifies_iris::OBJECT),
-            tp.object.clone(),
-            span,
-        ));
+        for unit in &annotation.units {
+            let reifier = resolve_reifier(unit, mode, bnodes)?;
 
-        // f:reifiesLang — required for a language-tagged object.
-        // `EdgeKey::from_reifies_facts` reads `lang` from a dedicated
-        // f:reifiesLang flake, NOT from the f:reifiesObject flake's
-        // `m.lang`. Without this triple the decoded EdgeKey carries
-        // `lang = None` while the base edge's EdgeKey carries
-        // `lang = Some(tag)`, so the forward-map lookup misses: the
-        // annotation silently vanishes from `@annotation` hydration
-        // and the bundle is never cascaded on base-edge retract.
-        // Mirrors the JSON-LD writer (`build_annotation_sibling`).
-        if let Term::Literal(lit) = &tp.object {
-            if let SparqlLiteralValue::LangTagged { lang, .. } = &lit.value {
-                out.push(TriplePattern::new(
-                    reifier.clone(),
-                    pred_iri(reifies_iris::LANG),
-                    Term::Literal(Literal::string(lang.as_ref(), span)),
-                    span,
-                ));
+            // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT, and (for a
+            // language-tagged object) LANG. f:reifiesGraph is omitted
+            // (default graph only) — WITH-scoped templates are rejected
+            // upstream by `reject_with_scoped_annotations` so this default
+            // identity never gets graph-stamped. f:reifiesDatatype rides on
+            // the f:reifiesObject flake's flake-level dt (the decoder derives
+            // it), and f:reifiesListIndex is deferred (v1).
+            let pred_iri =
+                |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
+            out.push(TriplePattern::new(
+                reifier.clone(),
+                pred_iri(reifies_iris::SUBJECT),
+                subject_to_object(&tp.subject),
+                span,
+            ));
+            out.push(TriplePattern::new(
+                reifier.clone(),
+                pred_iri(reifies_iris::PREDICATE),
+                predicate_to_object(&tp.predicate),
+                span,
+            ));
+            out.push(TriplePattern::new(
+                reifier.clone(),
+                pred_iri(reifies_iris::OBJECT),
+                tp.object.clone(),
+                span,
+            ));
+
+            // f:reifiesLang — required for a language-tagged object.
+            // `EdgeKey::from_reifies_facts` reads `lang` from a dedicated
+            // f:reifiesLang flake, NOT from the f:reifiesObject flake's
+            // `m.lang`. Without this triple the decoded EdgeKey carries
+            // `lang = None` while the base edge's EdgeKey carries
+            // `lang = Some(tag)`, so the forward-map lookup misses: the
+            // annotation silently vanishes from `@annotation` hydration
+            // and the bundle is never cascaded on base-edge retract.
+            // Mirrors the JSON-LD writer (`build_annotation_sibling`).
+            if let Term::Literal(lit) = &tp.object {
+                if let SparqlLiteralValue::LangTagged { lang, .. } = &lit.value {
+                    out.push(TriplePattern::new(
+                        reifier.clone(),
+                        pred_iri(reifies_iris::LANG),
+                        Term::Literal(Literal::string(lang.as_ref(), span)),
+                        span,
+                    ));
+                }
             }
-        }
 
-        // Body entries become (reifier, ann_pred, ann_obj) triples.
-        if let Some(block) = annotation.block.as_ref() {
-            for entry in &block.entries {
-                out.push(TriplePattern::new(
-                    reifier.clone(),
-                    entry.predicate.clone(),
-                    entry.object.clone(),
-                    entry.span,
-                ));
+            // Body entries become (reifier, ann_pred, ann_obj) triples.
+            // Property-path verbs (legal in query annotation blocks)
+            // have no template meaning — reject with a clear error.
+            if let Some(block) = unit.block.as_ref() {
+                for entry in &block.entries {
+                    let predicate = match &entry.verb {
+                        AnnotationVerb::Simple(p) => p.clone(),
+                        AnnotationVerb::Path(path) => {
+                            return Err(LowerError::UnsupportedFeature {
+                                feature: "property path inside an annotation block in \
+                                          SPARQL UPDATE (paths cannot be asserted)",
+                                span: path.span(),
+                            });
+                        }
+                    };
+                    out.push(TriplePattern::new(
+                        reifier.clone(),
+                        predicate,
+                        entry.object.clone(),
+                        entry.span,
+                    ));
+                }
             }
         }
     }
@@ -478,12 +495,50 @@ fn reject_user_authored_reifies(
         Ok(())
     }
 
+    // Path verbs are rejected later by the expansion pass (paths can't
+    // be asserted), but the firewall still walks their IRI leaves so a
+    // hidden `f:reifies*` leaf is reported as a firewall violation, not
+    // as a generic unsupported-path error after partial validation.
+    fn check_path(path: &PropertyPath, prologue: &Prologue) -> Result<(), LowerError> {
+        match path {
+            PropertyPath::Iri(iri) => check_predicate(&PredicateTerm::Iri(iri.clone()), prologue),
+            PropertyPath::A { .. } => Ok(()),
+            PropertyPath::Inverse { path, .. }
+            | PropertyPath::ZeroOrMore { path, .. }
+            | PropertyPath::OneOrMore { path, .. }
+            | PropertyPath::ZeroOrOne { path, .. }
+            | PropertyPath::Group { path, .. } => check_path(path, prologue),
+            PropertyPath::Sequence { left, right, .. }
+            | PropertyPath::Alternative { left, right, .. } => {
+                check_path(left, prologue)?;
+                check_path(right, prologue)
+            }
+            PropertyPath::NegatedSet { iris, .. } => {
+                use fluree_db_sparql::ast::NegatedPredicate;
+                for p in iris {
+                    match p {
+                        NegatedPredicate::Forward(iri) | NegatedPredicate::Inverse(iri) => {
+                            check_predicate(&PredicateTerm::Iri(iri.clone()), prologue)?;
+                        }
+                        NegatedPredicate::ForwardA { .. } | NegatedPredicate::InverseA { .. } => {}
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     for tp in triples {
         check_predicate(&tp.predicate, prologue)?;
         if let Some(ann) = &tp.annotation {
-            if let Some(block) = &ann.block {
-                for entry in &block.entries {
-                    check_predicate(&entry.predicate, prologue)?;
+            for unit in &ann.units {
+                if let Some(block) = &unit.block {
+                    for entry in &block.entries {
+                        match &entry.verb {
+                            AnnotationVerb::Simple(p) => check_predicate(p, prologue)?,
+                            AnnotationVerb::Path(path) => check_path(path, prologue)?,
+                        }
+                    }
                 }
             }
         }
@@ -1401,6 +1456,10 @@ fn object_to_unresolved_delete_where(
                 dtc: None,
             })
         }
+        Term::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
+            feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
+            span: qt.span,
+        }),
     }
 }
 
@@ -1475,6 +1534,12 @@ fn lower_triple_to_delete_template_delete_where(
                     (TemplateTerm::Var(vars.get_or_insert(&name)), None)
                 }
             }
+        }
+        Term::QuotedTriple(qt) => {
+            return Err(LowerError::UnsupportedFeature {
+                feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
+                span: qt.span,
+            });
         }
     };
 
@@ -1656,6 +1721,10 @@ fn object_to_template(
             };
             Ok(TemplateTerm::BlankNode(label))
         }
+        Term::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
+            feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
+            span: qt.span,
+        }),
     }
 }
 

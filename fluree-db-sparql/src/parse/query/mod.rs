@@ -62,7 +62,7 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
     }
 
     let mut stream = super::stream::TokenStream::new(tokens);
-    let mut parser = Parser::new(&mut stream);
+    let mut parser = Parser::with_source(&mut stream, input);
 
     match parser.parse_query() {
         Some(mut ast) => {
@@ -219,6 +219,13 @@ pub fn parse_group_graph_pattern(
 /// The SPARQL parser.
 struct Parser<'a> {
     stream: &'a mut super::stream::TokenStream,
+    /// Raw query text, when available. Used for checks that need the
+    /// token's original lexeme (e.g. the VERSION specifier must be a
+    /// *short* quoted string — the cooked `TokenKind::String` value
+    /// cannot distinguish `"1.2"` from `"""1.2"""`). `None` for
+    /// sub-parsers spun up without source access (EXISTS groups),
+    /// which never parse a prologue.
+    source: Option<&'a str>,
     /// Monotonic counter minting unique labels for blank-node property lists
     /// (`[ :p ?o ]`). Each list desugars to a fresh labeled blank node so the
     /// node and its nested triples share one join variable.
@@ -241,6 +248,17 @@ impl<'a> Parser<'a> {
     fn new(stream: &'a mut super::stream::TokenStream) -> Self {
         Self {
             stream,
+            source: None,
+            bnode_counter: 0,
+            pending_bnpl_triples: Vec::new(),
+            pending_bnpl_patterns: Vec::new(),
+        }
+    }
+
+    fn with_source(stream: &'a mut super::stream::TokenStream, source: &'a str) -> Self {
+        Self {
+            stream,
+            source: Some(source),
             bnode_counter: 0,
             pending_bnpl_triples: Vec::new(),
             pending_bnpl_patterns: Vec::new(),
@@ -297,9 +315,26 @@ impl<'a> Parser<'a> {
     /// parse).
     fn parse_version_decl(&mut self) {
         self.stream.advance(); // consume VERSION
-        if self.stream.consume_string().is_none() {
-            self.stream
-                .error_at_current("expected a version string after VERSION (e.g. \"1.2\")");
+        match self.stream.consume_string() {
+            None => {
+                self.stream
+                    .error_at_current("expected a version string after VERSION (e.g. \"1.2\")");
+            }
+            Some((_, span)) => {
+                // Grammar: VersionSpecifier ::= STRING_LITERAL1 |
+                // STRING_LITERAL2 — long (triple-quoted) strings are not
+                // legal here (W3C negative tests version-bad-01/02).
+                if let Some(source) = self.source {
+                    let raw = source.get(span.start..span.end).unwrap_or("");
+                    if raw.starts_with("\"\"\"") || raw.starts_with("'''") {
+                        self.stream.error_at(
+                            "VERSION requires a short quoted string (e.g. \"1.2\"); \
+                             long (triple-quoted) strings are not allowed",
+                            span,
+                        );
+                    }
+                }
+            }
         }
     }
 

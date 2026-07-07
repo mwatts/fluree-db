@@ -183,12 +183,14 @@ impl BnodeScopeChecker<'_> {
         self.record_subject(&triple.subject, scope);
         self.record_object(&triple.object, scope);
         if let Some(annotation) = &triple.annotation {
-            if let Some(ReifierId::BlankNode(b)) = &annotation.reifier {
-                self.record_bnode(b, scope);
-            }
-            if let Some(block) = &annotation.block {
-                for entry in &block.entries {
-                    self.record_object(&entry.object, scope);
+            for unit in &annotation.units {
+                if let Some(ReifierId::BlankNode(b)) = &unit.reifier {
+                    self.record_bnode(b, scope);
+                }
+                if let Some(block) = &unit.block {
+                    for entry in &block.entries {
+                        self.record_object(&entry.object, scope);
+                    }
                 }
             }
         }

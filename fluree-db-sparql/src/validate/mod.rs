@@ -217,17 +217,64 @@ impl<'a> Validator<'a> {
         }
     }
 
+    /// Reject annotation units without an explicit reifier id in DELETE
+    /// forms. An anonymous annotation (`{| ... |}` with no `~ id`, or a
+    /// bare `~`) mints a fresh blank node, and SPARQL 1.1 §3.1.3
+    /// forbids blank nodes in DELETE templates (W3C negative test
+    /// `syntax-update-anonreifier-01`). Blank-node *reifier ids*
+    /// (`~ _:b`) stay under the broader bnodes-in-DELETE validation
+    /// owned by burn-down PR-U1.
+    fn reject_anonymous_annotations_in_delete(&mut self, pattern: &QuadPattern, context: &str) {
+        let check_triples = |triples: &[TriplePattern], diags: &mut Vec<Diagnostic>| {
+            for tp in triples {
+                let Some(ann) = &tp.annotation else { continue };
+                for unit in &ann.units {
+                    if unit.reifier.is_none() {
+                        diags.push(
+                            Diagnostic::error(
+                                DiagCode::AnonymousAnnotationInDelete,
+                                format!(
+                                    "anonymous annotation (`{{| ... |}}` without `~ <reifier>`) \
+                                     is not allowed in {context}"
+                                ),
+                                unit.span,
+                            )
+                            .with_help(
+                                "Name the reifier explicitly (`~ <iri>`) or bind it with a \
+                                 variable reifier (`~ ?r`) in the WHERE clause.",
+                            ),
+                        );
+                    }
+                }
+            }
+        };
+        for el in &pattern.patterns {
+            match el {
+                QuadPatternElement::Triple(tp) => {
+                    check_triples(std::slice::from_ref(&**tp), &mut self.diagnostics);
+                }
+                QuadPatternElement::Graph { triples, .. } => {
+                    check_triples(triples, &mut self.diagnostics);
+                }
+            }
+        }
+    }
+
     /// Reject an annotation tail that mints an anonymous reifier inside
     /// DELETE DATA (see [`Validator::validate_delete_data`]).
     fn check_delete_data_annotation(&mut self, triple: &TriplePattern) {
         if let Some(annotation) = &triple.annotation {
-            if annotation.reifier.is_none() {
+            for unit in annotation
+                .units
+                .iter()
+                .filter(|unit| unit.reifier.is_none())
+            {
                 self.diagnostics.push(
                     Diagnostic::error(
                         DiagCode::AnonymousAnnotationInGroundData,
                         "anonymous annotation block ({| |}) in DELETE DATA — \
                          no addressable identity to delete",
-                        annotation.span,
+                        unit.span,
                     )
                     .with_help(
                         "Name the reifier explicitly (s p o ~ <reifier> {| ... |}) \
@@ -249,6 +296,10 @@ impl<'a> Validator<'a> {
         // variables are not (Phase 1), and blank nodes are forbidden
         // (SPARQL 1.1 Update §19.8 grammar note 8).
         self.validate_update_template_quad_pattern(&delete_where.pattern, "DELETE WHERE", true);
+        // The DELETE WHERE pattern doubles as the delete template —
+        // anonymous reifiers are blank nodes, which SPARQL forbids in
+        // DELETE templates.
+        self.reject_anonymous_annotations_in_delete(&delete_where.pattern, "DELETE WHERE");
     }
 
     /// Validate Modify (INSERT/DELETE with WHERE).
@@ -259,6 +310,7 @@ impl<'a> Validator<'a> {
         // per-solution fresh nodes, CONSTRUCT-style).
         if let Some(delete_clause) = &modify.delete_clause {
             self.validate_update_template_quad_pattern(delete_clause, "DELETE", true);
+            self.reject_anonymous_annotations_in_delete(delete_clause, "DELETE template");
         }
         if let Some(insert_clause) = &modify.insert_clause {
             self.validate_update_template_quad_pattern(insert_clause, "INSERT", false);
@@ -415,61 +467,63 @@ impl<'a> Validator<'a> {
         }
     }
 
-    /// Validate that a triple pattern is ground (no variables).
+    /// Validate that a triple pattern is ground (no variables),
+    /// recursing into RDF 1.2 reified-triple terms (`<< s p o ~ r >>`)
+    /// whose inner positions and reifier must be ground too.
     fn validate_ground_triple(&mut self, triple: &TriplePattern, context: &str) {
-        // Check subject
-        if let SubjectTerm::Var(var) = &triple.subject {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    DiagCode::VariableInGroundData,
-                    format!("Variable ?{} not allowed in {}", var.name, context),
-                    var.span,
-                )
-                .with_label(Label::new(var.span, "variable not allowed here"))
-                .with_help(format!(
-                    "{context} requires ground triples (IRIs, literals, blank nodes) with no variables."
-                ))
-                .with_note(
-                    "Use DELETE WHERE or INSERT/DELETE with WHERE clause for patterns with variables.",
-                ),
-            );
-        }
+        self.validate_ground_subject(&triple.subject, context);
+        self.validate_ground_predicate(&triple.predicate, context);
+        self.validate_ground_object(&triple.object, context);
+    }
 
-        // Check predicate
-        if let PredicateTerm::Var(var) = &triple.predicate {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    DiagCode::VariableInGroundData,
-                    format!("Variable ?{} not allowed in {}", var.name, context),
-                    var.span,
-                )
-                .with_label(Label::new(var.span, "variable not allowed here"))
-                .with_help(format!(
-                    "{context} requires ground triples (IRIs, literals, blank nodes) with no variables."
-                ))
-                .with_note(
-                    "Use DELETE WHERE or INSERT/DELETE with WHERE clause for patterns with variables.",
-                ),
-            );
+    fn validate_ground_subject(&mut self, subject: &SubjectTerm, context: &str) {
+        match subject {
+            SubjectTerm::Var(var) => self.push_ground_violation(&var.name, var.span, context),
+            SubjectTerm::QuotedTriple(qt) => self.validate_ground_quoted_triple(qt, context),
+            SubjectTerm::Iri(_) | SubjectTerm::BlankNode(_) => {}
         }
+    }
 
-        // Check object
-        if let Term::Var(var) = &triple.object {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    DiagCode::VariableInGroundData,
-                    format!("Variable ?{} not allowed in {}", var.name, context),
-                    var.span,
-                )
-                .with_label(Label::new(var.span, "variable not allowed here"))
-                .with_help(format!(
-                    "{context} requires ground triples (IRIs, literals, blank nodes) with no variables."
-                ))
-                .with_note(
-                    "Use DELETE WHERE or INSERT/DELETE with WHERE clause for patterns with variables.",
-                ),
-            );
+    fn validate_ground_predicate(&mut self, predicate: &PredicateTerm, context: &str) {
+        if let PredicateTerm::Var(var) = predicate {
+            self.push_ground_violation(&var.name, var.span, context);
         }
+    }
+
+    fn validate_ground_object(&mut self, object: &Term, context: &str) {
+        match object {
+            Term::Var(var) => self.push_ground_violation(&var.name, var.span, context),
+            Term::QuotedTriple(qt) => self.validate_ground_quoted_triple(qt, context),
+            Term::Iri(_) | Term::Literal(_) | Term::BlankNode(_) => {}
+        }
+    }
+
+    fn validate_ground_quoted_triple(&mut self, qt: &crate::ast::QuotedTriple, context: &str) {
+        self.validate_ground_subject(&qt.subject, context);
+        self.validate_ground_predicate(&qt.predicate, context);
+        self.validate_ground_object(&qt.object, context);
+        if let Some(crate::ast::ReifierId::Var(var)) =
+            qt.reifier.as_ref().and_then(|r| r.id.as_ref())
+        {
+            self.push_ground_violation(&var.name, var.span, context);
+        }
+    }
+
+    fn push_ground_violation(&mut self, name: &str, span: SourceSpan, context: &str) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                DiagCode::VariableInGroundData,
+                format!("Variable ?{name} not allowed in {context}"),
+                span,
+            )
+            .with_label(Label::new(span, "variable not allowed here"))
+            .with_help(format!(
+                "{context} requires ground triples (IRIs, literals, blank nodes) with no variables."
+            ))
+            .with_note(
+                "Use DELETE WHERE or INSERT/DELETE with WHERE clause for patterns with variables.",
+            ),
+        );
     }
 
     /// Validate a graph pattern recursively.

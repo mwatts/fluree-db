@@ -202,7 +202,9 @@ pub enum GraphPattern {
         /// IRI, rejecting rebound-prefix false positives.
         predicate: super::term::PredicateTerm,
         /// The reified base edge (`<<( s p o )>>`).
-        triple_term: super::annotation::TripleTerm,
+        /// Boxed: `TripleTerm` embeds full subject/object terms (which
+        /// can hold reified triples inline), dominating the enum size.
+        triple_term: Box<super::annotation::TripleTerm>,
         /// Source span covering the entire pattern.
         span: SourceSpan,
     },
@@ -356,16 +358,20 @@ fn add_triple_pattern_variables<'a>(triple: &'a TriplePattern, out: &mut Vec<&'a
         out.push(v);
     }
     if let Some(annotation) = &triple.annotation {
-        if let Some(super::annotation::ReifierId::Var(v)) = &annotation.reifier {
-            out.push(v);
-        }
-        if let Some(block) = &annotation.block {
-            for entry in &block.entries {
-                if let PredicateTerm::Var(v) = &entry.predicate {
-                    out.push(v);
-                }
-                if let Term::Var(v) = &entry.object {
-                    out.push(v);
+        for unit in &annotation.units {
+            if let Some(super::annotation::ReifierId::Var(v)) = &unit.reifier {
+                out.push(v);
+            }
+            if let Some(block) = &unit.block {
+                for entry in &block.entries {
+                    if let super::annotation::AnnotationVerb::Simple(PredicateTerm::Var(v)) =
+                        &entry.verb
+                    {
+                        out.push(v);
+                    }
+                    if let Term::Var(v) = &entry.object {
+                        out.push(v);
+                    }
                 }
             }
         }

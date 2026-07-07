@@ -135,7 +135,7 @@ pub enum DiagCode {
     #[serde(rename = "F010")]
     BlankNodeInDelete,
 
-    // =========================================================================
+    // =================================================================
     // Semantic validation (V001-V099) - SPARQL spec semantic rules
     // =========================================================================
     /// Blank node label reused across basic graph patterns (SPARQL §19.6)
@@ -169,6 +169,10 @@ pub enum DiagCode {
     /// Annotation minting an anonymous reifier in ground DATA (DELETE DATA)
     #[serde(rename = "V008")]
     AnonymousAnnotationInGroundData,
+
+    /// Anonymous annotation (fresh blank-node reifier) in a DELETE form
+    #[serde(rename = "F011")]
+    AnonymousAnnotationInDelete,
 
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
@@ -227,6 +231,7 @@ impl DiagCode {
             Self::DuplicateValuesVariable => "V007",
             Self::AnonymousAnnotationInGroundData => "V008",
             Self::BlankNodeInDelete => "F010",
+            Self::AnonymousAnnotationInDelete => "F011",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings
