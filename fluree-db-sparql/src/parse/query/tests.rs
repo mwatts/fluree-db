@@ -2673,7 +2673,7 @@ fn test_pragma_in_trailing_comment_honored() {
     assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
 }
 
-// =============================================================================
+// =====================================================================
 // V5 — BIND scope (SPARQL 1.1 §10.1 / grammar note 12)
 //
 // This check is parse-time by necessity: the single-pattern group
@@ -2716,6 +2716,63 @@ fn test_bind_scope_prior_triple_rejected() {
     // the same group.
     assert_bind_scope_rejected(
         "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . :s :q ?o1 . BIND((1+?o) AS ?o1) }",
+=======
+// =========================================================================
+// V1: dot structure inside group graph patterns (W3C syn-bad-02..14)
+// =========================================================================
+
+#[test]
+fn test_v1_legal_dot_usage_still_parses() {
+    // Trailing dot after the last triple is optional but legal.
+    assert_parses("SELECT * WHERE { ?s ?p ?o . }");
+    // Mandatory dot between two same-subject blocks.
+    assert_parses("SELECT * WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 . }");
+    // One optional dot may follow a GraphPatternNotTriples.
+    assert_parses("SELECT * WHERE { OPTIONAL { ?s ?p ?o } . ?a ?b ?c }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o . FILTER(?o) . }");
+    assert_parses("SELECT * WHERE { BIND(1 AS ?x) . ?s ?p ?x }");
+    assert_parses("SELECT * WHERE { { ?s ?p ?o } . ?a ?b ?c }");
+    assert_parses("SELECT * WHERE { GRAPH ?g { ?s ?p ?o } . ?a ?b ?c }");
+    // No dot needed between a TriplesBlock and a keyword pattern.
+    assert_parses("SELECT * WHERE { ?s ?p ?o OPTIONAL { ?a ?b ?c } }");
+}
+
+#[test]
+fn test_v1_standalone_dot_rejected() {
+    // syn-bad-05 / syn-bad-06
+    assert_parse_error("SELECT * WHERE { . }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { . . }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_leading_dot_rejected() {
+    // syn-bad-07 / syn-bad-14
+    assert_parse_error("SELECT * WHERE { . ?s ?p ?o }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { . FILTER(?x) }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_doubled_dot_rejected() {
+    // syn-bad-08..13
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o . . }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o .. }", "unexpected '.'");
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o . . ?s1 ?p1 ?o1 }",
+        "unexpected '.'",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o .. ?s1 ?p1 ?o1 }",
+        "unexpected '.'",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o . ?s1 ?p1 ?o1 .. }",
+        "unexpected '.'",
+    );
+    // A doubled dot after a GraphPatternNotTriples: only ONE optional dot.
+    assert_parse_error(
+        "SELECT * WHERE { OPTIONAL { ?s ?p ?o } . . }",
+        "unexpected '.'",
     );
 }
 
@@ -2725,6 +2782,55 @@ fn test_bind_scope_nested_group_propagates_rejected() {
     // nested group to the BIND in the outer group.
     assert_bind_scope_rejected(
         "PREFIX : <http://example.org/> SELECT * WHERE { { :s :p ?o . :s :q ?o1 . } BIND((1+?o) AS ?o1) }",
+fn test_v1_missing_dot_between_triples_rejected() {
+    // syn-bad-02 / syn-bad-03
+    assert_parse_error(
+        "PREFIX : <http://example/ns#> SELECT * { :s1 :p1 :o1 :s2 :p2 :o2 . }",
+        "expected '.' between triple patterns",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o ?s2 ?p2 ?o2 }",
+        "expected '.' between triple patterns",
+    );
+}
+
+// =========================================================================
+// V2: FILTER requires a Constraint (W3C filter-missing-parens)
+// =========================================================================
+
+#[test]
+fn test_v2_filter_constraint_forms_still_parse() {
+    // BrackettedExpression
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER (?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER (?o > 5) }");
+    // BuiltInCall
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER bound(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER regex(?o, \"x\") }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER isIRI(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER EXISTS { ?o ?q ?v } }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER NOT EXISTS { ?o ?q ?v } }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER IF(?o, true, false) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER COALESCE(?o, false) }");
+    // FunctionCall (extension function by IRI / prefixed name)
+    assert_parses("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:f(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER <http://example.org/f>(?o) }");
+}
+
+#[test]
+fn test_v2_filter_bare_term_rejected() {
+    // W3C filter-missing-parens: a bare Var is not a Constraint.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER ?x }",
+        "FILTER requires a bracketted expression",
+    );
+    // Bare literals and IRIs are not Constraints either.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER true }",
+        "FILTER requires a bracketted expression",
+    );
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:c }",
+        "FILTER requires a bracketted expression",
     );
 }
 
@@ -2734,6 +2840,107 @@ fn test_bind_scope_union_branch_propagates_rejected() {
     // in-scope variables.
     assert_bind_scope_rejected(
         "PREFIX : <http://example.org/> SELECT * { { { :s :p ?Y } UNION { :s :p ?Z } } BIND(1 AS ?Y) }",
+fn test_v2_filter_unparenthesized_operator_expression_rejected() {
+    // Relational / boolean operator expressions need the parens too.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER ?o > 5 }",
+        "FILTER requires a bracketted expression",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER !bound(?o) }",
+        "FILTER requires a bracketted expression",
+    );
+}
+
+// =========================================================================
+// Accepts-valid gaps unmasked by making parse errors authoritative:
+// bare ORDER BY constraints, VALUES row shape, sub-select VALUES clause
+// =========================================================================
+
+#[test]
+fn test_order_by_bare_builtin_and_function_call() {
+    // OrderCondition ::= ( 'ASC' | 'DESC' ) BrackettedExpression | ( Constraint | Var )
+    // W3C sort#dawg-sort-builtin / dawg-sort-function / syntax-order-06.
+    assert_parses("SELECT ?s WHERE { ?s ?p ?o . } ORDER BY str(?o)");
+    assert_parses(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT ?s WHERE { ?s ?p ?o . } ORDER BY xsd:integer(?o)",
+    );
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/ns#> \
+         SELECT * { ?s ?p ?o } ORDER BY DESC(?o+57) :func2(?o) ASC(?s)",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let order_by = q.modifiers.order_by.as_ref().expect("ORDER BY clause");
+        assert_eq!(order_by.conditions.len(), 3, "all three conditions kept");
+    } else {
+        panic!("expected SELECT");
+    }
+}
+
+#[test]
+fn test_values_parenthesized_single_var_takes_parenthesized_rows() {
+    // InlineDataFull row shape follows the var-LIST shape, not the count
+    // (W3C bindings#values7 / inline2).
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/> \
+         SELECT * { ?s ?p ?o } VALUES (?o) { (:b) (UNDEF) }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let values = q.values.as_ref().expect("post-query VALUES");
+        if let GraphPattern::Values { vars, data, .. } = values.as_ref() {
+            assert_eq!(vars.len(), 1);
+            assert_eq!(data.len(), 2);
+            assert!(data[0][0].is_some());
+            assert!(data[1][0].is_none(), "UNDEF row");
+        } else {
+            panic!("expected Values pattern");
+        }
+    }
+    // A bare (unparenthesized) var list still takes bare values.
+    assert_parses("PREFIX : <http://example.org/> SELECT * {{ ?s ?p ?o }} VALUES ?o { :b :c }");
+}
+
+#[test]
+fn test_subselect_trailing_values_clause() {
+    // SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause
+    // (W3C bindings#inline2).
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/> \
+         SELECT ?s ?o { { SELECT * WHERE { ?s ?p ?o . } VALUES (?o) { (:b) } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
+            let values = query.values.as_ref().expect("subselect VALUES clause");
+            assert!(matches!(values.as_ref(), GraphPattern::Values { .. }));
+        } else {
+            panic!("expected SubSelect, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+// =========================================================================
+// Trailing-token / EOF assertion at the parse entry (issue #1438 / D-10a)
+// =========================================================================
+
+#[test]
+fn test_trailing_tokens_after_query_rejected() {
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o } ?x",
+        "unexpected trailing tokens",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o } <http://example.org/trailing>",
+        "unexpected trailing tokens",
+    );
+    // A stray ';' after a query form is trailing content too.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o } ;",
+        "unexpected trailing tokens",
+    );
+    assert_parse_error(
+        "ASK { ?s ?p ?o } SELECT * WHERE { ?s ?p ?o }",
+        "unexpected trailing tokens",
     );
 }
 
@@ -2743,6 +2950,20 @@ fn test_bind_scope_use_after_bind_accepted() {
     // BIND count.
     assert_bind_scope_accepted(
         "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . BIND((1+?o) AS ?o1) :s :q ?o1 }",
+fn test_multi_operation_update_rejected_loudly() {
+    // Issue #1438: `INSERT ...; DELETE ...` used to parse as the INSERT
+    // alone, silently discarding every following operation (silent data
+    // loss at commit time). Until PR-U2 adds real multi-op support, the
+    // request must fail loudly (D-10a interim guard).
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { ex:s ex:p 1 } ; DELETE DATA { ex:s ex:p 1 }",
+        "multi-operation SPARQL UPDATE",
+    );
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { ex:s ex:p 1 } ; INSERT DATA { ex:s ex:p 2 }",
+        "multi-operation SPARQL UPDATE",
     );
 }
 
@@ -2789,5 +3010,13 @@ fn test_bind_scope_filter_var_not_in_scope_accepted() {
     // FILTER contributes nothing to the in-scope set.
     assert_bind_scope_accepted(
         "PREFIX : <http://example.org/> SELECT * WHERE { ?s :p ?o FILTER(?f) BIND(1 AS ?f) }",
+fn test_single_trailing_semicolon_after_update_is_legal() {
+    // Update ::= Prologue ( Update1 ( ';' Update )? )? — the recursive
+    // Update may be empty, so one trailing ';' is valid SPARQL.
+    assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
+    // ...but only one.
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ; ;",
+        "multi-operation SPARQL UPDATE",
     );
 }

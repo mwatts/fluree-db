@@ -67,6 +67,39 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
     match parser.parse_query() {
         Some(mut ast) => {
             ast.pragmas = extract_pragmas(&comments);
+
+            // Trailing-token / EOF assertion: after a complete Query or
+            // Update parses, every remaining non-EOF token is an
+            // error-severity diagnostic. Without this, anything after the
+            // parsed operation was silently discarded — most damagingly a
+            // standard multi-operation UPDATE request (`INSERT ...; DELETE
+            // ...`), which committed only the first operation: silent data
+            // loss (issue #1438). PR-U2 replaces the multi-op rejection with
+            // real ';'-loop support and reuses this single entry-point
+            // assertion (D-10a interim guard).
+            if !stream.is_eof() {
+                if matches!(ast.body, QueryBody::Update(_)) && stream.check(&TokenKind::Semicolon) {
+                    // Update ::= Prologue ( Update1 ( ';' Update )? )? — the
+                    // recursive Update may be empty, so one trailing ';'
+                    // after the last operation is valid SPARQL.
+                    stream.advance();
+                    if !stream.is_eof() {
+                        let span = stream.current_span();
+                        stream.add_diagnostic(Diagnostic::error(
+                            DiagCode::ExpectedToken,
+                            "multi-operation SPARQL UPDATE requests (';'-separated) are not \
+                             supported yet; only the first operation was parsed — submit each \
+                             operation as its own request"
+                                .to_string(),
+                            span,
+                        ));
+                    }
+                } else {
+                    stream
+                        .error_at_current("unexpected trailing tokens after the end of the query");
+                }
+            }
+
             let diagnostics = stream.take_diagnostics();
             // Parse-time *semantic* rejections (currently the V5 BIND-scope
             // check) must prevent AST production: unlike recovered syntax

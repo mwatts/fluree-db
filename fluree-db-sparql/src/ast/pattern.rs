@@ -431,6 +431,10 @@ pub struct SubSelect {
     /// subquery inherits HAVING, post-aggregation SELECT binds, and
     /// expression/aggregate ORDER BY identically.
     pub modifiers: SolutionModifiers,
+    /// Trailing VALUES clause (`SubSelect ::= SelectClause WhereClause
+    /// SolutionModifier ValuesClause`). Always a `GraphPattern::Values`
+    /// when present.
+    pub values: Option<Box<GraphPattern>>,
     /// Source span
     pub span: SourceSpan,
 }
