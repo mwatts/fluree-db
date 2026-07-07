@@ -434,6 +434,7 @@ impl TokenStream {
                 | TokenKind::LParen    // Collection syntax (non-empty)
                 | TokenKind::Nil       // Collection syntax (empty list)
                 | TokenKind::TripleStart // RDF-star quoted triple
+                | TokenKind::TripleTermStart // RDF 1.2 triple-term value (subject position)
         )
     }
 }

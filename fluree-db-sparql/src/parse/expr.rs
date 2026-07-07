@@ -12,9 +12,10 @@
 //! 6. `+`, `-`, `!` (unary)
 //! 7. Primary expressions (literals, variables, function calls, parenthesized)
 
+use crate::ast::annotation::TripleTerm;
 use crate::ast::expr::{AggregateFunction, BinaryOp, Expression, FunctionName, UnaryOp};
 use crate::ast::pattern::GraphPattern;
-use crate::ast::term::{Iri, IriValue, Literal, Var};
+use crate::ast::term::{Iri, IriValue, Literal, PredicateTerm, SubjectTerm, Term, Var};
 use crate::lex::TokenKind;
 use crate::parse::stream::TokenStream;
 use crate::span::SourceSpan;
@@ -244,6 +245,20 @@ fn parse_primary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
     // Keywords: EXISTS, NOT EXISTS, BOUND, etc.
     if let Some(expr) = try_parse_keyword_expr(tokens)? {
         return Ok(expr);
+    }
+
+    // RDF 1.2 triple term value `<<( s p o )>>` used as an expression
+    // (`BIND(<<( … )>> AS ?t)`, `FILTER`). It is the SPARQL 1.2
+    // `TRIPLE(s, p, o)` constructor, so it flows through the same
+    // accept-then-defer path (D-1). It is parsed *structurally* by the
+    // query parser — never as three sub-expressions — so a path
+    // (`:p/:q`), collection, reified triple, or blank node inside is
+    // rejected rather than misread (e.g. `/` as division). Note `<<` is
+    // deliberately NOT accepted here: reifiers are not expressions
+    // (negative `bind-reified` / `bind-anonreified`).
+    if tokens.check(&TokenKind::TripleTermStart) {
+        let tt = super::query::parse_triple_term_value(tokens)?;
+        return triple_term_to_expr(tt);
     }
 
     // Full IRI - could be function call or just an IRI
@@ -842,6 +857,63 @@ fn parse_expression_list(tokens: &mut TokenStream) -> Result<Vec<Expression>, St
 /// This is a forward reference to the pattern parser.
 fn parse_group_pattern_for_exists(tokens: &mut TokenStream) -> Result<GraphPattern, String> {
     super::query::parse_group_graph_pattern(tokens)
+}
+
+/// Convert a parsed triple-term value `<<( s p o )>>` into the equivalent
+/// expression `TRIPLE(s, p, o)` (SPARQL 1.2 §18.x: `<<( … )>>` in an
+/// expression is the TRIPLE constructor). This reuses the accept-then-defer
+/// lowering of [`FunctionName::Triple`] (D-1) and gives correct variable
+/// tracking for free. A nested triple-term object becomes a nested
+/// `TRIPLE(…)`. Blank-node components are rejected: they are not
+/// expressions (negative `bindbnode-tripleterm`).
+fn triple_term_to_expr(tt: TripleTerm) -> Result<Expression, String> {
+    let span = tt.span;
+    let s = subject_term_to_expr(tt.subject)?;
+    let p = predicate_term_to_expr(tt.predicate);
+    let o = object_term_to_expr(tt.object)?;
+    Ok(Expression::FunctionCall {
+        name: FunctionName::Triple,
+        args: vec![s, p, o],
+        distinct: false,
+        span,
+    })
+}
+
+fn subject_term_to_expr(s: SubjectTerm) -> Result<Expression, String> {
+    match s {
+        SubjectTerm::Var(v) => Ok(Expression::Var(v)),
+        SubjectTerm::Iri(i) => Ok(Expression::iri(i)),
+        SubjectTerm::BlankNode(_) => {
+            Err("blank nodes are not allowed in a triple term used in an expression".to_string())
+        }
+        // Rejected by the value parser before reaching here.
+        SubjectTerm::QuotedTriple(_) | SubjectTerm::TripleTerm(_) => {
+            Err("invalid triple-term subject".to_string())
+        }
+    }
+}
+
+fn predicate_term_to_expr(p: PredicateTerm) -> Expression {
+    match p {
+        PredicateTerm::Var(v) => Expression::Var(v),
+        PredicateTerm::Iri(i) => Expression::iri(i),
+    }
+}
+
+fn object_term_to_expr(o: Term) -> Result<Expression, String> {
+    match o {
+        Term::Var(v) => Ok(Expression::Var(v)),
+        Term::Iri(i) => Ok(Expression::iri(i)),
+        Term::Literal(l) => Ok(Expression::Literal(l)),
+        Term::BlankNode(_) => {
+            Err("blank nodes are not allowed in a triple term used in an expression".to_string())
+        }
+        // A nested triple-term object is itself a TRIPLE(…) constructor.
+        Term::TripleTerm(inner) => triple_term_to_expr(*inner),
+        Term::QuotedTriple(_) => {
+            Err("reified triples (<< s p o >>) are not allowed inside a triple term".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
