@@ -214,6 +214,19 @@ pub enum WriteClause {
     Set(SetClause),
     Remove(RemoveClause),
     Delete(DeleteClause),
+    /// `FOREACH (x IN <list> | <write clauses>)` — unrolled at
+    /// param-substitution time for constant lists (inline literals,
+    /// `range()`, `$param` arrays); runtime lists are deferred.
+    Foreach(ForeachClause),
+}
+
+/// `FOREACH (var IN list | body)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeachClause {
+    pub var: Variable,
+    pub list: Expr,
+    pub body: Vec<WriteClause>,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq)]

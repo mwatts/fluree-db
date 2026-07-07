@@ -67,7 +67,218 @@ pub fn substitute_params(ast: &mut CypherAst, params: &ParamMap) -> Result<(), P
     // never sees the list-of-maps parameter it would otherwise reject.
     expand_unwind_create(ast, params)?;
     expand_unwind_match(ast, params)?;
+    expand_foreach(ast, params)?;
     subst_statement(&mut ast.statement, params)
+}
+
+/// Unroll `FOREACH (x IN <constant list> | <writes>)` into repeated write
+/// clauses with `x` substituted per element. Constant lists are inline
+/// literal lists, `range()` over integer literals, and `$param` arrays —
+/// runtime lists (e.g. a collected list) are deferred with a clear error.
+/// Body CREATE variables are freshened per element (each iteration creates
+/// distinct nodes), except variables bound by the statement's read clauses,
+/// which keep referring to the matched entities.
+fn expand_foreach(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    let Statement::Update(u) = &mut ast.statement else {
+        return Ok(());
+    };
+    if !u
+        .write_clauses
+        .iter()
+        .any(|w| matches!(w, WriteClause::Foreach(_)))
+    {
+        return Ok(());
+    }
+
+    // Variables bound by MATCH / UNWIND read clauses keep their names inside
+    // unrolled CREATE bodies (they reference the matched entities).
+    let mut read_bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in &u.read_clauses {
+        match c {
+            ReadClause::Match(m) | ReadClause::OptionalMatch(m) => {
+                for part in &m.pattern.parts {
+                    if let Some(v) = &part.head.var {
+                        read_bound.insert(v.name.clone());
+                    }
+                    for (rel, node) in &part.tail {
+                        if let Some(v) = &rel.var {
+                            read_bound.insert(v.name.clone());
+                        }
+                        if let Some(v) = &node.var {
+                            read_bound.insert(v.name.clone());
+                        }
+                    }
+                }
+            }
+            ReadClause::Unwind(uw) => {
+                read_bound.insert(uw.alias.name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let clauses = std::mem::take(&mut u.write_clauses);
+    let mut out = Vec::with_capacity(clauses.len());
+    let mut anon = 0u32;
+    let mut iteration = 0usize;
+    for w in clauses {
+        match w {
+            WriteClause::Foreach(f) => {
+                unroll_foreach(&f, params, &read_bound, &mut out, &mut anon, &mut iteration)?;
+            }
+            other => out.push(other),
+        }
+    }
+    u.write_clauses = out;
+    Ok(())
+}
+
+fn unroll_foreach(
+    f: &crate::ast::ForeachClause,
+    params: &ParamMap,
+    read_bound: &std::collections::HashSet<String>,
+    out: &mut Vec<WriteClause>,
+    anon: &mut u32,
+    iteration: &mut usize,
+) -> Result<(), ParamError> {
+    let alias = f.var.name.as_str();
+    let elems: Vec<JsonValue> = if let Expr::Param(p) = &f.list {
+        match params.get(&p.name) {
+            Some(JsonValue::Array(a)) => a.clone(),
+            Some(_) => {
+                return Err(unsupported_param(
+                    &p.name,
+                    "FOREACH parameter must be a list",
+                ))
+            }
+            None => return Err(ParamError::Missing(p.name.clone())),
+        }
+    } else if let Some(v) = const_list_value(&f.list)? {
+        v
+    } else {
+        return Err(unsupported_param(
+            alias,
+            "FOREACH iterates an inline literal list, a constant range(), or a `$param` \
+             list in v1 — runtime lists (e.g. a collected list) are deferred",
+        ));
+    };
+
+    let mut produced: Vec<WriteClause> = Vec::new();
+    for elem in &elems {
+        *iteration += 1;
+        if *iteration > MAX_INLINE_UNWIND_ROWS {
+            return Err(unsupported_param(
+                alias,
+                "FOREACH unrolling is capped at 10000 iterations — batch via `UNWIND $param`",
+            ));
+        }
+        for clause in &f.body {
+            match clause {
+                WriteClause::Create(c) => {
+                    let mut c = c.clone();
+                    replace_alias_in_pattern(&mut c.pattern, alias, elem, alias)?;
+                    rename_unbound_pattern_vars(&mut c.pattern, *iteration, anon, read_bound);
+                    produced.push(WriteClause::Create(c));
+                }
+                WriteClause::Set(s) => {
+                    let mut s = s.clone();
+                    for item in &mut s.items {
+                        replace_alias_in_set_item_value(item, alias, elem)?;
+                    }
+                    produced.push(WriteClause::Set(s));
+                }
+                WriteClause::Remove(r) => produced.push(WriteClause::Remove(r.clone())),
+                WriteClause::Merge(_) | WriteClause::Delete(_) | WriteClause::Foreach(_) => {
+                    return Err(unsupported_param(
+                        alias,
+                        "FOREACH bodies support CREATE / SET / REMOVE in v1 — MERGE, DELETE, \
+                         and nested FOREACH are deferred",
+                    ));
+                }
+            }
+        }
+    }
+    dedupe_last_wins_sets(&mut produced);
+    out.append(&mut produced);
+    Ok(())
+}
+
+/// Cypher FOREACH iterations apply *sequentially*, so a `SET n.p = x` body
+/// leaves the LAST element's value on the property. The unrolled clauses
+/// execute as one transaction against the pre-write state, which would
+/// multi-value the property instead — keep only the last unrolled SET item
+/// per (target, property) shape.
+fn dedupe_last_wins_sets(clauses: &mut Vec<WriteClause>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for clause in clauses.iter_mut().rev() {
+        let WriteClause::Set(s) = clause else {
+            continue;
+        };
+        s.items.retain(|item| {
+            let key = match item {
+                SetItem::Property {
+                    target, property, ..
+                } => format!("p\u{0}{}\u{0}{property}", target.name),
+                SetItem::MapReplace { target, .. } => format!("r\u{0}{}", target.name),
+                SetItem::MapMerge { target, map } => {
+                    let keys: Vec<&str> = map.entries.iter().map(|(k, _)| k.as_str()).collect();
+                    format!("m\u{0}{}\u{0}{}", target.name, keys.join("\u{0}"))
+                }
+                SetItem::Labels { target, labels } => {
+                    format!("l\u{0}{}\u{0}{labels:?}", target.name)
+                }
+            };
+            seen.insert(key)
+        });
+    }
+    clauses.retain(|c| !matches!(c, WriteClause::Set(s) if s.items.is_empty()));
+}
+
+/// Substitute the FOREACH element into a SET item's value expressions.
+fn replace_alias_in_set_item_value(
+    s: &mut SetItem,
+    alias: &str,
+    elem: &JsonValue,
+) -> Result<(), ParamError> {
+    match s {
+        SetItem::Property { value, .. } => replace_alias_in_expr(value, alias, elem, alias),
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => {
+            replace_alias_in_maplit(map, alias, elem, alias)
+        }
+        SetItem::Labels { .. } => Ok(()),
+    }
+}
+
+/// Freshen the CREATE pattern's variables per FOREACH iteration so each
+/// element creates distinct nodes — except read-clause-bound variables,
+/// which keep referring to the matched entities. Mirrors
+/// [`rename_pattern_vars`] with an exclusion set.
+fn rename_unbound_pattern_vars(
+    pat: &mut Pattern,
+    row: usize,
+    anon: &mut u32,
+    bound: &std::collections::HashSet<String>,
+) {
+    let mut rename_node = |n: &mut NodePattern| match &mut n.var {
+        Some(v) if !bound.contains(&v.name) => v.name = format!("{}__cyfe{}", v.name, row),
+        Some(_) => {}
+        None => {
+            let name = format!("__cyfeanon{anon}__cyfe{row}");
+            *anon += 1;
+            n.var = Some(Variable { name, span: n.span });
+        }
+    };
+    for part in &mut pat.parts {
+        rename_node(&mut part.head);
+        for (rel, node) in &mut part.tail {
+            if let Some(v) = &mut rel.var {
+                if !bound.contains(&v.name) {
+                    v.name = format!("{}__cyfe{}", v.name, row);
+                }
+            }
+            rename_node(node);
+        }
+    }
 }
 
 /// Upper bound on rows a constant inline `UNWIND` may expand to on the write
@@ -427,6 +638,46 @@ fn collect_alias_in_update(
                 }
             }
             WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+            WriteClause::Foreach(f) => {
+                collect_alias_in_expr(&f.list, alias, fields, bare);
+                if f.var.name != alias {
+                    for inner in &f.body {
+                        collect_alias_in_write_clause(inner, alias, fields, bare);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FOREACH-body recursion for [`collect_alias_in_update`].
+fn collect_alias_in_write_clause(
+    w: &WriteClause,
+    alias: &str,
+    fields: &mut Vec<String>,
+    bare: &mut bool,
+) {
+    match w {
+        WriteClause::Create(c) => collect_alias_in_pattern(&c.pattern, alias, fields, bare),
+        WriteClause::Merge(m) => {
+            collect_alias_in_pattern(&m.pattern, alias, fields, bare);
+            for s in m.on_create.iter().chain(&m.on_match) {
+                collect_alias_in_set_item(s, alias, fields, bare);
+            }
+        }
+        WriteClause::Set(s) => {
+            for it in &s.items {
+                collect_alias_in_set_item(it, alias, fields, bare);
+            }
+        }
+        WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+        WriteClause::Foreach(f) => {
+            collect_alias_in_expr(&f.list, alias, fields, bare);
+            if f.var.name != alias {
+                for inner in &f.body {
+                    collect_alias_in_write_clause(inner, alias, fields, bare);
+                }
+            }
         }
     }
 }
@@ -608,6 +859,48 @@ fn rewrite_alias_in_update<F: Fn(&str) -> String>(
                 }
             }
             WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+            WriteClause::Foreach(f) => {
+                rewrite_alias_in_expr_to_var(&mut f.list, alias, col_var, bare_var);
+                if f.var.name != alias {
+                    for inner in &mut f.body {
+                        rewrite_alias_in_write_clause(inner, alias, col_var, bare_var);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FOREACH-body recursion for [`rewrite_alias_in_update`].
+fn rewrite_alias_in_write_clause<F: Fn(&str) -> String>(
+    w: &mut WriteClause,
+    alias: &str,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    match w {
+        WriteClause::Create(c) => {
+            rewrite_alias_in_pattern(&mut c.pattern, alias, col_var, bare_var);
+        }
+        WriteClause::Merge(m) => {
+            rewrite_alias_in_pattern(&mut m.pattern, alias, col_var, bare_var);
+            for s in m.on_create.iter_mut().chain(&mut m.on_match) {
+                rewrite_alias_in_set_item(s, alias, col_var, bare_var);
+            }
+        }
+        WriteClause::Set(s) => {
+            for it in &mut s.items {
+                rewrite_alias_in_set_item(it, alias, col_var, bare_var);
+            }
+        }
+        WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+        WriteClause::Foreach(f) => {
+            rewrite_alias_in_expr_to_var(&mut f.list, alias, col_var, bare_var);
+            if f.var.name != alias {
+                for inner in &mut f.body {
+                    rewrite_alias_in_write_clause(inner, alias, col_var, bare_var);
+                }
+            }
         }
     }
 }
@@ -1104,6 +1397,13 @@ fn subst_write_clause(w: &mut WriteClause, p: &ParamMap) -> Result<(), ParamErro
             Ok(())
         }
         WriteClause::Remove(_) | WriteClause::Delete(_) => Ok(()),
+        WriteClause::Foreach(f) => {
+            subst_expr(&mut f.list, p)?;
+            for inner in &mut f.body {
+                subst_write_clause(inner, p)?;
+            }
+            Ok(())
+        }
     }
 }
 

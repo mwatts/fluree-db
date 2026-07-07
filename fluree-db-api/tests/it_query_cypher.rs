@@ -8864,6 +8864,72 @@ async fn cypher_exists_in_projection_with_both_endpoints_bound() {
 }
 
 #[tokio::test]
+async fn cypher_foreach_unrolls_constant_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:foreach");
+
+    // Pure CREATE body: one distinct node per element.
+    let l = fluree
+        .transact_cypher(l, r#"FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))"#)
+        .await
+        .expect("foreach create")
+        .ledger;
+    // range() as the list; a MATCH-bound variable stays referenced in the body.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (n:N {v: 1}) FOREACH (i IN range(1, 2) | CREATE (n)-[:T]->(:M {i: i}))"#,
+        )
+        .await
+        .expect("foreach edges from bound node")
+        .ledger;
+    // SET body applies per element (last write wins on the same property).
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (n:N {v: 2}) FOREACH (x IN ["a", "b"] | SET n.mark = x)"#,
+        )
+        .await
+        .expect("foreach set")
+        .ledger;
+
+    let db = graphdb_from_ledger(&l);
+    let counts = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:N) WITH count(n) AS nodes
+               MATCH (:N {v: 1})-[:T]->(m:M)
+               RETURN nodes, count(m) AS edges"#,
+        )
+        .await
+        .expect("read back")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        counts,
+        json!([[3, 2]]),
+        "3 nodes; 2 edges from the bound node"
+    );
+    let mark = fluree
+        .query_cypher(&db, r#"MATCH (n:N {v: 2}) RETURN n.mark"#)
+        .await
+        .expect("mark")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(mark, json!([["b"]]), "SET per element, last wins");
+
+    // Runtime lists are deferred with a clear error.
+    let msg = fluree
+        .transact_cypher(l, r#"MATCH (n:N) FOREACH (x IN n.list | SET n.y = x)"#)
+        .await
+        .expect_err("runtime list")
+        .to_string();
+    assert!(msg.contains("FOREACH"), "{msg}");
+}
+
+#[tokio::test]
 async fn cypher_null_literal_in_expressions() {
     // `null` is a first-class expression value: projected as JSON null,
     // never equal to anything, detected by IS NULL, skipped by coalesce.

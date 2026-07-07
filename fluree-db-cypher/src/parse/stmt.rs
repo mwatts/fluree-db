@@ -1,10 +1,10 @@
 //! Statement-level parser.
 
 use crate::ast::{
-    CallSubqueryClause, CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection,
-    OrderItem, ProcedureCall, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem,
-    ReturnClause, SchemaCommand, SchemaCommandKind, SetClause, SetItem, Statement, UnionTail,
-    UnwindClause, Update, WithClause, WriteClause, YieldItem,
+    CallSubqueryClause, CreateClause, DeleteClause, ForeachClause, MatchClause, MergeClause,
+    OrderDirection, OrderItem, ProcedureCall, ProjectionItem, Query, ReadClause, RemoveClause,
+    RemoveItem, ReturnClause, SchemaCommand, SchemaCommandKind, SetClause, SetItem, Statement,
+    UnionTail, UnwindClause, Update, WithClause, WriteClause, YieldItem,
 };
 use crate::ast::{Expr, MapLit, ParamRef, Variable};
 use crate::diag::{DiagCode, Diagnostic};
@@ -95,6 +95,9 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                     return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
                 }
                 write_clauses.push(WriteClause::Delete(parse_delete(s, true)?));
+            }
+            TokenKind::Ident(w) if w.eq_ignore_ascii_case("foreach") => {
+                write_clauses.push(WriteClause::Foreach(parse_foreach(s)?));
             }
             TokenKind::Eof => break,
             other => {
@@ -731,6 +734,67 @@ fn parse_set_map(s: &mut TokenStream) -> Result<MapLit, Diagnostic> {
         });
     }
     parse_map_lit(s)
+}
+
+/// Parse `FOREACH (var IN <list expr> | <write clauses>)`. The leading
+/// `FOREACH` identifier has been sighted by the caller.
+fn parse_foreach(s: &mut TokenStream) -> Result<ForeachClause, Diagnostic> {
+    let start = s.peek_span();
+    s.advance(); // FOREACH
+    s.expect(&TokenKind::LParen)?;
+    let var = parse_var(s)?;
+    if !matches!(s.peek_kind(), TokenKind::In) {
+        return Err(s.error(
+            DiagCode::UnexpectedToken,
+            "expected IN after the FOREACH variable",
+        ));
+    }
+    s.advance();
+    let list = parse_expr(s)?;
+    s.expect(&TokenKind::Pipe)?;
+    let mut body = Vec::new();
+    loop {
+        match s.peek_kind() {
+            TokenKind::Create => body.push(WriteClause::Create(parse_create(s)?)),
+            TokenKind::Merge => body.push(WriteClause::Merge(parse_merge(s)?)),
+            TokenKind::Set => body.push(WriteClause::Set(parse_set(s)?)),
+            TokenKind::Remove => body.push(WriteClause::Remove(parse_remove(s)?)),
+            TokenKind::Delete => body.push(WriteClause::Delete(parse_delete(s, false)?)),
+            TokenKind::Detach => {
+                s.advance();
+                if !matches!(s.peek_kind(), TokenKind::Delete) {
+                    return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
+                }
+                body.push(WriteClause::Delete(parse_delete(s, true)?));
+            }
+            TokenKind::Ident(w) if w.eq_ignore_ascii_case("foreach") => {
+                body.push(WriteClause::Foreach(parse_foreach(s)?));
+            }
+            TokenKind::RParen => break,
+            other => {
+                return Err(s.error(
+                    DiagCode::UnexpectedToken,
+                    format!(
+                        "unexpected `{other}` in FOREACH body — expected \
+                         CREATE / MERGE / SET / REMOVE / DELETE"
+                    ),
+                ));
+            }
+        }
+    }
+    let end = s.expect(&TokenKind::RParen)?;
+    if body.is_empty() {
+        return Err(s.error(
+            DiagCode::UnexpectedToken,
+            "FOREACH body needs at least one write clause",
+        ));
+    }
+    Ok(ForeachClause {
+        var,
+        list,
+        body,
+        span: start.union(end),
+    })
 }
 
 fn parse_remove(s: &mut TokenStream) -> Result<RemoveClause, Diagnostic> {

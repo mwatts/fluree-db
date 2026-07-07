@@ -761,6 +761,7 @@ fn write_clause_name(wc: &WriteClause) -> &'static str {
         WriteClause::Set(_) => "SET",
         WriteClause::Remove(_) => "REMOVE",
         WriteClause::Delete(_) => "DELETE",
+        WriteClause::Foreach(_) => "FOREACH",
     }
 }
 

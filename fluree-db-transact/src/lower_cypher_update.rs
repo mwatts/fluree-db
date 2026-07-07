@@ -317,6 +317,15 @@ impl<'a> CypherLowering<'a> {
                 }
                 // MERGE-standalone is guaranteed by the merge-count guard above.
                 WriteClause::Merge(m) => self.lower_merge(m)?,
+                // Constant-list FOREACH unrolls at param substitution;
+                // reaching here means the list is a runtime expression.
+                WriteClause::Foreach(_) => {
+                    return Err(LowerCypherError::unsupported(
+                        "FOREACH iterates an inline literal list, a constant range(), or a \
+                         `$param` list in v1 — runtime lists (e.g. a collected list) are \
+                         deferred",
+                    ));
+                }
             }
         }
         Ok(())
