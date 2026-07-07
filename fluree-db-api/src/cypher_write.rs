@@ -36,6 +36,25 @@ pub enum WritePlan {
     Conditional(Box<ConditionalCypherWrite>),
 }
 
+/// The outcome of resolving a [`ConditionalCypherWrite`] against the writer
+/// snapshot: a ready-to-stage `Txn`, plus an optional second `Txn` that must be
+/// staged into the **same** commit (the create branch of a per-row relationship
+/// `MERGE … ON MATCH SET`). When `followup` is `Some`, callers stage the pair
+/// atomically via [`crate::Fluree::stage_pair_from_txns`].
+pub struct ResolvedConditional {
+    pub primary: Txn,
+    pub followup: Option<Txn>,
+}
+
+impl ResolvedConditional {
+    pub fn single(primary: Txn) -> Self {
+        Self {
+            primary,
+            followup: None,
+        }
+    }
+}
+
 /// A write that needs a pre-write probe to choose between branches.
 pub enum ConditionalCypherWrite {
     /// Single-node `MERGE` with an `ON MATCH SET` and/or trailing `SET`
@@ -59,6 +78,14 @@ pub enum ConditionalCypherWrite {
     /// SIDs), reject if so, otherwise stage the base-edge retraction (the
     /// `f:reifies*` cascade removes the bundle).
     DeleteRel(Update),
+    /// `MATCH (leading) MERGE (a)-[:T]->(b) ON MATCH SET … [ON CREATE SET …]` —
+    /// the *per-row* relationship find-or-create. Each matched row independently
+    /// matches or creates the edge, so no single statement-level branch fits.
+    /// Resolves to an ordered **pair** of Txns staged into one commit: the
+    /// `ON MATCH SET` branch (over already-existing edges) first, then the
+    /// create branch (over the absent rows). See
+    /// [`crate::Fluree::stage_pair_from_txns`] for the atomicity model.
+    MergeRelPerRowSet(Update),
 }
 
 /// Detect a write shape that requires a pre-write probe. Returns `None` for
@@ -85,14 +112,21 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
                 })
                 .flatten()
                 .collect();
-            if u.read_clauses.is_empty()
-                && conditional_merge_pattern(m)
-                && (!m.on_match.is_empty() || !trailing.is_empty())
-            {
-                Some(ConditionalCypherWrite::MergeSet {
-                    merge: m.clone(),
-                    trailing,
-                })
+            let has_conditional_set = !m.on_match.is_empty() || !trailing.is_empty();
+            if u.read_clauses.is_empty() {
+                if conditional_merge_pattern(m) && has_conditional_set {
+                    Some(ConditionalCypherWrite::MergeSet {
+                        merge: m.clone(),
+                        trailing,
+                    })
+                } else {
+                    None
+                }
+            } else if is_conditional_rel_merge(m) && has_conditional_set {
+                // Per-row relationship find-or-create with an ON MATCH SET (or a
+                // trailing SET, which applies on both branches). Resolves to an
+                // ordered pair of Txns committed atomically.
+                Some(ConditionalCypherWrite::MergeRelPerRowSet(u.clone()))
             } else {
                 None
             }
@@ -151,6 +185,91 @@ fn conditional_merge_pattern(m: &MergeClause) -> bool {
         }
         _ => false,
     }
+}
+
+/// A `conditional_merge_pattern` that is specifically a single relationship
+/// (not a bare node) — the shape the per-row `MERGE … ON MATCH SET` decomposer
+/// handles. A per-row *node* MERGE with a leading MATCH is a different (and
+/// currently unsupported) shape.
+fn is_conditional_rel_merge(m: &MergeClause) -> bool {
+    conditional_merge_pattern(m) && m.pattern.parts[0].tail.len() == 1
+}
+
+/// Build the ON MATCH branch of a per-row relationship MERGE: the leading
+/// read clauses, then a `MATCH` of the MERGE relationship pattern (binding the
+/// existing edge), then `SET <on_match ++ trailing>`. Matches only rows where
+/// the edge already exists; property writes here don't change edge existence,
+/// so the create branch's `NOT EXISTS` guard is unaffected — which is why this
+/// branch stages first.
+pub(crate) fn build_merge_per_row_on_match_ast(update: &Update, merge: &MergeClause) -> CypherAst {
+    let span = merge.span;
+    let mut items = merge.on_match.clone();
+    items.extend(trailing_set_items(update));
+
+    let mut read_clauses = update.read_clauses.clone();
+    read_clauses.push(ReadClause::Match(MatchClause {
+        pattern: merge.pattern.clone(),
+        where_clause: None,
+        span,
+    }));
+
+    CypherAst {
+        statement: Statement::Update(Update {
+            read_clauses,
+            write_clauses: vec![WriteClause::Set(SetClause { items, span })],
+            return_clause: None,
+            span,
+        }),
+        span,
+    }
+}
+
+/// Build the create branch of a per-row relationship MERGE: the original
+/// statement with the MERGE's `ON MATCH SET` cleared and any trailing `SET`
+/// folded into `ON CREATE SET` (both apply only to newly-created edges here).
+/// Lowers via the existing single-`Txn` relationship-MERGE path (leading MATCH
+/// + `NOT EXISTS` guard + create templates), which fires only on absent rows.
+pub(crate) fn build_merge_per_row_create_ast(update: &Update) -> CypherAst {
+    let span = update.span;
+    let trailing = trailing_set_items(update);
+    let write_clauses = update
+        .write_clauses
+        .iter()
+        .filter_map(|w| match w {
+            WriteClause::Merge(m) => {
+                let mut m = m.clone();
+                m.on_match.clear();
+                m.on_create.extend(trailing.iter().cloned());
+                Some(WriteClause::Merge(m))
+            }
+            // Trailing SET clauses are folded into ON CREATE SET above.
+            WriteClause::Set(_) => None,
+            other => Some(other.clone()),
+        })
+        .collect();
+
+    CypherAst {
+        statement: Statement::Update(Update {
+            read_clauses: update.read_clauses.clone(),
+            write_clauses,
+            return_clause: None,
+            span,
+        }),
+        span,
+    }
+}
+
+/// Flatten the items of any `SET` clauses trailing the MERGE.
+fn trailing_set_items(update: &Update) -> Vec<SetItem> {
+    update
+        .write_clauses
+        .iter()
+        .filter_map(|w| match w {
+            WriteClause::Set(s) => Some(s.items.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// True if `name` is bound as a *relationship* variable in any MATCH.

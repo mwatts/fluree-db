@@ -1187,14 +1187,17 @@ impl<'a> CypherLowering<'a> {
             ));
         }
         if !m.on_match.is_empty() {
-            // Standalone MERGE … ON MATCH SET resolves as a conditional write
-            // (probe-then-branch) before reaching this single-Txn lowering; a
-            // per-row form (leading MATCH) can mix create and match rows, which
-            // a statement-level branch cannot honor.
+            // MERGE … ON MATCH SET resolves as a conditional write
+            // (probe-or-branch) before reaching this single-Txn lowering:
+            // standalone MERGE probes once; a per-row *relationship* MERGE
+            // (leading MATCH) stages an ON-MATCH-SET branch and a create branch
+            // into one commit. Reaching here means an unsupported shape — a
+            // per-row *node* MERGE with ON MATCH SET, which has no relationship
+            // to partition rows on.
             return Err(LowerCypherError::unsupported(
-                "ON MATCH SET on a MERGE with a leading MATCH (per-row find-or-create) is \
-                 deferred — each row independently creates or matches, which needs per-row \
-                 branching. Standalone MERGE … ON MATCH SET is supported.",
+                "ON MATCH SET on a per-row node MERGE (a leading MATCH before a node MERGE) is \
+                 not supported. Per-row relationship MERGE … ON MATCH SET and standalone \
+                 MERGE … ON MATCH SET are supported.",
             ));
         }
 

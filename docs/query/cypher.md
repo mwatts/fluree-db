@@ -399,11 +399,16 @@ error listing the supported set.
 
   `ON CREATE SET` is supported on both forms and may target endpoint node
   variables or the relationship variable (`ON CREATE SET r.checks = 1`).
-  `ON MATCH SET` is supported on single-node `MERGE` and on **standalone**
+  `ON MATCH SET` is supported on single-node `MERGE`, on **standalone**
   relationship `MERGE` (resolved by probing the current writer state, then
-  staging either branch); on the per-row form (leading `MATCH`) it stays
-  deferred — each row independently creates or matches, which a
-  statement-level branch cannot honor.
+  staging either branch), and on the **per-row** relationship form (leading
+  `MATCH`). The per-row form decomposes into two branches over the same
+  leading `MATCH` — an `ON MATCH SET` over the rows whose edge already exists,
+  then a create (`ON CREATE SET`) over the rows whose edge is absent — staged
+  into a **single atomic commit** (either both branches publish, or an error
+  returns with nothing committed). `ON MATCH SET` on a per-row *node* MERGE
+  (leading `MATCH` before a node `MERGE`) stays deferred — there is no
+  relationship to partition the rows on.
 
   A single-node or standalone relationship `MERGE` also takes trailing `SET`
   clauses, which apply on *both* branches — the standard upsert idiom:

@@ -159,8 +159,8 @@ impl Fluree {
                 skolem_txn_id.clone(),
             )
             .await?;
-        let lowered = match plan {
-            WritePlan::Single(t) => *t,
+        let resolved = match plan {
+            WritePlan::Single(t) => cypher_write::ResolvedConditional::single(*t),
             WritePlan::Conditional(cw) => {
                 // Policy-wrap the branch-choosing probe (mirrors the
                 // consensus committer's `resolve_cypher_under_lock`): a
@@ -193,15 +193,28 @@ impl Fluree {
 
         let index_config = crate::server_defaults::default_index_config();
         let tracker = Tracker::disabled();
-        let stage_result = self
-            .stage_transaction_from_txn(
+        let stage_result = if let Some(followup) = resolved.followup {
+            // Per-row relationship MERGE … ON MATCH SET: stage both branches into
+            // this statement's single pending commit.
+            self.stage_pair_from_txns(
                 txn.state.clone(),
-                lowered,
+                resolved.primary,
+                followup,
                 Some(&index_config),
                 policy.as_ref(),
                 Some(&tracker),
             )
-            .await?;
+            .await?
+        } else {
+            self.stage_transaction_from_txn(
+                txn.state.clone(),
+                resolved.primary,
+                Some(&index_config),
+                policy.as_ref(),
+                Some(&tracker),
+            )
+            .await?
+        };
         let crate::StageResult {
             view,
             ns_registry,

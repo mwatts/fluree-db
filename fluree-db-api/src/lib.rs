@@ -3574,8 +3574,10 @@ impl Fluree {
                 skolem_txn_id.clone(),
             )
             .await?;
-        let txn = match plan {
-            crate::cypher_write::WritePlan::Single(txn) => *txn,
+        let resolved = match plan {
+            crate::cypher_write::WritePlan::Single(txn) => {
+                crate::cypher_write::ResolvedConditional::single(*txn)
+            }
             crate::cypher_write::WritePlan::Conditional(cw) => {
                 // Unwrapped probe: this method has no policy. See the method doc.
                 let probe = GraphDb::from_ledger_state(&ledger);
@@ -3583,7 +3585,11 @@ impl Fluree {
                     .await?
             }
         };
-        let result = self.stage_owned(ledger).txn(txn).execute().await?;
+        let mut builder = self.stage_owned(ledger).txn(resolved.primary);
+        if let Some(followup) = resolved.followup {
+            builder = builder.txn_followup(followup);
+        }
+        let result = builder.execute().await?;
 
         let rows = match (&return_plan, &skolem_txn_id) {
             (Some(plan), Some(id)) => {
@@ -3655,8 +3661,9 @@ impl Fluree {
         probe_view: GraphDb,
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
-    ) -> Result<fluree_db_transact::ir::Txn> {
+    ) -> Result<crate::cypher_write::ResolvedConditional> {
         use crate::cypher_write::ConditionalCypherWrite;
+        use crate::cypher_write::ResolvedConditional;
         // Attach the ledger's default context so the probe resolves bare
         // identifiers the same way the write does.
         let default_context = match self.get_default_context(ledger_id).await {
@@ -3693,8 +3700,45 @@ impl Fluree {
                 } else {
                     crate::cypher_write::build_create_ast(merge, trailing)
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
+            }
+            ConditionalCypherWrite::MergeRelPerRowSet(update) => {
+                // Per-row relationship find-or-create with ON MATCH SET. Decompose
+                // into two branches over the same leading MATCH, staged into one
+                // commit: the ON MATCH SET over already-existing edges FIRST (it
+                // only mutates properties, never edge existence), then the create
+                // branch over the absent rows (its NOT EXISTS guard is thus
+                // unaffected by the first branch). No probe needed — each branch's
+                // guard partitions the rows.
+                let merge = update
+                    .write_clauses
+                    .iter()
+                    .find_map(|w| match w {
+                        fluree_db_cypher::ast::WriteClause::Merge(m) => Some(m),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        ApiError::cypher(
+                            "per-row MERGE plan has no MERGE clause".to_string(),
+                            Vec::new(),
+                        )
+                    })?;
+                let on_match_ast =
+                    crate::cypher_write::build_merge_per_row_on_match_ast(update, merge);
+                let create_ast = crate::cypher_write::build_merge_per_row_create_ast(update);
+                let primary = self
+                    .lower_cypher_ast_to_txn(&on_match_ast, ledger_id, snapshot)
+                    .await?;
+                let followup = self
+                    .lower_cypher_ast_to_txn(&create_ast, ledger_id, snapshot)
+                    .await?;
+                Ok(ResolvedConditional {
+                    primary,
+                    followup: Some(followup),
+                })
             }
             ConditionalCypherWrite::DeleteNode(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3736,8 +3780,10 @@ impl Fluree {
                 // No relationships → the node retraction is identical to
                 // DETACH DELETE.
                 let ast = crate::cypher_write::build_detach_delete_ast(update);
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
             }
             ConditionalCypherWrite::DeleteRel(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3790,8 +3836,10 @@ impl Fluree {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
             }
         }
     }

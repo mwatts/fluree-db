@@ -9180,3 +9180,118 @@ async fn cypher_keyword_alias_names_output_column_and_binds_downstream() {
     assert_eq!(cj["results"][0]["columns"], json!(["count"]), "{cj}");
     assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(1), "{cj}");
 }
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_per_row_on_match_set() {
+    // Per-row relationship MERGE where the rows split across both branches:
+    // ON MATCH SET fires on the pre-existing edge, ON CREATE SET on the newly
+    // created one — atomically, in a single commit.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-per-row-onmatch");
+
+    // Seed Alice, Bob, Carol and one existing Alice-KNOWS->Bob edge.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                      (c:Person {name: "Carol"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let seed_t = l.t();
+
+    // MERGE Alice→(everyone else): Alice->Bob already exists (ON MATCH), Alice->
+    // Carol is missing (ON CREATE). One statement, one commit.
+    let result = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}), (b:Person) WHERE b.name <> "Alice"
+               MERGE (a)-[:KNOWS]->(b)
+               ON CREATE SET b.tag = "created"
+               ON MATCH SET b.tag = "matched""#,
+        )
+        .await
+        .expect("per-row merge with on-match/on-create");
+
+    assert_eq!(
+        result.ledger.t(),
+        seed_t + 1,
+        "the two branches publish as a single commit (t advances by exactly one)"
+    );
+
+    let db = graphdb_from_ledger(&result.ledger);
+
+    // Exactly two edges: the pre-existing Alice->Bob plus the created Alice->Carol.
+    let edges = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+               RETURN b.name AS name, b.tag AS tag ORDER BY name"#,
+        )
+        .await
+        .expect("edges")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        edges,
+        json!([["Bob", "matched"], ["Carol", "created"]]),
+        "ON MATCH tags the pre-existing edge's endpoint; ON CREATE tags the new one: {edges}"
+    );
+
+    // Alice was never a MERGE tail, so it carries no tag.
+    let alice_tagged = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}) WHERE a.tag IS NOT NULL RETURN a"#,
+        )
+        .await
+        .expect("alice")
+        .row_count();
+    assert_eq!(
+        alice_tagged, 0,
+        "the head endpoint is untouched by either branch"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_per_row_on_match_only_all_existing() {
+    // When every matched row already has the edge, only ON MATCH SET fires and
+    // no new edges are created — still a single commit.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-per-row-onmatch-only");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+               MERGE (a)-[:KNOWS]->(b)
+               ON CREATE SET b.tag = "created"
+               ON MATCH SET b.tag = "matched""#,
+        )
+        .await
+        .expect("per-row merge all-existing")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person) RETURN b.tag AS tag"#,
+        )
+        .await
+        .expect("rows")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(rows, json!([["matched"]]), "only ON MATCH fired: {rows}");
+}
