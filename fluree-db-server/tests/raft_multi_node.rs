@@ -1145,6 +1145,11 @@ async fn liveness_monitor_demotes_killed_follower() {
         unreachable_after: Duration::from_millis(500),
         live_after: Duration::from_millis(200),
         refusal_backoff: Duration::from_millis(300),
+        // Tiny lag window so the frozen follower trips within a
+        // sample or two of the modest (~10-writes/s) progress loop —
+        // any real gap counts as behind. (Production uses the far
+        // larger DEFAULT_MAX_HEALTHY_LAG so normal pipelining is fine.)
+        max_healthy_lag: 1,
     };
     let mut cluster = TestCluster::spawn_with_liveness(CLUSTER_SIZE, liveness_config).await;
     cluster.bootstrap().await;
