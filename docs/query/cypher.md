@@ -371,6 +371,15 @@ error listing the supported set.
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
+- **`FOREACH`** — unroll a write over a **constant** list (inline literal,
+  constant `range()`, or a `$param` array), running a `CREATE` / `SET` /
+  `REMOVE` body per element:
+  ```cypher
+  FOREACH (n IN range(1, 3) | CREATE (:Ping {n: n}))
+  ```
+  Bodies unroll at parse time (≤ 10000 iterations; same-property `SET` is
+  last-wins). Deferred: runtime lists (e.g. a collected list) and
+  `MERGE` / `DELETE` / nested `FOREACH` bodies.
 - **`MERGE`** — find-or-create for a single node
   (`MERGE (n:Person {name: "Alice"})`) or a single relationship path, in two
   forms:
@@ -474,6 +483,21 @@ let committed = fluree
     )
     .await?;
 ```
+
+To **bulk-load a CSV**, use the CLI's [`fluree load`](../cli/load.md) — Fluree's
+`LOAD CSV` analog. It reads the file client-side and streams it as batched
+per-row upserts, one commit per batch. Each row binds as `row` inside
+`UNWIND $batch AS row …` (`--cypher`), or the batch is injected as an update's
+`values` clause (`--jsonld`):
+
+```bash
+fluree load people --from people.csv \
+  --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
+```
+
+The same per-row upsert shape works directly on the transact API:
+`UNWIND $batch AS row MERGE (n:Person {id: row.id}) SET n.name = row.name`, with
+`$batch` a parameter array of row maps.
 
 Writes default to LPG mode, where every relationship reifies (carries an
 annotation identity). See [Edge annotations](../concepts/edge-annotations.md) for the RDF
