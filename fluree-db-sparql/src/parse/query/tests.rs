@@ -2667,3 +2667,58 @@ fn test_v1_missing_dot_between_triples_rejected() {
         "expected '.' between triple patterns",
     );
 }
+
+// =========================================================================
+// V2: FILTER requires a Constraint (W3C filter-missing-parens)
+// =========================================================================
+
+#[test]
+fn test_v2_filter_constraint_forms_still_parse() {
+    // BrackettedExpression
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER (?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER (?o > 5) }");
+    // BuiltInCall
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER bound(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER regex(?o, \"x\") }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER isIRI(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER EXISTS { ?o ?q ?v } }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER NOT EXISTS { ?o ?q ?v } }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER IF(?o, true, false) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER COALESCE(?o, false) }");
+    // FunctionCall (extension function by IRI / prefixed name)
+    assert_parses(
+        "PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:f(?o) }",
+    );
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER <http://example.org/f>(?o) }");
+}
+
+#[test]
+fn test_v2_filter_bare_term_rejected() {
+    // W3C filter-missing-parens: a bare Var is not a Constraint.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER ?x }",
+        "FILTER requires a bracketted expression",
+    );
+    // Bare literals and IRIs are not Constraints either.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER true }",
+        "FILTER requires a bracketted expression",
+    );
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:c }",
+        "FILTER requires a bracketted expression",
+    );
+}
+
+#[test]
+fn test_v2_filter_unparenthesized_operator_expression_rejected() {
+    // Relational / boolean operator expressions need the parens too.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER ?o > 5 }",
+        "FILTER requires a bracketted expression",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER !bound(?o) }",
+        "FILTER requires a bracketted expression",
+    );
+}

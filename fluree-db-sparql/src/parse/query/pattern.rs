@@ -9,6 +9,33 @@ use crate::span::SourceSpan;
 
 use super::expr::parse_expression;
 
+/// Grammar predicate for `Constraint ::= BrackettedExpression | BuiltInCall
+/// | FunctionCall`, mapped onto the expression AST after parsing.
+///
+/// `Bracketed` is the BrackettedExpression alternative. `FunctionCall`,
+/// `If`, `Coalesce`, `Exists`, `NotExists`, and `Aggregate` cover the
+/// BuiltInCall alternatives (an aggregate in FILTER is grammatically a
+/// BuiltInCall — rejecting it there is a semantic-validation concern, not a
+/// parse error) plus extension-function calls. Everything else — bare
+/// variables, literals, IRIs, and unparenthesized unary/binary operator
+/// expressions — is not a Constraint.
+///
+/// PR-1's P5b (bare Constraint as an ORDER BY condition) admits the same
+/// alternatives; keep the two aligned if either changes.
+fn is_constraint_expression(expr: &crate::ast::Expression) -> bool {
+    use crate::ast::Expression;
+    matches!(
+        expr,
+        Expression::Bracketed { .. }
+            | Expression::FunctionCall { .. }
+            | Expression::If { .. }
+            | Expression::Coalesce { .. }
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::Aggregate { .. }
+    )
+}
+
 impl super::Parser<'_> {
     /// Parse a WHERE clause.
     pub(super) fn parse_where_clause(&mut self) -> Option<WhereClause> {
@@ -418,6 +445,20 @@ impl super::Parser<'_> {
         // Parse the filter expression
         match parse_expression(self.stream) {
             Ok(expr) => {
+                // Filter ::= 'FILTER' Constraint
+                // Constraint ::= BrackettedExpression | BuiltInCall | FunctionCall
+                // A bare variable, literal, IRI, or unparenthesized operator
+                // expression (`FILTER ?x`, `FILTER ?x > 5`) is not a
+                // Constraint (V2, W3C filter-missing-parens). The Filter
+                // pattern is still produced for tooling; the error-severity
+                // diagnostic makes the parse authoritative-fail at the API.
+                if !is_constraint_expression(&expr) {
+                    self.stream.error_at(
+                        "FILTER requires a bracketted expression, built-in call, or \
+                         function call — wrap the expression in parentheses: FILTER(...)",
+                        expr.span(),
+                    );
+                }
                 let span = start.union(self.stream.previous_span());
                 Some(GraphPattern::Filter { expr, span })
             }
