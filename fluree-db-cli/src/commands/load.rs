@@ -1,13 +1,18 @@
-//! `fluree load` — stream a local CSV into a ledger as batched per-row Cypher
-//! upserts (the `LOAD CSV` analog).
+//! `fluree load` — stream a local CSV into a ledger as batched per-row upserts
+//! (the `LOAD CSV` analog).
 //!
 //! The CLI is the component that actually holds the file, so it reads the CSV
 //! locally, batches the rows, and sends each batch to the ledger — local or
-//! remote — as one `UNWIND $batch AS row <template>` transaction (one commit
-//! per batch). This sidesteps server-side file access entirely: the server
-//! only ever receives ordinary parameterized Cypher writes. Rows are maps
-//! keyed by CSV column; every value is a string (cast in the template with
-//! `toInteger()` / `toFloat()`), and an empty cell is `null`.
+//! remote — as one transaction (one commit per batch). This sidesteps
+//! server-side file access entirely: the server only ever receives ordinary
+//! parameterized Cypher writes or JSON-LD updates.
+//!
+//! Two template languages, same batch:
+//! - `--cypher`: the per-row body rides in `UNWIND $batch AS row <template>`;
+//!   columns are read as `row.<column>`. Empty cell → `null`.
+//! - `--jsonld`: the batch is injected as the update's `values` clause, one
+//!   `?<column>` variable per CSV column. Empty cell → `""` (the JSON-LD
+//!   `values` parser rejects nulls).
 
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
@@ -15,11 +20,47 @@ use fluree_db_api::server_defaults::FlureeDir;
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
+/// The per-row write, in one of the two supported template languages.
+pub enum Template {
+    /// Cypher body wrapped as `UNWIND $batch AS row <body>`.
+    Cypher(String),
+    /// A JSON-LD update object; the batch is injected as its `values` clause.
+    JsonLd(Value),
+}
+
+impl Template {
+    /// Resolve the mutually-exclusive `--cypher` / `--jsonld` flags. clap's arg
+    /// group already rejects passing both; this enforces that exactly one is
+    /// present and parses the JSON-LD body up front.
+    pub fn from_flags(cypher: Option<String>, jsonld: Option<String>) -> CliResult<Self> {
+        match (cypher, jsonld) {
+            (Some(c), None) => Ok(Template::Cypher(c)),
+            (None, Some(j)) => {
+                let obj = serde_json::from_str::<Value>(&j)
+                    .map_err(|e| CliError::Usage(format!("--jsonld is not valid JSON: {e}")))?;
+                if !obj.is_object() {
+                    return Err(CliError::Usage(
+                        "--jsonld must be a JSON-LD update object (with where/insert/delete)"
+                            .into(),
+                    ));
+                }
+                Ok(Template::JsonLd(obj))
+            }
+            (None, None) => Err(CliError::Usage(
+                "provide the per-row template with --cypher or --jsonld".into(),
+            )),
+            (Some(_), Some(_)) => Err(CliError::Usage(
+                "pass only one of --cypher or --jsonld".into(),
+            )),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     ledger_flag: Option<&str>,
     from: &Path,
-    template: &str,
+    template: Template,
     batch_size: usize,
     field_terminator: &str,
     dirs: &FlureeDir,
@@ -30,11 +71,6 @@ pub async fn run(
         return Err(CliError::Usage("--batch-size must be at least 1".into()));
     }
     let delimiter = single_byte_delimiter(field_terminator)?;
-
-    // Wrap the per-row template. The batch rides in as the `$batch` parameter;
-    // `UNWIND … AS row` binds one row map at a time, exactly like `LOAD CSV …
-    // AS row`.
-    let wrapped = format!("UNWIND $batch AS row\n{template}");
 
     // Resolve where the write lands: explicit --remote, or the local ledger
     // (auto-routed to a running local server unless --direct), mirroring
@@ -61,27 +97,21 @@ pub async fn run(
             let mut reader = csv_reader(from, delimiter)?;
             let headers = header_row(&mut reader)?;
             let (mut total, mut commits) = (0usize, 0usize);
-            let mut batch: Vec<Value> = Vec::with_capacity(batch_size);
+            let mut rows: Vec<csv::StringRecord> = Vec::with_capacity(batch_size);
             for record in reader.records() {
-                batch.push(record_to_row(&headers, &record.map_err(csv_err)?));
-                if batch.len() >= batch_size {
-                    let params = json!({ "batch": std::mem::take(&mut batch) });
-                    client
-                        .update_cypher(&remote_alias, &wrapped, params.as_object())
-                        .await?;
+                rows.push(record.map_err(csv_err)?);
+                if rows.len() >= batch_size {
+                    send_remote(&client, &remote_alias, &template, &headers, &rows).await?;
                     commits += 1;
-                    total += batch_len(&params);
+                    total += rows.len();
                     report_progress(total);
-                    batch = Vec::with_capacity(batch_size);
+                    rows.clear();
                 }
             }
-            if !batch.is_empty() {
-                let params = json!({ "batch": batch });
-                client
-                    .update_cypher(&remote_alias, &wrapped, params.as_object())
-                    .await?;
+            if !rows.is_empty() {
+                send_remote(&client, &remote_alias, &template, &headers, &rows).await?;
                 commits += 1;
-                total += batch_len(&params);
+                total += rows.len();
             }
             context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
             println!("Loaded {total} rows into `{remote_alias}` in {commits} commit(s)");
@@ -91,35 +121,131 @@ pub async fn run(
             let mut reader = csv_reader(from, delimiter)?;
             let headers = header_row(&mut reader)?;
             let (mut total, mut commits) = (0usize, 0usize);
-            let mut batch: Vec<Value> = Vec::with_capacity(batch_size);
+            let mut rows: Vec<csv::StringRecord> = Vec::with_capacity(batch_size);
             for record in reader.records() {
-                batch.push(record_to_row(&headers, &record.map_err(csv_err)?));
-                if batch.len() >= batch_size {
-                    let params = json!({ "batch": std::mem::take(&mut batch) });
-                    let result = fluree
-                        .transact_cypher_with_params(ledger, &wrapped, params.as_object())
-                        .await?;
-                    ledger = result.ledger;
+                rows.push(record.map_err(csv_err)?);
+                if rows.len() >= batch_size {
+                    ledger = send_local(&fluree, ledger, &template, &headers, &rows).await?;
                     commits += 1;
-                    total += batch_len(&params);
+                    total += rows.len();
                     report_progress(total);
-                    batch = Vec::with_capacity(batch_size);
+                    rows.clear();
                 }
             }
-            if !batch.is_empty() {
-                let params = json!({ "batch": batch });
-                let result = fluree
-                    .transact_cypher_with_params(ledger, &wrapped, params.as_object())
-                    .await?;
+            if !rows.is_empty() {
+                ledger = send_local(&fluree, ledger, &template, &headers, &rows).await?;
                 commits += 1;
-                total += batch_len(&params);
-                let _ = result;
+                total += rows.len();
             }
+            let _ = ledger;
             println!("Loaded {total} rows into `{alias}` in {commits} commit(s)");
         }
     }
 
     Ok(())
+}
+
+/// Send one batch to a remote ledger via the update endpoint.
+async fn send_remote(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    template: &Template,
+    headers: &[String],
+    rows: &[csv::StringRecord],
+) -> CliResult<()> {
+    match template {
+        Template::Cypher(body) => {
+            let wrapped = wrap_cypher(body);
+            let params = json!({ "batch": cypher_batch(headers, rows) });
+            client
+                .update_cypher(ledger, &wrapped, params.as_object())
+                .await?;
+        }
+        Template::JsonLd(obj) => {
+            let update = jsonld_with_values(obj, headers, rows);
+            client.update_jsonld(ledger, &update).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Send one batch to the local ledger, returning the advanced ledger state.
+async fn send_local(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    template: &Template,
+    headers: &[String],
+    rows: &[csv::StringRecord],
+) -> CliResult<fluree_db_api::LedgerState> {
+    match template {
+        Template::Cypher(body) => {
+            let wrapped = wrap_cypher(body);
+            let params = json!({ "batch": cypher_batch(headers, rows) });
+            let result = fluree
+                .transact_cypher_with_params(ledger, &wrapped, params.as_object())
+                .await?;
+            Ok(result.ledger)
+        }
+        Template::JsonLd(obj) => {
+            let update = jsonld_with_values(obj, headers, rows);
+            let result = fluree.stage_owned(ledger).update(&update).execute().await?;
+            Ok(result.ledger)
+        }
+    }
+}
+
+/// Wrap a per-row Cypher body so the batch rides in as `$batch` and each row
+/// binds as `row`, exactly like `LOAD CSV … AS row`.
+fn wrap_cypher(body: &str) -> String {
+    format!("UNWIND $batch AS row\n{body}")
+}
+
+/// The `$batch` parameter for a Cypher load: one map per row, keyed by column.
+/// Empty cell → `null` (Neo4j-faithful).
+fn cypher_batch(headers: &[String], rows: &[csv::StringRecord]) -> Value {
+    Value::Array(
+        rows.iter()
+            .map(|record| {
+                let mut obj = Map::with_capacity(headers.len());
+                for (header, cell) in headers.iter().zip(record.iter()) {
+                    let value = if cell.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(cell.to_string())
+                    };
+                    obj.insert(header.clone(), value);
+                }
+                Value::Object(obj)
+            })
+            .collect(),
+    )
+}
+
+/// Clone the JSON-LD update template and inject the batch as its `values`
+/// clause: `[["?col1", …], [[cells…], …]]`, one `?<column>` variable per CSV
+/// column. Empty cell → `""` (the `values` parser rejects nulls).
+fn jsonld_with_values(template: &Value, headers: &[String], rows: &[csv::StringRecord]) -> Value {
+    let vars: Vec<Value> = headers.iter().map(|h| json!(format!("?{h}"))).collect();
+    let value_rows: Vec<Value> = rows
+        .iter()
+        .map(|record| {
+            let cells: Vec<Value> = headers
+                .iter()
+                .enumerate()
+                .map(|(i, _)| Value::String(record.get(i).unwrap_or("").to_string()))
+                .collect();
+            Value::Array(cells)
+        })
+        .collect();
+
+    let mut update = template.clone();
+    if let Some(obj) = update.as_object_mut() {
+        obj.insert(
+            "values".to_string(),
+            Value::Array(vec![Value::Array(vars), Value::Array(value_rows)]),
+        );
+    }
+    update
 }
 
 /// One CSV field delimiter byte. Cypher/CSV field terminators are single
@@ -151,28 +277,6 @@ fn header_row(reader: &mut csv::Reader<std::fs::File>) -> CliResult<Vec<String>>
         ));
     }
     Ok(headers.iter().map(str::to_string).collect())
-}
-
-/// One CSV record → a `row` map: each column keyed to its cell as a string
-/// (empty → `null`, matching Neo4j `LOAD CSV`).
-fn record_to_row(headers: &[String], record: &csv::StringRecord) -> Value {
-    let mut obj = Map::with_capacity(headers.len());
-    for (header, cell) in headers.iter().zip(record.iter()) {
-        let value = if cell.is_empty() {
-            Value::Null
-        } else {
-            Value::String(cell.to_string())
-        };
-        obj.insert(header.clone(), value);
-    }
-    Value::Object(obj)
-}
-
-fn batch_len(params: &Value) -> usize {
-    params
-        .get("batch")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
 }
 
 fn report_progress(total: usize) {

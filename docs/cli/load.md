@@ -17,10 +17,13 @@ fluree load [LEDGER] --from <FILE.csv> --cypher <TEMPLATE> [OPTIONS]
 
 ## Options
 
+Provide the per-row template with **exactly one** of `--cypher` or `--jsonld`.
+
 | Option | Description |
 |--------|-------------|
 | `--from <PATH>` | CSV file to read (required). The first line must be a header row naming the columns. |
-| `--cypher <TEMPLATE>` | Per-row Cypher template (required). Each row is bound as `row`, a map keyed by CSV column; reference cells as `row.<column>`. |
+| `--cypher <TEMPLATE>` | Per-row Cypher template. Each row is bound as `row`, a map keyed by CSV column; reference cells as `row.<column>`. |
+| `--jsonld <TEMPLATE>` | Per-row JSON-LD update. The batch is injected as the update's `values` clause, binding one `?<column>` variable per CSV column; reference them in `where` / `insert` / `delete`. |
 | `--batch-size <N>` | Rows per commit (default `1000`). Each batch is one transaction / one commit. |
 | `--field-terminator <CHAR>` | CSV field delimiter (default `,`). Single character. |
 | `--remote <NAME>` | Load into a ledger on a remote server instead of locally. |
@@ -29,24 +32,49 @@ fluree load [LEDGER] --from <FILE.csv> --cypher <TEMPLATE> [OPTIONS]
 
 Unlike Neo4j's `LOAD CSV`, the file is never handed to the server — the CLI
 holds the file, so it reads and parses the CSV **client-side**, groups rows into
-batches, and sends each batch to the ledger as a single transaction:
+batches, and sends each batch to the ledger as a single transaction (one commit
+per batch). The server only ever receives ordinary parameterized writes — no
+server-side file access, no import directory, no URL fetching.
+
+There is no transactionality across batches: a mid-load failure leaves earlier
+batches committed. Writes route the same way as `fluree update`: to the local
+ledger by default (auto-forwarded to a running local server unless `--direct`),
+or to a named remote with `--remote`.
+
+Every cell arrives as a **string**. An empty cell is `null` under `--cypher`
+(matching Neo4j) and `""` under `--jsonld` (the JSON-LD `values` clause rejects
+nulls).
+
+### Cypher template (`--cypher`)
+
+Each batch is wrapped and sent as one Cypher transaction:
 
 ```cypher
 UNWIND $batch AS row
 <your --cypher template>
 ```
 
-The `$batch` parameter carries that batch's rows; `UNWIND … AS row` binds one row
-map at a time, exactly like `LOAD CSV … AS row`. The server only ever receives
-ordinary parameterized Cypher writes — no server-side file access, no import
-directory, no URL fetching.
+The `$batch` parameter carries that batch's rows; `UNWIND … AS row` binds one
+row map at a time, exactly like `LOAD CSV … AS row`. Columns are read as
+`row.<column>`; cast with `toInteger(row.age)`, `toFloat(row.score)`, etc.
 
-Every cell arrives as a **string**; an empty cell is `null` (matching Neo4j).
-Cast in the template with `toInteger(row.age)`, `toFloat(row.score)`, etc.
+### JSON-LD template (`--jsonld`)
 
-Writes route the same way as `fluree update`: to the local ledger by default
-(auto-forwarded to a running local server unless `--direct`), or to a named
-remote with `--remote`.
+The template is an ordinary JSON-LD update. The CLI injects the batch as its
+`values` clause — one `?<column>` variable per CSV column — and the template
+references those variables:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "where":  {"@id": "?s", "ex:id": "?id"},
+  "insert": {"@id": "?s", "ex:email": "?email"}
+}
+```
+
+Loaded against a CSV with `id,email` columns, this matches each subject by its
+`ex:id` and adds an `ex:email`. The injected `values` clause is equivalent to
+writing `"values": [["?id","?email"], [["1","a@x"], ["2","b@x"]]]` by hand.
 
 ### Upsert semantics
 
@@ -65,9 +93,13 @@ same file twice and the second run is a no-op update, not a duplicate.
 ## Examples
 
 ```bash
-# Upsert people from a CSV keyed by id
+# Upsert people from a CSV keyed by id (Cypher template)
 fluree load people --from people.csv \
   --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name, n.age = toInteger(row.age)'
+
+# JSON-LD template: match each subject by ex:id and add an ex:email
+fluree load folks --from emails.csv \
+  --jsonld '{"@context":{"ex":"http://example.org/"},"where":{"@id":"?s","ex:id":"?id"},"insert":{"@id":"?s","ex:email":"?email"}}'
 
 # Tab-separated, 5000 rows per commit
 fluree load metrics --from metrics.tsv --field-terminator '\t' --batch-size 5000 \

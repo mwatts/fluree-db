@@ -243,15 +243,17 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             ledger,
             from,
             cypher,
+            jsonld,
             batch_size,
             field_terminator,
             remote,
         } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
+            let template = commands::load::Template::from_flags(cypher, jsonld)?;
             commands::load::run(
                 ledger.as_deref(),
                 &from,
-                &cypher,
+                template,
                 batch_size,
                 &field_terminator,
                 &fluree_dir,

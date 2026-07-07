@@ -531,19 +531,24 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher template.
+    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD
+    /// template (the `LOAD CSV` analog).
     ///
     /// Reads the CSV locally and streams it to the ledger — local or remote —
-    /// as batched `UNWIND $batch AS row <template>` transactions (the `LOAD
-    /// CSV` analog). Each row is a map keyed by CSV column; all values are
-    /// strings, so cast in the template with `toInteger()` / `toFloat()`.
-    /// Empty cells are `null`.
+    /// one batch per transaction (one commit each). All cell values are
+    /// strings; cast in the template as needed. An empty cell is `null` for
+    /// `--cypher` and `""` for `--jsonld`.
+    ///
+    /// With `--cypher`, the per-row body rides in `UNWIND $batch AS row …` and
+    /// columns are read as `row.<column>`. With `--jsonld`, the batch is
+    /// injected as the update's `values` clause and columns are bound to
+    /// `?<column>` variables.
     ///
     /// Examples:
     ///   fluree load people --from people.csv \
     ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
-    ///   fluree load people --from people.csv --remote origin \
-    ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.age = toInteger(row.age)'
+    ///   fluree load people --from people.csv \
+    ///     --jsonld '{"where":{"@id":"?s","ex:id":"?id"},"insert":{"@id":"?s","ex:name":"?name"}}'
     Load {
         /// Ledger name (defaults to the active ledger).
         ledger: Option<String>,
@@ -553,8 +558,13 @@ pub enum Commands {
         from: PathBuf,
 
         /// Per-row Cypher, using `row` (wrapped in `UNWIND $batch AS row …`).
-        #[arg(long)]
-        cypher: String,
+        #[arg(long, group = "load_template")]
+        cypher: Option<String>,
+
+        /// Per-row JSON-LD update; the batch is injected as its `values`
+        /// clause, binding one `?<column>` variable per CSV column.
+        #[arg(long, group = "load_template")]
+        jsonld: Option<String>,
 
         /// Rows per transaction (one commit each).
         #[arg(long, default_value_t = 1000)]

@@ -282,6 +282,75 @@ independent of `t` — the value of `--at --explain` is in honoring the
 contract and consistency with the query path, not in producing
 materially different plans.
 
+### `fluree load` (CSV → batched upserts), `fluree update --format cypher`
+
+`fluree load` streams a local CSV into a ledger as a sequence of batched
+upserts. **No new endpoint is required** — every batch is an ordinary write to
+the existing ledger-scoped update endpoint:
+
+- `POST {api_base_url}/update/{ledger}`
+
+The CLI holds the file: it reads and parses the CSV client-side, groups rows
+into batches (`--batch-size`, default 1000), and sends **one request per
+batch**, each committing independently. The server never receives the CSV, a
+file path, or a URL — only ordinary parameterized writes. There is no
+transactionality across batches; a mid-load failure leaves earlier batches
+committed.
+
+The per-row template is either Cypher or JSON-LD, which selects the request
+content type:
+
+**Cypher template (`--cypher`, and `fluree update --format cypher`):**
+
+```
+POST {api_base_url}/update/{ledger}
+Content-Type: application/cypher
+
+{ "cypher": "UNWIND $batch AS row\nMERGE (n:Person {id: row.id}) SET n.name = row.name",
+  "params": { "batch": [ {"id":"1","name":"Alice"}, {"id":"2","name":"Bob"} ] } }
+```
+
+- The server must detect Cypher by content type — the reference server matches
+  `application/cypher` **or** `application/opencypher`
+  (`FlureeHeaders::is_cypher_query`).
+- The body is the `{cypher, params}` envelope (the Neo4j-HTTP shape). A body
+  that isn't a JSON object with a `cypher` key is treated as **raw Cypher text**
+  with no params, so plain-text Cypher also works. The reference server splits
+  it with `fluree_db_api::extract_cypher_envelope` and executes via
+  `execute_cypher_transact`.
+- **Cypher writes must be ledger-scoped.** The connection-scoped
+  `POST /update` (no `{ledger}` in the path) rejects Cypher with `400` because
+  it can't resolve a target ledger — the CLI always targets the ledger-scoped
+  route.
+- The `$batch` parameter and the `UNWIND $batch AS row …` wrapper are
+  constructed entirely client-side; the server just substitutes `$param`
+  references and runs the statement. Empty CSV cells arrive as JSON `null`.
+
+**JSON-LD template (`--jsonld`):**
+
+```
+POST {api_base_url}/update/{ledger}
+Content-Type: application/json
+
+{ "@context": {"ex": "http://example.org/"},
+  "where":  {"@id": "?s", "ex:id": "?id"},
+  "insert": {"@id": "?s", "ex:email": "?email"},
+  "values": [ ["?id", "?email"], [ ["1","alice@ex.org"], ["2","bob@ex.org"] ] ] }
+```
+
+- This is an ordinary JSON-LD update — identical to `fluree update` with a
+  JSON-LD body. The CLI injects the batch as the update's `values` clause, one
+  `?<column>` variable per CSV column; the template author references those
+  variables in `where` / `insert` / `delete`. Empty CSV cells arrive as `""`
+  (the JSON-LD `values` parser rejects nulls).
+- No special handling beyond the existing JSON-LD update path.
+
+**Auth, policy, and tracking** ride exactly as for `fluree update` above: normal
+write auth (`can_write(ledger)`), and the [Policy Enforcement
+Contract](#policy-enforcement-contract) headers (plus JSON-LD body `opts` for
+the JSON-LD template). A server that already implements `POST /update/{ledger}`
+for `fluree update` supports `fluree load` with no additional work.
+
 ### `fluree multi-query`
 
 - `POST {api_base_url}/multi-query`
