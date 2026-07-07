@@ -566,6 +566,19 @@ vocab-resolved IRIs are different identifiers. Adding `@vocab` to a
 ledger whose data was written bare (or vice versa) changes what Cypher
 statements match.
 
+### Identifiers and keywords
+
+Keyword tokens (`count`, `end`, `order`, `limit`, `all`, …) are accepted
+as binding names — both as aliases (`RETURN n.name AS end`,
+`WITH count(*) AS count`, `UNWIND xs AS end`, `YIELD col AS type`) and
+when referenced downstream as plain variables
+(`WITH count(*) AS count WHERE count > 5 RETURN count`). This is a
+deliberate leniency over strict openCypher, which reserves these words
+and requires backticking (`` AS `count` ``) — backticked identifiers are
+also accepted. The dedicated meanings win where a keyword is followed by
+its delimiter: `count(*)`, `exists { … }`, and `all(x IN … )` still
+parse as their constructs.
+
 ## See also
 
 - [Edge annotations (concept)](../concepts/edge-annotations.md) — the storage primitive

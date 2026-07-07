@@ -226,7 +226,7 @@ fn parse_unwind(s: &mut TokenStream) -> Result<UnwindClause, Diagnostic> {
     let start = s.expect(&TokenKind::Unwind)?;
     let expr = parse_expr(s)?;
     s.expect(&TokenKind::As)?;
-    let alias = parse_var(s)?;
+    let alias = parse_binding_name(s)?;
     let end = alias.span;
     Ok(UnwindClause {
         expr,
@@ -393,7 +393,7 @@ fn parse_procedure_call(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                 let span = s.peek_span();
                 let column = parse_ident_or_keyword(s)?;
                 let alias = if s.eat(&TokenKind::As).is_some() {
-                    Some(parse_var(s)?)
+                    Some(parse_binding_name(s)?)
                 } else {
                     None
                 };
@@ -507,7 +507,7 @@ fn parse_projection_items(s: &mut TokenStream) -> Result<Vec<ProjectionItem>, Di
             let expr = parse_expr(s)?;
             let alias = if matches!(s.peek_kind(), TokenKind::As) {
                 s.advance();
-                Some(parse_var(s)?)
+                Some(parse_binding_name(s)?)
             } else {
                 None
             };
@@ -870,24 +870,34 @@ pub(crate) fn parse_var(s: &mut TokenStream) -> Result<Variable, Diagnostic> {
 /// source text, not the token's canonical uppercase display (`{end: 1}`
 /// must produce the key `end`, not `END`).
 pub(crate) fn parse_ident_or_keyword(s: &mut TokenStream) -> Result<String, Diagnostic> {
-    let kind = s.peek_kind().clone();
-    if let TokenKind::Ident(name) = kind {
-        s.advance();
-        Ok(name)
-    } else {
-        let display = format!("{}", s.peek_kind());
-        if display.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
-            let text = s
-                .source_slice(s.peek_span())
-                .map(str::to_string)
-                .unwrap_or(display);
+    match s.peek_ident_text() {
+        Some(text) => {
             s.advance();
             Ok(text)
-        } else {
-            Err(s.error(
-                DiagCode::UnexpectedToken,
-                format!("expected identifier, got `{}`", s.peek_kind()),
-            ))
         }
+        None => Err(s.error(
+            DiagCode::UnexpectedToken,
+            format!("expected identifier, got `{}`", s.peek_kind()),
+        )),
+    }
+}
+
+/// Parse a binding name — a variable introduced in name position (`AS <name>`,
+/// `UNWIND … AS <name>`, `YIELD col AS <name>`). Unlike [`parse_var`], this
+/// accepts keyword tokens as identifiers (`AS end`, `AS count`): after `AS`
+/// exactly one name is expected, so there is no grammar ambiguity. This is a
+/// deliberate leniency over strict openCypher, which requires backticking
+/// reserved words.
+pub(crate) fn parse_binding_name(s: &mut TokenStream) -> Result<Variable, Diagnostic> {
+    let span = s.peek_span();
+    match s.peek_ident_text() {
+        Some(name) => {
+            s.advance();
+            Ok(Variable { name, span })
+        }
+        None => Err(s.error(
+            DiagCode::UnexpectedToken,
+            format!("expected identifier, got `{}`", s.peek_kind()),
+        )),
     }
 }

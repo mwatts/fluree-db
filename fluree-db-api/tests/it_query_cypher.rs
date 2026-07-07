@@ -9133,3 +9133,50 @@ async fn cypher_call_procedure_errors_are_actionable() {
         "mid-query procedure is a clear parse error: {msg}"
     );
 }
+
+#[tokio::test]
+async fn cypher_keyword_alias_names_output_column_and_binds_downstream() {
+    // Keyword tokens (`count`, `end`, `order`, …) are accepted as binding
+    // names — a deliberate leniency over strict openCypher. The alias must
+    // both name the output column and remain referenceable downstream.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:keyword-alias");
+    let l = fluree
+        .insert(
+            l,
+            &json!({"@context": ctx(), "@id": "alice", "@type": "Person", "name": "Alice"}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Terminal RETURN alias named with a keyword → that column name.
+    let cj = fluree
+        .query_cypher(&db, r#"MATCH (n:Person) RETURN n.name AS end"#)
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["columns"], json!(["end"]), "{cj}");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!("Alice"),
+        "{cj}"
+    );
+
+    // WITH-aliased keyword aggregate, referenced in a later WHERE and RETURN.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WITH count(*) AS count WHERE count > 0 RETURN count"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["columns"], json!(["count"]), "{cj}");
+    assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(1), "{cj}");
+}

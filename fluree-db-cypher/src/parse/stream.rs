@@ -48,6 +48,33 @@ impl TokenStream {
         self.src.get(span.start..span.end)
     }
 
+    /// If the current token can stand in as an identifier — a real `Ident` or a
+    /// keyword used in name position — return its **as-written** text (the
+    /// source slice, so `end` is not canonicalized to `END`). Returns `None`
+    /// for punctuation, literals, and EOF. Does not advance.
+    ///
+    /// Keyword tokens all `Display` as their all-alphabetic uppercase form; no
+    /// literal or punctuation token does, so that shape is a sound classifier.
+    pub fn peek_ident_text(&self) -> Option<String> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => Some(name.clone()),
+            other => {
+                let display = format!("{other}");
+                if !display.is_empty()
+                    && display.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+                {
+                    Some(
+                        self.source_slice(self.peek_span())
+                            .map(str::to_string)
+                            .unwrap_or(display),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Enter one level of recursion, erroring (rather than overflowing the
     /// stack) past [`MAX_PARSE_DEPTH`]. Every successful `enter_recursion` MUST
     /// be paired with a [`Self::leave_recursion`] on the success path; the

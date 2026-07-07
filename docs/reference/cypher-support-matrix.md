@@ -104,6 +104,7 @@ These shape everything below; read them first.
 | Pattern comprehension `[(a)-->(b) \| e]` | ✅ | Correlated; reuses the EXISTS path. |
 | `EXISTS { … }` (predicate + value) | ✅ | Incl. inside map/projection entries. |
 | Parameters `$p` | ✅ | Scalars, lists, maps; substituted everywhere incl. inside `CALL`/patterns. |
+| Keyword-as-identifier (`AS end`, `WITH count(*) AS count … RETURN count`) | ✅ | Deliberate leniency (⟂): reserved words usable as aliases/variables unescaped; backticks also accepted. `count(*)`/`exists {}`/`all()` keep their construct meaning when followed by their delimiter. |
 
 ## Functions
 
