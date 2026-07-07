@@ -166,10 +166,7 @@ pub const SPARQL11_GROUPING: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/grouping/manifest#group07",
 ];
 
-pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[
-    // result mismatch (1)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/project-expression/manifest#projexp05",
-];
+pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[];
 
 pub const SPARQL11_SUBQUERY: &[&str] = &[
     // result mismatch (2)
@@ -184,7 +181,7 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
 // binding typed as literal — audit §4.2.
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (111)
+    // result mismatch (86)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
@@ -204,20 +201,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-bool",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dT",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dbl",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dec",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-flt",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-int",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-str",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-datatype-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-2",
@@ -274,28 +262,15 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/sort/manifest#dawg-sort-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/sort/manifest#dawg-sort-6",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/sort/manifest#dawg-sort-8",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-01",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-02",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-03",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-04",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-05",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-09",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-10",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-12",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-13",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-14",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-15",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-16",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-17",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-18",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-19",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-20",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-21",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-22",
+    // tP-29/30 expect ASK=false and previously "passed" only because
+    // DATATYPE(expr) errored; evaluating expression arguments unmasks the
+    // D4 numeric-promotion defect (double/decimal, float) — PR-X2.
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-29",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-30",
     // dataset: FROM/FROM NAMED unsupported on single-ledger GraphDb (12)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-01",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-02",
@@ -672,11 +647,7 @@ pub const SPARQL12_LANG_BASEDIR: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/lang-basedir/manifest#strlang",
 ];
 
-pub const SPARQL12_RDF11: &[&str] = &[
-    // query execution error (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#langstring-datatype",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-datatype",
-];
+pub const SPARQL12_RDF11: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX: &[&str] = &[
     // parser accepts invalid input (missing validation) (2)

@@ -56,7 +56,7 @@ impl Function {
 
             // String functions
             Function::Str => string::eval_str(args, row, ctx),
-            Function::Lang => string::eval_lang(args, row, ctx),
+            Function::Lang { strict } => string::eval_lang(args, row, ctx, *strict),
             Function::Lcase => string::eval_lcase(args, row, ctx),
             Function::Ucase => string::eval_ucase(args, row, ctx),
             Function::Strlen => string::eval_strlen(args, row, ctx),
@@ -109,7 +109,7 @@ impl Function {
             Function::IsBlank => types::eval_is_blank(args, row, ctx),
 
             // RDF term functions
-            Function::Datatype => rdf::eval_datatype(args, row, ctx),
+            Function::Datatype { strict } => rdf::eval_datatype(args, row, ctx, *strict),
             Function::LangMatches => rdf::eval_lang_matches(args, row, ctx),
             Function::SameTerm => rdf::eval_same_term(args, row, ctx),
             Function::Iri => rdf::eval_iri(args, row, ctx),

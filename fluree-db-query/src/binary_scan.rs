@@ -352,7 +352,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
         // FILTER(LANG(?o) = "en")  (either side order)
         let is_lang_o = |e: &Expression| match (e, obj_var) {
             (Expression::Call { func, args }, Some(ov)) => {
-                *func == Function::Lang
+                matches!(func, Function::Lang { .. })
                     && args.len() == 1
                     && matches!(&args[0], Expression::Var(v) if *v == ov)
             }

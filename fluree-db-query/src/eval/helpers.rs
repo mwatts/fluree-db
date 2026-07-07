@@ -462,7 +462,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::StrEnds
             | Function::Regex
             | Function::Str
-            | Function::Lang
+            | Function::Lang { .. }
             | Function::Lcase
             | Function::Ucase
             | Function::Strlen
@@ -481,7 +481,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::EncodeForUri
             | Function::StrDt
             | Function::StrLang
-            | Function::Datatype
+            | Function::Datatype { .. }
             | Function::LangMatches
             | Function::SameTerm
             | Function::Iri

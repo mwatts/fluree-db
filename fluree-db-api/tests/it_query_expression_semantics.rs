@@ -137,3 +137,208 @@ async fn jsonld_constant_filter_keeps_all_rows() {
     });
     assert_eq!(jsonld_rows(&fluree, &ledger, &q_false).await, json!([]));
 }
+
+// =============================================================================
+// D2 — DATATYPE()/LANG() accept expression arguments (#1440)
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_datatype_of_expression_arguments() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/d2:sparql").await;
+
+    // Arithmetic argument (the type-promotion test shape).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> \
+             ASK { ?s ex:age ?a . FILTER(datatype(?a + ?a) = xsd:integer) }",
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+
+    // Constant literal arguments (SPARQL12_RDF11 langstring-datatype /
+    // plain-string-datatype shapes).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            r#"SELECT (DATATYPE("foo"@en) AS ?dt) WHERE {}"#,
+        )
+        .await,
+        json!([["http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"]])
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            r#"SELECT (DATATYPE("foo") AS ?dt) WHERE {}"#,
+        )
+        .await,
+        json!([["http://www.w3.org/2001/XMLSchema#string"]])
+    );
+
+    // LANG of a constant lang-tagged literal.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            r#"SELECT (LANG("foo"@en) AS ?l) WHERE {}"#
+        )
+        .await,
+        json!([["en"]])
+    );
+
+    // STR result is a plain string.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> \
+             ASK { ?s ex:age ?a . FILTER(datatype(str(?a)) = xsd:string) }",
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}
+
+#[tokio::test]
+async fn jsonld_datatype_of_expression_arguments() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/d2:jsonld").await;
+
+    // The same engine capability must be reachable from the JSON-LD surface.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?n", "?dt"],
+        "where": [
+            { "@id": "?s", "ex:name": "?n", "ex:age": "?age" },
+            ["bind", "?dt", ["expr", ["datatype", ["+", "?age", "?age"]]]]
+        ],
+        "orderBy": "?n"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["Alice", "xsd:integer"], ["Bob", "xsd:integer"]])
+    );
+}
+
+// =============================================================================
+// D2b — non-literal DATATYPE()/LANG(): SPARQL type error vs JSON-LD extension
+// (decision D-12: SPARQL-scoped strictness; the JSON-LD `@id` extension is
+// deliberate and preserved)
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_datatype_of_iri_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/d2b:sparql-dt").await;
+
+    // Project expression: the type error leaves ?dt unbound (projexp05 shape).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?s (DATATYPE(?s) AS ?dt) WHERE { ?s ex:name ?n } ORDER BY ?s",
+        )
+        .await,
+        json!([["ex:alice", null], ["ex:bob", null]])
+    );
+
+    // FILTER: the type error excludes the row — even under `!=`
+    // (dawg-datatype-2 shape).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             ASK { ?s ex:name ?n . FILTER(datatype(?s) != <http://example.org/NotADatatype>) }",
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+}
+
+#[tokio::test]
+async fn sparql_lang_of_iri_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/d2b:sparql-lang").await;
+
+    // Project expression: unbound.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?s (LANG(?s) AS ?l) WHERE { ?s ex:name ?n } ORDER BY ?s",
+        )
+        .await,
+        json!([["ex:alice", null], ["ex:bob", null]])
+    );
+
+    // FILTER: excluded even under `!=` (dawg-lang-1 shape).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             ASK { ?s ex:name ?n . FILTER(lang(?s) != \"fr\") }",
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+
+    // LANG of a plain literal stays "" (not an error).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             ASK { ?s ex:name ?n . FILTER(lang(?n) = \"\") }",
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}
+
+#[tokio::test]
+async fn jsonld_datatype_of_iri_keeps_id_extension() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/d2b:jsonld").await;
+
+    // JSON-LD surface: DATATYPE of an @id/ref reports the `@id` ref type —
+    // the deliberate Fluree extension this fix must NOT remove (D-12).
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s", "?dt"],
+        "where": [
+            { "@id": "?s", "ex:name": "?n" },
+            ["bind", "?dt", ["expr", ["datatype", "?s"]]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["ex:alice", "@id"], ["ex:bob", "@id"]])
+    );
+
+    // JSON-LD LANG of a non-literal stays the lenient "" (no row loss).
+    let q_lang = json!({
+        "@context": ctx(),
+        "select": ["?s", "?l"],
+        "where": [
+            { "@id": "?s", "ex:name": "?n" },
+            ["bind", "?l", ["expr", ["lang", "?s"]]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_lang).await,
+        json!([["ex:alice", ""], ["ex:bob", ""]])
+    );
+}

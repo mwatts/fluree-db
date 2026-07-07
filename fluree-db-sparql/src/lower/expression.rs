@@ -233,9 +233,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::IsLiteral => Function::IsLiteral,
             FunctionName::IsNumeric => Function::IsNumeric,
 
-            // RDF term functions
-            FunctionName::Lang => Function::Lang,
-            FunctionName::Datatype => Function::Datatype,
+            // RDF term functions — SPARQL semantics: a non-literal argument is
+            // a type error (strict), per §17.4.2.2/§17.4.2.3. The JSON-LD
+            // surface keeps the lenient extension (decision D-12).
+            FunctionName::Lang => Function::Lang { strict: true },
+            FunctionName::Datatype => Function::Datatype { strict: true },
 
             // String functions
             FunctionName::Strlen => Function::Strlen,

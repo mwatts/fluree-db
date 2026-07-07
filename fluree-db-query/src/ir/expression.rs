@@ -842,8 +842,26 @@ pub enum Function {
     // =========================================================================
     // RDF term functions
     // =========================================================================
-    Lang,
-    Datatype,
+    /// `LANG(expr)` — the language tag of a literal (empty string if none).
+    ///
+    /// `strict` selects the SPARQL 1.1 §17.4.2.2 behavior for non-literal
+    /// arguments: a type error (no value). The lenient form — Fluree's
+    /// JSON-LD-surface behavior — returns `""` for IRIs/refs instead. The
+    /// surface lowering picks the mode (SPARQL → strict, JSON-LD → lenient);
+    /// see decision D-12 in `docs/audit/burn-down/ROADMAP.md` §4.
+    Lang {
+        strict: bool,
+    },
+    /// `DATATYPE(expr)` — the datatype IRI of a literal.
+    ///
+    /// `strict` selects the SPARQL 1.1 §17.4.2.3 behavior for non-literal
+    /// arguments: a type error (no value). The lenient form preserves the
+    /// deliberate JSON-LD-surface extension where `DATATYPE(<iri>)` reports
+    /// the `@id` ref type. See decision D-12 in
+    /// `docs/audit/burn-down/ROADMAP.md` §4.
+    Datatype {
+        strict: bool,
+    },
     LangMatches,
     SameTerm,
 
