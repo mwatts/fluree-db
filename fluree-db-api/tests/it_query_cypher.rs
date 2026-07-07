@@ -4705,7 +4705,6 @@ async fn cypher_shortest_path_batched_lane_respects_novelty() {
         .expect("seed chain");
     rebuild_and_publish_index(&fluree, ledger_id).await;
     let l = fluree.ledger(ledger_id).await.expect("reload");
-    let db = graphdb_from_ledger(&l);
 
     let sp_len = |db: fluree_db_api::GraphDb, q: &'static str| {
         let fluree = &fluree;

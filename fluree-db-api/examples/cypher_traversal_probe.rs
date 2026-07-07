@@ -136,6 +136,23 @@ async fn main() {
         ),
     ];
 
+    // Tight-loop mode for CPU sampling: PROBE_LOOP=<n> runs the single selected
+    // statement n times (no timing/format noise from the table print).
+    if let (Ok(loops), Some(only)) = (std::env::var("PROBE_LOOP"), &single) {
+        let loops: usize = loops.parse().unwrap_or(200_000);
+        let text = &statements
+            .iter()
+            .find(|(n, _)| n == only)
+            .expect("PROBE_SINGLE")
+            .1;
+        eprintln!("looping {only} x{loops} (pid {})", std::process::id());
+        for _ in 0..loops {
+            let r = fluree.query_cypher(&db, text).await.expect("loop query");
+            std::hint::black_box(r.to_cypher_typed_table(&db).await.expect("loop fmt"));
+        }
+        return;
+    }
+
     eprintln!("== indexed {users}-user knows-graph ==");
     for (name, text) in &statements {
         if let Some(only) = &single {
