@@ -839,7 +839,20 @@ pub enum NameServiceEvent {
         index_id: ContentId,
         index_t: i64,
     },
-    /// A ledger was retracted.
+    /// A branch's authoritative state went away: fired for retract
+    /// (soft tombstone), `drop_branch`, and purge alike. The event
+    /// carries only the exact `ledger:branch` id, and consumers use
+    /// it uniformly to evict per-branch state, so the distinction
+    /// between those transitions isn't conveyed.
+    ///
+    /// Known limitation: a query peer reacting to this always
+    /// applies a local retract (tombstone), even when the origin
+    /// hard-dropped or purged the branch. The divergence is benign
+    /// and self-healing — a later re-creation of the alias overwrites
+    /// the peer's tombstone via `init`, and `retracted` reads
+    /// identically to `not-found` for a peer's query path.
+    /// Distinguishing the transitions would need separate event
+    /// variants threaded through the SSE peer-sync protocol.
     LedgerRetracted { ledger_id: String },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
