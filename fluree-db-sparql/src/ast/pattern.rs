@@ -202,7 +202,9 @@ pub enum GraphPattern {
         /// IRI, rejecting rebound-prefix false positives.
         predicate: super::term::PredicateTerm,
         /// The reified base edge (`<<( s p o )>>`).
-        triple_term: super::annotation::TripleTerm,
+        /// Boxed: `TripleTerm` embeds full subject/object terms (which
+        /// can hold reified triples inline), dominating the enum size.
+        triple_term: Box<super::annotation::TripleTerm>,
         /// Source span covering the entire pattern.
         span: SourceSpan,
     },

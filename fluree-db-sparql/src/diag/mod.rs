@@ -130,6 +130,10 @@ pub enum DiagCode {
     #[serde(rename = "F009")]
     VariableInGroundData,
 
+    /// Anonymous annotation (fresh blank-node reifier) in a DELETE form
+    #[serde(rename = "F010")]
+    AnonymousAnnotationInDelete,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -177,6 +181,7 @@ impl DiagCode {
             Self::UnsupportedSelectReduced => "F007",
             Self::UnsupportedDistinctAggregate => "F008",
             Self::VariableInGroundData => "F009",
+            Self::AnonymousAnnotationInDelete => "F010",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings
