@@ -126,13 +126,12 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // result mismatch (83); subgroup ownership per
     // docs/audit/burn-down/ROADMAP.md §6.1
     //
-    // W-1 algebra cluster (4): join-scope-1 = sub-SELECT merge of an
-    // OPTIONAL-produced correlation var (PR-W1 Family B); join-combo-2 =
-    // GRAPH ?g default-graph enumeration (PR-G1); nested-opt-1/2 =
-    // correlated-OPTIONAL independence (PR-W1-OPT). filter-nested-2's
-    // nested-group FILTER scope leak is fixed (PR-W1 Family A).
+    // W-1 algebra cluster (3): join-combo-2 = GRAPH ?g default-graph
+    // enumeration (PR-G1); nested-opt-1/2 = correlated-OPTIONAL independence
+    // (PR-W1-OPT). filter-nested-2 (nested-group FILTER scope) and join-scope-1
+    // (sub-SELECT merge of an OPTIONAL-produced correlation var) are fixed
+    // (PR-W1 Families A/B).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
     // PR-BASE: relative-IRI/BASE resolution in query output (2)

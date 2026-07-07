@@ -131,3 +131,63 @@ async fn optional_nested_filter_referencing_outer_var_does_not_bind() {
          price is bound; got {rows}"
     );
 }
+
+/// Family B — JSON-LD analogue of W3C `var-scope-join-1` (join-scope-1)
+/// (`{ ?X :name "paul" { ?Y :name "george" . OPTIONAL { ?X :email ?Z } } }`
+/// expects 0).
+///
+/// The sub-SELECT binds `?x` only via an inner OPTIONAL (to the subjects that
+/// have an `ex:email` — `ex:john`, `ex:ringo`), while the parent binds
+/// `?x = ex:paul`, who has no email. SPARQL §18.2 evaluates the sub-SELECT
+/// independently then joins on `?x`, so `ex:paul` ∉ {john, ringo} → 0 rows.
+///
+/// This exercises the Family B fix end-to-end on the JSON-LD surface: `?x` is a
+/// correlation var the sub-SELECT does not self-produce, so it must NOT be
+/// seeded (pinned to `ex:paul`) — it is produced independently and reconciled at
+/// the merge, dropping the incompatible rows.
+#[tokio::test]
+async fn subselect_optional_bound_correlation_var_reconciles_to_empty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:b");
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:paul", "ex:name": "paul"},
+            {"@id": "ex:george", "ex:name": "george"},
+            {"@id": "ex:john", "ex:email": "john@example.org"},
+            {"@id": "ex:ringo", "ex:email": "ringo@example.org"}
+        ]
+    });
+    let db = graphdb_from_ledger(&fluree.insert(ledger0, &txn).await.expect("seed").ledger);
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?x", "?y", "?z"],
+        "where": [
+            {"@id": "?x", "ex:name": "paul"},
+            ["query", {
+                "@context": ctx(),
+                "select": ["?x", "?y", "?z"],
+                "where": [
+                    {"@id": "?y", "ex:name": "george"},
+                    ["optional", {"@id": "?x", "ex:email": "?z"}]
+                ]
+            }]
+        ]
+    });
+
+    let rows = fluree
+        .query(&db, &q)
+        .await
+        .expect("query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+
+    assert_eq!(
+        rows,
+        json!([]),
+        "?x is bound only via the sub-SELECT's OPTIONAL (email subjects); it must \
+         reconcile against the parent ?x = ex:paul and drop every row; got {rows}"
+    );
+}
