@@ -8689,6 +8689,104 @@ async fn cypher_call_apoc_meta_data_answers_langchain_schema_queries() {
 }
 
 #[tokio::test]
+async fn cypher_exists_in_projection_evaluates_per_row() {
+    // EXISTS { pattern } in RETURN projection (IC7/IC10 shape) must evaluate
+    // per row, not constant-false.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:exists-proj");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:P {name: "A"})-[:K]->(b:P {name: "B"}); CREATE (:P {name: "C"});"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:P) RETURN n.name AS name, EXISTS { (n)-[:K]->() } AS has ORDER BY name"#,
+        )
+        .await
+        .expect("projected exists")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["A", true], ["B", false], ["C", false]]),
+        "EXISTS evaluates per row in projection position"
+    );
+}
+
+#[tokio::test]
+async fn cypher_exists_in_projection_with_both_endpoints_bound() {
+    // Regression: an EXISTS whose inner pattern correlates on MULTIPLE bound
+    // vars used to be swallowed by the fused join block's synchronous eval,
+    // collapsing to constant false (the IC7 shape). It must resolve per row —
+    // bare, inside CASE, and in a WITH projection.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:exists-both-bound");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:P {name: "A"})-[:K]->(b:P {name: "B"}); CREATE (:P {name: "C"});"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Directed and undirected, both endpoints bound.
+    for pattern in ["(a)-[:K]->(x)", "(a)-[:K]-(x)"] {
+        let stmt = format!(
+            r#"MATCH (a:P {{name: "A"}}), (x:P) WHERE x.name <> "A"
+               RETURN x.name AS name, EXISTS {{ {pattern} }} AS knows ORDER BY name"#
+        );
+        let out = fluree
+            .query_cypher(&db, &stmt)
+            .await
+            .expect("both-bound exists")
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        assert_eq!(out, json!([["B", true], ["C", false]]), "{pattern}");
+    }
+
+    // Inside CASE in projection.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:P {name: "A"}), (x:P) WHERE x.name <> "A"
+               RETURN x.name AS name,
+                      CASE WHEN EXISTS { (a)-[:K]-(x) } THEN 1 ELSE 0 END AS knows
+               ORDER BY name"#,
+        )
+        .await
+        .expect("case exists")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["B", 1], ["C", 0]]));
+
+    // In a WITH projection.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:P) WITH n.name AS name, EXISTS { (n)-[:K]->() } AS has
+               RETURN name, has ORDER BY name"#,
+        )
+        .await
+        .expect("with exists")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["A", true], ["B", false], ["C", false]]));
+}
+
+#[tokio::test]
 async fn cypher_call_procedure_errors_are_actionable() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:proc-errors");
