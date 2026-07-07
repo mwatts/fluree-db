@@ -71,6 +71,12 @@ The body may be raw Cypher, or a JSON envelope `{"cypher": "...", "params": {...
 (the Neo4j-HTTP shape). Responses are cypher-json; request RDF JSON-LD with
 `Accept: application/ld+json`.
 
+**Bulk loading** — a `.cypher` dump of `CREATE` / `MATCH … CREATE` statements
+(the Neo4j/Memgraph export idiom) should not be replayed statement-by-statement.
+`fluree create <ledger> --from dump.cypher` converts it on the fly and loads it
+through the chunked bulk-import pipeline; see
+[the create command](../cli/create.md#property-graph-imports-csv--cypher).
+
 ## Cardinality
 
 Cypher's default is **bag semantics**; SPARQL's default is set
