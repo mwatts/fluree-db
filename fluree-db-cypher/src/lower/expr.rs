@@ -411,7 +411,9 @@ pub fn lower_expr<E: IriEncoder>(
 fn lower_temporal_constructor(name: &str, args: Vec<Expression>) -> Result<Expression> {
     match args.as_slice() {
         [] => match name {
-            "datetime" => Ok(Expression::call(Function::Now, args)),
+            // localdatetime() differs from datetime() only in timezone
+            // rendering; both answer the current instant.
+            "datetime" | "localdatetime" => Ok(Expression::call(Function::Now, args)),
             "date" => Ok(Expression::call(Function::Today, args)),
             _ => Err(LowerError::unsupported(format!(
                 "zero-argument {name}() is deferred — use datetime() or date(), \
@@ -427,11 +429,47 @@ fn lower_temporal_constructor(name: &str, args: Vec<Expression>) -> Result<Expre
                 None => unreachable!("caller matched a temporal constructor name"),
             }
         }
+        // Component map: `date({year: 2024, month: 1, day: 15})` etc., with
+        // constant components.
+        [Expression::Map(entries)] => {
+            let fields = temporal_component_fields(name, entries)?;
+            match fluree_db_core::temporal::cypher_temporal_from_components(name, &fields) {
+                Some(Ok(value)) => Ok(Expression::Const(value)),
+                Some(Err(e)) => Err(LowerError::unsupported(format!(
+                    "invalid {name}({{…}}): {e}"
+                ))),
+                None => unreachable!("caller matched a temporal constructor name"),
+            }
+        }
         _ => Err(LowerError::unsupported(format!(
-            "{name}() takes a literal string in v1 (e.g. {name}('2024-01-15')) \
-             or, for date()/datetime(), no argument"
+            "{name}() takes a literal string (e.g. {name}('2024-01-15')) or a constant \
+             component map (e.g. {name}({{year: 2024}})); for date()/datetime(), no argument"
         ))),
     }
+}
+
+/// Extract constant components from a lowered temporal component map.
+fn temporal_component_fields(
+    name: &str,
+    entries: &[(Arc<str>, Expression)],
+) -> Result<Vec<(String, fluree_db_core::temporal::TemporalComponent)>> {
+    use fluree_db_core::temporal::TemporalComponent;
+    entries
+        .iter()
+        .map(|(k, v)| {
+            let c = match v {
+                Expression::Const(FlakeValue::Long(n)) => TemporalComponent::Int(*n),
+                Expression::Const(FlakeValue::String(s)) => TemporalComponent::Str(s.clone()),
+                _ => {
+                    return Err(LowerError::unsupported(format!(
+                        "{name}({{…}}) components must be constant integers (or a timezone \
+                         string) in v1 — `{k}` is not"
+                    )))
+                }
+            };
+            Ok((k.to_string(), c))
+        })
+        .collect()
 }
 
 /// Lower Cypher `substring(s, start[, len])` (0-indexed) to the engine's

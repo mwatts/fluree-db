@@ -2033,6 +2033,205 @@ pub fn cypher_temporal_constructor(
     Some(v)
 }
 
+/// One constant component of a Cypher temporal component-map constructor
+/// (`date({year: 2024, month: 1})`): an integer field or a string field
+/// (`timezone`).
+#[derive(Debug, Clone)]
+pub enum TemporalComponent {
+    Int(i64),
+    Str(String),
+}
+
+/// Fold a Cypher temporal component-map constructor
+/// (`date({year: 2024, month: 1, day: 15})`, `datetime({…})`, `time({…})`,
+/// `duration({days: 3, hours: 12})`) into a typed value by composing the
+/// lexical form and delegating to [`cypher_temporal_constructor`] (so a
+/// duration still picks the narrowest orderable type). Returns `None` when
+/// `func` (expected lowercased) is not a temporal constructor; `Some(Err)`
+/// on an unknown key, a wrong component type, or out-of-range values.
+pub fn cypher_temporal_from_components(
+    func: &str,
+    fields: &[(String, TemporalComponent)],
+) -> Option<Result<crate::value::FlakeValue, String>> {
+    if !matches!(
+        func,
+        "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration"
+    ) {
+        return None;
+    }
+    Some(compose_components(func, fields).and_then(|lexical| {
+        cypher_temporal_constructor(func, &lexical)
+            .expect("func checked above")
+            .map_err(|e| format!("{e} (composed `{lexical}`)"))
+    }))
+}
+
+fn compose_components(
+    func: &str,
+    fields: &[(String, TemporalComponent)],
+) -> Result<String, String> {
+    let int = |allowed: &str, default: i64| -> Result<i64, String> {
+        for (k, v) in fields {
+            if k.eq_ignore_ascii_case(allowed) {
+                return match v {
+                    TemporalComponent::Int(n) => Ok(*n),
+                    TemporalComponent::Str(_) => {
+                        Err(format!("component `{allowed}` must be an integer"))
+                    }
+                };
+            }
+        }
+        Ok(default)
+    };
+
+    let known = |keys: &[&str]| -> Result<(), String> {
+        for (k, _) in fields {
+            if !keys.iter().any(|a| k.eq_ignore_ascii_case(a)) {
+                return Err(format!(
+                    "unknown component `{k}` — supported: {}",
+                    keys.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    let timezone = fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("timezone"))
+        .map(|(_, v)| match v {
+            TemporalComponent::Str(s) => Ok(s.clone()),
+            TemporalComponent::Int(_) => Err("component `timezone` must be a string".to_string()),
+        })
+        .transpose()?;
+    // Neo4j's default timezone is UTC; the `local*` forms carry none.
+    let tz_suffix = |default_utc: bool| match &timezone {
+        Some(tz) if tz == "Z" || tz.eq_ignore_ascii_case("utc") => "Z".to_string(),
+        Some(tz) => tz.clone(),
+        None if default_utc => "Z".to_string(),
+        None => String::new(),
+    };
+
+    // Fractional seconds from millisecond/microsecond/nanosecond components.
+    let frac = |ms: i64, us: i64, ns: i64| -> String {
+        let total = ms * 1_000_000 + us * 1_000 + ns;
+        if total == 0 {
+            String::new()
+        } else {
+            format!(".{total:09}").trim_end_matches('0').to_string()
+        }
+    };
+
+    match func {
+        "date" => {
+            known(&["year", "month", "day"])?;
+            let (y, m, d) = (int("year", 0)?, int("month", 1)?, int("day", 1)?);
+            if !fields.iter().any(|(k, _)| k.eq_ignore_ascii_case("year")) {
+                return Err("date({…}) requires a `year` component".to_string());
+            }
+            Ok(format!("{y:04}-{m:02}-{d:02}"))
+        }
+        "datetime" | "localdatetime" => {
+            known(&[
+                "year",
+                "month",
+                "day",
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "microsecond",
+                "nanosecond",
+                "timezone",
+            ])?;
+            if !fields.iter().any(|(k, _)| k.eq_ignore_ascii_case("year")) {
+                return Err(format!("{func}({{…}}) requires a `year` component"));
+            }
+            let (y, mo, d) = (int("year", 0)?, int("month", 1)?, int("day", 1)?);
+            let (h, mi, s) = (int("hour", 0)?, int("minute", 0)?, int("second", 0)?);
+            let f = frac(
+                int("millisecond", 0)?,
+                int("microsecond", 0)?,
+                int("nanosecond", 0)?,
+            );
+            let tz = tz_suffix(func == "datetime");
+            Ok(format!(
+                "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}{f}{tz}"
+            ))
+        }
+        "time" | "localtime" => {
+            known(&[
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "microsecond",
+                "nanosecond",
+                "timezone",
+            ])?;
+            let (h, mi, s) = (int("hour", 0)?, int("minute", 0)?, int("second", 0)?);
+            let f = frac(
+                int("millisecond", 0)?,
+                int("microsecond", 0)?,
+                int("nanosecond", 0)?,
+            );
+            let tz = tz_suffix(func == "time");
+            Ok(format!("{h:02}:{mi:02}:{s:02}{f}{tz}"))
+        }
+        "duration" => {
+            known(&[
+                "years",
+                "months",
+                "weeks",
+                "days",
+                "hours",
+                "minutes",
+                "seconds",
+                "milliseconds",
+            ])?;
+            let months = int("years", 0)? * 12 + int("months", 0)?;
+            let days = int("weeks", 0)? * 7 + int("days", 0)?;
+            let (h, mi) = (int("hours", 0)?, int("minutes", 0)?);
+            let ms = int("milliseconds", 0)?;
+            let s = int("seconds", 0)?;
+            let mut out = String::from("P");
+            if months != 0 {
+                out.push_str(&format!("{months}M"));
+            }
+            if days != 0 {
+                out.push_str(&format!("{days}D"));
+            }
+            let total_ms = s * 1000 + ms;
+            let has_time = h != 0 || mi != 0 || total_ms != 0;
+            if has_time {
+                out.push('T');
+                if h != 0 {
+                    out.push_str(&format!("{h}H"));
+                }
+                if mi != 0 {
+                    out.push_str(&format!("{mi}M"));
+                }
+                if total_ms != 0 {
+                    if total_ms % 1000 == 0 {
+                        out.push_str(&format!("{}S", total_ms / 1000));
+                    } else {
+                        out.push_str(&format!(
+                            "{}.{:03}S",
+                            total_ms / 1000,
+                            (total_ms % 1000).unsigned_abs()
+                        ));
+                    }
+                }
+            }
+            if out == "P" {
+                out.push_str("T0S");
+            }
+            Ok(out)
+        }
+        _ => unreachable!("caller checked the constructor name"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

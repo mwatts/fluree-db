@@ -8337,6 +8337,83 @@ async fn cypher_zero_arg_datetime_and_date_write_statement_timestamp() {
 }
 
 #[tokio::test]
+async fn cypher_temporal_component_map_constructors() {
+    // Component maps fold to the same typed values the lexical forms build:
+    // in reads (accessors + comparisons) and as write property values.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-components");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Event {name: "a", at: datetime({year: 2024, month: 3, day: 4,
+                                                        hour: 5, minute: 6, second: 7}),
+                               on: date({year: 2024, month: 3, day: 4}),
+                               took: duration({hours: 2, minutes: 30})})"#,
+        )
+        .await
+        .expect("create with component maps")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Component-map constant equals the lexical constant.
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (e:Event)
+               WHERE e.at = datetime("2024-03-04T05:06:07Z")
+                 AND e.on = date("2024-03-04")
+               RETURN e.name,
+                      date({year: 2024, month: 2}).month,
+                      duration({days: 3}) = duration("P3D"),
+                      time({hour: 10, minute: 30}).hour"#,
+        )
+        .await
+        .expect("component map read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([["a", 2, true, 10]]), "{res}");
+
+    // Errors are actionable: unknown component / missing year.
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (e:Event) RETURN date({year: 2024, dayz: 3})"#)
+        .await
+        .expect_err("unknown component")
+        .to_string();
+    assert!(msg.contains("dayz"), "{msg}");
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (e:Event) RETURN date({month: 3})"#)
+        .await
+        .expect_err("missing year")
+        .to_string();
+    assert!(msg.contains("year"), "{msg}");
+}
+
+#[tokio::test]
+async fn cypher_zero_arg_localdatetime_is_now() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:localdatetime-now");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:T {name: "x"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:T)
+               RETURN localdatetime() >= datetime("2026-01-01T00:00:00Z")"#,
+        )
+        .await
+        .expect("localdatetime()")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[true]]), "{res}");
+}
+
+#[tokio::test]
 async fn cypher_temporal_constructor_bad_literal_errors() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:temporal-bad");

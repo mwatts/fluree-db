@@ -1809,10 +1809,43 @@ impl<'a> CypherLowering<'a> {
                 ))),
                 None => Ok(None),
             },
+            // Component map: `date({year: 2024, month: 1, day: 15})` etc.,
+            // with constant components.
+            (
+                "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration",
+                [Expr::Map(entries, _)],
+            ) => {
+                use fluree_db_core::temporal::{
+                    cypher_temporal_from_components, TemporalComponent,
+                };
+                let fields = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        let c = match v {
+                            Expr::Lit(Literal::Integer(n, _)) => TemporalComponent::Int(*n),
+                            Expr::Lit(Literal::String(s, _)) => TemporalComponent::Str(s.clone()),
+                            _ => {
+                                return Err(LowerCypherError::unsupported(format!(
+                                    "{name}({{…}}) components must be constant integers (or a \
+                                     timezone string) in v1 — `{k}` is not"
+                                )))
+                            }
+                        };
+                        Ok((k.clone(), c))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match cypher_temporal_from_components(&name, &fields) {
+                    Some(Ok(v)) => Ok(Some(v)),
+                    Some(Err(e)) => Err(LowerCypherError::unsupported(format!(
+                        "invalid {name}({{…}}): {e}"
+                    ))),
+                    None => Ok(None),
+                }
+            }
             ("date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration", _) => {
                 Err(LowerCypherError::unsupported(format!(
-                    "{name}() takes a literal string in v1 (e.g. {name}('2024-01-15')) \
-                     or, for date()/datetime(), no argument"
+                    "{name}() takes a literal string (e.g. {name}('2024-01-15')) or a constant \
+                     component map; for date()/datetime(), no argument"
                 )))
             }
             _ => Ok(None),

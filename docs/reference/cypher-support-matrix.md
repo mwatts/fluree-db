@@ -118,7 +118,7 @@ These shape everything below; read them first.
 | Path/metadata: `length` `nodes` `relationships` `pathPairs` `labels` `type` `startNode` `endNode` `keys` `properties` | ✅ | |
 | `id` / `elementId` | ⟂ | Returns the identity string (name, or IRI in `@vocab` mode). |
 | Temporal accessors `<date>.year/.month/.day/.hour/.minute/.second` | ✅ | |
-| Temporal constructors `date()` `datetime()` `duration()` | ◑ | A constant lexical argument folds to a typed value (`date('2024-01-15')`, `datetime('…T…Z')`, `time('…')`, `duration('P1D')` — durations pick the narrowest orderable XSD type), in reads and as write property values. Zero-arg `datetime()` / `date()` = current instant / date (one instant per write statement). Deferred: non-constant arguments, component-map constructors (`date({year: …})`), duration arithmetic (`date + duration`), zero-arg `time()`/`localdatetime()`. |
+| Temporal constructors `date()` `datetime()` `duration()` | ◑ | A constant lexical argument folds to a typed value (`date('2024-01-15')`, `datetime('…T…Z')`, `time('…')`, `duration('P1D')` — durations pick the narrowest orderable XSD type), in reads and as write property values. Zero-arg `datetime()` / `date()` = current instant / date (one instant per write statement). Component maps with constant fields fold too (`date({year: 2024, month: 1})`, `datetime({…, timezone: '+02:00'})`, `duration({days: 3, hours: 12})`); zero-arg `localdatetime()` = current instant. Deferred: non-constant arguments, duration arithmetic (`date + duration`), zero-arg `time()`/`localtime()`. |
 | Spatial `point()` / `distance()` | ⏳ | |
 
 ## Null & type semantics
