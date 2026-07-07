@@ -13,6 +13,8 @@ mod it_query_dataset;
 mod it_query_datatype;
 #[path = "it_query_explain_native.rs"]
 mod it_query_explain_native;
+#[path = "it_query_expression_semantics.rs"]
+mod it_query_expression_semantics;
 #[path = "it_query_fuel_bound_object.rs"]
 mod it_query_fuel_bound_object;
 #[path = "it_query_fulltext.rs"]

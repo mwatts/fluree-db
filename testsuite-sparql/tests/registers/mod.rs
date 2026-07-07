@@ -153,12 +153,10 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 ];
 
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
-    // result mismatch (6)
+    // result mismatch (4)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#in01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#notin01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
 ];
 
@@ -186,7 +184,7 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
 // binding typed as literal — audit §4.2.
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (113)
+    // result mismatch (111)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
@@ -206,7 +204,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-boolean-literal",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-bool",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dT",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dbl",
@@ -239,7 +236,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#add-literals",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#add-numbers-cast",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#divide-numbers-cast",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#multiply-numbers-cast",
@@ -680,8 +676,6 @@ pub const SPARQL12_RDF11: &[&str] = &[
     // query execution error (2)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#langstring-datatype",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-datatype",
-    // result mismatch (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-same",
 ];
 
 pub const SPARQL12_SYNTAX: &[&str] = &[
