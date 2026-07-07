@@ -2388,6 +2388,23 @@ fn pop_validated_front(
     Ok(queue.pop_front().expect("non-empty checked above"))
 }
 
+/// Remove a branch's queue from `state.queues` if it has drained
+/// empty. The normal pop path (unlike `clear_queue_for_admin`)
+/// leaves the `VecDeque` behind otherwise, so without this every
+/// branch that ever transacted retains an empty queue forever. A
+/// missing queue and an empty one are already equivalent to
+/// `pop_validated_front` (both surface `InvariantViolated`), so this
+/// is behaviour-preserving.
+fn drop_queue_if_empty(state: &mut NameServiceState, ref_key: &RefKey) {
+    if state
+        .queues
+        .get(ref_key)
+        .is_some_and(std::collections::VecDeque::is_empty)
+    {
+        state.queues.remove(ref_key);
+    }
+}
+
 fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) -> Response {
     let StagedHead {
         ledger_id,
@@ -2428,9 +2445,10 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
     // `t` and replace the head's content lineage with a non-
     // descendant. Push the popped entry back at the front so the
     // worker retries once its local view catches up.
-    if let Some(existing) = state.refs.get(&ref_key) {
-        if commit_t <= existing.t {
-            let current_t = existing.t;
+    // The read borrows only `.t` (a `Copy`), so it ends before the
+    // `state.queues` push-back below.
+    if let Some(current_t) = state.refs.get(&ref_key).map(|r| r.t) {
+        if commit_t <= current_t {
             state
                 .queues
                 .get_mut(&ref_key)
@@ -2447,26 +2465,41 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
         }
     }
 
-    // Advance the branch's `RefEntry`, carrying forward index +
-    // lineage state from any existing entry (matches the
-    // self-healing pattern in `advance_ref`).
-    let (prior_index, prior_source, prior_branches) = state
-        .refs
-        .get(&ref_key)
-        .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
-        .unwrap_or_default();
-    state.refs.insert(
-        ref_key.clone(),
-        RefEntry {
-            head: commit_id.clone(),
-            t: commit_t,
-            last_advanced_at_millis: applied_at_millis,
-            last_advanced_index: log_index,
-            index: prior_index,
-            source_branch: prior_source,
-            branches: prior_branches,
-        },
-    );
+    // The entry is consumed for good now (the monotonic guard above
+    // is the only path that pushes it back). Drop the queue if it
+    // drained empty so `state.queues` holds one entry per *live*
+    // branch, not one per branch that ever transacted — which also
+    // keeps the global-depth `sum()` in `apply_enqueue_command`
+    // proportional to live branches. `apply_enqueue_command`
+    // re-creates the queue on the next submission.
+    drop_queue_if_empty(state, &ref_key);
+
+    // Advance the branch's `RefEntry`. Mutate the existing entry in
+    // place so its index pointer + lineage (source/child count) stay
+    // put without cloning them out and rebuilding; only a fresh
+    // branch (no entry yet) takes the insert path.
+    match state.refs.get_mut(&ref_key) {
+        Some(existing) => {
+            existing.head = commit_id.clone();
+            existing.t = commit_t;
+            existing.last_advanced_at_millis = applied_at_millis;
+            existing.last_advanced_index = log_index;
+        }
+        None => {
+            state.refs.insert(
+                ref_key.clone(),
+                RefEntry {
+                    head: commit_id.clone(),
+                    t: commit_t,
+                    last_advanced_at_millis: applied_at_millis,
+                    last_advanced_index: log_index,
+                    index: None,
+                    source_branch: None,
+                    branches: 0,
+                },
+            );
+        }
+    }
 
     // Self-healing branch registration on the `LedgerRecord`,
     // matching `advance_ref`'s behaviour so the queue path doesn't
@@ -2529,6 +2562,9 @@ fn apply_poison_queue_entry(
         Ok(entry) => entry,
         Err(resp) => return *resp,
     };
+    // Poison always consumes the front — drop the queue if it
+    // drained empty (see `drop_queue_if_empty`).
+    drop_queue_if_empty(state, &ref_key);
 
     // Keyless entries release their envelope now; keyed entries
     // hold it in the `PoisonRecord` until eviction. See
@@ -4049,6 +4085,38 @@ mod tests {
         };
         assert_eq!(record.request_cid, cid(7));
         assert_eq!(record.head, cid(42));
+    }
+
+    #[test]
+    fn apply_head_drops_queue_when_drained_empty() {
+        // Draining the last entry removes the queue from the map
+        // (not just leaves an empty VecDeque), so `state.queues`
+        // tracks live branches only.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state.queues.contains_key(&ref_key));
+
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", queue_id, cid(42), 10),
+            3,
+        );
+        // Queue fully drained → entry gone from the map, not an
+        // empty VecDeque left behind.
+        assert!(
+            !state.queues.contains_key(&ref_key),
+            "drained queue should be removed from state.queues"
+        );
+
+        // A fresh submission re-creates it.
+        apply(&mut state, enqueue("test/db", "main", 8, None), 4);
+        assert!(state.queues.contains_key(&ref_key));
     }
 
     #[test]
