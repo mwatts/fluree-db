@@ -1152,7 +1152,7 @@ fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String
 
     let is_lang_o = |e: &crate::ir::Expression| match e {
         crate::ir::Expression::Call { func, args } => {
-            *func == crate::ir::Function::Lang
+            matches!(func, crate::ir::Function::Lang { .. })
                 && args.len() == 1
                 && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
         }
@@ -1293,7 +1293,7 @@ fn detect_count_rows_with_encoded_filters(
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == o_var);
     let is_lang_call = |e: &crate::ir::Expression| match e {
         crate::ir::Expression::Call { func, args } => {
-            *func == crate::ir::Function::Lang
+            matches!(func, crate::ir::Function::Lang { .. })
                 && args.len() == 1
                 && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
         }

@@ -149,12 +149,9 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 ];
 
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
-    // result mismatch (6)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01",
+    // result mismatch (3)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#in01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#notin01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
 ];
 
@@ -164,10 +161,7 @@ pub const SPARQL11_GROUPING: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/grouping/manifest#group07",
 ];
 
-pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[
-    // result mismatch (1)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/project-expression/manifest#projexp05",
-];
+pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[];
 
 pub const SPARQL11_SUBQUERY: &[&str] = &[
     // graph cluster (2) — PR-G1: subquery02 = GRAPH ?g correlation into the
@@ -182,7 +176,7 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
 // binding typed as literal — audit §4.2.
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (110); subgroup ownership per
+    // result mismatch (83); subgroup ownership per
     // docs/audit/burn-down/ROADMAP.md §6.1
     //
     // W-1 algebra cluster: nested-group FILTER sees enclosing-scope
@@ -214,22 +208,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-boolean-literal",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-bool",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dT",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dbl",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dec",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-flt",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-int",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-str",
     // W-2 serialization cluster: reification output in CONSTRUCT (2)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-datatype-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-2",
@@ -250,7 +233,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#add-literals",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#add-numbers-cast",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#divide-numbers-cast",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#multiply-numbers-cast",
@@ -286,30 +268,15 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/regex/manifest#regex-no-metacharacters",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/regex/manifest#regex-no-metacharacters-case-insensitive",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-01",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-02",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-03",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-04",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-05",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-09",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-10",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-12",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-13",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-14",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-15",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-16",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-17",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-18",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-19",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-20",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-21",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-22",
+    // tP-29/30 expect ASK=false and previously "passed" only because
+    // DATATYPE(expr) errored; evaluating expression arguments unmasks the
+    // D4 numeric-promotion defect (double/decimal, float) — PR-X2.
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-29",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-30",
     // dataset: FROM/FROM NAMED unsupported on single-ledger GraphDb (12)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-01",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-02",
@@ -697,15 +664,7 @@ pub const SPARQL12_LANG_BASEDIR: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/lang-basedir/manifest#strlang",
 ];
 
-pub const SPARQL12_RDF11: &[&str] = &[
-    // DATATYPE() rejects constant (non-variable) arguments — the same D2
-    // defect as the expression cluster; PR-X1 removes both clusters'
-    // entries in one fix (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#langstring-datatype",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-datatype",
-    // result mismatch (1) — PR-X2
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/rdf11/manifest#plain-string-same",
-];
+pub const SPARQL12_RDF11: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX: &[&str] = &[
     // parser accepts invalid input (missing validation) (2)

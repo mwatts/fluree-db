@@ -47,6 +47,12 @@ impl RowAccess for RowWithLocals<'_> {
             .map(|(_, b)| b)
             .or_else(|| self.base.get(var))
     }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        // Loop locals are comprehension-scoped, not part of the solution
+        // mapping — the per-solution identity comes from the base row only.
+        self.base.for_each_binding(f);
+    }
 }
 
 /// The elements of `list`, or `None` when it isn't a list (a null or non-list
