@@ -147,17 +147,15 @@ pub const SPARQL11_CONSTRUCT: &[&str] = &[
 ];
 
 pub const SPARQL11_EXISTS: &[&str] = &[
-    // result mismatch (2)
+    // result mismatch (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/exists/manifest#exists-graph-variable",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/exists/manifest#exists03",
 ];
 
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
-    // result mismatch (6)
+    // result mismatch (5)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#in01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#notin01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
 ];
@@ -186,14 +184,12 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
 // binding typed as literal — audit §4.2.
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (113)
+    // result mismatch (110)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#base-prefix-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#base-prefix-5",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
@@ -255,7 +251,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-10b",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#dawg-graph-11",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-empty",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-exist",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-optional",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-variable-join",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
@@ -314,6 +309,9 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-11",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-12b",
     // query execution error (1)
+    // base-prefix-1's BASE-resolution half landed (PR-BASE); it now fails
+    // only on lexing `PREFIX : <>` — the empty-IRIREF rejection that roadmap
+    // PR-1 deletes (parser-syntax-validation.md P4). Second lander removes.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#base-prefix-1",
 ];
 
@@ -704,7 +702,9 @@ pub const SPARQL12_VERSION: &[&str] = &[
 // Audit §4.2.7 (hot-operator semantics; fix must preserve `*`/`+` fast path).
 pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp16",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp34",
+    // pp35 is a graph-cluster test, not path cardinality: base-relative GRAPH
+    // IRI resolution (landed, PR-BASE) unblocked it, but it still needs the
+    // GraphOperator ?g fixes (roadmap PR-G1) — second lander removes this.
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp36",
 ];

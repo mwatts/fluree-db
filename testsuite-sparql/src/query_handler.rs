@@ -338,9 +338,17 @@ pub async fn run_eval_test(
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = setup_graph_store(&fluree, data_url, graph_data).await?;
 
-    // 2. Read + execute the SPARQL query
+    // 2. Read + execute the SPARQL query.
+    //
+    // W3C engines resolve relative IRIs in a query against the query
+    // document's URL (RFC 3986 §5.1.3 "URI used to retrieve the entity").
+    // Supply that document base the same way the data loader does
+    // (`prepare_for_insert` prepends `@base`): a leading BASE declaration.
+    // An explicit BASE in the query text overrides it (last declaration
+    // wins), exactly like a document-supplied base would be overridden.
     let sparql = read_file_to_string(query_url)
         .with_context(|| format!("Reading query file: {query_url}"))?;
+    let sparql = format!("BASE <{query_url}>\n{sparql}");
 
     let db = GraphDb::from_ledger_state(&ledger);
     let query_result = fluree
