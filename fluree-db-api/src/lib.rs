@@ -3705,11 +3705,12 @@ impl Fluree {
                         .await?,
                 ))
             }
-            ConditionalCypherWrite::MergeRelPerRowSet(update) => {
-                // Per-row relationship find-or-create with ON MATCH SET. Decompose
-                // into two branches over the same leading MATCH, staged into one
-                // commit: the ON MATCH SET over already-existing edges FIRST (it
-                // only mutates properties, never edge existence), then the create
+            ConditionalCypherWrite::MergePerRowSet(update) => {
+                // Per-row find-or-create (relationship, or an UNWIND-batch node
+                // upsert) with an ON MATCH / trailing SET. Decompose into two
+                // branches over the same leading rows, staged into one commit:
+                // the ON MATCH SET over already-existing edges/nodes FIRST (it
+                // only mutates properties, never existence), then the create
                 // branch over the absent rows (its NOT EXISTS guard is thus
                 // unaffected by the first branch). No probe needed — each branch's
                 // guard partitions the rows.

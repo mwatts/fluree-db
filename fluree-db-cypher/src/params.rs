@@ -485,20 +485,27 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
         let Some(found) = found else {
             return Ok(());
         };
-        // The edge-batch desugar needs a *mandatory* MATCH — its endpoints feed
-        // a CREATE, and an OPTIONAL (possibly-unbound) endpoint could assert a
-        // partial reifier bundle. An OPTIONAL-only body is rejected; no match at
-        // all means this isn't the edge case (handled by `expand_unwind_create`
-        // or left to the generic path).
+        // This desugar fires for the batched **edge** insert (MATCH endpoints →
+        // CREATE) and the batched **node upsert** (`UNWIND $rows AS row MERGE
+        // (n {id: row.id}) …`). Both need per-row independence — the edge's
+        // endpoints come from a mandatory MATCH; the node upsert's per-row
+        // NOT EXISTS guard comes from the MERGE. Either qualifies. An
+        // OPTIONAL-only body (no mandatory MATCH, no MERGE) is rejected; no
+        // trigger at all leaves this to `expand_unwind_create` / the generic
+        // path.
         let has_mandatory = u
             .read_clauses
             .iter()
             .any(|c| matches!(c, ReadClause::Match(_)));
+        let has_merge = u
+            .write_clauses
+            .iter()
+            .any(|w| matches!(w, WriteClause::Merge(_)));
         let has_optional = u
             .read_clauses
             .iter()
             .any(|c| matches!(c, ReadClause::OptionalMatch(_)));
-        if !has_mandatory {
+        if !has_mandatory && !has_merge {
             if has_optional {
                 return Err(unsupported_param(
                     &found.2,

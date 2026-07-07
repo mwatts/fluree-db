@@ -9295,3 +9295,109 @@ async fn transact_cypher_merge_relationship_per_row_on_match_only_all_existing()
         .expect("jsonld");
     assert_eq!(rows, json!([["matched"]]), "only ON MATCH fired: {rows}");
 }
+
+#[tokio::test]
+async fn transact_cypher_unwind_batch_node_merge_upsert() {
+    // The `LOAD CSV` shape: per-row node find-or-create keyed on a unique id,
+    // with a trailing SET applied on both branches. Two passes prove upsert:
+    // first pass creates, second pass updates without duplicating.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:unwind-node-merge");
+
+    let batch1 = json!({ "batch": [
+        {"id": "1", "name": "Alice"},
+        {"id": "2", "name": "Bob"},
+    ]});
+    let stmt = "UNWIND $batch AS row \
+                MERGE (n:Person {id: row.id}) \
+                SET n.name = row.name";
+
+    let seed_t = l.t();
+    let res = fluree
+        .transact_cypher_with_params(l, stmt, batch1.as_object())
+        .await
+        .expect("first upsert pass");
+    assert_eq!(res.ledger.t(), seed_t + 1, "one batch → one commit");
+    let db = graphdb_from_ledger(&res.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "first pass creates both nodes"
+    );
+
+    // Second pass: id 1 already exists (update name), id 3 is new (create).
+    let batch2 = json!({ "batch": [
+        {"id": "1", "name": "Alice2"},
+        {"id": "3", "name": "Carol"},
+    ]});
+    let res = fluree
+        .transact_cypher_with_params(res.ledger, stmt, batch2.as_object())
+        .await
+        .expect("second upsert pass");
+    let db = graphdb_from_ledger(&res.ledger);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) RETURN n.id AS id, n.name AS name ORDER BY id",
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        rows,
+        json!([["1", "Alice2"], ["2", "Bob"], ["3", "Carol"]]),
+        "id 1 updated in place (no duplicate), id 3 created, id 2 untouched: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_batch_node_merge_on_create_on_match() {
+    // Per-row node upsert with distinct ON CREATE vs ON MATCH branches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:unwind-node-merge-oncreate");
+    // Seed id 1 so the next pass matches it and creates id 2.
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $batch AS row MERGE (n:Person {id: row.id})",
+            json!({"batch": [{"id": "1"}]}).as_object(),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $batch AS row MERGE (n:Person {id: row.id}) \
+             ON CREATE SET n.origin = 'created' \
+             ON MATCH SET n.origin = 'matched'",
+            json!({"batch": [{"id": "1"}, {"id": "2"}]}).as_object(),
+        )
+        .await
+        .expect("upsert with on-create/on-match")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) RETURN n.id AS id, n.origin AS origin ORDER BY id",
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        rows,
+        json!([["1", "matched"], ["2", "created"]]),
+        "existing id 1 took ON MATCH; new id 2 took ON CREATE: {rows}"
+    );
+}

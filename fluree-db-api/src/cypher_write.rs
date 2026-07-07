@@ -78,14 +78,16 @@ pub enum ConditionalCypherWrite {
     /// SIDs), reject if so, otherwise stage the base-edge retraction (the
     /// `f:reifies*` cascade removes the bundle).
     DeleteRel(Update),
-    /// `MATCH (leading) MERGE (a)-[:T]->(b) ON MATCH SET … [ON CREATE SET …]` —
-    /// the *per-row* relationship find-or-create. Each matched row independently
-    /// matches or creates the edge, so no single statement-level branch fits.
-    /// Resolves to an ordered **pair** of Txns staged into one commit: the
-    /// `ON MATCH SET` branch (over already-existing edges) first, then the
-    /// create branch (over the absent rows). See
-    /// [`crate::Fluree::stage_pair_from_txns`] for the atomicity model.
-    MergeRelPerRowSet(Update),
+    /// A *per-row* find-or-create MERGE with an `ON MATCH SET` (and/or a
+    /// trailing `SET`), where each row independently matches or creates —
+    /// either `MATCH (leading) MERGE (a)-[:T]->(b) …` (relationship) or
+    /// `UNWIND $batch AS row MERGE (n {id: row.id}) SET …` (node upsert, the
+    /// `LOAD CSV` shape). No single statement-level branch fits, so it resolves
+    /// to an ordered **pair** of Txns staged into one commit: the `ON MATCH
+    /// SET` branch (over already-existing edges/nodes) first, then the create
+    /// branch (over the absent rows). See [`crate::Fluree::stage_pair_from_txns`]
+    /// for the atomicity model.
+    MergePerRowSet(Update),
 }
 
 /// Detect a write shape that requires a pre-write probe. Returns `None` for
@@ -122,11 +124,12 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
                 } else {
                     None
                 }
-            } else if is_conditional_rel_merge(m) && has_conditional_set {
-                // Per-row relationship find-or-create with an ON MATCH SET (or a
-                // trailing SET, which applies on both branches). Resolves to an
-                // ordered pair of Txns committed atomically.
-                Some(ConditionalCypherWrite::MergeRelPerRowSet(u.clone()))
+            } else if has_conditional_set && is_per_row_conditional_merge(m, &u.read_clauses) {
+                // Per-row find-or-create with an ON MATCH SET (or a trailing SET,
+                // which applies on both branches): a relationship MERGE under any
+                // leading read, or a node MERGE fed by an UNWIND-batch VALUES
+                // join. Resolves to an ordered pair of Txns committed atomically.
+                Some(ConditionalCypherWrite::MergePerRowSet(u.clone()))
             } else {
                 None
             }
@@ -187,12 +190,26 @@ fn conditional_merge_pattern(m: &MergeClause) -> bool {
     }
 }
 
-/// A `conditional_merge_pattern` that is specifically a single relationship
-/// (not a bare node) — the shape the per-row `MERGE … ON MATCH SET` decomposer
-/// handles. A per-row *node* MERGE with a leading MATCH is a different (and
-/// currently unsupported) shape.
-fn is_conditional_rel_merge(m: &MergeClause) -> bool {
-    conditional_merge_pattern(m) && m.pattern.parts[0].tail.len() == 1
+/// Whether `m` under `read_clauses` is a per-row find-or-create the
+/// pair-staging decomposer handles: a single-relationship MERGE (endpoints may
+/// be bound by any leading read), or a single-node MERGE fed by an
+/// `UNWIND $batch` VALUES join (all leading read clauses are `InlineRows`). A
+/// node MERGE under a plain leading MATCH is excluded — it would create one
+/// duplicate per matched row (see the lowering guard).
+fn is_per_row_conditional_merge(m: &MergeClause, read_clauses: &[ReadClause]) -> bool {
+    if !conditional_merge_pattern(m) {
+        return false;
+    }
+    match m.pattern.parts[0].tail.len() {
+        1 => true, // relationship
+        0 => {
+            !read_clauses.is_empty()
+                && read_clauses
+                    .iter()
+                    .all(|c| matches!(c, ReadClause::InlineRows { .. }))
+        }
+        _ => false,
+    }
 }
 
 /// Build the ON MATCH branch of a per-row relationship MERGE: the leading

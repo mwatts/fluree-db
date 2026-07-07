@@ -241,10 +241,26 @@ impl<'a> CypherLowering<'a> {
                      single-Txn staging can't provide",
                 ));
             }
-            if !update.read_clauses.is_empty() && !is_relationship_merge(merges[0]) {
+            // A node MERGE fed by an `UNWIND $batch` row set (which desugars to
+            // an inline VALUES join) is a per-row find-or-create: the NOT EXISTS
+            // guard's identifying props reference the row's columns
+            // (`MERGE (n:Person {id: row.id})`), so it runs once per row against
+            // the pre-write snapshot. A leading *plain MATCH* before a node
+            // MERGE stays rejected — with a row-independent identifying value it
+            // would create one duplicate per matched row (a cartesian footgun);
+            // the batch form carries a per-row key.
+            let node_merge_ok = update
+                .read_clauses
+                .iter()
+                .all(|c| matches!(c, ReadClause::InlineRows { .. }));
+            if !update.read_clauses.is_empty()
+                && !is_relationship_merge(merges[0])
+                && !node_merge_ok
+            {
                 return Err(LowerCypherError::unsupported(
-                    "a leading MATCH is only allowed before a relationship MERGE \
-                     (`MATCH (a),(b) MERGE (a)-[:T]->(b)`) in v1 — a node MERGE must stand alone",
+                    "a leading MATCH before a node MERGE is not supported (it would create one \
+                     duplicate per matched row). Use `UNWIND $batch AS row MERGE (n {id: row.id})` \
+                     for per-row node upsert, or a standalone MERGE.",
                 ));
             }
         }
