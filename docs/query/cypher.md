@@ -333,6 +333,16 @@ ORDER BY / SKIP / LIMIT
   (deferred on a relationship `MERGE`). Resolved by probing the current writer
   state, then staging either a create or an update.
 
+  A single-node `MERGE` also takes trailing `SET` clauses, which apply on
+  *both* branches — the standard upsert idiom:
+
+  ```cypher
+  MERGE (n:User {id: $id}) SET n += $props
+  ```
+
+  The map side of `SET n = …` / `SET n += …` may be a whole-map parameter
+  (`$props` above) or an inline `{k: v}` literal.
+
   Style note: write bound endpoints **bare** in the `MERGE` pattern
   (`MATCH (a:Person) MERGE (a)-[:T]->(b)`). Repeating a label on a bound
   endpoint (`MERGE (a:Person)-[:T]->(b)`) re-asserts its `rdf:type` triple when

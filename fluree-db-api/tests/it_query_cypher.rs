@@ -3943,6 +3943,216 @@ async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_trailing_set_applies_on_both_branches() {
+    // The upsert idiom: `MERGE (n {key}) SET …` — the SET runs after the
+    // MERGE on the create AND the match branch.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-trailing-set");
+
+    // First run: node absent → created, trailing SET applies.
+    let l = fluree
+        .transact_cypher(l, r#"MERGE (n:Person {name: "Carol"}) SET n.seen = 1"#)
+        .await
+        .expect("merge+set create branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {name: "Carol", seen: 1}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "trailing SET applied on the create branch"
+    );
+
+    // Second run: node present → matched, trailing SET overwrites.
+    let l = fluree
+        .transact_cypher(l, r#"MERGE (n:Person {name: "Carol"}) SET n.seen = 2"#)
+        .await
+        .expect("merge+set match branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "still exactly one node (no duplicate)"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {seen: 2}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "trailing SET applied on the match branch"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {seen: 1}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        0,
+        "old value was retracted"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_on_create_and_trailing_set_combine() {
+    // ON CREATE SET fires only on create; the trailing SET fires on both runs.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-oncreate-trailing");
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Item {sku: "a1"}) ON CREATE SET n.origin = "created" SET n.stamp = 7"#,
+        )
+        .await
+        .expect("first run")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:Item {origin: "created", stamp: 7}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "both ON CREATE SET and trailing SET applied on create"
+    );
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Item {sku: "a1"}) ON CREATE SET n.origin = "recreated" SET n.stamp = 9"#,
+        )
+        .await
+        .expect("second run")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:Item {origin: "created", stamp: 9}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "trailing SET updated stamp; ON CREATE SET did not re-fire"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_trailing_set_map_merge_with_params() {
+    // The canonical ETL statement: MERGE (n {key: $k}) SET n += $props.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-set-map");
+
+    let params = json!({ "id": 42, "props": { "name": "Eve", "age": 30 } });
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "MERGE (n:User {id: $id}) SET n += $props",
+            params.as_object(),
+        )
+        .await
+        .expect("upsert create branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:User {id: 42, name: "Eve", age: 30}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "map merged into the created node"
+    );
+
+    // Re-run with changed props: same node, values updated.
+    let params = json!({ "id": 42, "props": { "name": "Eve", "age": 31 } });
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "MERGE (n:User {id: $id}) SET n += $props",
+            params.as_object(),
+        )
+        .await
+        .expect("upsert match branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:User) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "no duplicate node"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:User {age: 31}) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "map merge updated the property on the match branch"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_match_set_map_merge_param() {
+    // `SET n += $map` after a plain MATCH (the same whole-map param the MERGE
+    // upsert uses, through the ordinary MATCH … SET lowering).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:match-set-map-param");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (n:User {id: 7, name: "Ann"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+
+    let params = json!({ "props": { "name": "Anne", "city": "Oslo" } });
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "MATCH (n:User {id: 7}) SET n += $props",
+            params.as_object(),
+        )
+        .await
+        .expect("set map param")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:User {id: 7, name: "Anne", city: "Oslo"}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "whole-map param merged via MATCH … SET"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:merge-on-create");

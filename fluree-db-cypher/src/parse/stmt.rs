@@ -5,7 +5,7 @@ use crate::ast::{
     OrderItem, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause,
     SetClause, SetItem, Statement, UnionTail, UnwindClause, Update, WithClause, WriteClause,
 };
-use crate::ast::{Expr, Variable};
+use crate::ast::{Expr, MapLit, ParamRef, Variable};
 use crate::diag::{DiagCode, Diagnostic};
 use crate::lex::TokenKind;
 
@@ -499,12 +499,12 @@ fn parse_set_items(s: &mut TokenStream) -> Result<Vec<SetItem>, Diagnostic> {
             }
             TokenKind::Eq => {
                 s.advance();
-                let map = parse_map_lit(s)?;
+                let map = parse_set_map(s)?;
                 items.push(SetItem::MapReplace { target, map });
             }
             TokenKind::PlusEq => {
                 s.advance();
-                let map = parse_map_lit(s)?;
+                let map = parse_set_map(s)?;
                 items.push(SetItem::MapMerge { target, map });
             }
             TokenKind::Colon => {
@@ -526,6 +526,27 @@ fn parse_set_items(s: &mut TokenStream) -> Result<Vec<SetItem>, Diagnostic> {
         }
     }
     Ok(items)
+}
+
+/// The map side of `SET n = …` / `SET n += …`: an inline `{k: v, …}` literal,
+/// or a whole-map parameter (`SET n += $props`) — encoded as a single entry
+/// under [`crate::params::WHOLE_MAP_PARAM_KEY`] and expanded to real entries
+/// during param substitution (map keys parse as identifiers, so the reserved
+/// empty key cannot occur otherwise).
+fn parse_set_map(s: &mut TokenStream) -> Result<MapLit, Diagnostic> {
+    if let TokenKind::Param(name) = s.peek_kind() {
+        let name = name.clone();
+        let span = s.peek_span();
+        s.advance();
+        return Ok(MapLit {
+            entries: vec![(
+                crate::params::WHOLE_MAP_PARAM_KEY.to_string(),
+                Expr::Param(ParamRef { name, span }),
+            )],
+            span,
+        });
+    }
+    parse_map_lit(s)
 }
 
 fn parse_remove(s: &mut TokenStream) -> Result<RemoveClause, Diagnostic> {

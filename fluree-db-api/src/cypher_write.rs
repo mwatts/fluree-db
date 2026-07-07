@@ -21,7 +21,7 @@
 use fluree_db_cypher::ast::{
     BinOp, CypherAst, DeleteClause, Direction, Expr, FuncCall, Literal, MatchClause, MergeClause,
     NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause,
-    Statement, Update, Variable, WithClause, WriteClause,
+    SetItem, Statement, Update, Variable, WithClause, WriteClause,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
@@ -38,10 +38,17 @@ pub enum WritePlan {
 
 /// A write that needs a pre-write probe to choose between branches.
 pub enum ConditionalCypherWrite {
-    /// Single-node `MERGE` with a non-empty `ON MATCH SET`: probe existence,
-    /// then stage the create branch (when absent) or the `ON MATCH SET`
-    /// (when present).
-    MergeOnMatch(MergeClause),
+    /// Single-node `MERGE` with an `ON MATCH SET` and/or trailing `SET`
+    /// clauses (`MERGE (n {…}) [ON CREATE SET …] [ON MATCH SET …] [SET …]`,
+    /// the upsert idiom): probe existence, then stage the create branch
+    /// (trailing SETs folded into `ON CREATE SET`) or the match branch
+    /// (`MATCH … SET on_match + trailing`).
+    MergeSet {
+        merge: MergeClause,
+        /// Flattened items of `SET` clauses following the MERGE — Cypher
+        /// applies them after the MERGE regardless of which branch ran.
+        trailing: Vec<SetItem>,
+    },
     /// Bare `MATCH … DELETE n` (non-`DETACH`): probe whether any matched node
     /// still has a relationship, error if so, otherwise stage the node
     /// retraction (via the `DETACH DELETE` lowering — equivalent when there
@@ -60,15 +67,30 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
     let Statement::Update(u) = &ast.statement else {
         return None;
     };
-    if u.write_clauses.len() != 1 {
-        return None;
-    }
-    match &u.write_clauses[0] {
-        // MERGE … ON MATCH SET: standalone single-node MERGE with on-match.
-        WriteClause::Merge(m) => {
+    match u.write_clauses.as_slice() {
+        // MERGE … [ON MATCH SET …] [SET …]: standalone single-node MERGE
+        // needing a probe — an on-match branch, and/or trailing SET clauses
+        // that must apply on both branches (the upsert idiom).
+        [WriteClause::Merge(m), rest @ ..]
+            if rest.iter().all(|w| matches!(w, WriteClause::Set(_))) =>
+        {
             let single_node = m.pattern.parts.len() == 1 && m.pattern.parts[0].tail.is_empty();
-            if u.read_clauses.is_empty() && !m.on_match.is_empty() && single_node {
-                Some(ConditionalCypherWrite::MergeOnMatch(m.clone()))
+            let trailing: Vec<SetItem> = rest
+                .iter()
+                .filter_map(|w| match w {
+                    WriteClause::Set(s) => Some(s.items.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if u.read_clauses.is_empty()
+                && single_node
+                && (!m.on_match.is_empty() || !trailing.is_empty())
+            {
+                Some(ConditionalCypherWrite::MergeSet {
+                    merge: m.clone(),
+                    trailing,
+                })
             } else {
                 None
             }
@@ -77,7 +99,7 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
         // (parallel-edge probe). All-node-variable bare targets → DeleteNode
         // (relationship-existence probe). DETACH DELETE (node) and mixed/other
         // shapes lower directly (the lowering handles or rejects them).
-        WriteClause::Delete(d) => {
+        [WriteClause::Delete(d)] => {
             if u.read_clauses.is_empty() {
                 return None;
             }
@@ -206,10 +228,13 @@ pub(crate) fn build_merge_probe_ast(node: &NodePattern) -> CypherAst {
     }
 }
 
-/// Build the on-match branch: `MATCH (pattern) SET <on_match>`. Reuses the
-/// existing MATCH … SET lowering.
-pub(crate) fn build_on_match_ast(merge: &MergeClause) -> CypherAst {
+/// Build the on-match branch: `MATCH (pattern) SET <on_match + trailing>`.
+/// Reuses the existing MATCH … SET lowering. Trailing SETs run after the
+/// MERGE regardless of branch, so they concatenate after the ON MATCH items.
+pub(crate) fn build_on_match_ast(merge: &MergeClause, trailing: &[SetItem]) -> CypherAst {
     let span = merge.span;
+    let mut items = merge.on_match.clone();
+    items.extend(trailing.iter().cloned());
     CypherAst {
         statement: Statement::Update(Update {
             read_clauses: vec![ReadClause::Match(MatchClause {
@@ -217,10 +242,7 @@ pub(crate) fn build_on_match_ast(merge: &MergeClause) -> CypherAst {
                 where_clause: None,
                 span,
             })],
-            write_clauses: vec![WriteClause::Set(SetClause {
-                items: merge.on_match.clone(),
-                span,
-            })],
+            write_clauses: vec![WriteClause::Set(SetClause { items, span })],
             return_clause: None,
             span,
         }),
@@ -360,14 +382,18 @@ pub(crate) fn build_detach_delete_ast(update: &Update) -> CypherAst {
 
 /// Build the create branch: the MERGE with `ON MATCH SET` cleared (so it
 /// lowers to the single-Txn create-if-absent path with `ON CREATE SET`).
-pub(crate) fn build_create_ast(merge: &MergeClause) -> CypherAst {
+/// Trailing SETs apply on this branch too, so they fold into `ON CREATE SET`
+/// after the original items.
+pub(crate) fn build_create_ast(merge: &MergeClause, trailing: &[SetItem]) -> CypherAst {
     let span = merge.span;
+    let mut on_create = merge.on_create.clone();
+    on_create.extend(trailing.iter().cloned());
     CypherAst {
         statement: Statement::Update(Update {
             read_clauses: Vec::new(),
             write_clauses: vec![WriteClause::Merge(MergeClause {
                 pattern: merge.pattern.clone(),
-                on_create: merge.on_create.clone(),
+                on_create,
                 on_match: Vec::new(),
                 span,
             })],

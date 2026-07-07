@@ -3620,12 +3620,13 @@ impl Fluree {
         let probe_view = probe_view.with_default_context(default_context);
 
         match cw {
-            ConditionalCypherWrite::MergeOnMatch(merge) => {
+            ConditionalCypherWrite::MergeSet { merge, trailing } => {
                 let node = &merge.pattern.parts[0].head;
-                // ON MATCH SET references the MERGE variable, so the node needs one.
+                // The SET items reference the MERGE variable, so the node needs one.
                 if node.var.is_none() {
                     return Err(ApiError::cypher(
-                        "MERGE … ON MATCH SET requires a node variable".to_string(),
+                        "MERGE with ON MATCH SET or a trailing SET requires a node variable"
+                            .to_string(),
                         Vec::new(),
                     ));
                 }
@@ -3636,9 +3637,9 @@ impl Fluree {
                     .row_count()
                     > 0;
                 let ast = if exists {
-                    crate::cypher_write::build_on_match_ast(merge)
+                    crate::cypher_write::build_on_match_ast(merge, trailing)
                 } else {
-                    crate::cypher_write::build_create_ast(merge)
+                    crate::cypher_write::build_create_ast(merge, trailing)
                 };
                 self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
                     .await

@@ -22,6 +22,12 @@ use crate::span::SourceSpan;
 /// Map of parameter name → JSON value, as supplied in the request envelope.
 pub type ParamMap = serde_json::Map<String, JsonValue>;
 
+/// Reserved `MapLit` entry key marking a whole-map parameter in `SET n = $p` /
+/// `SET n += $p` (see `parse::stmt::parse_set_map`). Map keys parse as
+/// identifiers, so an empty key cannot occur in real input; substitution
+/// expands the entry into one entry per key of the object param.
+pub(crate) const WHOLE_MAP_PARAM_KEY: &str = "";
+
 /// Error raised while substituting `$param` references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamError {
@@ -1087,9 +1093,37 @@ fn subst_write_clause(w: &mut WriteClause, p: &ParamMap) -> Result<(), ParamErro
 fn subst_set_item(s: &mut SetItem, p: &ParamMap) -> Result<(), ParamError> {
     match s {
         SetItem::Property { value, .. } => subst_expr(value, p),
-        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => subst_maplit(map, p),
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => subst_set_map(map, p),
         SetItem::Labels { .. } => Ok(()),
     }
+}
+
+/// Substitute the map side of a `SET n = …` / `SET n += …`. A whole-map
+/// parameter (`SET n += $props`, parsed as a single entry under
+/// [`WHOLE_MAP_PARAM_KEY`]) expands into one entry per key of the object
+/// param; an inline map literal substitutes its entry values as usual.
+fn subst_set_map(map: &mut MapLit, p: &ParamMap) -> Result<(), ParamError> {
+    if let [(key, Expr::Param(pref))] = map.entries.as_slice() {
+        if key == WHOLE_MAP_PARAM_KEY {
+            let val = p
+                .get(&pref.name)
+                .ok_or_else(|| ParamError::Missing(pref.name.clone()))?;
+            let JsonValue::Object(obj) = val else {
+                return Err(ParamError::Unsupported {
+                    name: pref.name.clone(),
+                    reason: "`SET … = $param` / `SET … += $param` needs an object (map) value"
+                        .to_string(),
+                });
+            };
+            let (name, span) = (pref.name.clone(), pref.span);
+            map.entries = obj
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), json_to_expr(v, &name, span)?)))
+                .collect::<Result<Vec<_>, ParamError>>()?;
+            return Ok(());
+        }
+    }
+    subst_maplit(map, p)
 }
 
 fn subst_pattern(pat: &mut Pattern, p: &ParamMap) -> Result<(), ParamError> {
