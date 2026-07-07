@@ -447,3 +447,45 @@ WHERE {
     all_bnodes.dedup();
     assert_eq!(all_bnodes.len(), 4, "b1 must be fresh per solution");
 }
+
+// =============================================================================
+// D10 — regex `q` flag (literal pattern, XPath fn:matches)
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_regex_q_flag_literal_pattern() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprsem/d10:sparql");
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:m", "ex:val": "a?+*.{}()[]c" },
+            { "@id": "ex:n", "ex:val": "abc" }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.expect("insert").ledger;
+
+    // With `q`, metacharacters match literally (regex-no-metacharacters shape).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?s WHERE { ?s ex:val ?v . FILTER regex(?v, \"a?+*.{}()[]c\", \"q\") }",
+        )
+        .await,
+        json!([["ex:m"]])
+    );
+
+    // `q` composes with `i`.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?s WHERE { ?s ex:val ?v . FILTER regex(?v, \"A?+*.{}()[]C\", \"qi\") }",
+        )
+        .await,
+        json!([["ex:m"]])
+    );
+}
