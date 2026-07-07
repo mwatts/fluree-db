@@ -622,9 +622,12 @@ here to stay:
   name by default, a full IRI in `@vocab` mode — see
   [Names, and opting into IRIs](#names-and-opting-into-iris)).
 - **Relationships are edge annotations.** `-[r:T]->` reifies the base triple
-  `(s, p, o)` into an `f:reifies*` node (the edge identity). Fluree does not
-  implement RDF-star triple terms — see
-  [How Cypher maps to RDF](#how-cypher-maps-to-rdf).
+  `(s, p, o)` into a reifier node (the edge identity) — the same RDF 1.2 model
+  SPARQL exposes via the `{| … |}` annotation tail and `rdf:reifies <<( s p o )>>`
+  triple terms. So an edge is a *reifier over* a triple, not a triple term
+  stored as a value (triple terms are supported as the object of `rdf:reifies`,
+  not free-standing). See [How Cypher maps to RDF](#how-cypher-maps-to-rdf) and
+  [Edge annotations](../concepts/edge-annotations.md).
 - **`id(n)` / `elementId(n)` return the identity string**, not an integer — RDF
   subjects have no integer element id. Over Bolt, `xsd:decimal` renders as
   Float (Neo4j parity, precision loss); integer division yields decimals, so
