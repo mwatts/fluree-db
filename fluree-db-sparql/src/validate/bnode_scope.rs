@@ -35,10 +35,7 @@ use crate::span::SourceSpan;
 ///
 /// Appends one [`DiagCode::BlankNodeLabelCrossScope`] error per label that
 /// appears in more than one basic graph pattern.
-pub(super) fn check_blank_node_scopes(
-    pattern: &GraphPattern,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+pub(super) fn check_blank_node_scopes(pattern: &GraphPattern, diagnostics: &mut Vec<Diagnostic>) {
     let mut checker = BnodeScopeChecker {
         labels: HashMap::new(),
         next_scope: 0,

@@ -71,15 +71,12 @@ async fn sparql_select_star_with_groupby_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "query/grouping-parity-star:main").await;
 
-    let err = support::query_sparql(
-        &fluree,
-        &ledger,
-        "SELECT * WHERE { ?s ?p ?o } GROUP BY ?s",
-    )
-    .await
-    .expect_err("SELECT * with GROUP BY must be rejected");
+    let err = support::query_sparql(&fluree, &ledger, "SELECT * WHERE { ?s ?p ?o } GROUP BY ?s")
+        .await
+        .expect_err("SELECT * with GROUP BY must be rejected");
     assert!(
-        err.to_string().contains("SELECT * is not allowed with GROUP BY"),
+        err.to_string()
+            .contains("SELECT * is not allowed with GROUP BY"),
         "unexpected error: {err}"
     );
 }
@@ -128,7 +125,12 @@ async fn jsonld_groupby_ungrouped_select_projects_grouped_list() {
     assert_eq!(rows.len(), 2, "one row per ?age group: {rows:?}");
     let group50 = rows
         .iter()
-        .find(|r| r.as_array().and_then(|c| c.first()).and_then(|v| v.as_i64()) == Some(50))
+        .find(|r| {
+            r.as_array()
+                .and_then(|c| c.first())
+                .and_then(serde_json::Value::as_i64)
+                == Some(50)
+        })
         .expect("age-50 group");
     let mut names: Vec<String> = group50.as_array().expect("cols")[1]
         .as_array()
@@ -210,7 +212,7 @@ async fn jsonld_bind_on_bound_variable_accepted_as_constraint() {
         .await
         .expect("JSON-LD bind on a bound variable is accepted (divergence)");
     let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
-    assert_eq!(rows.as_array().map(|r| r.len()), Some(0), "{rows:?}");
+    assert_eq!(rows.as_array().map(Vec::len), Some(0), "{rows:?}");
 
     // Consistent rebind (?age = ?age + 0 always holds): all rows survive.
     let consistent = json!({
@@ -225,7 +227,7 @@ async fn jsonld_bind_on_bound_variable_accepted_as_constraint() {
         .await
         .expect("JSON-LD bind on a bound variable is accepted (divergence)");
     let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
-    assert_eq!(rows.as_array().map(|r| r.len()), Some(3), "{rows:?}");
+    assert_eq!(rows.as_array().map(Vec::len), Some(3), "{rows:?}");
 }
 
 // =============================================================================
@@ -293,13 +295,9 @@ async fn sparql_12_syntax_checks_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "query/grouping-parity-s12:main").await;
 
-    let err = support::query_sparql(
-        &fluree,
-        &ledger,
-        "SELECT (COUNT(COUNT(*)) AS ?c) WHERE {}",
-    )
-    .await
-    .expect_err("nested aggregate must be rejected");
+    let err = support::query_sparql(&fluree, &ledger, "SELECT (COUNT(COUNT(*)) AS ?c) WHERE {}")
+        .await
+        .expect_err("nested aggregate must be rejected");
     assert!(
         err.to_string().contains("cannot be nested"),
         "unexpected error: {err}"

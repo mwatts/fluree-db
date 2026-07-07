@@ -611,9 +611,9 @@ mod tests {
             query: Box::new(SubSelect {
                 distinct: false,
                 reduced: false,
-                variables: SelectVariables::Explicit(vec![
-                    crate::ast::query::SelectVariable::Var(Var::new("x", test_span())),
-                ]),
+                variables: SelectVariables::Explicit(vec![crate::ast::query::SelectVariable::Var(
+                    Var::new("x", test_span()),
+                )]),
                 pattern: Box::new(GraphPattern::bgp(vec![triple("x", "hidden")], test_span())),
                 modifiers: SolutionModifiers::default(),
                 span: test_span(),

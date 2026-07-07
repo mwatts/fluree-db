@@ -444,9 +444,7 @@ impl<'a> Validator<'a> {
                                 ),
                                 var.span,
                             )
-                            .with_help(
-                                "Each variable in a VALUES clause must be distinct.",
-                            ),
+                            .with_help("Each variable in a VALUES clause must be distinct."),
                         );
                     }
                 }
@@ -827,8 +825,7 @@ mod tests {
 
     #[test]
     fn test_bnode_scope_across_union_rejected() {
-        let diags =
-            validate_query("SELECT * WHERE { { _:a ex:p ?v } UNION { _:a ex:q 1 } }");
+        let diags = validate_query("SELECT * WHERE { { _:a ex:p ?v } UNION { _:a ex:q 1 } }");
         assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
     }
 
@@ -836,16 +833,13 @@ mod tests {
     fn test_bnode_scope_boundary_breaks_bgp_rejected() {
         // Reuse in the SAME group but across a GRAPH boundary: the GRAPH
         // pattern ends the first BGP, so the second `_:a` is a new BGP.
-        let diags = validate_query(
-            "SELECT * WHERE { _:a ?p ?v . GRAPH ?g { ?s ?p ?v } _:a ?q 1 }",
-        );
+        let diags = validate_query("SELECT * WHERE { _:a ?p ?v . GRAPH ?g { ?s ?p ?v } _:a ?q 1 }");
         assert!(has_code(&diags, DiagCode::BlankNodeLabelCrossScope));
     }
 
     #[test]
     fn test_bnode_scope_distinct_labels_valid() {
-        let diags =
-            validate_query("SELECT * WHERE { _:a ex:p ?v OPTIONAL { _:b ex:q 1 } }");
+        let diags = validate_query("SELECT * WHERE { _:a ex:p ?v OPTIONAL { _:b ex:q 1 } }");
         assert!(
             !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
             "{diags:?}"
@@ -880,9 +874,7 @@ mod tests {
 
     #[test]
     fn test_projection_group_key_and_aggregate_valid() {
-        let diags = validate_query(
-            "SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s",
-        );
+        let diags = validate_query("SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s");
         assert!(
             !has_code(&diags, DiagCode::UngroupedVariableInProjection),
             "{diags:?}"
@@ -910,9 +902,7 @@ mod tests {
     #[test]
     fn test_projection_bracketed_var_key_valid() {
         // GROUP BY (?s) — a bracketed bare variable counts as the key ?s.
-        let diags = validate_query(
-            "SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY (?s)",
-        );
+        let diags = validate_query("SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY (?s)");
         assert!(
             !has_code(&diags, DiagCode::UngroupedVariableInProjection),
             "{diags:?}"
@@ -953,9 +943,8 @@ mod tests {
 
     #[test]
     fn test_projection_subselect_checked() {
-        let diags = validate_query(
-            "SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }",
-        );
+        let diags =
+            validate_query("SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }");
         assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
     }
 
@@ -998,9 +987,8 @@ mod tests {
         // W3C syntax-SELECTscope1/3 (positive): each sub-SELECT clause is
         // checked against its own (empty) pattern; the outer SELECT * makes
         // no assignments.
-        let diags = validate_query(
-            "SELECT * WHERE { { SELECT (1 AS ?X) {} } { SELECT (1 AS ?X) {} } }",
-        );
+        let diags =
+            validate_query("SELECT * WHERE { { SELECT (1 AS ?X) {} } { SELECT (1 AS ?X) {} } }");
         assert!(
             !has_code(&diags, DiagCode::SelectAliasAlreadyBound),
             "{diags:?}"
@@ -1045,9 +1033,8 @@ mod tests {
 
     #[test]
     fn test_nested_aggregate_in_having_rejected() {
-        let diags = validate_query(
-            "SELECT ?s WHERE { ?s ?p ?x } GROUP BY ?s HAVING (SUM(AVG(?x)) > 1)",
-        );
+        let diags =
+            validate_query("SELECT ?s WHERE { ?s ?p ?x } GROUP BY ?s HAVING (SUM(AVG(?x)) > 1)");
         assert!(has_code(&diags, DiagCode::NestedAggregate));
     }
 
@@ -1060,8 +1047,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_values_variable_postclause_rejected() {
-        let diags =
-            validate_query("SELECT * WHERE { ?s ?p ?o } VALUES (?a ?a) { (1 1) }");
+        let diags = validate_query("SELECT * WHERE { ?s ?p ?o } VALUES (?a ?a) { (1 1) }");
         assert!(has_code(&diags, DiagCode::DuplicateValuesVariable));
     }
 

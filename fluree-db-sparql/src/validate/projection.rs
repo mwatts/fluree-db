@@ -237,11 +237,7 @@ pub(super) fn check_nested_aggregates(
     }
 }
 
-fn ungrouped_error(
-    name: &str,
-    span: SourceSpan,
-    group_by: Option<&GroupByClause>,
-) -> Diagnostic {
+fn ungrouped_error(name: &str, span: SourceSpan, group_by: Option<&GroupByClause>) -> Diagnostic {
     let mut diag = Diagnostic::error(
         DiagCode::UngroupedVariableInProjection,
         format!(
