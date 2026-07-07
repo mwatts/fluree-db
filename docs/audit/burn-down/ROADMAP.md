@@ -318,6 +318,54 @@ tiny); `where_plan.rs` (PR-X1 D1 vs W-1); `graph.rs` (PR-G1 vs residual A1-A4
 
 ---
 
+## 4b. Wave 0 — implementation status (2026-07-06, updated post-implementation)
+
+All six Wave-0 PRs are implemented, review-accepted, and sitting on local
+branches stacked on this coverage branch (not pushed until PR #1437 merges):
+
+| Branch | Scope | Net register delta | Notes |
+|---|---|---|---|
+| `burndown/pr-h1` | harness `.rdf`/SRX self-closing-element fix (+`rdf:nodeID`), register-comment batch, parent-audit corrections | −3 | mechanism verified as the §1.1-6 corrected direction |
+| `burndown/pr-1` | P1/P4/P5a/P5b/P6/P7/P8 + codepoint pre-pass, collections guarded out of quoted-triple contexts | −32 (33 removed, `test_65` added for PR-2 V6) | see deltas below |
+| `burndown/pr-l1` | bnode-dot lexer (greedy-scan + trailing-dot rewind) | −5 (json-res 4 + `owlds02`) | ABAB n=100 benches within budget |
+| `burndown/pr-l2` | canonical `xsd:double` across all six RDF-lexical sites | −1 | `ryu` dep dropped; changelog note in description |
+| `burndown/pr-x1` | D1/D2/D2b/D3/D9/D10/#1319, per-defect commits each suite-green | −37 (39 removed, `tP-29/30` added) | D-12 transparency section in description |
+| `burndown/pr-pp` | pp16 zero-length universe (full terms incl. literals), pp36 batch guard, new `query_hot_property_path` bench + budget | −2 | slower closure numbers = spec-mandated larger output on previously-wrong shapes |
+
+Combined: ≈−80 register entries once merged (integration re-baseline at merge
+time is authoritative). Merge order: PR #1437 → PR-H1 (owns the comment batch)
+→ siblings in any order (trivial register-file textual conflicts against H1).
+
+**Post-implementation corrections to this roadmap:**
+
+- **`basic#list-1..4` do NOT green via PR-1** (contra §2's PR-1 row): Turtle
+  *ingest* stores object-position collections as Fluree `list_index` items and
+  drops `()` objects entirely (`parse_collection_as_list`,
+  fluree-graph-turtle), so the `rdf:first/rest` triples never exist in
+  storage. This is a new, owned-by-no-one ingest/model gap — **decision D-13**:
+  materialize first/rest at ingest vs translate at query time vs documented
+  divergence. Register comments updated in PR-1.
+- **`subquery12` is resolved by PR-1** (bare-`{SELECT}` misparse executing
+  through error recovery) — remove it from PR-X2's scope; its probe item is
+  closed, and it further evidences the diagnostic-swallowing hole PR-3 must
+  fix.
+- **PR-W2A's expected shrink adjusts 63 → 61**: PR-1's P8 greened
+  `annotation-(anon)reifier-07` ×2.
+- **PR-X2's scope gains `tP-29/30`**: PR-X1's D2 fix unmasked the D4
+  promotion defect underneath (expected dynamics; entries registered with
+  that comment).
+- **Entailment enforced-green set is now 21** (`owlds02` was a bnode-dot
+  data-load casualty, not an entailment gap); `sparqldl-03` re-pointed to
+  result-mismatch.
+- **PR-X1's D1 mechanism** differed from the cluster doc: the fix landed in
+  `reorder_patterns` front-hoisting plus `Batch::new` zero-column length
+  inference (plan-time; var-full paths byte-identical).
+- **Bench-corpus gap**: the `insert_formats`/`import_bulk` corpora contain no
+  `_:` tokens, so lexer changes to blank-node handling are invisible to the
+  gates — add bnode-heavy content when the bench backlog is next touched.
+
+---
+
 ## 5. Production bugs to file as GitHub issues NOW
 
 Independent of W3C work; all confirmed end-to-end through public surfaces.
