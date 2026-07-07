@@ -115,6 +115,9 @@ mod vector;
 mod catalog_session;
 
 #[cfg(feature = "iceberg")]
+pub(crate) mod crawl;
+
+#[cfg(feature = "iceberg")]
 mod r2rml;
 
 #[cfg(feature = "iceberg")]

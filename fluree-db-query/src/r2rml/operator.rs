@@ -208,6 +208,20 @@ impl R2rmlScanOperator {
             }
         }
 
+        // Add predicate variable (`?s ?p ?o` / `<iri> ?p ?o`) if present and new
+        if let Some(pred_var) = pattern.predicate_var {
+            if seen.insert(pred_var) {
+                schema_vars.push(pred_var);
+            }
+        }
+
+        // Add type variable (`?s rdf:type ?type`) if present and new
+        if let Some(type_var) = pattern.type_var {
+            if seen.insert(type_var) {
+                schema_vars.push(type_var);
+            }
+        }
+
         // Add same-subject star object variables if new
         for (_, var) in &pattern.star_bindings {
             if seen.insert(*var) {
@@ -1526,10 +1540,31 @@ fn materialize_batch(
                 }
                 continue;
             }
-            produced.push(match pattern.subject_var {
-                Some(sv) => vec![(sv, subject_binding)],
-                None => Vec::new(),
-            });
+            // Pure subject-only pattern. A plain `?s a ex:Class` scan (constrained
+            // by `class_filter`) emits the subject alone. A projected `?s a ?type`
+            // scan (`type_var`) instead emits one row per class the map declares,
+            // binding `?type` to that class IRI — the same subjects a bound-class
+            // scan visits, with the class projected rather than filtered. A map
+            // that declares no class produces no row for a `type_var` pattern (its
+            // subjects have no rdf:type triple).
+            match pattern.type_var {
+                Some(tv) => {
+                    for class_iri in triples_map.classes() {
+                        let mut row = Vec::with_capacity(2);
+                        if let Some(sv) = pattern.subject_var {
+                            row.push((sv, subject_binding.clone()));
+                        }
+                        row.push((tv, Binding::iri(class_iri.as_str())));
+                        produced.push(row);
+                    }
+                }
+                None => {
+                    produced.push(match pattern.subject_var {
+                        Some(sv) => vec![(sv, subject_binding)],
+                        None => Vec::new(),
+                    });
+                }
+            }
             continue;
         };
 
@@ -1543,11 +1578,20 @@ fn materialize_batch(
                 materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
             {
                 let object_binding = encoder.encode(&t);
-                // Allocate at the final capacity (subject? + object) so the push
-                // below never reallocates — this is the hottest scan path.
-                let mut row = Vec::with_capacity(2);
+                // Allocate at the final capacity (subject? + predicate? + object)
+                // so the pushes below never reallocate — this is the hottest scan
+                // path.
+                let mut row = Vec::with_capacity(3);
                 if let Some(sv) = pattern.subject_var {
                     row.push((sv, subject_binding.clone()));
+                }
+                // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
+                // `?p` to this POM's predicate IRI. A templated (non-constant)
+                // predicate leaves `?p` unbound for that triple.
+                if let Some(pv) = pattern.predicate_var {
+                    if let Some(pred_iri) = pom.predicate_map.as_constant() {
+                        row.push((pv, Binding::iri(pred_iri)));
+                    }
                 }
                 row.push((obj_var, object_binding));
                 produced.push(row);

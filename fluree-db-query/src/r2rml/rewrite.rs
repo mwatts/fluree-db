@@ -613,21 +613,37 @@ pub fn convert_triple_to_r2rml(
     let is_type_pattern = tp.p.is_rdf_type();
 
     if is_type_pattern {
-        // rdf:type pattern: ?s rdf:type ex:Class
-        // Extract the class IRI - handle both Term::Sid (decode) and Term::Iri (use directly)
-        let class_filter = match &tp.o {
-            Term::Sid(sid) => snapshot.decode_sid(sid),
-            Term::Iri(iri) => Some(iri.to_string()),
-            Term::Value(fluree_db_core::FlakeValue::Ref(sid)) => snapshot.decode_sid(sid),
-            Term::Var(_) => None, // Class is a variable - no filter
-            _ => None,
-        };
-
-        // For rdf:type, we create an R2RML pattern with class_filter and no object_var
-        // (the type binding is implicit in the class_filter)
+        // rdf:type pattern. Both forms reduce to the SAME class-driven TriplesMap
+        // scan a SPARQL `a` produces — the class is either a constraint or a
+        // projected variable:
+        //   `?s rdf:type ex:Class` (FQL `@type: ex:Class`) → `class_filter`: the
+        //      scan is limited to TriplesMaps declaring the class; no object var.
+        //   `?s rdf:type ?type`    (FQL `@type: ?type`)    → `type_var`: the scan
+        //      visits every map and the operator binds `?type` to each matched
+        //      subject's declared class IRI (previously the variable was dropped,
+        //      leaving `?type` unbound / `null`).
+        // `object_var` stays `None` in both cases; the class is drawn from the
+        // mapping, never a table column.
         let mut pattern = make_pattern(None);
-        if let Some(class_iri) = class_filter {
-            pattern = pattern.with_class(class_iri);
+        match &tp.o {
+            Term::Sid(sid) => {
+                if let Some(class_iri) = snapshot.decode_sid(sid) {
+                    pattern = pattern.with_class(class_iri);
+                }
+            }
+            Term::Iri(iri) => {
+                pattern = pattern.with_class(iri.to_string());
+            }
+            Term::Value(fluree_db_core::FlakeValue::Ref(sid)) => {
+                if let Some(class_iri) = snapshot.decode_sid(sid) {
+                    pattern = pattern.with_class(class_iri);
+                }
+            }
+            // Variable class: project it instead of filtering on it.
+            Term::Var(v) => {
+                pattern = pattern.with_type_var(*v);
+            }
+            _ => {}
         }
         return Some(pattern);
     }
@@ -638,6 +654,14 @@ pub fn convert_triple_to_r2rml(
         Ref::Sid(sid) => snapshot.decode_sid(sid),
         Ref::Iri(iri) => Some(iri.to_string()),
         Ref::Var(_) => None, // Predicate is variable - no filter
+    };
+
+    // A variable predicate (`?s ?p ?o` / `<iri> ?p ?o`) is projected: the
+    // operator binds `?p` to each materialized triple's predicate IRI, so a
+    // wildcard scan yields the predicate instead of leaving it `null`.
+    let predicate_var = match &tp.p {
+        Ref::Var(v) => Some(*v),
+        _ => None,
     };
 
     // Extract the object: a variable, or a constant equality constraint the
@@ -670,19 +694,19 @@ pub fn convert_triple_to_r2rml(
         _ => return None,
     };
 
-    // A bound subject with a variable predicate (`<store/5> ?p ?o`) has no
-    // `predicate_filter` to resolve the POM and no predicate-var field to bind
-    // `?p`, so materialization would bind `?o` across every predicate with `?p`
-    // left unbound (`?p = NULL`). This PR newly routes bound subjects here, so
-    // leave that shape unconverted for normal evaluation. (The var-subject
-    // wildcard `?s ?p ?o` keeps its existing all-maps scan behavior.)
-    if subject_constant.is_some() && predicate_filter.is_none() && object_var.is_some() {
-        return None;
-    }
-
     let mut pattern = make_pattern(object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
+    }
+    // A variable-predicate wildcard (`?s ?p ?o` or the bound-subject
+    // `<iri> ?p ?o`) carries a `predicate_var` so the operator binds `?p` to each
+    // triple's predicate IRI. This is what makes a bound-subject wildcard (the
+    // UI's subject inspector) resolvable: previously it was left unconverted
+    // because there was no field to bind `?p`.
+    if object_var.is_some() {
+        if let Some(pv) = predicate_var {
+            pattern = pattern.with_predicate_var(pv);
+        }
     }
     pattern.object_constant = object_constant;
 
@@ -705,6 +729,115 @@ mod tests {
 
         let not_type_sid = Sid::new(100, "name");
         assert!(!is_rdf_type(&not_type_sid));
+    }
+
+    /// Extract the single triple pattern lowered from a `where` clause.
+    #[cfg(test)]
+    fn only_triple(q: &crate::ir::Query) -> TriplePattern {
+        q.patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp.clone()),
+                _ => None,
+            })
+            .expect("expected a single triple pattern")
+    }
+
+    /// FQL `@type` must lower to the SAME `rdf:type` scan SPARQL `a` produces.
+    ///
+    /// SPARQL `a` lowers the predicate to `Ref::Iri(rdf::TYPE)` (see
+    /// `fluree-db-sparql` `lower::path`); this test parses the FQL `@type` surface
+    /// and asserts (1) it lowers to the identical `rdf:type` predicate, and (2) it
+    /// converts to the identical R2RML type-scan — a `class_filter` for a bound
+    /// class, and a `type_var` (binding the class IRI, not dropped) for a variable
+    /// class. This is the regression guard for the FQL-vs-SPARQL by-class parity
+    /// bug: FQL `@type` previously produced no type binding for a variable class.
+    #[test]
+    fn fql_type_lowers_to_same_rdf_type_scan_as_sparql_a() {
+        use crate::parse::parse_query;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+
+        // `LedgerSnapshot` is both the IRI encoder (for parse) and the snapshot
+        // (for convert's `decode_sid`, unused here since class objects stay IRIs).
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let class = "http://example.org/Geography";
+
+        // --- Bound class: `@type: <class>` (≡ SPARQL `?s a <class>`) ---
+        let mut vars = VarRegistry::new();
+        let bound = serde_json::json!({
+            "select": ["?s"],
+            "where": {"@id": "?s", "@type": class},
+        });
+        let parsed = parse_query(&bound, &snapshot, &mut vars, None).expect("parse @type");
+        let tp = only_triple(&parsed);
+        assert!(
+            tp.p.is_rdf_type(),
+            "FQL @type must lower to the rdf:type predicate (same as SPARQL `a`)"
+        );
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot).expect("convertible");
+        assert_eq!(
+            pat.class_filter.as_deref(),
+            Some(class),
+            "bound @type ⇒ class_filter (the class-scan)"
+        );
+        assert_eq!(pat.type_var, None);
+        assert_eq!(pat.object_var, None);
+        assert_eq!(pat.predicate_filter, None);
+
+        // --- Variable class: `@type: ?t` (≡ SPARQL `?s a ?t`) ---
+        let mut vars = VarRegistry::new();
+        let vquery = serde_json::json!({
+            "select": ["?s", "?t"],
+            "where": {"@id": "?s", "@type": "?t"},
+        });
+        let parsed = parse_query(&vquery, &snapshot, &mut vars, None).expect("parse @type var");
+        let tp = only_triple(&parsed);
+        assert!(tp.p.is_rdf_type());
+        let want_s = vars.get_or_insert("?s");
+        let want_t = vars.get_or_insert("?t");
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot).expect("convertible");
+        assert_eq!(
+            pat.type_var,
+            Some(want_t),
+            "variable @type ⇒ type_var binds the class IRI (was dropped → null)"
+        );
+        assert_eq!(pat.class_filter, None);
+        assert_eq!(pat.object_var, None);
+        assert_eq!(pat.subject_var, Some(want_s));
+    }
+
+    /// A variable-predicate wildcard binds `?p` (subject inspector / crawl). Both
+    /// the var-subject (`?s ?p ?o`) and bound-subject (`<iri> ?p ?o`) forms — the
+    /// latter previously left unconverted for want of a predicate-var field.
+    #[test]
+    fn wildcard_predicate_binds_predicate_var() {
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+
+        // ?s ?p ?o
+        let tp = TriplePattern::new(Ref::Var(VarId(0)), Ref::Var(VarId(1)), Term::Var(VarId(2)));
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot).expect("convertible");
+        assert_eq!(pat.subject_var, Some(VarId(0)));
+        assert_eq!(pat.predicate_var, Some(VarId(1)));
+        assert_eq!(pat.object_var, Some(VarId(2)));
+        assert!(pat.produced_vars().contains(&VarId(1)));
+
+        // <iri> ?p ?o — bound subject wildcard is now convertible.
+        let tp = TriplePattern::new(
+            Ref::Iri("http://example.org/geography/1".into()),
+            Ref::Var(VarId(1)),
+            Term::Var(VarId(2)),
+        );
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot)
+            .expect("bound-subject wildcard is convertible");
+        assert_eq!(pat.subject_var, None);
+        assert_eq!(
+            pat.subject_constant.as_deref(),
+            Some("http://example.org/geography/1")
+        );
+        assert_eq!(pat.predicate_var, Some(VarId(1)));
+        assert_eq!(pat.object_var, Some(VarId(2)));
     }
 
     #[test]

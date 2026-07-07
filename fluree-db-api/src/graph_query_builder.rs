@@ -231,6 +231,32 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+
+        // A subgraph ("crawl") projection over an R2RML graph source cannot use
+        // native binary-index hydration (the source has no flakes); expand it
+        // through the R2RML operator instead. Only a wildcard `["*"]` crawl is
+        // handled here — any other shape returns `None` and falls through to the
+        // normal path unchanged.
+        #[cfg(feature = "iceberg")]
+        if let (Some((provider, table_provider)), Some(json)) = (r2rml.as_ref(), input.as_jsonld())
+        {
+            if view.graph_source_id.is_some() {
+                if let Some(expanded) = crate::graph_source::crawl::expand_wildcard_crawl(
+                    self.graph.fluree,
+                    &view,
+                    json,
+                    provider.as_ref(),
+                    table_provider.as_ref(),
+                    execution.clone(),
+                    &format_config,
+                )
+                .await?
+                {
+                    return Ok(expanded);
+                }
+            }
+        }
+
         let result = match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph
