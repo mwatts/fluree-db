@@ -181,7 +181,7 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction, GRAPH ?g
 // binding typed as literal — audit §4.2.
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (86)
+    // result mismatch (85)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
@@ -201,7 +201,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/cast/manifest#cast-dT",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",

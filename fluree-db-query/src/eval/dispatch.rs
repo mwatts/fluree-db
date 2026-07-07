@@ -188,6 +188,9 @@ impl Function {
             Function::XsdDouble => cast::eval_xsd_double(args, row, ctx),
             Function::XsdDecimal => cast::eval_xsd_decimal(args, row, ctx),
             Function::XsdString => cast::eval_xsd_string(args, row, ctx),
+            Function::XsdDateTime => cast::eval_xsd_datetime(args, row, ctx),
+            Function::XsdDate => cast::eval_xsd_date(args, row, ctx),
+            Function::XsdTime => cast::eval_xsd_time(args, row, ctx),
 
             // Path functions
             Function::PathLength => path::eval_path_length(args, row),

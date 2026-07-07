@@ -924,6 +924,9 @@ pub enum Function {
     XsdDouble,
     XsdDecimal,
     XsdString,
+    XsdDateTime,
+    XsdDate,
+    XsdTime,
 
     // =========================================================================
     // Path functions (Cypher shortestPath result values)

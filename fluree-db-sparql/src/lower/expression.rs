@@ -319,6 +319,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     xsd::DOUBLE => Function::XsdDouble,
                     xsd::DECIMAL => Function::XsdDecimal,
                     xsd::STRING => Function::XsdString,
+                    xsd::DATE_TIME => Function::XsdDateTime,
+                    xsd::DATE => Function::XsdDate,
+                    xsd::TIME => Function::XsdTime,
                     _ => Function::Custom(full_iri),
                 }
             }

@@ -342,3 +342,52 @@ async fn jsonld_datatype_of_iri_keeps_id_extension() {
         json!([["ex:alice", ""], ["ex:bob", ""]])
     );
 }
+
+// =============================================================================
+// D3 — xsd:dateTime / xsd:date / xsd:time constructor casts
+// (surface note: XSD casts are SPARQL-only syntax; the JSON-LD surface has no
+// cast form — recorded in the PR description per compliance § Query Surface
+// Parity)
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_xsd_temporal_casts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprsem/d3:sparql");
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:a", "ex:p": "2002-10-10T17:00:00Z" },
+            { "@id": "ex:b", "ex:p": "not a date" },
+            { "@id": "ex:c", "ex:p": 13 }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.expect("insert").ledger;
+
+    // Only the parseable dateTime string survives the cast (cast-dT shape).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> \
+             SELECT ?s WHERE { ?s ex:p ?v . \
+               FILTER(datatype(xsd:dateTime(?v)) = xsd:dateTime) }",
+        )
+        .await,
+        json!([["ex:a"]])
+    );
+
+    // xsd:date / xsd:time parse their lexical forms.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             ASK { FILTER(datatype(xsd:date(\"2002-10-10\")) = xsd:date \
+                   && datatype(xsd:time(\"17:00:00Z\")) = xsd:time) }",
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}

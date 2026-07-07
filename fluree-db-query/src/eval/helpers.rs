@@ -498,6 +498,9 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::XsdDouble
             | Function::XsdDecimal
             | Function::XsdString
+            | Function::XsdDateTime
+            | Function::XsdDate
+            | Function::XsdTime
             | Function::Year
             | Function::Month
             | Function::Day
