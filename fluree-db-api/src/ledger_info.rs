@@ -863,7 +863,19 @@ pub fn build_virtual_ledger_info(
     meta: &VirtualSourceMeta,
     table_row_counts: &HashMap<String, i64>,
 ) -> JsonValue {
-    let mut classes: BTreeMap<String, Option<i64>> = BTreeMap::new();
+    // Per-class aggregation: class IRI -> (row count, its property membership).
+    // The native `/info` derives class->property membership from commit history;
+    // a virtual dataset has none, so we derive it deterministically from the
+    // compiled R2RML mapping — each triples map contributes its class(es) and, to
+    // each, the predicates of its predicate-object maps (with datatypes). This is
+    // the map the instance view and the data-model / LLM reader need to render a
+    // class's properties; without it they saw only @id.
+    #[derive(Default)]
+    struct ClassAgg {
+        count: Option<i64>,
+        properties: BTreeMap<String, PropertyAgg>,
+    }
+    let mut classes: BTreeMap<String, ClassAgg> = BTreeMap::new();
     let mut properties: BTreeMap<String, PropertyAgg> = BTreeMap::new();
 
     if let Some(mapping) = mapping {
@@ -874,18 +886,33 @@ pub fn build_virtual_ledger_info(
                 .table_name()
                 .and_then(|t| table_row_counts.get(t).copied());
 
+            // The named predicates this triples map contributes (with datatypes).
+            // Only constant predicates can be named without reading data.
+            let poms: Vec<(String, String)> = tm
+                .predicate_object_maps
+                .iter()
+                .filter_map(|pom| {
+                    pom.predicate_map
+                        .as_constant()
+                        .map(|pred| (pred.to_string(), object_map_datatype(&pom.object_map)))
+                })
+                .collect();
+
             for class in tm.classes() {
-                let entry = classes.entry(class.clone()).or_insert(None);
-                *entry = add_row_counts(*entry, rows);
+                let cls = classes.entry(class.clone()).or_default();
+                cls.count = add_row_counts(cls.count, rows);
+                // Per-class property membership (mirrors the native class->property map).
+                for (pred, datatype) in &poms {
+                    let agg = cls.properties.entry(pred.clone()).or_default();
+                    agg.count = add_row_counts(agg.count, rows);
+                    let dt_entry = agg.datatypes.entry(datatype.clone()).or_insert(None);
+                    *dt_entry = add_row_counts(*dt_entry, rows);
+                }
             }
 
-            for pom in &tm.predicate_object_maps {
-                // Only constant predicates can be named without reading data.
-                let Some(pred) = pom.predicate_map.as_constant() else {
-                    continue;
-                };
-                let datatype = object_map_datatype(&pom.object_map);
-                let agg = properties.entry(pred.to_string()).or_default();
+            // Flat, dataset-wide property stats (`stats.properties`), unchanged.
+            for (pred, datatype) in poms {
+                let agg = properties.entry(pred).or_default();
                 agg.count = add_row_counts(agg.count, rows);
                 let dt_entry = agg.datatypes.entry(datatype).or_insert(None);
                 *dt_entry = add_row_counts(*dt_entry, rows);
@@ -895,7 +922,38 @@ pub fn build_virtual_ledger_info(
 
     let classes_json: Map<String, JsonValue> = classes
         .into_iter()
-        .map(|(iri, count)| (iri, json!({ "count": opt_i64_json(count) })))
+        .map(|(iri, agg)| {
+            // Native class shape: { count, properties: { <prop>: { types:
+            // {<datatype>: <count>}, langs: {}, ref-classes: {} } } }. `langs` is
+            // empty (a Phase-1 R2RML mapping carries no language tags); FK
+            // `ref-classes` (relationship targets) are a follow-up enhancement.
+            let props: Map<String, JsonValue> = agg
+                .properties
+                .into_iter()
+                .map(|(piri, pagg)| {
+                    let types: Map<String, JsonValue> = pagg
+                        .datatypes
+                        .into_iter()
+                        .map(|(dt, c)| (dt, opt_i64_json(c)))
+                        .collect();
+                    (
+                        piri,
+                        json!({
+                            "types": JsonValue::Object(types),
+                            "langs": json!({}),
+                            "ref-classes": json!({}),
+                        }),
+                    )
+                })
+                .collect();
+            (
+                iri,
+                json!({
+                    "count": opt_i64_json(agg.count),
+                    "properties": JsonValue::Object(props),
+                }),
+            )
+        })
         .collect();
 
     let properties_json: Map<String, JsonValue> = properties
@@ -1955,6 +2013,29 @@ mod tests {
         assert_eq!(
             info["stats"]["properties"]["http://ex.org/founded"]["datatypes"]["xsd:integer"],
             100
+        );
+
+        // Per-class property membership (the map the instance view + the
+        // data-model / LLM reader consume; previously absent for virtual
+        // datasets, which left classes showing only @id). Mirrors the native
+        // class shape: classes[c].properties[p].types[<datatype>] = count.
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Airline"]["properties"]["http://ex.org/name"]
+                ["types"]["xsd:string"],
+            100
+        );
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Airline"]["properties"]
+                ["http://ex.org/founded"]["types"]["xsd:integer"],
+            100
+        );
+        // Membership is class-scoped: Airline's `founded` is not attributed to Route.
+        assert!(
+            info["stats"]["classes"]["http://ex.org/Route"]["properties"]
+                .get("http://ex.org/founded")
+                .is_none(),
+            "founded leaked onto Route: {}",
+            info["stats"]["classes"]["http://ex.org/Route"]
         );
 
         // Totals + Iceberg snapshot as the version `t`.
