@@ -47,8 +47,9 @@ pub const DEFAULT_UNREACHABLE_AFTER: Duration = Duration::from_secs(15);
 pub const DEFAULT_LIVE_AFTER: Duration = Duration::from_secs(5);
 
 /// Default minimum time between consecutive eligibility proposes
-/// for the same peer after a refusal. A refused propose (e.g.
-/// quorum-floor refusal) still commits a raft log entry that
+/// for the same peer after a refusal. A refused propose (the apply
+/// refuses a voter no longer in the configured set —
+/// `VoterNotConfigured`) still commits a raft log entry that
 /// applies as a no-op; without backoff, the monitor would commit
 /// one such entry every [`DEFAULT_SAMPLE_INTERVAL`] until the
 /// refusal condition clears. Set well above the sample interval
@@ -72,8 +73,8 @@ pub struct LivenessConfig {
     pub live_after: Duration,
     /// Minimum time between consecutive eligibility proposes for
     /// the same peer after the prior one was refused. Caps the
-    /// raft-log commit rate when the refusal condition (e.g.
-    /// quorum-floor) is persistent.
+    /// raft-log commit rate when the refusal condition
+    /// (`VoterNotConfigured`) is persistent.
     pub refusal_backoff: Duration,
 }
 
@@ -132,7 +133,7 @@ struct PeerTracker {
     /// timestamp, preventing the monitor from committing a raft
     /// log entry every sample tick when the refusal condition
     /// hasn't cleared. Cleared whenever a propose lands
-    /// successfully — the underlying refusal (e.g. quorum-floor)
+    /// successfully — the underlying refusal (`VoterNotConfigured`)
     /// is by definition no longer in effect.
     last_refused: Option<Instant>,
 }
@@ -333,9 +334,9 @@ impl LivenessMonitor {
     }
 
     /// `true` only when the apply landed (or was idempotent against
-    /// state that already matched). `WorkerEligibilityRefused` —
-    /// notably the quorum-floor refusal — returns `false` so the
-    /// next tick re-attempts once the refusal condition clears.
+    /// state that already matched). `WorkerEligibilityRefused`
+    /// (`VoterNotConfigured`) returns `false` so the next tick
+    /// re-attempts once the refusal condition clears.
     async fn propose_eligibility(&self, args: WorkerEligibility) -> bool {
         let voter = args.voter;
         let eligible = args.eligible;
@@ -422,7 +423,7 @@ fn record_replication_progress(
 ///
 /// Returns `None` while the [`LivenessConfig::refusal_backoff`]
 /// window after a refused propose is still in effect — without
-/// this short-circuit, a persistent refusal (e.g. quorum-floor)
+/// this short-circuit, a persistent refusal (`VoterNotConfigured`)
 /// would commit a raft log entry every sample tick until the
 /// underlying condition cleared.
 fn next_eligibility_proposal(

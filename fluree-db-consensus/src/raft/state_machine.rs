@@ -405,9 +405,11 @@ pub struct ClearMarker {
 }
 
 /// Bounds the replicated cost of the per-branch queues. Held on
-/// [`NameServiceState`] so the apply path consults the same
-/// values on every node (configured at bootstrap time via
-/// `RaftBootstrapConfig`).
+/// [`NameServiceState`] so the apply path consults the same values
+/// on every node. No wiring sets it today — every node uses
+/// [`QueueConfig::default`], which keeps it deterministic across the
+/// cluster; a configuration surface would have to replicate the
+/// values (e.g. via a command) so all nodes agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueConfig {
     /// Maximum queue depth per `RefKey`. Isolates branches from
@@ -1300,8 +1302,9 @@ pub enum EligibilityRefusal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesyncReason {
     /// Some other proposal popped the entry the worker was
-    /// trying to apply. `actual_queue_id` is whatever's at the
-    /// front now (which may be the next entry, or 0 if empty).
+    /// trying to apply. `actual_queue_id` is the entry now at the
+    /// front — always a real queued id, since an empty queue
+    /// surfaces as [`Self::InvariantViolated`], not this variant.
     WrongFront { actual_queue_id: u64 },
     /// Per-branch queue was drained by a head-mutating admin
     /// command between the worker's stage and apply.
@@ -5808,9 +5811,10 @@ mod tests {
     }
 
     #[test]
-    fn set_eligibility_demotes_above_quorum_floor() {
-        // 5 configured voters → quorum floor is 3. Demoting one
-        // when 5 are eligible drops to 4 — still above floor.
+    fn set_eligibility_demote_removes_voter_from_eligible_set() {
+        // Demotion of a configured voter always succeeds — the apply
+        // imposes no eligible-count floor (worker eligibility and
+        // raft voting quorum are independent).
         let mut state = NameServiceState::new();
         seed_voters(&mut state, [1, 2, 3, 4, 5]);
 
@@ -5834,8 +5838,8 @@ mod tests {
 
     #[test]
     fn set_eligibility_demoting_already_ineligible_voter_is_unchanged_noop() {
-        // Idempotent demotion bypasses the quorum check because no
-        // mutation would occur.
+        // Demoting a voter that's already ineligible is a no-op
+        // (`changed: false`) — no mutation occurs.
         let mut state = NameServiceState::new();
         seed_voters(&mut state, [1, 2, 3]);
         state.worker_eligible_voters.remove(&3);

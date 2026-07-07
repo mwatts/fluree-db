@@ -169,10 +169,15 @@ where
     /// log purge (the default `SnapshotPolicy`) the pre-snapshot log
     /// entries are gone, so committed nameservice state would be
     /// silently lost. With the snapshot restored here, openraft's
-    /// replay starts at `last_applied + 1` and the apply path skips
-    /// the entries already folded into the snapshot — so the
-    /// post-apply side effects (CAS releases, event-bus emissions)
-    /// never re-fire on recovery.
+    /// replay starts at the snapshot's `last_applied + 1`.
+    ///
+    /// Note this restores from the *snapshot's* last-applied, not
+    /// the last entry applied before the crash: any entry committed
+    /// after the snapshot but before the crash is re-applied on
+    /// recovery, so its post-apply side effects (CAS releases,
+    /// event-bus emissions) do re-fire. That's benign — `release`
+    /// is idempotent and event subscribers tolerate duplicates —
+    /// but it is not "exactly once."
     pub async fn open(storage: Arc<S>) -> Result<Self, StorageError<NodeId>> {
         let mut adapter = Self::new(storage);
         adapter.restore_from_snapshot().await?;
