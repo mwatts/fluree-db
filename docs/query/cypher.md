@@ -112,12 +112,27 @@ ORDER BY / SKIP / LIMIT
   listed type per hop (LDBC IC12's
   `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`). Bounded alternation
   (`-[:A|B*1..3]->`) is still deferred — use the unbounded form.
-- **Variable-length relationship / path binding** — a **bounded** typed
-  var-length relationship may bind a variable: `-[r:T*1..n]->` binds `r` to the
-  list of relationship values on each match, and `MATCH p = (a)-[:T*1..n]->(b)`
-  binds `p` to a path. Each fixed-length chain branch constructs the value from
-  its nodes. Deferred: binding on an **unbounded** (`-[r:T*]->`), **undirected**,
-  **untyped**, or IRI-anchored var-length path (all reject with a clear error).
+- **Variable-length relationship / path binding.** A var-length relationship
+  may bind a variable: `-[r:T*…]->` binds `r` to the list of relationship
+  values per match, and `MATCH p = (a)-[:T*…]->(b)` binds `p` to a path value.
+  Two execution strategies, chosen automatically:
+  - **Bounded typed directed** ranges expand to fixed-length chain branches,
+    each constructing the value from its nodes.
+  - Everything else — **unbounded** (`-[r:T*]->`, `p = (a)-[:T*]->(b)`),
+    **untyped/wildcard**, **undirected**, zero lower bounds (`*0..`), and
+    lower bounds above 1 — runs the **path-enumeration** search: a DFS from
+    the (anchored) start emitting one row per **node-distinct** path whose
+    hop count is in range. The end node binds per path when free, or filters
+    the enumeration when already bound. Node-distinctness stands in for
+    Cypher's relationship-uniqueness (a walk that revisits a node is not
+    enumerated), and the search is guarded by visited/path caps that **error**
+    rather than silently truncate — narrow dense patterns with hop bounds, a
+    bound end, or a type.
+
+  A **fixed** single hop also takes a path variable
+  (`MATCH p = (a)-[:T]->(b)` is a `*1..1` path). Deferred: multi-hop path
+  values (`p = (a)-[:T]->(b)-[:U]->(c)`), binding over a type alternation,
+  and property filters on a var-length relationship.
 - **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the

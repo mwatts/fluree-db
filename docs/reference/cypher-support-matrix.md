@@ -71,16 +71,16 @@ These shape everything below; read them first.
 | Undirected `-[:T]-` | ✅ | Forward ∪ reverse `Union`. |
 | Untyped relationship `-->` / `-[r]->` | ✅ | Follows relationships only: `rdf:type`, `f:reifies*`, and data properties (literal objects) are excluded from the hop. |
 | Bounded var-length `-[:T*m..n]->` | ✅ | **Enumerates trails** (one row per path, relationship-uniqueness). |
-| Unbounded var-length `-[:T*]->` | ⟂ | **Reachability** (one row per reachable endpoint), not path enumeration. |
-| Untyped var-length `-[*m..n]->` | ⟂ | Wildcard reachability over node→node edges; excludes `rdf:type`/`f:reifies*`. A direction is required (`-[*]-` deferred); an unbounded lower bound above 1 (`-[*2..]->`) deferred — give an upper bound or name a type. |
+| Unbounded var-length `-[:T*]->` | ⟂ | Without a binding: **reachability** (one row per reachable endpoint). With a rel/path binding (`-[r:T*]->` / `p = …`): **enumerates node-distinct paths** (one row each; end node bound per path or filtered when already bound). Node-distinctness stands in for Cypher's relationship-uniqueness — a walk revisiting a node is not enumerated. Guarded by visited/path caps that error (never silently truncate). |
+| Untyped var-length `-[*m..n]->` | ⟂ | Wildcard reachability over node→node edges; excludes `rdf:type`/`f:reifies*`. A direction is required (`-[*]-` deferred); an unbounded lower bound above 1 (`-[*2..]->`) deferred unless a rel/path binding makes it enumerate — give an upper bound, name a type, or bind. |
 | Bounded var-length **binding** `-[r:T*m..n]->` / `p = …` | ✅ | `r` = rel list, `p` = path; via per-branch construction. |
-| Unbounded var-length binding | ⏳ | Needs a path-enumeration operator. |
+| Unbounded var-length binding `-[r:T*]->` / `p = (a)-[:T*]->(b)` | ✅ | Enumerate-mode path search: `p` = path value, `r` = `relationships(p)`. Works typed or untyped (wildcard), any direction, lower bounds ≥ 0, bound or free end. Type alternation deferred. |
 | `shortestPath` / `allShortestPaths` | ✅ | Anchored; single typed predicate or the untyped wildcard form (`shortestPath((a)-[*..15]->(b))`, same edge-set as untyped var-length); `All` emits one row per minimal path. Type alternation deferred. |
 | `relationships(p)` / `nodes(p)` / `pathPairs(p)` / `length(p)` | ✅ | `relationships(p)` carries the stored edge orientation. |
 | Bounded type-alternation var-length `-[:A\|B*1..3]->` | ⏳ | Use the unbounded form. |
-| Undirected **unbounded** path `-[:T*]-` | ⏳ | |
-| Free path value `MATCH p = (...)` without a `shortestPath`/`allShortestPaths` wrapper | ⏳ | Wrap with a path-finding function. |
-| Zero-length *typed* bounded path `-[:T*0..M]->` | ⏳ | Use `*1..M`. |
+| Undirected **unbounded** path `-[:T*]-` | ◑ | With a rel/path binding: enumerates. Without one, use a bounded range (reachability operator is single-direction). |
+| Free path value `MATCH p = (...)` | ◑ | A single relationship segment — fixed (`p = (a)-[:T]->(b)`, a `*1..1` path) or variable-length (bounded via per-branch construction, unbounded via enumeration). Multi-hop path values (`p = (a)-[:T]->(b)-[:U]->(c)`) deferred. |
+| Zero-length *typed* bounded path `-[:T*0..M]->` | ◑ | With a rel/path binding: enumerates (the zero-length path binds the end to the start with an empty rel list). Without a binding, use `*1..M`. |
 | Property filter on a var-length / `shortestPath` relationship | ⏳ | |
 
 ## Expressions & operators

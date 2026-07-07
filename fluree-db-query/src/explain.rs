@@ -579,6 +579,7 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
             match sp.mode {
                 crate::ir::ShortestPathMode::Single => "shortestPath",
                 crate::ir::ShortestPathMode::All => "allShortestPaths",
+                crate::ir::ShortestPathMode::Enumerate => "enumeratePaths",
             },
             format_ref(&sp.start),
             format_ref(&sp.end),

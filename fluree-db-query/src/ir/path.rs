@@ -249,6 +249,12 @@ pub enum ShortestPathMode {
     Single,
     /// `allShortestPaths(...)` — every path of the minimal length.
     All,
+    /// Path *enumeration* — every node-distinct path whose hop count is in
+    /// `[min_hops, max_hops]` (Cypher `p = (a)-[:T*]->(b)`, `-[r:T*]->`).
+    /// Unlike the shortest modes, the **end may be unbound**: the operator
+    /// binds it per discovered path (a bound end filters instead). Only the
+    /// start anchors the search.
+    Enumerate,
 }
 
 /// Anchored shortest-path pattern — Cypher `shortestPath` / `allShortestPaths`.
@@ -309,7 +315,8 @@ pub struct PathNodeFilter {
 }
 
 impl ShortestPathPattern {
-    /// Variables that must be bound before this pattern runs (both endpoints).
+    /// Endpoint variables this pattern touches (bound-input or, for an
+    /// `Enumerate` end, produced). Used for join-variable counting.
     pub fn referenced_vars(&self) -> Vec<VarId> {
         let mut vars = Vec::with_capacity(2);
         if let Ref::Var(v) = &self.start {
@@ -321,8 +328,33 @@ impl ShortestPathPattern {
         vars
     }
 
-    /// Variables this pattern adds to the binding set (the path value).
+    /// Variables that must be bound before this pattern runs. The shortest
+    /// modes are anchored on both endpoints; `Enumerate` anchors only the
+    /// start — an end bound by an earlier pattern filters at runtime, an
+    /// unbound end is produced per path.
+    pub fn required_input_vars(&self) -> Vec<VarId> {
+        let mut vars = Vec::with_capacity(2);
+        if let Ref::Var(v) = &self.start {
+            vars.push(*v);
+        }
+        if !matches!(self.mode, ShortestPathMode::Enumerate) {
+            if let Ref::Var(v) = &self.end {
+                vars.push(*v);
+            }
+        }
+        vars
+    }
+
+    /// Variables this pattern adds to the binding set: the path value, and —
+    /// under `Enumerate` — the end variable (bound per discovered path when
+    /// no earlier pattern bound it).
     pub fn produced_vars(&self) -> Vec<VarId> {
-        vec![self.path_var]
+        let mut vars = vec![self.path_var];
+        if matches!(self.mode, ShortestPathMode::Enumerate) {
+            if let Ref::Var(v) = &self.end {
+                vars.push(*v);
+            }
+        }
+        vars
     }
 }

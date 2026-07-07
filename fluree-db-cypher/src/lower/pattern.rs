@@ -63,15 +63,36 @@ fn lower_part<E: IriEncoder>(
     // unlabeled but it must participate in a relationship.
     lower_node(ctx, &part.head, out)?;
 
-    // A plain `p = …` path variable (not shortestPath) is supported only for a
-    // single bounded variable-length relationship in v1; that segment builds the
-    // path value. Reject it on other shapes rather than silently leaving p unbound.
+    // A plain `p = …` path variable (not shortestPath) is supported for a
+    // single relationship segment — fixed or variable-length — which builds
+    // the path value. Reject multi-hop shapes rather than silently leaving
+    // p unbound.
     let single_var_length = part.tail.len() == 1 && part.tail[0].0.length.is_some();
-    if part.path_var.is_some() && !single_var_length {
+    let single_fixed_hop = part.tail.len() == 1 && part.tail[0].0.length.is_none();
+    if part.path_var.is_some() && !single_var_length && !single_fixed_hop {
         return Err(LowerError::unsupported(
             "a path variable (`p = …`) is supported for shortestPath and a single \
-             bounded variable-length relationship in v1",
+             relationship segment in v1 (multi-hop path values are deferred)",
         ));
+    }
+    // `p = (a)-[:T]->(b)`: a fixed hop is a `*1..1` path — reuse the
+    // variable-length machinery to build the path value.
+    if part.path_var.is_some() && single_fixed_hop {
+        let (rel, next) = &part.tail[0];
+        if rel.props.is_some() {
+            return Err(LowerError::unsupported(
+                "a path variable over a property-filtered relationship is deferred — \
+                 filter via WHERE on the relationship variable instead",
+            ));
+        }
+        lower_node(ctx, next, out)?;
+        let mut fixed = rel.clone();
+        fixed.length = Some(crate::ast::LengthRange {
+            min: Some(1),
+            max: Some(1),
+            span: rel.span,
+        });
+        return lower_var_length_rel(ctx, &part.head, &fixed, next, out, part.path_var.as_ref());
     }
 
     let mut prev = part.head.clone();
@@ -503,13 +524,12 @@ fn lower_var_length_rel<E: IriEncoder>(
         ));
     }
     if rel.types.is_empty() {
-        // Untyped wildcard paths can't name a single predicate to build rel/path
-        // values from, so binding is deferred there.
+        // Untyped wildcard paths with a rel/path binding enumerate (the
+        // wildcard operator resolves each found hop's stored predicate to
+        // build the values); without a binding the cheaper reachability
+        // operator answers.
         if rel.var.is_some() || path_var.is_some() {
-            return Err(LowerError::unsupported(
-                "binding a relationship/path variable on an untyped variable-length path \
-                 (`-[r*]->` / `p = (a)-[*]->(b)`) is deferred; name a relationship type",
-            ));
+            return lower_enumerate_path(ctx, left, rel, right, out, path_var);
         }
         return lower_untyped_var_length_rel(ctx, left, rel, right, out);
     }
@@ -531,14 +551,10 @@ fn lower_var_length_rel<E: IriEncoder>(
         // whose closure follows an edge of any listed type per hop (LDBC IC12's
         // `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`).
         None => {
-            // Unbounded paths use the transitive operator, which yields reachable
-            // endpoints but no enumerated hops to build a rel-list / path from.
+            // The transitive operator yields reachable endpoints but no
+            // enumerated hops; a rel/path binding enumerates instead.
             if rel.var.is_some() || path_var.is_some() {
-                return Err(LowerError::unsupported(
-                    "binding a relationship/path variable on an UNBOUNDED variable-length path \
-                     (`-[r:T*]->` / `p = (a)-[:T*]->(b)`) is deferred; use a bounded range \
-                     like `-[r:T*1..3]->`",
-                ));
+                return lower_enumerate_path(ctx, left, rel, right, out, path_var);
             }
             let modifier = match lo {
                 0 => PathModifier::ZeroOrMore,
@@ -591,6 +607,14 @@ fn lower_var_length_rel<E: IriEncoder>(
                      deferred; use an unbounded `[:A|B*]` or a single type",
                 ));
             }
+            // Bounded shapes the fixed-chain expansion can't express — an
+            // undirected hop, a zero lower bound, or a bound too deep to
+            // unroll — bind via path enumeration instead.
+            if (rel.var.is_some() || path_var.is_some())
+                && (matches!(rel.direction, Direction::Either) || lo == 0 || hi > MAX_BOUNDED_HOPS)
+            {
+                return lower_enumerate_path(ctx, left, rel, right, out, path_var);
+            }
             let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
             if lo == 0 {
                 return Err(LowerError::unsupported(
@@ -606,14 +630,6 @@ fn lower_var_length_rel<E: IriEncoder>(
                 return Err(LowerError::unsupported(
                     "bounded variable-length paths above 16 hops are not supported; use an \
                      unbounded `*` for deeper traversal",
-                ));
-            }
-            if matches!(rel.direction, Direction::Either)
-                && (rel.var.is_some() || path_var.is_some())
-            {
-                return Err(LowerError::unsupported(
-                    "binding a relationship/path variable on an undirected variable-length path \
-                     is deferred (a bound relationship needs a definite orientation)",
                 ));
             }
             // The predicate SID for constructing rel/path values per branch. If the
@@ -651,6 +667,98 @@ fn lower_var_length_rel<E: IriEncoder>(
             Ok(())
         }
     }
+}
+
+/// Lower a variable-length relationship that binds a relationship or path
+/// variable into an `Enumerate`-mode path search: one row per node-distinct
+/// path whose hop count is in the pattern's bounds, with the path variable
+/// bound to the path value and a relationship variable bound to
+/// `relationships(path)`. The end node is produced per path when unbound,
+/// or filters the enumeration when an earlier pattern bound it.
+///
+/// Handles the shapes the cheaper operators can't: unbounded with binding,
+/// untyped (wildcard) with binding, undirected, lower bounds above 1, and
+/// zero-length (`*0..`). Node-distinctness stands in for Cypher's
+/// relationship-uniqueness (walks that revisit a node are not enumerated).
+fn lower_enumerate_path<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    left: &NodePattern,
+    rel: &RelPattern,
+    right: &NodePattern,
+    out: &mut Vec<Pattern>,
+    path_var: Option<&Variable>,
+) -> Result<()> {
+    if rel.types.len() > 1 {
+        return Err(LowerError::unsupported(
+            "binding a relationship/path variable over a type alternation (`[:A|B*]`) is \
+             deferred; use a single type or the untyped form",
+        ));
+    }
+    let length = rel
+        .length
+        .as_ref()
+        .expect("caller checked length.is_some()");
+    let lo = length.min.unwrap_or(1);
+    let hi = length.max;
+    if let Some(hi) = hi {
+        if hi < lo {
+            return Err(LowerError::unsupported(
+                "variable-length path upper bound must be ≥ the lower bound",
+            ));
+        }
+    }
+
+    let start_ref = lookup_node_ref(ctx, left);
+    let end_ref = lookup_node_ref(ctx, right);
+    let direction = match rel.direction {
+        Direction::Outgoing => PathDirection::Outgoing,
+        Direction::Incoming => PathDirection::Incoming,
+        Direction::Either => PathDirection::Either,
+    };
+
+    // Typed → the named predicate; a type absent from the dictionary has no
+    // edges, so the pattern matches nothing. Untyped → wildcard edge-set.
+    let predicate = match rel.types.first() {
+        None => None,
+        Some(t) => {
+            let type_iri = ctx.resolve_predicate(&t.name)?;
+            match ctx.encoder.encode_iri(&type_iri) {
+                Some(sid) => Some(sid),
+                None => {
+                    out.push(empty_path_result(&start_ref, &end_ref));
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let path_var_id = match path_var {
+        Some(v) => ctx.intern_var(&v.name),
+        // A rel-var-only binding (`-[r:T*]->`) still enumerates through a
+        // path value; the synthetic path var carries it to the Bind below.
+        None => ctx.fresh_synth(),
+    };
+    out.push(Pattern::ShortestPath(ShortestPathPattern {
+        start: start_ref,
+        end: end_ref,
+        predicate,
+        direction,
+        mode: ShortestPathMode::Enumerate,
+        path_var: path_var_id,
+        min_hops: Some(lo),
+        max_hops: hi,
+        needs_relationships: true,
+        // Var-length enumeration carries no `all(x IN nodes(p) …)` node filter.
+        node_filter: None,
+    }));
+    if let Some(rv) = &rel.var {
+        let rel_var_id = ctx.intern_var(&rv.name);
+        out.push(Pattern::Bind {
+            var: rel_var_id,
+            expr: Expression::call(Function::Relationships, vec![Expression::Var(path_var_id)]),
+        });
+    }
+    Ok(())
 }
 
 /// Lower an **untyped** variable-length relationship `-[*m..n]->` (no relationship

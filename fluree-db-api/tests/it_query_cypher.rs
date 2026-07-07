@@ -330,21 +330,19 @@ async fn cypher_bare_node_pattern_rejected_at_lower() {
 }
 
 #[tokio::test]
-async fn cypher_var_length_unbounded_bound_relationship_variable_rejected() {
-    // Binding a variable to an UNBOUNDED variable-length relationship needs path
-    // enumeration the transitive operator doesn't provide (deferred). The bounded
-    // form is supported — see `cypher_var_length_rel_and_path_binding`.
+async fn cypher_var_length_unbounded_bound_relationship_variable_enumerates() {
+    // Binding a variable to an UNBOUNDED variable-length relationship
+    // enumerates node-distinct paths (Enumerate mode). On an empty ledger the
+    // pattern simply matches nothing — the point is that it no longer rejects.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-bound");
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree
         .query_cypher(&db, "MATCH (a:Person)-[r:KNOWS*]->(b) RETURN b")
-        .await;
-    assert!(
-        r.is_err(),
-        "unbounded bound var-length relationship must be rejected"
-    );
+        .await
+        .expect("unbounded rel binding is supported");
+    assert_eq!(r.row_count(), 0, "empty ledger has no paths");
 }
 
 #[tokio::test]
@@ -5416,17 +5414,19 @@ async fn cypher_var_length_rel_and_path_binding() {
     assert_eq!(data[0]["row"], json!(["Bob", 1, 1]), "{path}");
     assert_eq!(data[1]["row"], json!(["Carol", 2, 2]), "{path}");
 
-    // Unbounded rel binding is deferred with a clear error.
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*]->(b:Person) RETURN size(r)"#,
-            )
-            .await
-            .is_err(),
-        "unbounded var-length rel binding is deferred"
-    );
+    // Unbounded rel binding enumerates: one row per node-distinct path.
+    let unbounded = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*]->(b:Person)
+               RETURN size(r) AS hops ORDER BY hops"#,
+        )
+        .await
+        .expect("unbounded rel binding enumerates")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(unbounded, json!([[1], [2], [3]]), "one row per path length");
 }
 
 #[tokio::test]
@@ -5579,6 +5579,217 @@ async fn cypher_shortest_path_no_path_drops_row() {
         .await
         .expect("no-path shortestPath");
     assert_eq!(rows.row_count(), 0, "no directed Dave→Alice path");
+}
+
+// ============================================================================
+// Path enumeration — free path values, unbounded var-length binding
+// ============================================================================
+
+#[tokio::test]
+async fn cypher_path_enumeration_unbounded_free_end() {
+    // `p = (a)-[:T*]->(b)` with b unbound: one row per node-distinct path.
+    // Chain Alice→Bob→Carol→Dave gives paths of length 1, 2, 3 from Alice.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-free").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["Bob", 1], ["Carol", 2], ["Dave", 3]]),
+        "every path from Alice, end bound per path"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_bound_end_filters() {
+    // A bound end keeps only paths ending there; a diamond yields both.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:enum-diamond");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:N {name: "A"}), (b:N {name: "B"}), (c:N {name: "C"}), (d:N {name: "D"});
+               MATCH (a:N {name: "A"}), (b:N {name: "B"}) CREATE (a)-[:E]->(b);
+               MATCH (a:N {name: "A"}), (c:N {name: "C"}) CREATE (a)-[:E]->(c);
+               MATCH (b:N {name: "B"}), (d:N {name: "D"}) CREATE (b)-[:E]->(d);
+               MATCH (c:N {name: "C"}), (d:N {name: "D"}) CREATE (c)-[:E]->(d);"#,
+        )
+        .await
+        .expect("seed diamond")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {name: "A"})-[:E*]->(d:N {name: "D"})
+               RETURN [n IN nodes(p) | n.name] AS names ORDER BY names"#,
+        )
+        .await
+        .expect("diamond paths")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[["A", "B", "D"]], [["A", "C", "D"]]]),
+        "both diamond arms enumerated"
+    );
+}
+
+#[tokio::test]
+async fn cypher_rel_var_binding_on_unbounded_path() {
+    // `-[r:T*]->` binds the relationship list per enumerated path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-relvar").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*2..]->(b)
+               RETURN b.name AS dst, size(r) AS hops, [x IN r | type(x)] AS types
+               ORDER BY hops"#,
+        )
+        .await
+        .expect("rel var enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([
+            ["Carol", 2, ["KNOWS", "KNOWS"]],
+            ["Dave", 3, ["KNOWS", "KNOWS", "KNOWS"]]
+        ]),
+        "lower bound 2 honored; rel list per path"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_untyped_and_fixed_hop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-untyped").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Untyped wildcard with a path binding.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[*1..2]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("untyped enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["Bob", 1], ["Carol", 2]]), "wildcard bounded");
+
+    // Fixed single hop `p = (a)-[:T]->(b)` — a *1..1 path value.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)
+               RETURN length(p) AS len, [n IN nodes(p) | n.name] AS names,
+                      [x IN relationships(p) | type(x)] AS types"#,
+        )
+        .await
+        .expect("fixed hop path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[1, ["Alice", "Bob"], ["KNOWS"]]]),
+        "fixed hop builds a 1-hop path value"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_zero_length_and_cycles() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:enum-zero-cycle");
+    // A→B and B→A: a 2-cycle.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:N {name: "A"})-[:E]->(b:N {name: "B"});
+               MATCH (a:N {name: "A"}), (b:N {name: "B"}) CREATE (b)-[:E]->(a);"#,
+        )
+        .await
+        .expect("seed cycle")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // `*0..` includes the zero-length path (end = start, no relationships).
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {name: "A"})-[:E*0..1]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("zero length")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["A", 0], ["B", 1]]),
+        "zero-length path binds end to start"
+    );
+
+    // Unbounded enumeration on a cyclic graph terminates (node-distinct):
+    // from A the only path is A→B (A→B→A revisits A).
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {name: "A"})-[:E*]->(b)
+               RETURN b.name AS dst, length(p) AS len"#,
+        )
+        .await
+        .expect("cycle safe")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["B", 1]]), "cycles do not loop or duplicate");
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_undirected_binding() {
+    // Undirected var-length with a binding routes through enumeration.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-undirected").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (b:Person {name: "Bob"})-[:KNOWS*1..1]-(x)
+               RETURN x.name AS other ORDER BY other"#,
+        )
+        .await
+        .expect("undirected enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["Alice"], ["Carol"]]),
+        "both undirected neighbors of Bob"
+    );
 }
 
 #[tokio::test]
