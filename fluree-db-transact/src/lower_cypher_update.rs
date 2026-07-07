@@ -576,11 +576,6 @@ impl<'a> CypherLowering<'a> {
                 "variable-length paths in a write MATCH are not allowed",
             ));
         }
-        if rel.props.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "relationship property filters in a write MATCH are deferred — match the connecting nodes instead",
-            ));
-        }
         if rel.types.len() != 1 {
             return Err(LowerCypherError::unsupported(
                 "write MATCH relationships need exactly one type (`-[:T]->`); untyped and alternation forms are deferred",
@@ -600,15 +595,17 @@ impl<'a> CypherLowering<'a> {
             dtc: None,
         };
 
-        match &rel.var {
-            // Anonymous relationship → plain base-edge triple (set semantics).
-            None => out.push(UnresolvedPattern::Triple(edge)),
+        match (&rel.var, &rel.props) {
+            // Anonymous bare relationship → plain base-edge triple (set
+            // semantics).
+            (None, None) => out.push(UnresolvedPattern::Triple(edge)),
             // Named relationship → bind `r` to the annotation SID via an
             // EdgeAnnotation pattern (only matches reifier-bundled edges, which
             // is every LPG/Cypher-written relationship). This makes `SET r.prop`
             // / `REMOVE r.prop` target the relationship's annotation metadata,
-            // and `DELETE r` retract the base edge it reifies.
-            Some(v) => {
+            // and `DELETE r` retract the base edge it reifies. Inline props
+            // (`-[r:T {w: 3}]->`) filter on the annotation's metadata.
+            (Some(v), props) => {
                 // A relationship variable may bind only one edge in a MATCH;
                 // reusing it would make the probe (first occurrence) and the
                 // delete lowering (last occurrence) disagree.
@@ -623,14 +620,50 @@ impl<'a> CypherLowering<'a> {
                 let p_sid = self.ns.sid_for_iri(&type_iri);
                 self.rel_var_edges
                     .insert(v.name.clone(), (s_name, p_sid, o_name));
+                let annotation = UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str()));
+                let body = self.annotation_props_body(&annotation, props.as_ref())?;
                 out.push(UnresolvedPattern::EdgeAnnotation {
                     edge,
-                    annotation: UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str())),
-                    body: Vec::new(),
+                    annotation,
+                    body,
+                });
+            }
+            // Anonymous property-bearing relationship → filter on a synthetic
+            // annotation subject.
+            (None, Some(_)) => {
+                let annotation = self.fresh_merge_probe();
+                let body = self.annotation_props_body(&annotation, rel.props.as_ref())?;
+                out.push(UnresolvedPattern::EdgeAnnotation {
+                    edge,
+                    annotation,
+                    body,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Annotation-metadata triples for a relationship's inline props
+    /// (`-[r:T {w: 3}]->` → `?r <w> 3`), for an `EdgeAnnotation` body.
+    fn annotation_props_body(
+        &mut self,
+        annotation: &UnresolvedTerm,
+        props: Option<&MapLit>,
+    ) -> Result<Vec<UnresolvedPattern>, LowerCypherError> {
+        let mut body = Vec::new();
+        if let Some(map) = props {
+            for (key, val_expr) in &map.entries {
+                let pred_iri = self.resolve_predicate(key)?;
+                let obj = self.match_object_term(val_expr)?;
+                body.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                    s: annotation.clone(),
+                    p: UnresolvedTerm::Iri(Arc::from(pred_iri.as_str())),
+                    o: obj,
+                    dtc: None,
+                }));
+            }
+        }
+        Ok(body)
     }
 
     /// The interned variable name for a node: its named variable (`?name`), or
@@ -1145,10 +1178,14 @@ impl<'a> CypherLowering<'a> {
             ));
         }
         if !m.on_match.is_empty() {
+            // Standalone MERGE … ON MATCH SET resolves as a conditional write
+            // (probe-then-branch) before reaching this single-Txn lowering; a
+            // per-row form (leading MATCH) can mix create and match rows, which
+            // a statement-level branch cannot honor.
             return Err(LowerCypherError::unsupported(
-                "MERGE … ON MATCH SET is deferred — it needs a complementary guarded \
-                 operation (create is the NOT EXISTS branch; ON MATCH SET is the EXISTS \
-                 branch). v1 supports MERGE [ON CREATE SET …].",
+                "ON MATCH SET on a MERGE with a leading MATCH (per-row find-or-create) is \
+                 deferred — each row independently creates or matches, which needs per-row \
+                 branching. Standalone MERGE … ON MATCH SET is supported.",
             ));
         }
 
@@ -1234,16 +1271,12 @@ impl<'a> CypherLowering<'a> {
                 "MERGE relationship needs exactly one type — `-[:T]->`",
             ));
         }
-        if rel.props.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "properties on a MERGE relationship are deferred — matching them needs an \
-                 annotation-sidecar guard; MERGE the bare edge, or use CREATE",
-            ));
-        }
-
         // NOT EXISTS guard over the whole path: a bound endpoint contributes its
         // MATCH variable (per-row check); an unbound one a fresh existential
-        // probe. Both are joined by the directed type triple.
+        // probe. Both are joined by the directed type triple; inline rel props
+        // (`-[r:T {w: 3}]->`) narrow the guard to edges whose annotation
+        // sidecar carries those values (an unmatched value creates a parallel
+        // edge, per Cypher).
         let head_term = self.merge_endpoint_term(head_node);
         let tail_term = self.merge_endpoint_term(tail_node);
         let mut guard = self.build_merge_guard(head_node, &head_term)?;
@@ -1254,37 +1287,84 @@ impl<'a> CypherLowering<'a> {
             Direction::Incoming => (tail_term, head_term),
             Direction::Either => unreachable!(),
         };
-        guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+        let edge = UnresolvedTriplePattern {
             s: gs,
             p: UnresolvedTerm::Iri(Arc::from(type_iri.as_str())),
             o: go,
             dtc: None,
-        }));
+        };
+        if rel.props.is_some() {
+            let annotation = self.fresh_merge_probe();
+            let body = self.annotation_props_body(&annotation, rel.props.as_ref())?;
+            guard.push(UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            });
+        } else {
+            guard.push(UnresolvedPattern::Triple(edge));
+        }
         self.where_patterns
             .push(UnresolvedPattern::NotExists(guard));
 
-        // Create branch: both endpoints + the directed edge with its bundle.
-        self.lower_create_part(part)?;
+        // ON CREATE SET on the relationship variable folds into the created
+        // edge's inline props (both land on the annotation subject); node-var
+        // items route to their endpoint below.
+        let rel_var = rel.var.as_ref().map(|v| v.name.clone());
+        let mut node_items: Vec<&SetItem> = Vec::new();
+        let mut rel_prop_items: Vec<(String, Expr)> = Vec::new();
+        for item in &m.on_create {
+            if rel_var.as_deref() == Some(set_item_target(item).name.as_str()) {
+                let SetItem::Property {
+                    property, value, ..
+                } = item
+                else {
+                    return Err(LowerCypherError::unsupported(
+                        "ON CREATE SET on a MERGE relationship variable supports single \
+                         properties (`r.prop = value`) in v1",
+                    ));
+                };
+                rel_prop_items.push((property.clone(), value.clone()));
+            } else {
+                node_items.push(item);
+            }
+        }
 
-        // ON CREATE SET — route each item to whichever endpoint var it targets.
-        if !m.on_create.is_empty() {
+        // Create branch: both endpoints + the directed edge with its bundle
+        // (rel-var ON CREATE items appended to the edge's props).
+        if rel_prop_items.is_empty() {
+            self.lower_create_part(part)?;
+        } else {
+            let mut part = part.clone();
+            let rel = &mut part.tail[0].0;
+            rel.props
+                .get_or_insert_with(|| MapLit {
+                    entries: Vec::new(),
+                    span: rel.span,
+                })
+                .entries
+                .extend(rel_prop_items);
+            self.lower_create_part(&part)?;
+        }
+
+        // ON CREATE SET — route each remaining item to its endpoint var.
+        if !node_items.is_empty() {
             let head_subj = self.node_subject(head_node);
             let tail_subj = self.node_subject(tail_node);
             let head_var = head_node.var.as_ref().map(|v| v.name.as_str());
             let tail_var = tail_node.var.as_ref().map(|v| v.name.as_str());
             let head_keys = node_identity_keys(head_node);
             let tail_keys = node_identity_keys(tail_node);
-            for item in &m.on_create {
+            for item in node_items {
                 let tgt = set_item_target(item).name.as_str();
                 if head_var == Some(tgt) {
                     self.emit_on_create_set(&head_subj, head_var, &head_keys, item)?;
                 } else if tail_var == Some(tgt) {
                     self.emit_on_create_set(&tail_subj, tail_var, &tail_keys, item)?;
                 } else {
-                    return Err(LowerCypherError::unsupported(
-                        "ON CREATE SET on a MERGE relationship targets only the endpoint node \
-                         variables in v1 (the relationship variable is deferred)",
-                    ));
+                    return Err(LowerCypherError::unsupported(format!(
+                        "ON CREATE SET target `{tgt}` is not a variable of the MERGE pattern",
+                    )));
                 }
             }
         }

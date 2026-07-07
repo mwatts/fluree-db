@@ -4208,6 +4208,175 @@ async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_relationship_with_properties_is_per_value() {
+    // `MERGE (a)-[:T {p: v}]->(b)` matches only an edge whose annotation
+    // carries those values; a different value creates a parallel edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-props");
+
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:City {name: "X"}), (:Country {name: "Y"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+
+    // Per-row form on bound endpoints: absent → creates the edge with props.
+    let stmt_w3 = r#"MATCH (a:City {name: "X"}), (b:Country {name: "Y"})
+                     MERGE (a)-[:IN {since: 2020}]->(b)"#;
+    let l = fluree
+        .transact_cypher(l, stmt_w3)
+        .await
+        .expect("create")
+        .ledger;
+    let t_after_create = l.t();
+
+    // Same statement again: annotation matches → no-op.
+    let l = fluree
+        .transact_cypher(l, stmt_w3)
+        .await
+        .expect("noop")
+        .ledger;
+    assert_eq!(l.t(), t_after_create, "matching property MERGE is a no-op");
+
+    // Different value → the guard misses → a parallel edge is created.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:City {name: "X"}), (b:Country {name: "Y"})
+               MERGE (a)-[:IN {since: 2021}]->(b)"#,
+        )
+        .await
+        .expect("parallel create")
+        .ledger;
+
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (:City {name: "X"})-[r:IN]->(:Country {name: "Y"})
+               RETURN r.since ORDER BY r.since"#,
+        )
+        .await
+        .expect("read back")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([[2020], [2021]]),
+        "two parallel edges by value"
+    );
+
+    // Exactly two City/Country nodes — per-row MERGE reused the endpoints.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:City) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_on_match_set_updates_annotation() {
+    // Standalone relationship MERGE with ON CREATE / ON MATCH SET resolves as
+    // a conditional write: first run creates (ON CREATE fires on the rel
+    // var), second run updates the annotation property.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-on-match");
+
+    let stmt = r#"MERGE (a:City {name: "X"})-[r:IN]->(b:Country {name: "Y"})
+                  ON CREATE SET r.checks = 1
+                  ON MATCH  SET r.checks = 2"#;
+
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("create")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let read = r#"MATCH (:City {name: "X"})-[r:IN]->(:Country {name: "Y"}) RETURN r.checks"#;
+    let jsonld = fluree
+        .query_cypher(&db, read)
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(jsonld, json!([[1]]), "ON CREATE SET fired on the rel var");
+
+    let l = fluree.transact_cypher(l, stmt).await.expect("match").ledger;
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(&db, read)
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([[2]]),
+        "ON MATCH SET updated the annotation property"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:City) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "no duplicate endpoints on the match branch"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_trailing_set_applies_on_both_branches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-trailing");
+
+    let stmt =
+        |year: i64| format!(r#"MERGE (a:U {{id: 1}})-[r:F]->(b:U {{id: 2}}) SET r.at = {year}"#);
+
+    // Create branch: trailing SET lands on the created edge.
+    let l = fluree
+        .transact_cypher(l, &stmt(2020))
+        .await
+        .expect("create branch")
+        .ledger;
+    // Match branch: same edge, trailing SET overwrites.
+    let l = fluree
+        .transact_cypher(l, &stmt(2021))
+        .await
+        .expect("match branch")
+        .ledger;
+
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(&db, "MATCH (:U {id: 1})-[r:F]->(:U {id: 2}) RETURN r.at")
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([[2021]]),
+        "trailing SET applied on both branches"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:U) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "exactly two endpoint nodes"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_delete_relationship_removes_edge() {
     // `DELETE r` retracts the relationship's base edge; the reifier cascade
     // clears the bundle. The endpoint nodes survive.

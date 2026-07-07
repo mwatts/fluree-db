@@ -3622,16 +3622,21 @@ impl Fluree {
 
         match cw {
             ConditionalCypherWrite::MergeSet { merge, trailing } => {
-                let node = &merge.pattern.parts[0].head;
-                // The SET items reference the MERGE variable, so the node needs one.
-                if node.var.is_none() {
-                    return Err(ApiError::cypher(
-                        "MERGE with ON MATCH SET or a trailing SET requires a node variable"
-                            .to_string(),
-                        Vec::new(),
-                    ));
-                }
-                let probe = crate::cypher_write::build_merge_probe_ast(node);
+                let part = &merge.pattern.parts[0];
+                let probe = if part.tail.is_empty() {
+                    // The SET items reference the MERGE variable, so the node
+                    // needs one.
+                    if part.head.var.is_none() {
+                        return Err(ApiError::cypher(
+                            "MERGE with ON MATCH SET or a trailing SET requires a node variable"
+                                .to_string(),
+                            Vec::new(),
+                        ));
+                    }
+                    crate::cypher_write::build_merge_probe_ast(&part.head)
+                } else {
+                    crate::cypher_write::build_merge_path_probe_ast(merge)
+                };
                 let exists = self
                     .query_cypher_ast(&probe_view, &probe)
                     .await?

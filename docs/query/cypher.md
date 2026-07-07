@@ -375,13 +375,20 @@ error listing the supported set.
   > considers every ordered pair — O(n²) candidate edges. Add a selective
   > `WHERE` (as above) unless a full cross-product is intended.
 
-  `ON CREATE SET` is supported on both forms (and may target either endpoint
-  node variable). `ON MATCH SET` is supported on **single-node** `MERGE` only
-  (deferred on a relationship `MERGE`). Resolved by probing the current writer
-  state, then staging either a create or an update.
+  A property-bearing relationship pattern (`MERGE (a)-[:IN {since: 2020}]->(b)`)
+  matches only an edge whose properties carry those values — a different value
+  creates a parallel edge, per Cypher.
 
-  A single-node `MERGE` also takes trailing `SET` clauses, which apply on
-  *both* branches — the standard upsert idiom:
+  `ON CREATE SET` is supported on both forms and may target endpoint node
+  variables or the relationship variable (`ON CREATE SET r.checks = 1`).
+  `ON MATCH SET` is supported on single-node `MERGE` and on **standalone**
+  relationship `MERGE` (resolved by probing the current writer state, then
+  staging either branch); on the per-row form (leading `MATCH`) it stays
+  deferred — each row independently creates or matches, which a
+  statement-level branch cannot honor.
+
+  A single-node or standalone relationship `MERGE` also takes trailing `SET`
+  clauses, which apply on *both* branches — the standard upsert idiom:
 
   ```cypher
   MERGE (n:User {id: $id}) SET n += $props
@@ -396,9 +403,10 @@ error listing the supported set.
   the edge is inserted — idempotent in RDF, but redundant.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
-  property filters, directed single-typed relationships, and scalar `WHERE`
-  filters over the same comparison/boolean/string/property-accessor expression
-  surface used by reads. `CASE` / `EXISTS` inside write-side `WHERE` are still
+  property filters (on nodes and relationships — `-[r:T {w: 3}]->` filters on
+  the relationship's properties), directed single-typed relationships, and
+  scalar `WHERE` filters over the same comparison/boolean/string/property-
+  accessor expression surface used by reads. `CASE` / `EXISTS` inside write-side `WHERE` are still
   deferred.
 - **`MATCH … WITH … <write>`** — a `WITH` between the match and the write,
   limited to the *horizon subset*: pass-through variables (`WITH a, b`), renames

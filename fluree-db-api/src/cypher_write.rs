@@ -68,13 +68,15 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
         return None;
     };
     match u.write_clauses.as_slice() {
-        // MERGE … [ON MATCH SET …] [SET …]: standalone single-node MERGE
-        // needing a probe — an on-match branch, and/or trailing SET clauses
-        // that must apply on both branches (the upsert idiom).
+        // MERGE … [ON MATCH SET …] [SET …]: standalone single-node or
+        // single-relationship MERGE needing a probe — an on-match branch,
+        // and/or trailing SET clauses that must apply on both branches (the
+        // upsert idiom). A leading MATCH (per-row find-or-create) can mix
+        // create and match rows, which a statement-level branch cannot honor —
+        // those route to the single-Txn lowering (clear error).
         [WriteClause::Merge(m), rest @ ..]
             if rest.iter().all(|w| matches!(w, WriteClause::Set(_))) =>
         {
-            let single_node = m.pattern.parts.len() == 1 && m.pattern.parts[0].tail.is_empty();
             let trailing: Vec<SetItem> = rest
                 .iter()
                 .filter_map(|w| match w {
@@ -84,7 +86,7 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
                 .flatten()
                 .collect();
             if u.read_clauses.is_empty()
-                && single_node
+                && conditional_merge_pattern(m)
                 && (!m.on_match.is_empty() || !trailing.is_empty())
             {
                 Some(ConditionalCypherWrite::MergeSet {
@@ -125,6 +127,29 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
             }
         }
         _ => None,
+    }
+}
+
+/// Whether a MERGE pattern is a shape the probe-then-branch conditional can
+/// resolve: a single node, or a single directed single-typed fixed-length
+/// relationship. Other shapes fall through to the single-Txn lowering's
+/// specific errors.
+fn conditional_merge_pattern(m: &MergeClause) -> bool {
+    if m.pattern.parts.len() != 1 {
+        return false;
+    }
+    let part = &m.pattern.parts[0];
+    if part.path_search.is_some() || part.path_var.is_some() {
+        return false;
+    }
+    match part.tail.as_slice() {
+        [] => true,
+        [(rel, _)] => {
+            rel.types.len() == 1
+                && !matches!(rel.direction, Direction::Either)
+                && rel.length.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -213,6 +238,42 @@ pub(crate) fn build_merge_probe_ast(node: &NodePattern) -> CypherAst {
                 items: vec![ProjectionItem {
                     expr: Expr::Var(var),
                     alias: None,
+                    span,
+                }],
+                distinct: false,
+                order_by: Vec::new(),
+                skip: None,
+                limit: Some(Expr::Lit(Literal::Integer(1, span))),
+                span,
+            },
+            union_tail: None,
+            span,
+        }),
+        span,
+    }
+}
+
+/// Build a probe that returns at most one row when the full MERGE path
+/// pattern matches: `MATCH <pattern> RETURN 1 AS <synthetic> LIMIT 1`. The
+/// pattern is cloned verbatim (endpoint labels/props and relationship props
+/// round-trip exactly); the projected constant avoids requiring any pattern
+/// variable.
+pub(crate) fn build_merge_path_probe_ast(merge: &MergeClause) -> CypherAst {
+    let span = merge.span;
+    CypherAst {
+        statement: Statement::Query(Query {
+            clauses: vec![ReadClause::Match(MatchClause {
+                pattern: merge.pattern.clone(),
+                where_clause: None,
+                span,
+            })],
+            return_clause: ReturnClause {
+                items: vec![ProjectionItem {
+                    expr: Expr::Lit(Literal::Integer(1, span)),
+                    alias: Some(Variable {
+                        name: "#__cy_merge_probe".to_string(),
+                        span,
+                    }),
                     span,
                 }],
                 distinct: false,

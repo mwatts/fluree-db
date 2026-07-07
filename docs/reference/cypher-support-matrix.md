@@ -50,7 +50,7 @@ These shape everything below; read them first.
 | `CALL { … }` (subquery) | ✅ | Imports `(a,b)` / `(*)`, uncorrelated broadcast, inner `UNION`, nesting, strict scope/shadowing, correlated-aggregate soundness. |
 | `CREATE` | ✅ | Nodes + relationships (relationships reify). Bare `CREATE ()` / `CREATE (n)` asserts a hidden `db:Node` existence marker (invisible to `labels()`). |
 | `MERGE` (node) | ✅ | Find-or-create with `ON CREATE SET` / `ON MATCH SET`, and trailing `SET` clauses that apply on both branches — the upsert idiom `MERGE (n:User {id: $id}) SET n += $props` works. |
-| `MERGE` (relationship) | ◑ | Standalone + bound-endpoint forms; `ON CREATE SET`. Deferred: `ON MATCH SET` on a relationship MERGE, property-bearing rel MERGE (`-[:T {p:v}]->`), multi-hop / multi-part MERGE, multiple `MERGE` clauses, and combining a MERGE with a non-`SET` write clause. |
+| `MERGE` (relationship) | ◑ | Standalone + bound-endpoint forms; property-bearing patterns (`-[:T {p:v}]->` matches on the annotation values — a different value creates a parallel edge); `ON CREATE SET` on endpoint and relationship variables; `ON MATCH SET` / trailing `SET` on the **standalone** form (probe-then-branch). Deferred: `ON MATCH SET` on the per-row form (leading `MATCH` — rows can mix create/match), multi-hop / multi-part MERGE, multiple `MERGE` clauses, and combining a MERGE with a non-`SET` write clause. |
 | `SET` / `REMOVE` | ✅ | Properties, `+=` map merge, labels. The map side of `SET n = …` / `SET n += …` may be a whole-map parameter (`SET n += $props`). |
 | `DELETE` / `DETACH DELETE` | ✅ | |
 | `FOREACH` | ⏳ | |
