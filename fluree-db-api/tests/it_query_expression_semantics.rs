@@ -489,3 +489,84 @@ async fn sparql_regex_q_flag_literal_pattern() {
         json!([["ex:m"]])
     );
 }
+
+// =============================================================================
+// #1319 — bare integers in VALUES/inline data are xsd:integer terms
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_values_integer_is_xsd_integer_term() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/1319:sparql").await;
+
+    // The result datatype tag matches storage tagging.
+    let result = support::query_sparql(&fluree, &ledger, "SELECT ?v WHERE { VALUES ?v { 3 } }")
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    assert_eq!(
+        sparql_json["results"]["bindings"][0]["v"]["datatype"],
+        json!("http://www.w3.org/2001/XMLSchema#integer")
+    );
+
+    // Term identity: a VALUES integer and a stored integer of the same value
+    // are the SAME term (sameTerm, DISTINCT collapse).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             ASK { VALUES ?v { 30 } ?s ex:age ?a . FILTER(sameTerm(?v, ?a)) }",
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT DISTINCT ?v WHERE { { VALUES ?v { 30 } } UNION { ?s ex:age ?v . FILTER(?v = 30) } }",
+        )
+        .await,
+        json!([[30]])
+    );
+}
+
+#[tokio::test]
+async fn jsonld_values_integer_is_xsd_integer_term() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/1319:jsonld").await;
+
+    // JSON-LD inline values: grouping a values-integer against stored
+    // integers collapses to one group (term identity).
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?v", "?dt"],
+        "where": [
+            ["values", ["?v", [30]]],
+            ["bind", "?dt", ["expr", ["datatype", "?v"]]]
+        ]
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([[30, "xsd:integer"]])
+    );
+
+    // Values-integer joins/compares as the same term as a stored integer.
+    let q_join = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            ["values", ["?v", [30]]],
+            { "@id": "?s", "ex:age": "?a" },
+            ["filter", "(sameTerm ?v ?a)"]
+        ]
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_join).await,
+        json!([["ex:alice"]])
+    );
+}

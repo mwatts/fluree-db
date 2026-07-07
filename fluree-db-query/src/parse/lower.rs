@@ -525,7 +525,9 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 None => {
                     let sid = match value {
                         LiteralValue::String(_) => dts.xsd_string,
-                        LiteralValue::Long(_) => dts.xsd_long,
+                        // RDF 1.1: a bare integer is xsd:integer, matching
+                        // storage and arithmetic tagging (#1319).
+                        LiteralValue::Long(_) => dts.xsd_integer,
                         LiteralValue::Double(_) => dts.xsd_double,
                         LiteralValue::Decimal(_) => dts.xsd_decimal,
                         LiteralValue::BigInt(_) => dts.xsd_integer,

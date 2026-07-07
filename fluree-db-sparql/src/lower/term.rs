@@ -450,9 +450,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     FlakeValue::String(value.to_string()),
                     lang.clone(),
                 )),
+                // RDF 1.1: a bare integer literal is xsd:integer. Storage,
+                // the Turtle parser, arithmetic results, and triple-pattern
+                // lowering all agree on xsd:integer — tagging VALUES rows
+                // xsd:long made the same number two distinct terms in
+                // term-identity contexts (DISTINCT/GROUP BY/sameTerm), #1319.
                 LiteralValue::Integer(i) => Ok(Binding::lit(
                     FlakeValue::Long(*i),
-                    Sid::new(XSD, xsd_names::LONG),
+                    Sid::new(XSD, xsd_names::INTEGER),
                 )),
                 LiteralValue::Double(d) => Ok(Binding::lit(
                     FlakeValue::Double(*d),
