@@ -1362,6 +1362,21 @@ mem:fact-01kwx4dgvp4p8pnsc5wq52fp5s a mem:Fact ;
     mem:branch "feature/cypher-import" ;
     mem:createdAt "2026-07-07T01:52:23.926306+00:00"^^xsd:dateTime .
 
+mem:fact-01kwx6n2brwbcgryf5txj1hchn a mem:Fact ;
+    mem:content "Cypher procedure shims (8412aba24): CALL db.labels/relationshipTypes/propertyKeys/schema.visualization/dbms.components answer from novelty-merged stats (assemble_fast_stats, to_t=i64::MAX) in fluree-db-api cypher_procedures.rs — Statement::CallProcedure is rewritten to an InlineRows query in lower_cypher_ast_to_ir BEFORE fluree-db-cypher lowering (which errors on the variant; it lacks ledger stats). Parser disambiguates CALL <ident> (procedure) vs CALL {/( (subquery); first-clause standalone only. dbms.components version \"5.4.0\" must stay in SYNC with server_agent() in bolt.rs. literal_to_binding now recurses into constant list/map Exprs for InlineRows cells." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "introspection" ;
+    mem:tag "procedures" ;
+    mem:tag "stats" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_procedures.rs" ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/parse/stmt.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-07T02:31:28.376492+00:00"^^xsd:dateTime .
+
 mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:content "Default context: per-ledger JSON prefix map auto-applied to queries/transactions that omit @context. Stored in CAS keyed by ContentId; pointer in ConfigPayload.default_context via nameservice.\n\nPopulation: bulk import captures @prefix + builtins; API set_default_context(); HTTP PUT /v1/fluree/context/*ledger; CLI fluree context set.\n\nPrecedence: Query @context/PREFIX > ledger default > built-in (rdf, rdfs, xsd, owl, sh, geo).\n\nUpdates use CAS via ConfigPublisher::push_config() with retry; disconnect_ledger() evicts cache after update. ProxyNameService does NOT implement ConfigPublisher — context writes only on tx server." ;
     mem:tag "api" ;

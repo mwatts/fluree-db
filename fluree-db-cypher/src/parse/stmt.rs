@@ -409,26 +409,51 @@ fn parse_procedure_call(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
         }
     }
 
-    let return_clause = if matches!(s.peek_kind(), TokenKind::Return) {
-        Some(parse_return(s)?)
-    } else {
-        None
+    // After the YIELD the statement continues like a read query — the
+    // schema-introspection shape `CALL apoc.meta.data() YIELD … WHERE …
+    // UNWIND other AS o RETURN …` needs WITH / UNWIND / MATCH here.
+    let mut rest = Vec::new();
+    let return_clause = loop {
+        match s.peek_kind() {
+            TokenKind::Match => rest.push(ReadClause::Match(parse_match(s, false)?)),
+            TokenKind::Optional => {
+                s.advance();
+                rest.push(ReadClause::OptionalMatch(parse_match(s, true)?));
+            }
+            TokenKind::With => rest.push(ReadClause::With(parse_with(s)?)),
+            TokenKind::Unwind => rest.push(ReadClause::Unwind(parse_unwind(s)?)),
+            TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "CALL <procedure> is supported only as the first clause of a statement",
+                ));
+            }
+            TokenKind::Call => rest.push(ReadClause::CallSubquery(parse_call_subquery(s)?)),
+            TokenKind::Return => break Some(parse_return(s)?),
+            TokenKind::Eof => break None,
+            TokenKind::Semicolon => {
+                return Err(s.error(
+                    DiagCode::DeferredMultiStatement,
+                    "multi-statement scripts (semicolon-separated) are deferred; \
+                     submit one statement per request",
+                ));
+            }
+            other => {
+                return Err(s.error(
+                    DiagCode::UnexpectedToken,
+                    format!(
+                        "unexpected `{other}` after CALL {name} — expected YIELD / WITH / \
+                         UNWIND / MATCH / RETURN"
+                    ),
+                ));
+            }
+        }
     };
 
-    if matches!(s.peek_kind(), TokenKind::Semicolon) {
+    if return_clause.is_none() && !rest.is_empty() {
         return Err(s.error(
-            DiagCode::DeferredMultiStatement,
-            "multi-statement scripts (semicolon-separated) are deferred; \
-             submit one statement per request",
-        ));
-    }
-    if !s.is_eof() {
-        return Err(s.error(
-            DiagCode::UnexpectedToken,
-            format!(
-                "unexpected `{}` after CALL {name} — only YIELD and RETURN may follow a procedure call",
-                s.peek_kind()
-            ),
+            DiagCode::UnexpectedEof,
+            "a procedure call followed by additional clauses must end in RETURN",
         ));
     }
 
@@ -438,6 +463,7 @@ fn parse_procedure_call(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
         args,
         yields,
         where_clause,
+        rest,
         return_clause,
         span: start.union(end),
     }))
@@ -776,18 +802,23 @@ pub(crate) fn parse_var(s: &mut TokenStream) -> Result<Variable, Diagnostic> {
 
 /// Parses an identifier or a keyword-as-identifier (Cypher allows
 /// reserved words in property/label position). We accept any token
-/// whose textual form is a valid identifier.
+/// whose textual form is a valid identifier — returning the **as-written**
+/// source text, not the token's canonical uppercase display (`{end: 1}`
+/// must produce the key `end`, not `END`).
 pub(crate) fn parse_ident_or_keyword(s: &mut TokenStream) -> Result<String, Diagnostic> {
     let kind = s.peek_kind().clone();
     if let TokenKind::Ident(name) = kind {
         s.advance();
         Ok(name)
     } else {
-        // Accept the token's display form if it's a keyword (uppercase).
         let display = format!("{}", s.peek_kind());
         if display.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
+            let text = s
+                .source_slice(s.peek_span())
+                .map(str::to_string)
+                .unwrap_or(display);
             s.advance();
-            Ok(display)
+            Ok(text)
         } else {
             Err(s.error(
                 DiagCode::UnexpectedToken,

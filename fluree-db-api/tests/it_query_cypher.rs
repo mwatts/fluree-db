@@ -8098,6 +8098,120 @@ async fn cypher_call_db_schema_visualization_returns_one_row() {
 }
 
 #[tokio::test]
+async fn cypher_call_apoc_meta_data_attributes_schema_per_label() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-meta-data").await;
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            "CALL apoc.meta.data() YIELD label, property, count, type, other, elementType \
+             RETURN label, property, type, other ORDER BY label, property",
+        )
+        .await
+        .expect("meta.data")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = jsonld.as_array().expect("rows");
+
+    // Company: name (STRING). Person: age (INTEGER), name (STRING),
+    // KNOWS (RELATIONSHIP → Company).
+    let flat: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_str().unwrap().to_string(),
+                r[1].as_str().unwrap().to_string(),
+                r[2].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flat,
+        vec![
+            ("Company".into(), "name".into(), "STRING".into()),
+            ("Person".into(), "KNOWS".into(), "RELATIONSHIP".into()),
+            ("Person".into(), "age".into(), "INTEGER".into()),
+            ("Person".into(), "name".into(), "STRING".into()),
+        ],
+        "{jsonld}"
+    );
+    let knows_other = rows[1][3].as_array().expect("other list");
+    assert_eq!(knows_other, &[json!("Company")], "{jsonld}");
+}
+
+#[tokio::test]
+async fn cypher_call_apoc_meta_data_answers_langchain_schema_queries() {
+    // The three exact queries LangChain's Neo4jGraph issues to build its
+    // schema description — the reason this shim exists.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-langchain").await;
+    let db = graphdb_from_ledger(&l);
+
+    let run = |stmt: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            fluree
+                .query_cypher(db, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{stmt}: {e:?}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld")
+        }
+    };
+
+    // Node properties.
+    let node_props = run("CALL apoc.meta.data() \
+         YIELD label, other, elementType, type, property \
+         WHERE NOT type = \"RELATIONSHIP\" AND elementType = \"node\" \
+         WITH label AS nodeLabels, collect({property:property, type:type}) AS properties \
+         RETURN {labels: nodeLabels, properties: properties} AS output")
+    .await;
+    let rows = node_props.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "one output per label: {node_props}");
+    let person = rows
+        .iter()
+        .map(|r| &r[0])
+        .find(|o| o["labels"] == json!("Person"))
+        .unwrap_or_else(|| panic!("Person output missing: {node_props}"));
+    let props = person["properties"].as_array().expect("properties");
+    assert!(
+        props.contains(&json!({"property": "age", "type": "INTEGER"}))
+            && props.contains(&json!({"property": "name", "type": "STRING"})),
+        "{node_props}"
+    );
+
+    // Relationship properties (edge-annotation attribution not emitted —
+    // zero rows, which LangChain tolerates).
+    let rel_props = run("CALL apoc.meta.data() \
+         YIELD label, other, elementType, type, property \
+         WHERE NOT type = \"RELATIONSHIP\" AND elementType = \"relationship\" \
+         WITH label AS nodeLabels, collect({property:property, type:type}) AS properties \
+         RETURN {type: nodeLabels, properties: properties} AS output")
+    .await;
+    assert_eq!(rel_props.as_array().expect("rows").len(), 0, "{rel_props}");
+
+    // Relationships (start)-[type]->(end).
+    let rels = run("CALL apoc.meta.data() \
+         YIELD label, other, elementType, type, property \
+         WHERE type = \"RELATIONSHIP\" AND elementType = \"node\" \
+         UNWIND other AS other_node \
+         RETURN {start: label, type: property, end: toString(other_node)} AS output")
+    .await;
+    let rows = rels.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{rels}");
+    assert_eq!(
+        rows[0][0],
+        json!({"start": "Person", "type": "KNOWS", "end": "Company"}),
+        "{rels}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_call_procedure_errors_are_actionable() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:proc-errors");
@@ -8105,12 +8219,12 @@ async fn cypher_call_procedure_errors_are_actionable() {
 
     // Unknown procedure names the supported set.
     let msg = fluree
-        .query_cypher(&db, "CALL apoc.meta.data()")
+        .query_cypher(&db, "CALL apoc.load.json()")
         .await
         .expect_err("unknown procedure")
         .to_string();
     assert!(
-        msg.contains("apoc.meta.data") && msg.contains("db.labels"),
+        msg.contains("apoc.load.json") && msg.contains("db.labels"),
         "unknown-procedure error lists the shims: {msg}"
     );
 

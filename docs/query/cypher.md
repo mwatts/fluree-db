@@ -310,12 +310,22 @@ scan), so they are instant even on large ledgers:
 | `CALL db.propertyKeys()` | Distinct property keys (predicates with literal values). |
 | `CALL db.schema.visualization()` | One row: `nodes` / `relationships` summary lists (best effort). |
 | `CALL dbms.components()` | Compatibility identity (mirrors the Bolt handshake's `Neo4j/<version> (compatible; Fluree/…)`). |
+| `CALL apoc.meta.data()` | Per-(label, property) schema rows — node properties with meta types (`STRING`/`INTEGER`/…) and outgoing relationships (`type: "RELATIONSHIP"`, `other` = end labels). Covers the LangChain `Neo4jGraph` schema queries verbatim. |
 
-The full call form composes like any read —
-`CALL proc() [YIELD * | col [AS alias], … [WHERE …]] [RETURN …]`:
+The full call form composes like any read — after the `YIELD` the statement
+continues with ordinary read clauses
+(`CALL proc() [YIELD * | col [AS alias], … [WHERE …]] [WITH/UNWIND/MATCH …] [RETURN …]`):
 
 ```cypher
 CALL db.labels() YIELD label WHERE label STARTS WITH "P" RETURN label ORDER BY label
+```
+
+```cypher
+CALL apoc.meta.data()
+YIELD label, other, elementType, type, property
+WHERE type = "RELATIONSHIP" AND elementType = "node"
+UNWIND other AS other_node
+RETURN {start: label, type: property, end: toString(other_node)} AS output
 ```
 
 Names render through the ledger's default context (`@vocab` stripped, term

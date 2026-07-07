@@ -20,12 +20,16 @@ pub enum Statement {
 }
 
 /// A standalone procedure call statement:
-/// `CALL dotted.name[(args)] [YIELD col [AS alias], … [WHERE expr]] [RETURN …]`.
+/// `CALL dotted.name[(args)] [YIELD col [AS alias], … [WHERE expr]]
+/// [<read clauses…>] [RETURN …]`.
 ///
 /// The parser accepts any dotted name; resolution against the supported
 /// shim set (`db.labels`, `dbms.components`, …) happens at the API layer,
 /// which has the ledger stats needed to answer them. Bare `CALL proc()`
-/// implicitly yields all of the procedure's columns.
+/// implicitly yields all of the procedure's columns. After the YIELD the
+/// statement continues like any read query (`WITH` / `UNWIND` / `MATCH` /
+/// nested `CALL { … }`), the shape schema-introspection tooling emits
+/// (e.g. `CALL apoc.meta.data() YIELD … UNWIND other AS o RETURN …`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcedureCall {
     /// Dotted procedure name as written (e.g. `db.labels`). Matched
@@ -37,6 +41,10 @@ pub struct ProcedureCall {
     pub yields: Vec<YieldItem>,
     /// `YIELD … WHERE expr` filter (only valid after a YIELD).
     pub where_clause: Option<Expr>,
+    /// Read clauses following the YIELD, before the RETURN. When non-empty,
+    /// an explicit RETURN is required (the implicit all-columns return only
+    /// applies to the bare call shape).
+    pub rest: Vec<ReadClause>,
     pub return_clause: Option<ReturnClause>,
     pub span: SourceSpan,
 }

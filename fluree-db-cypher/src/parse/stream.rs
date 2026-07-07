@@ -16,6 +16,11 @@ const MAX_PARSE_DEPTH: u32 = 256;
 
 pub struct TokenStream {
     tokens: Vec<Token>,
+    /// Original statement text, for recovering the as-written form of
+    /// keyword tokens in identifier position (`{end: 1}`, `YIELD count`) —
+    /// a token's `Display` is its canonical uppercase keyword, not what the
+    /// user typed.
+    src: String,
     pos: usize,
     depth: u32,
 }
@@ -29,12 +34,18 @@ pub struct Mark {
 }
 
 impl TokenStream {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Token>, src: impl Into<String>) -> Self {
         Self {
             tokens,
+            src: src.into(),
             pos: 0,
             depth: 0,
         }
+    }
+
+    /// The original source text under `span`, when the span is a valid slice.
+    pub fn source_slice(&self, span: SourceSpan) -> Option<&str> {
+        self.src.get(span.start..span.end)
     }
 
     /// Enter one level of recursion, erroring (rather than overflowing the

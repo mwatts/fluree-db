@@ -999,6 +999,9 @@ fn subst_statement(s: &mut Statement, p: &ParamMap) -> Result<(), ParamError> {
             if let Some(w) = &mut call.where_clause {
                 subst_expr(w, p)?;
             }
+            for c in &mut call.rest {
+                subst_read_clause(c, p)?;
+            }
             if let Some(r) = &mut call.return_clause {
                 subst_return(r, p)?;
             }
