@@ -434,6 +434,7 @@ SPARQL, JSON-LD query, and Cypher (`fluree-db-cypher`) all compile to the **same
 | -------- | ---------- |
 | SPARQL   | `fluree-db-api/tests/it_query_sparql.rs` |
 | JSON-LD  | `fluree-db-api/tests/it_query.rs`, `it_query_analytical.rs`, `it_query_grouping.rs` |
+| UPDATE / transact | `fluree-db-api/tests/it_transact_update.rs`, `it_named_graphs.rs` (SPARQL UPDATE and JSON-LD transactions share the `Txn` IR — fixes to either surface add the counterpart test here) |
 | Shared   | Unit tests in `fluree-db-query/src/` modules |
 
 ### Validation after shared-code changes

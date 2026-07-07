@@ -36,6 +36,7 @@ use crate::ast::pattern::{GraphPattern, TriplePattern};
 use crate::ast::query::{
     AskQuery, ConstructQuery, DescribeQuery, QueryBody, SelectQuery, SparqlAst,
 };
+use crate::ast::term::BlankNodeValue;
 use crate::ast::term::{PredicateTerm, SubjectTerm, Term};
 use crate::ast::update::{
     DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
@@ -43,6 +44,15 @@ use crate::ast::update::{
 };
 use crate::diag::{DiagCode, Diagnostic, Label};
 use crate::span::SourceSpan;
+
+/// Blank-node labels with this prefix are Fluree *stable ids*: they address
+/// the existing stored node as a constant instead of acting as a fresh blank
+/// node, so the SPARQL 1.1 Update §19.8 bnode-in-DELETE restriction does not
+/// apply to them. Must stay in sync with
+/// `fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX` (that crate
+/// is a feature-gated dependency, so the value is duplicated here; a
+/// lowering-feature test asserts equality).
+const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
 
 /// Fluree capability configuration.
 ///
@@ -176,7 +186,8 @@ impl<'a> Validator<'a> {
     /// from the W3C negative-syntax reading. DELETE DATA differs; see
     /// [`Validator::validate_delete_data`].
     fn validate_insert_data(&mut self, insert: &InsertData) {
-        self.validate_ground_quad_data(&insert.data, "INSERT DATA");
+        // Blank nodes are allowed: they mint fresh nodes (CONSTRUCT-style).
+        self.validate_ground_quad_data(&insert.data, "INSERT DATA", false);
     }
 
     /// Validate DELETE DATA - triples must be ground (no variables), and
@@ -188,7 +199,10 @@ impl<'a> Validator<'a> {
     /// rejection in fluree-db-transact so the query never produces an AST
     /// the API would act on.
     fn validate_delete_data(&mut self, delete: &DeleteData) {
-        self.validate_ground_quad_data(&delete.data, "DELETE DATA");
+        // Ground-data validation with blank nodes forbidden (SPARQL 1.1
+        // Update §19.8 grammar note 8): a blank node denotes a fresh node,
+        // which can never match stored data.
+        self.validate_ground_quad_data(&delete.data, "DELETE DATA", true);
         for el in &delete.data.quads {
             match el {
                 QuadPatternElement::Triple(triple) => {
@@ -229,73 +243,145 @@ impl<'a> Validator<'a> {
     fn validate_delete_where(&mut self, delete_where: &DeleteWhere) {
         // DELETE WHERE allows variables - no ground validation needed.
         //
-        // Phase 1: GRAPH blocks in DELETE WHERE are not supported yet because the lowering
-        // path in `fluree-db-transact` currently targets triple-only patterns.
-        for el in &delete_where.pattern.patterns {
-            if let QuadPatternElement::Graph { span, .. } = el {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        DiagCode::UnsupportedGraphInUpdate,
-                        "GRAPH blocks are not supported in DELETE WHERE yet",
-                        *span,
-                    )
-                    .with_help("Rewrite using explicit triples in the default graph, or use DELETE/INSERT with WHERE once GRAPH template support is extended to DELETE WHERE."),
-                );
-            }
-        }
+        // The quad pattern doubles as the DELETE template (`DELETE WHERE { P }`
+        // is shorthand for `DELETE { P } WHERE { P }`), so the same template
+        // rules as Modify apply: `GRAPH <iri>` blocks are supported, graph
+        // variables are not (Phase 1), and blank nodes are forbidden
+        // (SPARQL 1.1 Update §19.8 grammar note 8).
+        self.validate_update_template_quad_pattern(&delete_where.pattern, "DELETE WHERE", true);
     }
 
     /// Validate Modify (INSERT/DELETE with WHERE).
     fn validate_modify(&mut self, modify: &Modify) {
         // DELETE and INSERT templates can have variables (bound by WHERE)
-        // No ground validation needed for templates
+        // No ground validation needed for templates. Blank nodes are
+        // forbidden in the DELETE template only (INSERT templates mint
+        // per-solution fresh nodes, CONSTRUCT-style).
         if let Some(delete_clause) = &modify.delete_clause {
-            self.validate_update_template_quad_pattern(delete_clause, "DELETE");
+            self.validate_update_template_quad_pattern(delete_clause, "DELETE", true);
         }
         if let Some(insert_clause) = &modify.insert_clause {
-            self.validate_update_template_quad_pattern(insert_clause, "INSERT");
+            self.validate_update_template_quad_pattern(insert_clause, "INSERT", false);
         }
 
         // Validate WHERE graph pattern (same capabilities as query WHERE).
         self.validate_graph_pattern(&modify.where_clause);
     }
 
-    fn validate_update_template_quad_pattern(&mut self, pattern: &QuadPattern, context: &str) {
+    fn validate_update_template_quad_pattern(
+        &mut self,
+        pattern: &QuadPattern,
+        context: &str,
+        reject_blank_nodes: bool,
+    ) {
         for el in &pattern.patterns {
-            if let QuadPatternElement::Graph { name, span, .. } = el {
-                match name {
-                    crate::ast::pattern::GraphName::Iri(_iri) => {
-                        // Allowed (Phase 1)
+            match el {
+                QuadPatternElement::Triple(triple) => {
+                    if reject_blank_nodes {
+                        self.validate_no_blank_nodes_in_delete_triple(triple, context);
                     }
-                    crate::ast::pattern::GraphName::Var(v) => {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                DiagCode::UnsupportedGraphInUpdate,
-                                format!(
-                                    "GRAPH ?{} is not supported in SPARQL Update {} templates",
-                                    v.name, context
+                }
+                QuadPatternElement::Graph {
+                    name,
+                    triples,
+                    span,
+                } => {
+                    match name {
+                        crate::ast::pattern::GraphName::Iri(_iri) => {
+                            // Allowed (Phase 1)
+                        }
+                        crate::ast::pattern::GraphName::Var(v) => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    DiagCode::UnsupportedGraphInUpdate,
+                                    format!(
+                                        "GRAPH ?{} is not supported in SPARQL Update {} templates",
+                                        v.name, context
+                                    ),
+                                    *span,
+                                )
+                                .with_label(Label::new(v.span, "graph variables not supported here"))
+                                .with_help(
+                                    "Use GRAPH <iri> { ... } with an explicit graph IRI, or rewrite to a fixed target graph.",
                                 ),
-                                *span,
-                            )
-                            .with_label(Label::new(v.span, "graph variables not supported here"))
-                            .with_help(
-                                "Use GRAPH <iri> { ... } with an explicit graph IRI, or rewrite to a fixed target graph.",
-                            ),
-                        );
+                            );
+                        }
+                    }
+                    if reject_blank_nodes {
+                        for triple in triples {
+                            self.validate_no_blank_nodes_in_delete_triple(triple, context);
+                        }
                     }
                 }
             }
         }
     }
 
+    /// Reject blank nodes in a DELETE-side triple (SPARQL 1.1 Update §19.8
+    /// grammar note 8). Fluree stable ids (`_:fdb-...`) are exempt: they are
+    /// constants addressing the existing stored node.
+    fn validate_no_blank_nodes_in_delete_triple(&mut self, triple: &TriplePattern, context: &str) {
+        if let SubjectTerm::BlankNode(bn) = &triple.subject {
+            self.reject_blank_node_in_delete(&bn.value, bn.span, context);
+        }
+        if let Term::BlankNode(bn) = &triple.object {
+            self.reject_blank_node_in_delete(&bn.value, bn.span, context);
+        }
+    }
+
+    fn reject_blank_node_in_delete(
+        &mut self,
+        value: &BlankNodeValue,
+        span: SourceSpan,
+        context: &str,
+    ) {
+        let label = match value {
+            BlankNodeValue::Labeled(l) => {
+                if l.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+                    // Fluree stable id: denotes the stored node, not a fresh one.
+                    return;
+                }
+                format!("_:{l}")
+            }
+            BlankNodeValue::Anon => "[]".to_string(),
+        };
+        self.diagnostics.push(
+            Diagnostic::error(
+                DiagCode::BlankNodeInDelete,
+                format!("Blank node {label} is not allowed in {context}"),
+                span,
+            )
+            .with_label(Label::new(span, "blank node not allowed here"))
+            .with_help(
+                "SPARQL 1.1 Update forbids blank nodes in DELETE operations: a blank node \
+                 denotes a fresh node and can never match existing data. Use a variable \
+                 bound by a WHERE clause, or a concrete IRI.",
+            )
+            .with_note(
+                "Fluree stable blank-node ids (_:fdb-...) are allowed here: they address \
+                 the existing stored node.",
+            ),
+        );
+    }
+
     /// Validate that QuadData contains only ground triples (no variables),
     /// including inside `GRAPH <iri> { ... }` blocks. Variable graph names are
-    /// rejected: DATA must be ground.
-    fn validate_ground_quad_data(&mut self, data: &QuadData, context: &str) {
+    /// rejected: DATA must be ground. When `reject_blank_nodes` is set
+    /// (DELETE DATA), blank nodes are also rejected per SPARQL 1.1 Update
+    /// §19.8 grammar note 8.
+    fn validate_ground_quad_data(
+        &mut self,
+        data: &QuadData,
+        context: &str,
+        reject_blank_nodes: bool,
+    ) {
         for el in &data.quads {
             match el {
                 QuadPatternElement::Triple(triple) => {
                     self.validate_ground_triple(triple, context);
+                    if reject_blank_nodes {
+                        self.validate_no_blank_nodes_in_delete_triple(triple, context);
+                    }
                 }
                 QuadPatternElement::Graph {
                     name,
@@ -320,6 +406,9 @@ impl<'a> Validator<'a> {
                     }
                     for triple in triples {
                         self.validate_ground_triple(triple, context);
+                        if reject_blank_nodes {
+                            self.validate_no_blank_nodes_in_delete_triple(triple, context);
+                        }
                     }
                 }
             }
@@ -662,6 +751,31 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_where_graph_iri_block_allowed() {
+        // W3C syntax-update-1 test_36: GRAPH <iri> blocks are valid in
+        // DELETE WHERE (the pattern doubles as a Modify-style template).
+        let diags =
+            validate_query("DELETE WHERE { GRAPH <urn:g> { <urn:s> <http://example.org/p> ?o } }");
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "GRAPH <iri> should be allowed in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_graph_variable_rejected() {
+        // Graph variables are unsupported in update templates (Phase 1), and
+        // the DELETE WHERE pattern is also the delete template.
+        let diags = validate_query("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
+            "GRAPH ?var should be rejected in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[test]
     fn test_modify_variables_allowed() {
         let diags = validate_query(
             "DELETE { ?s ex:old ?o } INSERT { ?s ex:new ?o } WHERE { ?s ex:old ?o }",
@@ -672,6 +786,105 @@ mod tests {
                 .iter()
                 .any(|d| d.code == DiagCode::VariableInGroundData),
             "Variables should be allowed in Modify operations"
+        );
+    }
+
+    // =========================================================================
+    // Blank-node-in-DELETE validation tests (SPARQL 1.1 Update §19.8 note 8)
+    // =========================================================================
+
+    fn has_bnode_in_delete_error(diags: &[Diagnostic]) -> bool {
+        diags
+            .iter()
+            .any(|d| d.code == DiagCode::BlankNodeInDelete && d.is_error())
+    }
+
+    #[test]
+    fn test_delete_data_blank_node_rejected() {
+        // W3C syntax-update-1 test_52 (syntax-update-bad-12.ru)
+        let diags = validate_query("DELETE DATA { _:a <http://example.org/p> <urn:o> }");
+        assert!(
+            has_bnode_in_delete_error(&diags),
+            "labeled blank node must be rejected in DELETE DATA: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_blank_node_rejected() {
+        // W3C syntax-update-1 test_50 (syntax-update-bad-10.ru)
+        let diags = validate_query("DELETE WHERE { _:a <http://example.org/p> <urn:o> }");
+        assert!(
+            has_bnode_in_delete_error(&diags),
+            "labeled blank node must be rejected in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_template_anonymous_blank_node_rejected() {
+        // W3C syntax-update-1 test_51 (syntax-update-bad-11.ru)
+        let diags = validate_query(
+            "DELETE { <urn:s> <http://example.org/p> [] } WHERE { ?x <http://example.org/p> <urn:o> }",
+        );
+        assert!(
+            has_bnode_in_delete_error(&diags),
+            "anonymous blank node must be rejected in a DELETE template: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_template_graph_block_blank_node_rejected() {
+        // The rejection also applies inside GRAPH <iri> blocks.
+        let diags = validate_query(
+            "DELETE { GRAPH <urn:g> { _:b <http://example.org/p> ?o } } WHERE { ?s <http://example.org/p> ?o }",
+        );
+        assert!(
+            has_bnode_in_delete_error(&diags),
+            "blank node inside a GRAPH block must be rejected in a DELETE template: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_forms_blank_nodes_still_allowed() {
+        // INSERT DATA and INSERT templates mint fresh nodes (CONSTRUCT-style).
+        let diags = validate_query("INSERT DATA { _:a <http://example.org/p> <urn:o> }");
+        assert!(
+            !has_bnode_in_delete_error(&diags),
+            "blank nodes stay legal in INSERT DATA: {diags:?}"
+        );
+        let diags = validate_query(
+            "INSERT { ?s <http://example.org/q> [] } WHERE { ?s <http://example.org/p> ?o }",
+        );
+        assert!(
+            !has_bnode_in_delete_error(&diags),
+            "blank nodes stay legal in INSERT templates: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_forms_stable_blank_node_ids_allowed() {
+        // Fluree extension: stable `_:fdb-...` ids address the existing
+        // stored node (a constant), so the SPARQL restriction doesn't apply.
+        let diags = validate_query("DELETE DATA { _:fdb-abc123 <http://example.org/p> <urn:o> }");
+        assert!(
+            !has_bnode_in_delete_error(&diags),
+            "stable blank-node ids stay legal in DELETE DATA: {diags:?}"
+        );
+        let diags = validate_query("DELETE WHERE { _:fdb-abc123 ?p ?o }");
+        assert!(
+            !has_bnode_in_delete_error(&diags),
+            "stable blank-node ids stay legal in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[cfg(feature = "lowering")]
+    #[test]
+    fn test_stable_prefix_stays_in_sync_with_core() {
+        // The validator can't depend on fluree-db-core unconditionally (the
+        // dependency is feature-gated), so the prefix is duplicated. Keep it
+        // honest whenever the lowering feature is compiled in.
+        assert_eq!(
+            STABLE_BLANK_NODE_LABEL_PREFIX,
+            fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX
         );
     }
 

@@ -130,6 +130,11 @@ pub enum DiagCode {
     #[serde(rename = "F009")]
     VariableInGroundData,
 
+    /// Blank nodes not allowed in DELETE DATA / DELETE WHERE / DELETE templates
+    /// (SPARQL 1.1 Update §19.8 grammar note 8)
+    #[serde(rename = "F010")]
+    BlankNodeInDelete,
+
     // =========================================================================
     // Semantic validation (V001-V099) - SPARQL spec semantic rules
     // =========================================================================
@@ -221,6 +226,7 @@ impl DiagCode {
             Self::NestedAggregate => "V006",
             Self::DuplicateValuesVariable => "V007",
             Self::AnonymousAnnotationInGroundData => "V008",
+            Self::BlankNodeInDelete => "F010",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

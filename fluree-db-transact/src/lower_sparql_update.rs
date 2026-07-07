@@ -46,7 +46,7 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    Annotation, BlankNode, BlankNodeValue, Iri, IriValue, Literal,
+    Annotation, BlankNode, BlankNodeValue, GraphPattern, Iri, IriValue, Literal,
     LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue, QuadData, QuadPattern,
     QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term, TriplePattern,
     UpdateOperation,
@@ -84,6 +84,17 @@ pub enum LowerError {
     /// Undefined prefix in IRI
     #[error("Undefined prefix '{prefix}:'")]
     UndefinedPrefix { prefix: String, span: SourceSpan },
+
+    /// Blank node in a DELETE context (SPARQL 1.1 Update §19.8 grammar note 8)
+    #[error(
+        "blank nodes are not allowed in {context}: a blank node denotes a fresh node and can \
+         never match existing data (use a variable bound by WHERE, a concrete IRI, or a Fluree \
+         stable _:fdb- id)"
+    )]
+    BlankNodeInDelete {
+        context: &'static str,
+        span: SourceSpan,
+    },
 }
 
 /// Counter for generating anonymous blank node labels.
@@ -480,6 +491,59 @@ fn reject_user_authored_reifies(
     Ok(())
 }
 
+/// Reject non-stable blank nodes in DELETE-side quad patterns (SPARQL 1.1
+/// Update §19.8 grammar note 8: no blank nodes in DELETE DATA nor in the
+/// DeleteClause template). A blank node here denotes a fresh node, so a
+/// retraction built from it skolemizes a brand-new SID and silently matches
+/// nothing. Mirrors the validator's `BlankNodeInDelete` rule so callers that
+/// lower without running `validate()` (the transact builders) get the same
+/// clear error, and matches [`AnnotationExpansionMode::rejects_blank_reifier`]
+/// (DeleteData | DeleteTemplate).
+///
+/// Two deliberate carve-outs:
+/// - Fluree stable ids (`_:fdb-...`) pass: they are constants addressing the
+///   existing stored node (see `it_stable_blank_nodes.rs`).
+/// - DELETE WHERE is NOT routed through this check at lowering: its blank
+///   nodes keep Fluree's documented existential-variable semantics
+///   ([`BlankNodeVarNamer`]); the strict SPARQL surface rejects them in
+///   `validate()`.
+fn reject_blank_nodes_in_delete_quad_pattern(
+    pattern: &QuadPattern,
+    context: &'static str,
+) -> Result<(), LowerError> {
+    fn check_blank_node(bn: &BlankNode, context: &'static str) -> Result<(), LowerError> {
+        if let BlankNodeValue::Labeled(l) = &bn.value {
+            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                return Ok(());
+            }
+        }
+        Err(LowerError::BlankNodeInDelete {
+            context,
+            span: bn.span,
+        })
+    }
+    fn check_triple(tp: &TriplePattern, context: &'static str) -> Result<(), LowerError> {
+        if let SubjectTerm::BlankNode(bn) = &tp.subject {
+            check_blank_node(bn, context)?;
+        }
+        if let Term::BlankNode(bn) = &tp.object {
+            check_blank_node(bn, context)?;
+        }
+        Ok(())
+    }
+    for el in &pattern.patterns {
+        match el {
+            QuadPatternElement::Triple(tp) => check_triple(tp, context)?,
+            QuadPatternElement::Graph { triples, .. } => {
+                for tp in triples {
+                    check_triple(tp, context)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Same firewall, but for QuadPattern (handles Triple + Graph blocks).
 fn reject_user_authored_reifies_in_quad_pattern(
     pattern: &QuadPattern,
@@ -751,6 +815,7 @@ fn lower_delete_data(
     // M4.4: same firewall + expansion as INSERT DATA, with the
     // DELETE DATA blank-node / variable rejections per SPARQL §3.1.3.
     let mut pattern = QuadPattern::new(data.quads.clone(), data.span);
+    reject_blank_nodes_in_delete_quad_pattern(&pattern, "DELETE DATA")?;
     reject_user_authored_reifies_in_quad_pattern(&pattern, prologue)?;
     expand_annotated_triples_in_quad_pattern(
         &mut pattern,
@@ -808,7 +873,6 @@ fn lower_delete_where(
     // we lower blank nodes into variables consistently across BOTH:
     // - the WHERE patterns (for matching/bindings)
     // - the DELETE templates (for instantiating concrete retractions)
-    // Phase 1: GRAPH blocks are not supported in DELETE WHERE lowering yet.
     // M4.4: reject user-authored f:reifies* and expand annotation tails.
     reject_user_authored_reifies_in_quad_pattern(pattern, prologue)?;
     let mut expanded_pattern = pattern.clone();
@@ -819,17 +883,28 @@ fn lower_delete_where(
         &mut local_bnodes,
     )?;
 
+    // `GRAPH <iri> { ... }` blocks route through the same Modify machinery
+    // that DELETE/INSERT ... WHERE uses (staging-time SPARQL WHERE lowering +
+    // graph-scoped delete templates). The triple-only fast path below stays
+    // byte-identical for patterns without GRAPH blocks.
+    if expanded_pattern
+        .patterns
+        .iter()
+        .any(|el| matches!(el, QuadPatternElement::Graph { .. }))
+    {
+        return lower_delete_where_with_graphs(&expanded_pattern, prologue, ns, vars, opts);
+    }
+
     let triples: Vec<&TriplePattern> = expanded_pattern
         .patterns
         .iter()
         .map(|el| match el {
-            QuadPatternElement::Triple(t) => Ok(t.as_ref()),
-            QuadPatternElement::Graph { span, .. } => Err(LowerError::UnsupportedFeature {
-                feature: "GRAPH blocks in DELETE WHERE",
-                span: *span,
-            }),
+            QuadPatternElement::Triple(t) => t.as_ref(),
+            QuadPatternElement::Graph { .. } => {
+                unreachable!("GRAPH-bearing DELETE WHERE handled above")
+            }
         })
-        .collect::<Result<_, _>>()?;
+        .collect();
 
     let mut bnode_vars = BlankNodeVarNamer::new();
     let mut where_patterns: Vec<UnresolvedPattern> = Vec::with_capacity(triples.len());
@@ -873,6 +948,188 @@ fn lower_delete_where(
         graph_delta: FxHashMap::default(),
         namespace_delta: std::collections::HashMap::new(),
     })
+}
+
+/// Lower a GRAPH-bearing DELETE WHERE through the Modify machinery.
+///
+/// `DELETE WHERE { P }` is shorthand for `DELETE { P } WHERE { P }`, so a quad
+/// pattern with `GRAPH <iri>` blocks lowers exactly like the equivalent Modify:
+/// the WHERE side becomes a stored [`SparqlWhereClause`] (lowered at staging
+/// time by the shared query engine, which already evaluates GRAPH blocks) and
+/// the DELETE side becomes graph-scoped templates via
+/// [`lower_quad_pattern_to_templates`].
+///
+/// Blank nodes keep the same existential-variable semantics as the triple-only
+/// path: non-stable blank nodes are rewritten to reserved variables shared by
+/// the WHERE pattern and the DELETE templates, while stable `_:fdb-` ids pass
+/// through both lowerings as constants addressing the stored node.
+fn lower_delete_where_with_graphs(
+    pattern: &QuadPattern,
+    prologue: &Prologue,
+    ns: &mut NamespaceRegistry,
+    vars: &mut VarRegistry,
+    opts: TxnOpts,
+) -> Result<Txn, LowerError> {
+    let rewritten = rewrite_blank_nodes_to_vars(pattern);
+
+    let sparql_where = SparqlWhereClause {
+        prologue: prologue.clone(),
+        with_graph_iri: None,
+        using_default_graph_iris: Vec::new(),
+        using_named_graph_iris: Vec::new(),
+        pattern: quad_pattern_to_graph_pattern(&rewritten),
+    };
+
+    let mut graph_ids = TemplateGraphIds::new();
+    // Blank nodes were rewritten to variables above, so the counter is only a
+    // signature requirement here — the template lowering never mints from it.
+    let mut bnodes = BlankNodeCounter::new();
+    let delete_templates = lower_quad_pattern_to_templates(
+        &rewritten.patterns,
+        prologue,
+        ns,
+        vars,
+        &mut bnodes,
+        &mut graph_ids,
+        None,
+    )?;
+
+    Ok(Txn {
+        txn_type: TxnType::Update,
+        where_patterns: Vec::new(),
+        sparql_where: Some(sparql_where),
+        delete_templates,
+        insert_templates: Vec::new(),
+        values: None,
+        update_where_default_graph_iris: None,
+        update_where_named_graphs: None,
+        opts,
+        vars: mem::take(vars),
+        txn_meta: Vec::new(),
+        graph_delta: graph_ids.delta(),
+        namespace_delta: std::collections::HashMap::new(),
+    })
+}
+
+/// Rewrite non-stable blank nodes in a quad pattern into reserved variables.
+///
+/// SPARQL blank nodes in a graph pattern are locally-scoped existential
+/// variables. Because a DELETE WHERE pattern is used as both the WHERE clause
+/// and the DELETE template, the same variable must appear on both sides, so
+/// the rewrite happens once on the shared AST. Labeled blank nodes map to one
+/// variable per label; each anonymous blank node gets a fresh variable. The
+/// `_fluree_bn_` prefix keeps the synthesized names out of the user's
+/// variable namespace (`?` + `_fluree_` is already reserved by the annotation
+/// machinery). Stable `_:fdb-` ids are left untouched: they denote the stored
+/// node as a constant in both the WHERE lowering and the template lowering.
+fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
+    use fluree_db_sparql::ast::Var;
+
+    let mut anon_counter: u32 = 0;
+    let mut rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
+        match &bn.value {
+            BlankNodeValue::Labeled(l) => {
+                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                    None
+                } else {
+                    Some(Var::new(format!("_fluree_bn_{l}"), bn.span))
+                }
+            }
+            BlankNodeValue::Anon => {
+                let v = Var::new(format!("_fluree_bn_anon{anon_counter}"), bn.span);
+                anon_counter += 1;
+                Some(v)
+            }
+        }
+    };
+
+    let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
+        let mut out = tp.clone();
+        if let SubjectTerm::BlankNode(bn) = &tp.subject {
+            if let Some(v) = rewrite_bnode(bn) {
+                out.subject = SubjectTerm::Var(v);
+            }
+        }
+        if let Term::BlankNode(bn) = &tp.object {
+            if let Some(v) = rewrite_bnode(bn) {
+                out.object = Term::Var(v);
+            }
+        }
+        out
+    };
+
+    let patterns = pattern
+        .patterns
+        .iter()
+        .map(|el| match el {
+            QuadPatternElement::Triple(tp) => {
+                QuadPatternElement::Triple(Box::new(rewrite_triple(tp)))
+            }
+            QuadPatternElement::Graph {
+                name,
+                triples,
+                span,
+            } => QuadPatternElement::Graph {
+                name: name.clone(),
+                triples: triples.iter().map(&mut rewrite_triple).collect(),
+                span: *span,
+            },
+        })
+        .collect();
+
+    QuadPattern::new(patterns, pattern.span)
+}
+
+/// Build the `GroupGraphPattern` equivalent of a quad pattern for WHERE use.
+///
+/// Runs of default-graph triples become one BGP; each `GRAPH <iri>|?g { ... }`
+/// block becomes a `GraphPattern::Graph` wrapping its own BGP. Source order is
+/// preserved so bindings join exactly as the user wrote them.
+fn quad_pattern_to_graph_pattern(pattern: &QuadPattern) -> GraphPattern {
+    let span = pattern.span;
+    let mut parts: Vec<GraphPattern> = Vec::new();
+    let mut bgp: Vec<TriplePattern> = Vec::new();
+
+    for el in &pattern.patterns {
+        match el {
+            QuadPatternElement::Triple(tp) => bgp.push((**tp).clone()),
+            QuadPatternElement::Graph {
+                name,
+                triples,
+                span: g_span,
+            } => {
+                if !bgp.is_empty() {
+                    parts.push(GraphPattern::Bgp {
+                        patterns: std::mem::take(&mut bgp),
+                        span,
+                    });
+                }
+                parts.push(GraphPattern::Graph {
+                    name: name.clone(),
+                    pattern: Box::new(GraphPattern::Bgp {
+                        patterns: triples.clone(),
+                        span: *g_span,
+                    }),
+                    span: *g_span,
+                });
+            }
+        }
+    }
+    if !bgp.is_empty() {
+        parts.push(GraphPattern::Bgp {
+            patterns: bgp,
+            span,
+        });
+    }
+
+    if parts.len() == 1 {
+        parts.pop().expect("len checked")
+    } else {
+        GraphPattern::Group {
+            patterns: parts,
+            span,
+        }
+    }
 }
 
 /// Lower Modify operation (DELETE/INSERT with WHERE).
@@ -934,6 +1191,7 @@ fn lower_modify(
     // first so synthetic f:reifies* triples (added by the expansion)
     // aren't mistaken for user input.
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
+        reject_blank_nodes_in_delete_quad_pattern(delete_clause, "DELETE templates")?;
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
         if default_template_graph_id.is_some() {
             reject_with_scoped_annotations(delete_clause)?;
@@ -1718,6 +1976,165 @@ mod tests {
             "graph_delta must register <urn:g1>, got {:?}",
             txn.graph_delta
         );
+    }
+
+    #[test]
+    fn test_lower_delete_where_graph_block_uses_modify_machinery() {
+        // DELETE WHERE { GRAPH <g> { ... } } routes through the same
+        // staging-time SPARQL WHERE + graph-scoped template lowering as
+        // DELETE/INSERT ... WHERE (W3C dawg-delete-where-02/04/06).
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE WHERE { GRAPH <urn:g1> { <http://example.org/a> <http://example.org/knows> ?b } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        assert_eq!(txn.txn_type, TxnType::Update);
+        assert!(
+            txn.sparql_where.is_some(),
+            "GRAPH-bearing DELETE WHERE must store a SPARQL WHERE for staging-time lowering"
+        );
+        assert!(txn.where_patterns.is_empty());
+        assert_eq!(txn.delete_templates.len(), 1);
+        assert!(
+            txn.delete_templates[0].graph_id.is_some(),
+            "delete template should carry a txn-local graph id"
+        );
+        assert!(
+            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
+            "graph_delta must register <urn:g1>, got {:?}",
+            txn.graph_delta
+        );
+    }
+
+    #[test]
+    fn test_lower_delete_where_triple_only_path_unchanged() {
+        // Patterns without GRAPH blocks stay on the triple-only fast path:
+        // unresolved WHERE patterns, no stored SPARQL WHERE clause.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE WHERE { <http://example.org/a> <http://example.org/knows> ?b }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        assert!(txn.sparql_where.is_none());
+        assert_eq!(txn.where_patterns.len(), 1);
+        assert_eq!(txn.delete_templates.len(), 1);
+        assert!(txn.delete_templates[0].graph_id.is_none());
+    }
+
+    #[test]
+    fn test_lower_delete_where_graph_block_rewrites_blank_nodes_to_vars() {
+        // Blank nodes keep existential-variable semantics on the GRAPH path,
+        // with the same variable shared by WHERE and the delete template.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE WHERE { GRAPH <urn:g1> { _:x <http://example.org/knows> ?b } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        let template = &txn.delete_templates[0];
+        assert!(
+            matches!(template.subject, TemplateTerm::Var(_)),
+            "blank-node subject must lower to an existential variable, got {:?}",
+            template.subject
+        );
+        let sparql_where = txn.sparql_where.as_ref().expect("sparql where");
+        let rendered = format!("{:?}", sparql_where.pattern);
+        assert!(
+            rendered.contains("_fluree_bn_x"),
+            "WHERE pattern must reference the shared existential var: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_lower_delete_data_blank_node_rejected() {
+        // SPARQL 1.1 Update §19.8 note 8: no blank nodes in DELETE DATA.
+        // Enforced at lowering too, since the transact builders lower
+        // without running validate().
+        let parsed =
+            fluree_db_sparql::parse_sparql("DELETE DATA { _:a <http://example.org/p> <urn:o> }");
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let err = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect_err("bnode in DELETE DATA must be rejected");
+        assert!(
+            matches!(
+                err,
+                LowerError::BlankNodeInDelete {
+                    context: "DELETE DATA",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_lower_modify_delete_template_blank_node_rejected() {
+        // Anonymous `[]` in a Modify DELETE template (W3C delete-insert-03
+        // family shape).
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE { ?a <http://example.org/knows> [] } WHERE { ?a <http://example.org/name> \"Alan\" }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let err = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect_err("bnode in a DELETE template must be rejected");
+        assert!(
+            matches!(
+                err,
+                LowerError::BlankNodeInDelete {
+                    context: "DELETE templates",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_lower_delete_forms_stable_blank_node_ids_allowed() {
+        // Fluree stable ids stay legal: they address the stored node.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE DATA { _:fdb-abc123 <http://example.org/p> <urn:o> }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect("stable blank-node id in DELETE DATA must lower");
+    }
+
+    #[test]
+    fn test_lower_insert_data_blank_node_still_allowed() {
+        // INSERT DATA keeps CONSTRUCT-style fresh-mint blank nodes.
+        let parsed =
+            fluree_db_sparql::parse_sparql("INSERT DATA { _:a <http://example.org/p> <urn:o> }");
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect("blank node in INSERT DATA must lower");
     }
 
     #[test]

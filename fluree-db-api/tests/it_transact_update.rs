@@ -282,6 +282,51 @@ async fn update_where_bound_typed_string_delete_and_insert_use_same_datatype_sid
 }
 
 #[tokio::test]
+async fn update_delete_blank_node_rejected() {
+    // JSON-LD parity for SPARQL 1.1 Update §19.8 note 8 (W3C syntax-update-1
+    // test_50/51/52, delete-insert-03..09): blank nodes are not allowed in
+    // delete templates. A blank node denotes a fresh node — the retraction
+    // would skolemize a brand-new SID and silently match nothing.
+    let (fluree, db) = seed_users("it/transact-update:delete-bnode").await;
+
+    // Explicit blank-node @id.
+    let err = fluree
+        .update(
+            db.clone(),
+            &json!({
+                "@context": ctx_ex_schema(),
+                "where":  { "@id": "ex:alice", "schema:name": "?name" },
+                "delete": { "@id": "_:b0", "schema:name": "?name" }
+            }),
+        )
+        .await
+        .expect_err("blank-node @id in delete must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not allowed in delete"),
+        "error should explain the bnode-in-delete rule, got: {msg}"
+    );
+
+    // Nested object without @id mints a blank node — same rejection.
+    let err = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "where":  { "@id": "ex:alice", "schema:name": "?name" },
+                "delete": { "@id": "ex:alice", "schema:knows": { "schema:name": "?name" } }
+            }),
+        )
+        .await
+        .expect_err("nested blank node in delete must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not allowed in delete"),
+        "error should explain the bnode-in-delete rule, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn update_no_match_is_noop_success_and_does_not_bump_t() {
     let (fluree, db) = seed_users("it/transact-update:no-match-noop").await;
     let t_before = db.t();

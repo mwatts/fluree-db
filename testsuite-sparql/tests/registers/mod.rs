@@ -407,10 +407,6 @@ pub const SPARQL11_UPDATE: &[&str] = &[
     // graph (class F scoping) (2) — PR-U6, sequenced after PR-G1
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-02a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-06a",
-    // engine: GRAPH blocks in DELETE WHERE unsupported (3)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-where/manifest#dawg-delete-where-02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-where/manifest#dawg-delete-where-04",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete-where/manifest#dawg-delete-where-06",
 ];
 
 // Empty: jsonres01-04 went green once the Turtle lexer treated a trailing
