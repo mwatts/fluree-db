@@ -304,7 +304,7 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
             reason: AbortReason::BranchDropped,
         }),
         (
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id, branch, ..
             },
             Response::Purged { .. },
@@ -363,7 +363,7 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             index_t: *index_t,
         }),
         (Command::RetractLedger { .. }, Response::Retracted { ledger_id, .. })
-        | (Command::PurgeLedger { .. }, Response::Purged { ledger_id, .. })
+        | (Command::PurgeBranch { .. }, Response::Purged { ledger_id, .. })
         | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
                 ledger_id: ledger_id.clone(),
@@ -1080,7 +1080,7 @@ mod tests {
         sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
         sm.apply([Entry {
             log_id: log_id(1, 2),
-            payload: EntryPayload::Normal(RaftCommand::PurgeLedger {
+            payload: EntryPayload::Normal(RaftCommand::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -1106,7 +1106,7 @@ mod tests {
 
         sm.apply([Entry {
             log_id: log_id(1, 1),
-            payload: EntryPayload::Normal(RaftCommand::PurgeLedger {
+            payload: EntryPayload::Normal(RaftCommand::PurgeBranch {
                 ledger_id: "ghost".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,

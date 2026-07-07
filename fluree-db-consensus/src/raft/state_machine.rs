@@ -189,7 +189,7 @@ pub struct LedgerRecord {
     /// Branches registered on this ledger. Populated by
     /// [`Command::CreateLedger`] (on init) and the self-healing branch
     /// add inside [`Command::AdvanceRef`]. Drained by
-    /// [`Command::PurgeLedger`]; an empty `branches` list triggers
+    /// [`Command::PurgeBranch`]; an empty `branches` list triggers
     /// removal of the `LedgerRecord` so the ledger name can be reused.
     pub branches: Vec<String>,
 }
@@ -442,7 +442,7 @@ pub struct NameServiceState {
     /// Branches marked retracted (soft-dropped) but not yet purged.
     /// The branch's [`LedgerRecord`] entry and [`RefEntry`] (if born)
     /// stay in place so the name can't be reused until
-    /// [`Command::PurgeLedger`] runs.
+    /// [`Command::PurgeBranch`] runs.
     pub retracted: HashSet<RefKey>,
     /// One cache spanning successful and failed applies — see
     /// [`ApplyOutcome`]. A retry of `K` with matching `request_cid`
@@ -545,7 +545,7 @@ pub enum Command {
     /// implicit branch creation through [`Command::ApplyHead`]),
     /// decrementing the parent's child counter when applicable.
     /// Refuses to remove a branch whose own `branches` count is
-    /// non-zero. Unlike [`Command::PurgeLedger`], not idempotent on
+    /// non-zero. Unlike [`Command::PurgeBranch`], not idempotent on
     /// missing branches — returns `LedgerNotFound`.
     DropBranch {
         ledger_id: String,
@@ -581,8 +581,11 @@ pub enum Command {
     /// Hard-drop a branch: remove its [`RefEntry`], retraction mark,
     /// and entry from the parent [`LedgerRecord::branches`]. Removes
     /// the `LedgerRecord` itself when its branches list empties.
-    /// Idempotent.
-    PurgeLedger {
+    /// Idempotent. Refuses with [`Response::BranchHasChildren`] if
+    /// the branch still has children, like [`Self::DropBranch`] — a
+    /// whole-ledger drop composes these leaf-first, so the guard
+    /// never blocks it (the parent's child count is already 0).
+    PurgeBranch {
         ledger_id: String,
         branch: String,
         /// See [`Command::DropBranch::applied_at_millis`].
@@ -1161,17 +1164,17 @@ pub enum Response {
     /// targeted a branch flagged retracted by `RetractLedger`. Writes
     /// are rejected so the visible `retracted: true` status on
     /// `lookup` can't be silently undone — a branch only becomes
-    /// writable again via `PurgeLedger` + a fresh `CreateLedger` /
+    /// writable again via `PurgeBranch` + a fresh `CreateLedger` /
     /// `CreateBranch`.
     LedgerRetracted { ledger_id: String },
-    /// [`Command::PurgeLedger`] removed a registered branch (any
+    /// [`Command::PurgeBranch`] removed a registered branch (any
     /// retraction state). See [`Self::BranchDropped`] for
     /// `released_envelopes` semantics.
     Purged {
         ledger_id: String,
         released_envelopes: Vec<(String, ContentId)>,
     },
-    /// [`Command::PurgeLedger`] was a no-op — the branch wasn't
+    /// [`Command::PurgeBranch`] was a no-op — the branch wasn't
     /// registered. Idempotent at the trait layer; carried as a
     /// distinct variant so event emission can skip it.
     AlreadyPurged { ledger_id: String },
@@ -1370,11 +1373,11 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             branch,
             applied_at_millis,
         } => retract_ledger(state, ledger_id, branch, applied_at_millis),
-        Command::PurgeLedger {
+        Command::PurgeBranch {
             ledger_id,
             branch,
             applied_at_millis,
-        } => purge_ledger(state, ledger_id, branch, applied_at_millis),
+        } => purge_branch(state, ledger_id, branch, applied_at_millis),
         Command::ReleaseContent { id: _ } => Response::NoOp,
         Command::CompareAndSetRef {
             ledger_id,
@@ -1537,7 +1540,7 @@ fn retract_ledger(
     }
 }
 
-fn purge_ledger(
+fn purge_branch(
     state: &mut NameServiceState,
     ledger_id: String,
     branch: String,
@@ -1545,6 +1548,25 @@ fn purge_ledger(
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
+
+    // Refuse a branch that still has children — the same lineage
+    // guard `drop_branch` enforces. `purge_branch` already
+    // maintains the parent side of the child-count invariant
+    // (`decrement_child_count` below); this closes the other side so
+    // a purge can't strand a child with a dangling `source_branch`.
+    // A whole-ledger drop composes purges leaf-first, so by the time
+    // a parent is purged its children are gone and its count is 0 —
+    // the guard never blocks that path; it only catches an
+    // out-of-order direct purge.
+    if let Some(entry) = state.refs.get(&key) {
+        if entry.branches > 0 {
+            return Response::BranchHasChildren {
+                ledger_id: full,
+                children: entry.branches,
+            };
+        }
+    }
+
     let removed_entry = state.refs.remove(&key);
     let removed_ref = removed_entry.is_some();
     let removed_source = removed_entry.and_then(|r| r.source_branch);
@@ -2284,7 +2306,15 @@ fn apply_enqueue_command(
         };
     }
 
-    // 4. Append.
+    // 4. Append. Clear any admin-clear marker first: it exists only
+    //    to give a stale in-flight propose a meaningful
+    //    `QueueCleared` reason while the queue is empty. Once a fresh
+    //    entry is queued, a stale propose disambiguates as
+    //    `WrongFront` against this entry's `queue_id` instead — and
+    //    leaving the one-shot marker in place would make
+    //    `pop_validated_front` spuriously abort the first apply of
+    //    this very entry with `QueueCleared`.
+    state.recently_cleared.remove(&ref_key);
     let queue_id = state.next_queue_id;
     state.next_queue_id = state.next_queue_id.wrapping_add(1);
     let entry = QueueEntry {
@@ -3042,7 +3072,7 @@ mod tests {
 
         let resp = apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -3070,7 +3100,7 @@ mod tests {
         apply(&mut state, create_branch_cmd("test/db", "feature"), 2);
         apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
                 applied_at_millis: 0,
@@ -3086,7 +3116,7 @@ mod tests {
         let mut state = NameServiceState::new();
         let resp = apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "missing".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -3107,7 +3137,7 @@ mod tests {
         apply(&mut state, create_ledger("test/db"), 1);
         apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -3368,7 +3398,7 @@ mod tests {
         );
         apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
                 applied_at_millis: 0,
@@ -5353,8 +5383,8 @@ mod tests {
         }
     }
 
-    fn purge_ledger_cmd(ledger_id: &str, branch: &str) -> Command {
-        Command::PurgeLedger {
+    fn purge_branch_cmd(ledger_id: &str, branch: &str) -> Command {
+        Command::PurgeBranch {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             applied_at_millis: 0,
@@ -5393,6 +5423,56 @@ mod tests {
         assert_eq!(
             state.recently_cleared.get(&ref_key).map(|m| m.reason),
             Some(ClearReason::BranchDropped)
+        );
+    }
+
+    /// After an admin clear stamps a one-shot marker, a fresh
+    /// enqueue must clear it — otherwise `pop_validated_front`
+    /// spuriously aborts the first apply of that legitimate entry
+    /// with `QueueCleared`. (Regression: the marker used to survive
+    /// the enqueue and poison the very entry that superseded it.)
+    #[test]
+    fn enqueue_after_clear_consumes_marker_and_applies_cleanly() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        // Enqueue then drop: the drop clears the queue and stamps
+        // the marker.
+        apply(&mut state, enqueue("test/db", "feature", 7, None), 3);
+        apply(&mut state, drop_branch_cmd("test/db", "feature"), 4);
+        let ref_key = RefKey::new("test/db", "feature");
+        assert!(state.recently_cleared.contains_key(&ref_key));
+
+        // Re-create the branch and enqueue a fresh entry. The
+        // enqueue must consume the stale marker.
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            5,
+        );
+        let enq = apply(&mut state, enqueue("test/db", "feature", 8, None), 6);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        assert!(
+            !state.recently_cleared.contains_key(&ref_key),
+            "fresh enqueue must consume the admin-clear marker"
+        );
+
+        // Applying the fresh entry succeeds — no spurious QueueCleared.
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "feature", queue_id, cid(42), 1),
+            7,
+        );
+        assert!(
+            matches!(resp, Response::HeadApplied { .. }),
+            "fresh entry must apply cleanly, got {resp:?}"
         );
     }
 
@@ -5453,12 +5533,12 @@ mod tests {
     }
 
     #[test]
-    fn purge_ledger_clears_queue_and_stamps_marker() {
+    fn purge_branch_clears_queue_and_stamps_marker() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
         apply(&mut state, enqueue("test/db", "main", 7, None), 2);
 
-        apply(&mut state, purge_ledger_cmd("test/db", "main"), 3);
+        apply(&mut state, purge_branch_cmd("test/db", "main"), 3);
 
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
@@ -5469,7 +5549,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_ledger_clears_queue_for_unborn_branch() {
+    fn purge_branch_clears_queue_for_unborn_branch() {
         // Branches with queue entries but no RefEntry can exist (enqueue
         // does not require the branch to be live). A purge of such a
         // branch is otherwise AlreadyPurged but still has to drain the
@@ -5478,7 +5558,7 @@ mod tests {
         apply(&mut state, create_ledger("test/db"), 1);
         apply(&mut state, enqueue("test/db", "main", 7, None), 2);
 
-        let resp = apply(&mut state, purge_ledger_cmd("test/db", "main"), 3);
+        let resp = apply(&mut state, purge_branch_cmd("test/db", "main"), 3);
 
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
@@ -5494,6 +5574,61 @@ mod tests {
                 ledger_id: "test/db:main".into(),
                 released_envelopes: vec![("test/db:main".into(), cid(7))],
             }
+        );
+    }
+
+    #[test]
+    fn purge_branch_refuses_when_branch_has_children() {
+        // Same lineage guard `drop_branch` enforces: a direct,
+        // out-of-order purge of a parent must refuse rather than
+        // strand the child with a dangling `source_branch`.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        let resp = apply(&mut state, purge_branch_cmd("test/db", "main"), 3);
+        assert_eq!(
+            resp,
+            Response::BranchHasChildren {
+                ledger_id: "test/db:main".into(),
+                children: 1,
+            }
+        );
+        // State untouched — the parent survives.
+        assert!(state.refs.contains_key(&RefKey::new("test/db", "main")));
+    }
+
+    #[test]
+    fn purge_branch_child_first_lets_parent_purge_succeed() {
+        // The whole-ledger drop path: purging leaf-first decrements
+        // the parent's child count to 0, so the parent purge then
+        // passes the guard. Confirms the guard doesn't block the
+        // supported composition.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+
+        // Purge the child first.
+        let child = apply(&mut state, purge_branch_cmd("test/db", "feature"), 3);
+        assert!(matches!(child, Response::Purged { .. }));
+        // Parent's child count is now 0.
+        assert_eq!(
+            state.refs.get(&RefKey::new("test/db", "main")).unwrap().branches,
+            0
+        );
+
+        // Parent purge now succeeds.
+        let parent = apply(&mut state, purge_branch_cmd("test/db", "main"), 4);
+        assert!(
+            matches!(parent, Response::Purged { .. }),
+            "parent purge should succeed once its child is gone, got {parent:?}"
         );
     }
 

@@ -1446,7 +1446,7 @@ fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, Name
 
 fn build_purge_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    Ok(SmCommand::PurgeLedger {
+    Ok(SmCommand::PurgeBranch {
         ledger_id: ledger_name,
         branch,
         applied_at_millis: crate::raft::current_millis(),
@@ -1477,8 +1477,19 @@ fn map_retract_response(resp: SmResponse) -> Result<()> {
 fn map_purge_response(resp: SmResponse) -> Result<()> {
     match resp {
         SmResponse::Purged { .. } | SmResponse::AlreadyPurged { .. } => Ok(()),
+        // Purge, like drop_branch, refuses a branch that still has
+        // children. The whole-ledger drop composes purges leaf-first
+        // (children already gone → the parent's count is 0), so this
+        // only fires on an out-of-order direct purge of a parent —
+        // failing loud instead of stranding the child.
+        SmResponse::BranchHasChildren {
+            ledger_id,
+            children,
+        } => Err(NameServiceError::storage(format!(
+            "purge refused: {ledger_id} still has {children} child branch(es)"
+        ))),
         other => Err(NameServiceError::storage(format!(
-            "unexpected Response variant for PurgeLedger: {other:?}"
+            "unexpected Response variant for PurgeBranch: {other:?}"
         ))),
     }
 }
