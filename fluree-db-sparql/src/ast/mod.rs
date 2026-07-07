@@ -51,5 +51,5 @@ pub use term::{
 };
 pub use update::{
     DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
-    UpdateOperation, UsingClause,
+    UpdateOperation, UpdateRequest, UpdateRequestOp, UsingClause,
 };

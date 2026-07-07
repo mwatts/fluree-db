@@ -714,25 +714,59 @@ struct LiteralResult {
     dtc: Option<DatatypeConstraint>,
 }
 
-/// Lower a parsed SPARQL AST to the Transaction IR.
+/// Lower a parsed SPARQL UPDATE request to a sequence of Transaction IRs,
+/// one per `;`-separated operation, in request order.
 ///
-/// This is a convenience wrapper that extracts the `UpdateOperation` and `Prologue`
-/// from a `SparqlAst` and calls `lower_sparql_update`.
-///
-/// # Arguments
-///
-/// * `ast` - The parsed SPARQL AST (must contain an UPDATE operation)
-/// * `ns` - The namespace registry for IRI-to-Sid encoding
-/// * `opts` - Transaction options (branch, context, etc.)
-///
-/// # Returns
-///
-/// A `Txn` that can be staged using the shared transaction pipeline.
+/// Each operation is lowered against the prologue in effect for it (the
+/// grammar's accumulating `PREFIX`/`BASE` scope). The returned `Txn`s must
+/// be staged **sequentially** — SPARQL 1.1 Update §3.1 requires operation
+/// N+1 to observe the graph-store state operation N produced — and
+/// committed as ONE atomic commit (roadmap decision D-10). An empty vector
+/// (empty or prologue-only request) is a valid no-op.
 ///
 /// # Errors
 ///
 /// Returns `LowerError` if:
-/// - The AST body is not an UPDATE operation (is a query)
+/// - The AST body is not an UPDATE request (is a query)
+/// - WITH or USING clauses are present
+/// - Blank nodes appear in WHERE patterns
+/// - RDF-star quoted triples are used
+pub fn lower_sparql_update_request(
+    ast: &SparqlAst,
+    ns: &mut NamespaceRegistry,
+    opts: TxnOpts,
+) -> Result<Vec<Txn>, LowerError> {
+    let request = match &ast.body {
+        QueryBody::Update(request) => request,
+        _ => {
+            return Err(LowerError::NotAnUpdate { span: ast.span });
+        }
+    };
+    let mut txns = Vec::with_capacity(request.operations.len());
+    for op in &request.operations {
+        txns.push(lower_sparql_update(
+            &op.operation,
+            &op.prologue,
+            ns,
+            opts.clone(),
+        )?);
+    }
+    Ok(txns)
+}
+
+/// Lower a parsed **single-operation** SPARQL AST to the Transaction IR.
+///
+/// This is a convenience wrapper over [`lower_sparql_update_request`] for
+/// the common one-operation request. It fails loudly on a request with
+/// zero or multiple operations — callers that accept the full request
+/// grammar (the API transaction seam) must use
+/// [`lower_sparql_update_request`] and stage the sequence.
+///
+/// # Errors
+///
+/// Returns `LowerError` if:
+/// - The AST body is not an UPDATE request (is a query)
+/// - The request does not contain exactly one operation
 /// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
@@ -741,13 +775,25 @@ pub fn lower_sparql_update_ast(
     ns: &mut NamespaceRegistry,
     opts: TxnOpts,
 ) -> Result<Txn, LowerError> {
-    let update_op = match &ast.body {
-        QueryBody::Update(op) => op,
+    let request = match &ast.body {
+        QueryBody::Update(request) => request,
         _ => {
             return Err(LowerError::NotAnUpdate { span: ast.span });
         }
     };
-    lower_sparql_update(update_op, &ast.prologue, ns, opts)
+    match request.operations.as_slice() {
+        [op] => lower_sparql_update(&op.operation, &op.prologue, ns, opts),
+        [] => Err(LowerError::UnsupportedFeature {
+            feature: "empty update request (no operation) in single-operation lowering; \
+                      use lower_sparql_update_request",
+            span: ast.span,
+        }),
+        _ => Err(LowerError::UnsupportedFeature {
+            feature: "multi-operation update request in single-operation lowering; \
+                      use lower_sparql_update_request",
+            span: ast.span,
+        }),
+    }
 }
 
 /// Lower a SPARQL UPDATE operation to the Transaction IR.
