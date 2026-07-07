@@ -8787,6 +8787,57 @@ async fn cypher_exists_in_projection_with_both_endpoints_bound() {
 }
 
 #[tokio::test]
+async fn cypher_null_literal_in_expressions() {
+    // `null` is a first-class expression value: projected as JSON null,
+    // never equal to anything, detected by IS NULL, skipped by coalesce.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:null-lit");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:P {name: "A"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:P)
+               RETURN null AS nothing,
+                      coalesce(null, n.name) AS name,
+                      CASE WHEN n.name = "Z" THEN 1 ELSE null END AS via_case,
+                      null IS NULL AS yes"#,
+        )
+        .await
+        .expect("null literal expressions")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([[null, "A", null, true]]), "{out}");
+
+    // Comparison with null is never true: the row drops.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:P) WHERE n.name = null RETURN n"#)
+            .await
+            .expect("null comparison")
+            .row_count(),
+        0,
+        "= null matches nothing"
+    );
+
+    // Null inside a list literal survives as a null element.
+    let out = fluree
+        .query_cypher(&db, r#"MATCH (n:P) RETURN [1, null, 2] AS xs"#)
+        .await
+        .expect("null in list")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([[[1, null, 2]]]), "{out}");
+}
+
+#[tokio::test]
 async fn cypher_call_procedure_errors_are_actionable() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:proc-errors");

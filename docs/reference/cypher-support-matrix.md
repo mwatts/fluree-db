@@ -95,7 +95,7 @@ These shape everything below; read them first.
 | `x IN [ … ]` | ✅ | |
 | `IS NULL` / `IS NOT NULL` | ✅ | |
 | `CASE` (simple + generic) | ✅ | Aggregates inside `CASE` deferred; `CASE`/`EXISTS` inside a write-statement `MATCH … WHERE` deferred. |
-| `NULL` literal | ⏳ | Use an absent value / `IS NULL`. |
+| `NULL` literal | ✅ | A first-class expression value (the unbound binding): projected as JSON null, `= null` never true, `IS [NOT] NULL` folds, `coalesce` skips it, allowed as a list element / CASE branch. |
 | Property access `n.prop` | ◑ | Bare-variable target; chained `n.a.b` deferred — except temporal-field chains like `x.date.month`, which lower to an extraction function. |
 | List literal / indexing `[a,b]`, `list[i]` | ✅ | Negative index from end. |
 | Map literal `{k: v}` | ✅ | Key-order-insensitive identity (⟂ vs strict insertion order for equality). |

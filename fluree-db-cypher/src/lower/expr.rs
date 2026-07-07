@@ -28,6 +28,13 @@ pub fn lower_expr<E: IriEncoder>(
 ) -> Result<Expression> {
     match e {
         Expr::Var(v) => Ok(Expression::Var(ctx.intern_var(&v.name))),
+        // `null` is a first-class expression value: the unbound binding.
+        // (Comparisons with it are never true, `IS NULL` detects it, and a
+        // projected null renders as JSON null — matching Cypher's semantics
+        // through the engine's unbound handling.)
+        Expr::Lit(Literal::Null(_)) => Ok(Expression::Resolved(Box::new(
+            fluree_db_query::binding::Binding::Unbound,
+        ))),
         Expr::Lit(l) => Ok(Expression::Const(lower_literal(l)?)),
         Expr::Param(_) => Err(LowerError::unsupported(
             "parameter substitution is wired at the API layer, not the lowering layer; submit pre-substituted Cypher in v1",
@@ -122,14 +129,11 @@ pub fn lower_expr<E: IriEncoder>(
         }
         Expr::IsNull(inner, _) => {
             let inner = lower_expr(ctx, inner, aux)?;
-            Ok(Expression::call(Function::Not, vec![Expression::call(
-                Function::Bound,
-                vec![inner],
-            )]))
+            Ok(null_check_expr(inner, true))
         }
         Expr::IsNotNull(inner, _) => {
             let inner = lower_expr(ctx, inner, aux)?;
-            Ok(Expression::call(Function::Bound, vec![inner]))
+            Ok(null_check_expr(inner, false))
         }
         Expr::StartsWith(l, r, _) => {
             let l = lower_expr(ctx, l, aux)?;
@@ -648,6 +652,28 @@ fn lower_case<E: IriEncoder>(
         acc = Expression::call(Function::If, vec![test, val_expr, acc]);
     }
     Ok(acc)
+}
+
+/// Lower `IS NULL` / `IS NOT NULL` over an already-lowered inner expression.
+/// The engine's `Bound` requires a variable, so constant shapes fold here:
+/// a null literal (`null IS NULL` → true) and any other constant (never
+/// null). Variables and computed expressions test via `Bound` as before.
+fn null_check_expr(inner: Expression, is_null: bool) -> Expression {
+    use fluree_db_query::binding::Binding;
+    match &inner {
+        Expression::Resolved(b) if matches!(**b, Binding::Unbound) => {
+            Expression::Const(FlakeValue::Boolean(is_null))
+        }
+        Expression::Const(_) => Expression::Const(FlakeValue::Boolean(!is_null)),
+        _ => {
+            let bound = Expression::call(Function::Bound, vec![inner]);
+            if is_null {
+                Expression::call(Function::Not, vec![bound])
+            } else {
+                bound
+            }
+        }
+    }
 }
 
 pub fn lower_literal(lit: &Literal) -> Result<FlakeValue> {
