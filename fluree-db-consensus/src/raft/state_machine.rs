@@ -604,15 +604,7 @@ pub enum Command {
     /// and enforces per-kind monotonicity on the update
     /// (`new.t > current.t` for [`RefKind::CommitHead`],
     /// `new.t >= current.t` for [`RefKind::IndexHead`]).
-    CompareAndSetRef {
-        ledger_id: String,
-        branch: String,
-        kind: RefKind,
-        expected: Option<RefValue>,
-        new: RefValue,
-        /// See [`Command::DropBranch::applied_at_millis`].
-        applied_at_millis: u64,
-    },
+    CompareAndSetRef(RefCas),
     /// CAS push for one branch's operational status. Mirrors the
     /// [`fluree_db_nameservice::StatusPublisher::push_status`]
     /// contract: returns [`Response::StatusConflict`] when `expected`
@@ -1004,6 +996,18 @@ pub struct NewIndexHead {
     pub applied_at_millis: u64,
 }
 
+/// Payload for [`Command::CompareAndSetRef`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefCas {
+    pub ledger_id: String,
+    pub branch: String,
+    pub kind: RefKind,
+    pub expected: Option<RefValue>,
+    pub new: RefValue,
+    /// Leader's wall-clock at proposal, milliseconds since epoch.
+    pub applied_at_millis: u64,
+}
+
 /// Payload for [`Command::CreateLedger`].
 ///
 /// `ledger_id` is the bare ledger name (no branch suffix); `branch`
@@ -1382,23 +1386,7 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             applied_at_millis,
         } => purge_branch(state, ledger_id, branch, applied_at_millis),
         Command::ReleaseContent { id: _ } => Response::NoOp,
-        Command::CompareAndSetRef {
-            ledger_id,
-            branch,
-            kind,
-            expected,
-            new,
-            applied_at_millis,
-        } => apply_compare_and_set_ref(
-            state,
-            log_index,
-            ledger_id,
-            branch,
-            kind,
-            expected,
-            new,
-            applied_at_millis,
-        ),
+        Command::CompareAndSetRef(args) => apply_compare_and_set_ref(state, log_index, args),
         Command::PushStatus {
             ledger_id,
             expected,
@@ -1939,17 +1927,15 @@ fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> O
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_compare_and_set_ref(
-    state: &mut NameServiceState,
-    log_index: u64,
-    ledger_id: String,
-    branch: String,
-    kind: RefKind,
-    expected: Option<RefValue>,
-    new: RefValue,
-    applied_at_millis: u64,
-) -> Response {
+fn apply_compare_and_set_ref(state: &mut NameServiceState, log_index: u64, args: RefCas) -> Response {
+    let RefCas {
+        ledger_id,
+        branch,
+        kind,
+        expected,
+        new,
+        applied_at_millis,
+    } = args;
     let key = RefKey::new(&ledger_id, &branch);
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
 
@@ -2905,7 +2891,7 @@ mod tests {
 
         let resp = apply(
             &mut state,
-            Command::CompareAndSetRef {
+            Command::CompareAndSetRef(RefCas {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 kind: RefKind::CommitHead,
@@ -2918,7 +2904,7 @@ mod tests {
                     t: 6,
                 },
                 applied_at_millis: 0,
-            },
+            }),
             3,
         );
         assert_eq!(
@@ -4724,14 +4710,14 @@ mod tests {
         expected: Option<RefValue>,
         new: RefValue,
     ) -> Command {
-        Command::CompareAndSetRef {
+        Command::CompareAndSetRef(RefCas {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             kind,
             expected,
             new,
             applied_at_millis: 0,
-        }
+        })
     }
 
     #[test]

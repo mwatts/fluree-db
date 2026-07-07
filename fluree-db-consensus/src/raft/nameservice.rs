@@ -51,7 +51,7 @@ use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, StashGuard};
 use crate::raft::state_machine::{
     Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, NameServiceState, NewBranch,
-    NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefKey, ResetHeadSnapshot,
+    NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefCas, RefKey, ResetHeadSnapshot,
     Response as SmResponse, StagedHead, StoredConfig, StoredStatus,
 };
 use crate::raft::state_machine_adapter::SharedState;
@@ -1696,14 +1696,14 @@ impl RefPublisher for RaftNameService {
         new: &RefValue,
     ) -> Result<CasResult> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let cmd = SmCommand::CompareAndSetRef {
+        let cmd = SmCommand::CompareAndSetRef(RefCas {
             ledger_id: ledger_name,
             branch,
             kind,
             expected: expected.cloned(),
             new: new.clone(),
             applied_at_millis: crate::raft::current_millis(),
-        };
+        });
         match self.submit_lifecycle(cmd).await? {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
