@@ -29,6 +29,7 @@
 //! ```
 
 mod bnode_scope;
+mod projection;
 
 use crate::ast::path::PropertyPath;
 use crate::ast::pattern::{GraphPattern, TriplePattern};
@@ -103,6 +104,12 @@ impl<'a> Validator<'a> {
 
     fn validate_select(&mut self, query: &SelectQuery) {
         self.validate_query_where(&query.where_clause.pattern);
+        projection::check_projection_scope(
+            &query.select.variables,
+            query.modifiers.group_by.as_ref(),
+            query.select.span,
+            &mut self.diagnostics,
+        );
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
@@ -366,8 +373,14 @@ impl<'a> Validator<'a> {
             GraphPattern::Service { pattern, .. } => {
                 self.validate_graph_pattern(pattern);
             }
-            GraphPattern::SubSelect { query, .. } => {
+            GraphPattern::SubSelect { query, span } => {
                 self.validate_graph_pattern(&query.pattern);
+                projection::check_projection_scope(
+                    &query.variables,
+                    query.modifiers.group_by.as_ref(),
+                    *span,
+                    &mut self.diagnostics,
+                );
             }
             GraphPattern::Path { path, span, .. } => {
                 self.validate_property_path(path, *span);
@@ -753,6 +766,103 @@ mod tests {
             !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
             "{diags:?}"
         );
+    }
+
+    // =========================================================================
+    // V4 — GROUP BY / aggregate projection-scope tests (SPARQL 1.1 §11)
+    // =========================================================================
+
+    #[test]
+    fn test_projection_star_with_group_by_rejected() {
+        let diags = validate_query("SELECT * { ?s ?p ?o } GROUP BY ?s");
+        assert!(has_code(&diags, DiagCode::SelectStarWithGroupBy));
+    }
+
+    #[test]
+    fn test_projection_ungrouped_var_rejected() {
+        let diags = validate_query("SELECT ?o { ?s ?p ?o } GROUP BY ?s");
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_group_key_and_aggregate_valid() {
+        let diags = validate_query(
+            "SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_implicit_group_ungrouped_var_rejected() {
+        // agg10 shape: an aggregate in the projection groups implicitly;
+        // ?p is then neither a key nor aggregated.
+        let diags = validate_query("SELECT ?p (COUNT(?o) AS ?c) WHERE { ?s ?p ?o }");
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_expression_key_vars_not_licensed() {
+        // agg08 shape: GROUP BY (?a + ?b) — the *expression* is the key,
+        // not its variables.
+        let diags = validate_query(
+            "SELECT ((?a + ?b) AS ?ab) (COUNT(?a) AS ?c) WHERE { ?s ?p ?a, ?b } GROUP BY (?a + ?b)",
+        );
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_bracketed_var_key_valid() {
+        // GROUP BY (?s) — a bracketed bare variable counts as the key ?s.
+        let diags = validate_query(
+            "SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY (?s)",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_group_by_alias_valid() {
+        let diags = validate_query(
+            "SELECT ?key (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY (STR(?s) AS ?key)",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_earlier_alias_usable_in_later_expression() {
+        let diags = validate_query(
+            "SELECT (SUM(?x) AS ?sum) ((?sum + 1) AS ?sump) WHERE { ?s ?p ?x } GROUP BY ?s",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_ungrouped_query_unaffected() {
+        let diags = validate_query("SELECT ?s ?o WHERE { ?s ?p ?o }");
+        assert!(
+            !has_code(&diags, DiagCode::UngroupedVariableInProjection)
+                && !has_code(&diags, DiagCode::SelectStarWithGroupBy),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_projection_subselect_checked() {
+        let diags = validate_query(
+            "SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }",
+        );
+        assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
     }
 
     // =========================================================================

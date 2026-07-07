@@ -137,6 +137,14 @@ pub enum DiagCode {
     #[serde(rename = "V001")]
     BlankNodeLabelCrossScope,
 
+    /// SELECT * is not allowed with GROUP BY (SPARQL §11)
+    #[serde(rename = "V002")]
+    SelectStarWithGroupBy,
+
+    /// Projected variable is neither a group key nor aggregated (SPARQL §11 / §18.2.4)
+    #[serde(rename = "V003")]
+    UngroupedVariableInProjection,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -186,6 +194,8 @@ impl DiagCode {
             Self::VariableInGroundData => "F009",
             // Semantic validation
             Self::BlankNodeLabelCrossScope => "V001",
+            Self::SelectStarWithGroupBy => "V002",
+            Self::UngroupedVariableInProjection => "V003",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

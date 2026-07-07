@@ -22,12 +22,9 @@ pub const SPARQL11_SYNTAX_QUERY: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_36a",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_63",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_pp_coll",
-    // parser accepts invalid input (missing validation) (7)
-    // (test_65 formerly failed to parse for the wrong reason; PR #1436 made
-    // it parse, so it now needs the SELECT-scope validation pass — burn-down
-    // PR-2 V4/V5 territory)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_43",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_44",
+    // parser accepts invalid input (missing validation) (5)
+    // test_45 (duplicate AS alias) / test_60/61a/62a (BIND scope) /
+    // test_65 (SELECT alias in scope) — burn-down PR-2 V5/V6 passes.
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_45",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_60",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/syntax-query/manifest#test_61a",
@@ -113,12 +110,6 @@ pub const SPARQL10_SYNTAX: &[&str] = &[
 ];
 
 pub const SPARQL11_AGGREGATES: &[&str] = &[
-    // parser accepts invalid input (missing validation) (5)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg08",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg09",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg10",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg11",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg12",
     // result mismatch (3)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-err-01",
@@ -155,11 +146,7 @@ pub const SPARQL11_FUNCTIONS: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
 ];
 
-pub const SPARQL11_GROUPING: &[&str] = &[
-    // parser accepts invalid input (missing validation) (2)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/grouping/manifest#group06",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/grouping/manifest#group07",
-];
+pub const SPARQL11_GROUPING: &[&str] = &[];
 
 pub const SPARQL11_PROJECT_EXPRESSION: &[&str] = &[
     // result mismatch (1)
