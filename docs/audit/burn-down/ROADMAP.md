@@ -355,6 +355,32 @@ both-way CI gate enforces this mechanically). Full merge order:
 PR #1437 → pr-h1 → {pr-1, pr-l1, pr-l2, pr-x1, pr-pp, pr-2, pr-3, pr-u1} in
 any order → pr-w2a (needs pr-1).
 
+**Wave 2 — implementation status (2026-07-07):** all four PRs implemented and
+review-accepted; the ninth cluster audit (`algebra-serialization.md`) delivered:
+
+| Branch | Scope | Net register delta | Notes |
+|---|---|---|---|
+| `burndown/pr-base` | RFC 3986 resolver extracted to `fluree_vocab::iri`; all constant-IRI BASE resolution at lowering time; IRI()/URI() constant fold; `resolve_dataset_clause()` ready for PR-G2; harness supplies the query-document BASE | −6 | pp34 + exists03 greened on this branch ALONE (audit had predicted joint); variable-argument IRI() deliberately not base-resolved (documented, no W3C test) |
+| `burndown/pr-g1` | D-2 semantics change: `?g` as IRI, no implicit default-graph enumeration; seed-when-produced + join-at-merge (the cluster doc's unconditional seeding REGRESSED graph-variable-scope — deviation documented); EncodedSid arms + `GraphVarCorrelated` EXISTS fallback (Semijoin keys never match across encodings) | −14 | three pinning tests updated; #1317 not claimed; eq-graph-1/2/4 + pp35 second-lander comments |
+| `burndown/pr-u2` | multi-op UPDATE: `UpdateRequest` with per-op prologue snapshots; `Vec<Txn>` sequential staging via virtual commit, last-wins fold, ONE atomic commit (D-10b); real cross-op bnode validation + validator-owned annotation check replaced the guard-carried greens | −9 | STACKED ON pr-3; insert-05a + 3 same-bnode re-pointed at PR-U3 (verb-gated); benches noise-level incl. transact_commit |
+| `burndown/pr-w15` | Turtle-star asserting forms → `to_reifies_facts_jsonld_compatible` in FlakeSink + ImportSink; fresh reifier per anonymous occurrence; base-triple assertion recorded as deliberate divergence (Option-1 epic owns spec-exact semantics) | −2 | eval-triple-terms re-baselined: 15 wave-2 syntax / 10 D-1 data / 5 serialization / 5 TriG / 2 harness expected-graph / 2 misc; benches within budget (6-round interleave) |
+
+**Ninth-audit corrections (binding):** W-1's fix territory is parser/lowerer +
+`subquery.rs` + `optional.rs`, NOT `where_plan.rs` — the land-PR-X1-first gate
+is void; quotes-3/4 are the D5b datatype-drop (move to PR-X2), not
+serialization; all three optional-complex tests are GRAPH-gated (PR-G1 to
+re-verify post-merge); construct-3/4 + constructlist fall to one per-solution
+bnode-instantiation fix. New slate items: **PR-W1** (FILTER-scope + subquery
+correlation, low-med), **PR-W2** (CONSTRUCT bnode instantiation, SPARQL-only),
+**PR-W1-OPT** (OPTIONAL independent-scope semantics — hot-path risky,
+deferrable, double-bench-gated).
+
+Running ledger: Waves 0+1 ≈ −200, Wave 2 ≈ −31 → **~307 registered entries
+remain pre-integration** (of which 63 not-applicable + ~47 entailment).
+Remaining big movers: PR-U3 (~91), PR-X2 (~40), PR-W2BC (27), PR-G2 (13),
+PR-W1/W2 (~5). Merge order addendum: pr-u2 lands after pr-3; pr-w2a after
+pr-1; BASE↔G1 joint entries resolve at whichever lands second.
+
 **Post-implementation corrections to this roadmap:**
 
 - **`basic#list-1..4` do NOT green via PR-1** (contra §2's PR-1 row): Turtle
