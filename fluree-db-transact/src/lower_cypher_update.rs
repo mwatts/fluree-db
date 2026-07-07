@@ -104,7 +104,9 @@ pub fn lower_cypher_update(
 ) -> Result<Txn, LowerCypherError> {
     let update = match &ast.statement {
         Statement::Update(u) => u,
-        Statement::Query(_) => return Err(LowerCypherError::NotAnUpdate),
+        Statement::Query(_) | Statement::CallProcedure(_) => {
+            return Err(LowerCypherError::NotAnUpdate)
+        }
         // Schema DDL (CREATE/DROP INDEX|CONSTRAINT) is a no-op: Fluree
         // indexes everything. An empty Update-typed Txn rides the ordinary
         // staging path and takes the zero-effect early return (Insert-typed

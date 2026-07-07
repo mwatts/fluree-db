@@ -214,6 +214,26 @@ pub(crate) fn lower_cypher_ast_to_ir(
     // apply to bare Cypher identifiers.
     let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
 
+    // Procedure shims (`CALL db.labels() YIELD …`) answer from ledger stats:
+    // rewrite the statement to a constant-rows query, then lower that.
+    let rewritten;
+    let ast = if let fluree_db_cypher::ast::Statement::CallProcedure(call) = &ast.statement {
+        let query = crate::cypher_procedures::procedure_call_query(
+            call,
+            snapshot,
+            overlay.map(|(o, _)| o),
+            vocab.as_deref(),
+            &overrides,
+        )?;
+        rewritten = fluree_db_cypher::CypherAst {
+            statement: fluree_db_cypher::ast::Statement::Query(query),
+            span: ast.span,
+        };
+        &rewritten
+    } else {
+        ast
+    };
+
     let mut vars = VarRegistry::new();
     let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
         .with_vocab_opt(vocab)

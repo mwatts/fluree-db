@@ -7,7 +7,8 @@ use super::pattern::{MapLit, Pattern};
 
 /// A Cypher statement is either a read query (terminating in RETURN),
 /// an update (terminating in CREATE/SET/REMOVE/DELETE/MERGE without
-/// a final RETURN), or a schema DDL command (accepted as a no-op).
+/// a final RETURN), a schema DDL command (accepted as a no-op), or a
+/// standalone procedure call (`CALL db.labels() YIELD label …`).
 ///
 /// v1 supports exactly one statement per request body.
 #[derive(Clone, Debug, PartialEq)]
@@ -15,6 +16,37 @@ pub enum Statement {
     Query(Query),
     Update(Update),
     Schema(SchemaCommand),
+    CallProcedure(ProcedureCall),
+}
+
+/// A standalone procedure call statement:
+/// `CALL dotted.name[(args)] [YIELD col [AS alias], … [WHERE expr]] [RETURN …]`.
+///
+/// The parser accepts any dotted name; resolution against the supported
+/// shim set (`db.labels`, `dbms.components`, …) happens at the API layer,
+/// which has the ledger stats needed to answer them. Bare `CALL proc()`
+/// implicitly yields all of the procedure's columns.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcedureCall {
+    /// Dotted procedure name as written (e.g. `db.labels`). Matched
+    /// case-insensitively at resolution.
+    pub name: String,
+    pub args: Vec<Expr>,
+    /// Explicit `YIELD` items. Empty for bare `CALL proc()` and for
+    /// `YIELD *` — both expose every column.
+    pub yields: Vec<YieldItem>,
+    /// `YIELD … WHERE expr` filter (only valid after a YIELD).
+    pub where_clause: Option<Expr>,
+    pub return_clause: Option<ReturnClause>,
+    pub span: SourceSpan,
+}
+
+/// One `YIELD` item: a procedure column, optionally rebound with `AS`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct YieldItem {
+    pub column: String,
+    pub alias: Option<Variable>,
+    pub span: SourceSpan,
 }
 
 /// A schema DDL command. Fluree indexes everything and has no user-managed

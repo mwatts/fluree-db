@@ -749,5 +749,7 @@ pub fn cypher_statement_is_write(cypher: &str) -> crate::Result<bool> {
         Statement::Query(_) => false,
         // CREATE/DROP INDEX|CONSTRAINT route as (no-op) writes; SHOW reads.
         Statement::Schema(cmd) => !matches!(cmd.kind, SchemaCommandKind::ShowSchema),
+        // Procedure shims (db.labels() etc.) are introspection reads.
+        Statement::CallProcedure(_) => false,
     })
 }

@@ -296,6 +296,36 @@ ORDER BY / SKIP / LIMIT
   spec). `RETURN *` is also rejected in UNION branches because its
   projected-vars list is opaque at lower time.
 
+### Procedures (introspection shims)
+
+Graph tooling — Neo4j Browser, LangChain, driver smoke tests — introspects the
+database through built-in procedures before it issues real queries. Fluree
+answers the common ones directly from ledger statistics (novelty-merged, no
+scan), so they are instant even on large ledgers:
+
+| Procedure | Answers |
+|---|---|
+| `CALL db.labels()` | Distinct node labels (classes), sorted. |
+| `CALL db.relationshipTypes()` | Distinct relationship types (predicates whose objects are nodes; `rdf:type` excluded). |
+| `CALL db.propertyKeys()` | Distinct property keys (predicates with literal values). |
+| `CALL db.schema.visualization()` | One row: `nodes` / `relationships` summary lists (best effort). |
+| `CALL dbms.components()` | Compatibility identity (mirrors the Bolt handshake's `Neo4j/<version> (compatible; Fluree/…)`). |
+
+The full call form composes like any read —
+`CALL proc() [YIELD * | col [AS alias], … [WHERE …]] [RETURN …]`:
+
+```cypher
+CALL db.labels() YIELD label WHERE label STARTS WITH "P" RETURN label ORDER BY label
+```
+
+Names render through the ledger's default context (`@vocab` stripped, term
+overrides reversed), so `db.labels()` returns the identifiers you would write
+in a `MATCH`. Like Neo4j's own catalog procedures, answers are lenient about
+tombstones: a label or key whose facts were all retracted may keep appearing
+until a reindex. A procedure call stands alone as its own statement (it can't
+follow a `MATCH`), and unsupported procedures (e.g. `apoc.*`) fail with an
+error listing the supported set.
+
 ### Writes
 
 - **`CREATE`** — nodes and relationships. Directed typed relationships emit a

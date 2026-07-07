@@ -2,9 +2,9 @@
 
 use crate::ast::{
     CallSubqueryClause, CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection,
-    OrderItem, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause,
-    SchemaCommand, SchemaCommandKind, SetClause, SetItem, Statement, UnionTail, UnwindClause,
-    Update, WithClause, WriteClause,
+    OrderItem, ProcedureCall, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem,
+    ReturnClause, SchemaCommand, SchemaCommandKind, SetClause, SetItem, Statement, UnionTail,
+    UnwindClause, Update, WithClause, WriteClause, YieldItem,
 };
 use crate::ast::{Expr, MapLit, ParamRef, Variable};
 use crate::diag::{DiagCode, Diagnostic};
@@ -33,6 +33,12 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
         return Ok(Statement::Schema(cmd));
     }
 
+    // `CALL <ident>` is a procedure call (`CALL db.labels() YIELD …`);
+    // `CALL {` / `CALL (` is a subquery clause handled in the loop below.
+    if matches!(s.peek_kind(), TokenKind::Call) && matches!(s.peek_at(1), TokenKind::Ident(_)) {
+        return parse_procedure_call(s);
+    }
+
     // Categorize by first token. Queries start with MATCH / OPTIONAL /
     // WITH / UNWIND / RETURN. Writes start with CREATE / MERGE /
     // ((MATCH | OPTIONAL | WITH | UNWIND)+ then CREATE/MERGE/SET/REMOVE/DELETE).
@@ -54,6 +60,12 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             }
             TokenKind::Unwind => {
                 read_clauses.push(ReadClause::Unwind(parse_unwind(s)?));
+            }
+            TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "CALL <procedure> is supported only as the first clause of a statement",
+                ));
             }
             TokenKind::Call => {
                 read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?));
@@ -152,7 +164,7 @@ fn parse_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
     // (and so the AST depth that Drop / param substitution recurse over).
     let right = match parse_statement(s)? {
         Statement::Query(q) => q,
-        Statement::Update(_) | Statement::Schema(_) => {
+        Statement::Update(_) | Statement::Schema(_) | Statement::CallProcedure(_) => {
             return Err(s.error(
                 DiagCode::UnexpectedToken,
                 "UNION cannot combine write statements — both sides must be read queries",
@@ -278,6 +290,12 @@ fn parse_call_body(s: &mut TokenStream) -> Result<Query, Diagnostic> {
             }
             TokenKind::With => read_clauses.push(ReadClause::With(parse_with(s)?)),
             TokenKind::Unwind => read_clauses.push(ReadClause::Unwind(parse_unwind(s)?)),
+            TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "CALL <procedure> is supported only as the first clause of a statement",
+                ));
+            }
             TokenKind::Call => read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?)),
             TokenKind::Return => break parse_return(s)?,
             TokenKind::Create
@@ -337,6 +355,92 @@ fn parse_call_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
         right,
         span: start.union(end),
     })
+}
+
+/// Parse a standalone procedure-call statement:
+/// `CALL dotted.name[(args)] [YIELD col [AS alias], … | YIELD * [WHERE expr]] [RETURN …]`.
+/// The leading `CALL <ident>` has already been sighted by the caller.
+fn parse_procedure_call(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
+    let start = s.expect(&TokenKind::Call)?;
+    let mut name = parse_ident_or_keyword(s)?;
+    while s.eat(&TokenKind::Dot).is_some() {
+        name.push('.');
+        name.push_str(&parse_ident_or_keyword(s)?);
+    }
+
+    let mut args = Vec::new();
+    if s.eat(&TokenKind::LParen).is_some() {
+        if !matches!(s.peek_kind(), TokenKind::RParen) {
+            loop {
+                args.push(parse_expr(s)?);
+                if s.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        s.expect(&TokenKind::RParen)?;
+    }
+
+    let mut yields = Vec::new();
+    let mut where_clause = None;
+    if s.eat(&TokenKind::Yield).is_some() {
+        // `YIELD *` exposes all columns — same as omitting YIELD entirely.
+        if s.eat(&TokenKind::Star).is_none() {
+            loop {
+                let span = s.peek_span();
+                let column = parse_ident_or_keyword(s)?;
+                let alias = if s.eat(&TokenKind::As).is_some() {
+                    Some(parse_var(s)?)
+                } else {
+                    None
+                };
+                yields.push(YieldItem {
+                    column,
+                    alias,
+                    span,
+                });
+                if s.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        if s.eat(&TokenKind::Where).is_some() {
+            where_clause = Some(parse_expr(s)?);
+        }
+    }
+
+    let return_clause = if matches!(s.peek_kind(), TokenKind::Return) {
+        Some(parse_return(s)?)
+    } else {
+        None
+    };
+
+    if matches!(s.peek_kind(), TokenKind::Semicolon) {
+        return Err(s.error(
+            DiagCode::DeferredMultiStatement,
+            "multi-statement scripts (semicolon-separated) are deferred; \
+             submit one statement per request",
+        ));
+    }
+    if !s.is_eof() {
+        return Err(s.error(
+            DiagCode::UnexpectedToken,
+            format!(
+                "unexpected `{}` after CALL {name} — only YIELD and RETURN may follow a procedure call",
+                s.peek_kind()
+            ),
+        ));
+    }
+
+    let end = s.peek_span();
+    Ok(Statement::CallProcedure(ProcedureCall {
+        name,
+        args,
+        yields,
+        where_clause,
+        return_clause,
+        span: start.union(end),
+    }))
 }
 
 fn parse_return(s: &mut TokenStream) -> Result<ReturnClause, Diagnostic> {

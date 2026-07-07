@@ -310,6 +310,8 @@ async fn handle_connection(
 fn server_agent() -> String {
     // Official drivers parse a `Neo4j/<semver>` prefix for feature gating;
     // everything after it identifies the actual implementation.
+    // SYNC: keep the version in step with `COMPAT_NEO4J_VERSION` in
+    // fluree-db-api/src/cypher_procedures.rs (`CALL dbms.components()`).
     format!(
         "Neo4j/5.4.0 (compatible; Fluree/{})",
         env!("CARGO_PKG_VERSION")

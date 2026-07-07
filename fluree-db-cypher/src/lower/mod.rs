@@ -102,6 +102,14 @@ fn lower_with_context<E: IriEncoder>(
             }
             _ => Err(LowerError::WriteOnQueryPath),
         },
+        // Procedure shims are resolved at the API layer (they need ledger
+        // stats to answer); by the time lowering runs they have been
+        // rewritten to a constant-rows Query. Reaching here means a caller
+        // skipped that rewrite.
+        Statement::CallProcedure(call) => Err(LowerError::unsupported(format!(
+            "CALL {}() must be resolved against a ledger before lowering",
+            call.name
+        ))),
     }
 }
 

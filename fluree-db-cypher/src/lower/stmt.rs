@@ -1604,10 +1604,29 @@ fn lower_inline_rows<E: IriEncoder>(
 }
 
 fn literal_to_binding(e: &Expr) -> Result<Binding> {
-    let Expr::Lit(lit) = e else {
-        return Err(LowerError::unsupported(
-            "UNWIND list elements must be literals in v1 (no nested expressions yet)",
-        ));
+    let lit = match e {
+        Expr::Lit(lit) => lit,
+        // Constant list/map cells (procedure-shim rows like dbms.components'
+        // `versions` column) recurse element-wise.
+        Expr::List(items, _) => {
+            return items
+                .iter()
+                .map(literal_to_binding)
+                .collect::<Result<Vec<_>>>()
+                .map(Binding::List);
+        }
+        Expr::Map(entries, _) => {
+            return entries
+                .iter()
+                .map(|(k, v)| Ok((std::sync::Arc::from(k.as_str()), literal_to_binding(v)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Binding::Map);
+        }
+        _ => {
+            return Err(LowerError::unsupported(
+                "UNWIND list elements must be literals in v1 (no nested expressions yet)",
+            ));
+        }
     };
     Ok(match lit {
         Literal::Integer(n, _) => {

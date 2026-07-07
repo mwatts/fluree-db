@@ -992,6 +992,18 @@ fn subst_statement(s: &mut Statement, p: &ParamMap) -> Result<(), ParamError> {
         Statement::Update(u) => subst_update(u, p),
         // A schema no-op carries no expressions.
         Statement::Schema(_) => Ok(()),
+        Statement::CallProcedure(call) => {
+            for a in &mut call.args {
+                subst_expr(a, p)?;
+            }
+            if let Some(w) = &mut call.where_clause {
+                subst_expr(w, p)?;
+            }
+            if let Some(r) = &mut call.return_clause {
+                subst_return(r, p)?;
+            }
+            Ok(())
+        }
     }
 }
 

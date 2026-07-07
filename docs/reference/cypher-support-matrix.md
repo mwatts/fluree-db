@@ -54,7 +54,7 @@ These shape everything below; read them first.
 | `SET` / `REMOVE` | ✅ | Properties, `+=` map merge, labels. The map side of `SET n = …` / `SET n += …` may be a whole-map parameter (`SET n += $props`). |
 | `DELETE` / `DETACH DELETE` | ✅ | |
 | `FOREACH` | ⏳ | |
-| `CALL proc(...) YIELD` | ⏳ | Stored/builtin procedures (distinct from `CALL { … }`). |
+| `CALL proc(...) YIELD` | ◑ | Introspection shims answered from ledger stats (novelty-merged, no scan): `db.labels`, `db.relationshipTypes`, `db.propertyKeys`, `db.schema.visualization` (best effort), `dbms.components`. Full `YIELD [* \| col AS alias, …] [WHERE …] [RETURN …]` composition; first-clause standalone only. Other/user procedures error with the supported list. |
 | `LOAD CSV` | ⏳ | Bulk CSV import exists via the CLI (`fluree create --from *.csv` / `*.cypher`), not the `LOAD CSV` clause. |
 | `CREATE / DROP INDEX \| CONSTRAINT` | ⟂ | Accepted as **no-op writes** (commits nothing): Fluree indexes everything and has no user-managed index/constraint catalog. Keeps framework migrations (spring-data, neo4j-migrations) from crashing at startup. |
 | `SHOW INDEXES / SHOW CONSTRAINTS` | ⟂ | Answer **zero rows** (shared Neo4j column heads), for the same reason. |

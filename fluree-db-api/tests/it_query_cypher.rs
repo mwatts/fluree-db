@@ -7945,3 +7945,205 @@ async fn cypher_show_indexes_and_constraints_answer_zero_rows() {
         assert_eq!(res.row_count(), 0, "{stmt} answers zero rows");
     }
 }
+
+// ============================================================================
+// Procedure shims — CALL db.labels() / db.relationshipTypes() /
+// db.propertyKeys() / db.schema.visualization() / dbms.components()
+// ============================================================================
+
+/// Seed a small property graph: two labels, one relationship, two data
+/// properties — all bare ns-0 names, all still in novelty (no index build).
+async fn seed_procedure_graph(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+) -> support::MemoryLedger {
+    let l = genesis_ledger(fluree, ledger_id);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Ada", age: 36})-[:KNOWS]->(b:Company {name: "Acme"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger
+}
+
+/// Flatten a single-column string result into a list (result order).
+async fn string_column(
+    fluree: &support::MemoryFluree,
+    db: &fluree_db_api::GraphDb,
+    stmt: &str,
+) -> Vec<String> {
+    let jsonld = fluree
+        .query_cypher(db, stmt)
+        .await
+        .unwrap_or_else(|e| panic!("{stmt}: {e:?}"))
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[0].as_str().expect("string cell").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn cypher_call_db_labels_lists_labels_from_novelty() {
+    // Neo4j Browser's first act on connect. Data is novelty-only here —
+    // the stats merge must see labels that have never been indexed.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-labels").await;
+    let db = graphdb_from_ledger(&l);
+
+    let labels = string_column(&fluree, &db, "CALL db.labels()").await;
+    assert_eq!(labels, vec!["Company", "Person"], "sorted distinct labels");
+
+    // YIELD + WHERE + RETURN compose like any read.
+    let filtered = string_column(
+        &fluree,
+        &db,
+        r#"CALL db.labels() YIELD label WHERE label STARTS WITH "P" RETURN label"#,
+    )
+    .await;
+    assert_eq!(filtered, vec!["Person"]);
+
+    // YIELD alias renames the visible column.
+    let aliased = string_column(
+        &fluree,
+        &db,
+        "CALL db.labels() YIELD label AS l RETURN l ORDER BY l DESC",
+    )
+    .await;
+    assert_eq!(aliased, vec!["Person", "Company"]);
+}
+
+#[tokio::test]
+async fn cypher_call_relationship_types_and_property_keys_split_by_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-types-keys").await;
+    let db = graphdb_from_ledger(&l);
+
+    // KNOWS is the only ref-object predicate (rdf:type is excluded — it is
+    // the label edge, not a user relationship).
+    let types = string_column(&fluree, &db, "CALL db.relationshipTypes()").await;
+    assert_eq!(types, vec!["KNOWS"]);
+
+    // name/age are literal-object predicates.
+    let keys = string_column(&fluree, &db, "CALL db.propertyKeys()").await;
+    assert_eq!(keys, vec!["age", "name"]);
+}
+
+#[tokio::test]
+async fn cypher_call_procedures_answer_from_head_index_stats_too() {
+    // Same answers once the data is indexed and novelty is empty.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:proc-indexed";
+    seed_procedure_graph(&fluree, ledger_id).await;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let labels = string_column(&fluree, &db, "CALL db.labels()").await;
+    assert_eq!(labels, vec!["Company", "Person"]);
+    let types = string_column(&fluree, &db, "CALL db.relationshipTypes()").await;
+    assert_eq!(types, vec!["KNOWS"]);
+    let keys = string_column(&fluree, &db, "CALL db.propertyKeys()").await;
+    assert_eq!(keys, vec!["age", "name"]);
+}
+
+#[tokio::test]
+async fn cypher_call_dbms_components_reports_compat_identity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:proc-components");
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(&db, "CALL dbms.components() YIELD name, versions, edition")
+        .await
+        .expect("components")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = jsonld.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{jsonld}");
+    assert_eq!(rows[0][0].as_str(), Some("Neo4j Kernel"), "{jsonld}");
+    let versions = rows[0][1].as_array().expect("versions list");
+    assert_eq!(versions.len(), 1, "{jsonld}");
+    assert!(
+        rows[0][2].as_str().unwrap_or_default().contains("Fluree"),
+        "edition carries Fluree attribution: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_call_db_schema_visualization_returns_one_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-schema-viz").await;
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(&db, "CALL db.schema.visualization()")
+        .await
+        .expect("schema viz")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = jsonld.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{jsonld}");
+    let nodes = rows[0][0].as_array().expect("nodes list");
+    assert_eq!(nodes.len(), 2, "one entry per label: {jsonld}");
+    let rels = rows[0][1].as_array().expect("relationships list");
+    assert_eq!(rels.len(), 1, "one entry per rel type: {jsonld}");
+}
+
+#[tokio::test]
+async fn cypher_call_procedure_errors_are_actionable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:proc-errors");
+    let db = graphdb_from_ledger(&l);
+
+    // Unknown procedure names the supported set.
+    let msg = fluree
+        .query_cypher(&db, "CALL apoc.meta.data()")
+        .await
+        .expect_err("unknown procedure")
+        .to_string();
+    assert!(
+        msg.contains("apoc.meta.data") && msg.contains("db.labels"),
+        "unknown-procedure error lists the shims: {msg}"
+    );
+
+    // Unknown YIELD column names the real columns.
+    let msg = fluree
+        .query_cypher(&db, "CALL db.labels() YIELD nope")
+        .await
+        .expect_err("unknown yield column")
+        .to_string();
+    assert!(
+        msg.contains("nope") && msg.contains("label"),
+        "yield error names the columns: {msg}"
+    );
+
+    // Args on a no-arg shim.
+    let msg = fluree
+        .query_cypher(&db, r#"CALL db.labels("x")"#)
+        .await
+        .expect_err("args rejected")
+        .to_string();
+    assert!(msg.contains("no arguments"), "{msg}");
+
+    // Procedure calls only stand alone (first clause).
+    let msg = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) CALL db.labels() YIELD label RETURN label",
+        )
+        .await
+        .expect_err("mid-query procedure")
+        .to_string();
+    assert!(
+        msg.contains("first clause"),
+        "mid-query procedure is a clear parse error: {msg}"
+    );
+}

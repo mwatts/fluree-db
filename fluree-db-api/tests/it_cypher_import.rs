@@ -132,11 +132,11 @@ CREATE (a)-[k:KNOWS {since: 1999, weight: 0.5}]->(b);
 
 #[test]
 fn plain_policy_drops_edge_properties() {
-    let script = r#"
+    let script = r"
 CREATE (:P {id: 1});
 CREATE (:P {id: 2});
 MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R {w: 3}]->(b);
-"#;
+";
     let opts = CypherImportOptions {
         edge_policy: EdgePolicy::Plain,
         ..Default::default()
@@ -212,10 +212,10 @@ fn statement_splitter_respects_strings_and_comments() {
 
 #[test]
 fn dangling_edge_is_skipped_and_counted() {
-    let script = r#"
+    let script = r"
 CREATE (:U {id: 1});
 MATCH (a:U {id: 1}), (b:U {id: 99}) CREATE (a)-[:F]->(b);
-"#;
+";
     let mut importer = CypherImporter::new(CypherImportOptions::default());
     importer.learn_keys(script.as_bytes()).expect("keys");
     let mut buf = Vec::new();

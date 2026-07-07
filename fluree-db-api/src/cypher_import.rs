@@ -665,6 +665,10 @@ fn parse_update(stmt: &str, line: usize) -> Result<fluree_db_cypher::ast::Update
             line,
             "schema command in an import script (Fluree needs no index/constraint DDL)",
         )),
+        Statement::CallProcedure(_) => Err(unsupported(
+            line,
+            "procedure call in an import script (only CREATE / MATCH…CREATE statements load data)",
+        )),
     }
 }
 
