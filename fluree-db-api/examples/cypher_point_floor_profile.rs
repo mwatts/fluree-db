@@ -129,6 +129,10 @@ async fn main() {
             "MATCH (a:User {id: 4112})-[:knows]->(b)-[:knows]->(c)-[:knows]->(d) RETURN count(d)",
         ),
         ("scalar_prop", "MATCH (n:User {id: 4112}) RETURN n.name"),
+        (
+            "shortest_path",
+            "MATCH p = shortestPath((a:User {id: 5})-[*..15]->(b:User {id: 10487})) RETURN length(p)",
+        ),
     ];
 
     let only = std::env::var("PROBE_ONLY").ok();
