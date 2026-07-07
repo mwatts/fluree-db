@@ -1317,6 +1317,34 @@ mem:decision-01kje2pt9maxrxjw49ydgejmpe a mem:Decision ;
     mem:rationale "RDF strict equality treats \"hello\"^^xsd:string and \"hello\"^^ex:custom as different values because their datatype IRIs differ. For a uniqueness constraint this is surprising and easily subverted — users expect \"same text = same value.\" Storage-layer identity (FlakeValue enum variant + payload) is the right granularity: it's what the index actually stores and compares, it's deterministic, and it prevents accidental or intentional duplicate sneaking via datatype annotation." ;
     mem:alternatives "RDF strict equality (datatype-aware key including dt Sid), datatype-family matching via dt_compatible()" .
 
+mem:fact-01kwwxb012x61f0mkj5zzrrnns a mem:Fact ;
+    mem:content "Cypher bulk import (.cypher/.cyp/.cql): cypher_import.rs mirrors csv_import.rs — converts CREATE / MATCH…CREATE dump scripts (benchgraph pokec idiom) to bare-name JSON-LD NDJSON shards riding the JsonLdStream chunked bulk pipeline. Node identity: pass 1 learns per-label match-key property sets from MATCH…CREATE; node id = Label/keyval (percent-encoded, sorted-key order); key-less nodes = Label/_anon-N. Duplicate keys merge; dangling edges skipped+counted. 3 passes/file (keys → nodes → edges), one parse per statement; the importer owns a quote/comment-aware splitter (parser rejects multi-statement). Edge props reuse csv EdgePolicy. CLI: create --from x.cypher; --base-iri now Option (None = cypher bare-name mode)." ;
+    mem:tag "bulk" ;
+    mem:tag "cli" ;
+    mem:tag "csv" ;
+    mem:tag "cypher" ;
+    mem:tag "import" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/create.md" ;
+    mem:artifactRef "fluree-db-api/src/cypher_import.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_cypher_import.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-06T23:48:41.122129+00:00"^^xsd:dateTime .
+
+mem:fact-01kwwxbbtehrj3nrk2r9wykj8h a mem:Fact ;
+    mem:content "Bare relative @id values (\"User/4112\") and bare terms in JSON-LD inserts unify with zero-config Cypher reads (spike-proven in it_cypher_import.rs::bare_id_jsonld_insert_reads_from_cypher). Since the ns-0 landing (e13332382), bare JSON-LD terms land in namespace 0 like Cypher lowering; a bare @id goes through canonical_split (splits at last '/', e.g. allocating a \"User/\" namespace) — identical on every occurrence, so node objects and edge references encode to the same Sid. This is the contract the Cypher bulk importer's JSON-LD output depends on; no @context or @vocab needed." ;
+    mem:tag "bare-names" ;
+    mem:tag "cypher" ;
+    mem:tag "import" ;
+    mem:tag "json-ld" ;
+    mem:tag "ns-0" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_cypher_import.rs" ;
+    mem:artifactRef "fluree-db-transact/src/namespace.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-06T23:48:53.198165+00:00"^^xsd:dateTime .
+
 mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:content "Default context: per-ledger JSON prefix map auto-applied to queries/transactions that omit @context. Stored in CAS keyed by ContentId; pointer in ConfigPayload.default_context via nameservice.\n\nPopulation: bulk import captures @prefix + builtins; API set_default_context(); HTTP PUT /v1/fluree/context/*ledger; CLI fluree context set.\n\nPrecedence: Query @context/PREFIX > ledger default > built-in (rdf, rdfs, xsd, owl, sh, geo).\n\nUpdates use CAS via ConfigPublisher::push_config() with retry; disconnect_ledger() evicts cache after update. ProxyNameService does NOT implement ConfigPublisher — context writes only on tx server." ;
     mem:tag "api" ;
