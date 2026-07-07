@@ -481,10 +481,7 @@ pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/codepoint-escapes/manifest#codepoint-esc-bad-03",
 ];
 
-pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[
-    // parser accepts invalid input (missing validation) (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-negative/manifest#syntax-update-anonreifier-02",
-];
+pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[];
 
 // RDF-star / SPARQL 1.2 triple-term syntax (<<( )>> and related) is not
 // yet in the parser — audit §4.3 / Phase D.

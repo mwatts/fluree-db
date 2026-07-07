@@ -161,6 +161,10 @@ pub enum DiagCode {
     #[serde(rename = "V007")]
     DuplicateValuesVariable,
 
+    /// Annotation minting an anonymous reifier in ground DATA (DELETE DATA)
+    #[serde(rename = "V008")]
+    AnonymousAnnotationInGroundData,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -216,6 +220,7 @@ impl DiagCode {
             Self::SelectAliasAlreadyBound => "V005",
             Self::NestedAggregate => "V006",
             Self::DuplicateValuesVariable => "V007",
+            Self::AnonymousAnnotationInGroundData => "V008",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

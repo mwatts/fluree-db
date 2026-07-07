@@ -168,13 +168,61 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate INSERT DATA - triples must be ground (no variables).
+    ///
+    /// Annotation tails minting anonymous reifiers are deliberately
+    /// ALLOWED here: they are Fluree's committed SPARQL 1.2 transact
+    /// surface for edge annotations (a fresh blank reifier is minted at
+    /// lowering, like a bnode subject would be) — a reviewed divergence
+    /// from the W3C negative-syntax reading. DELETE DATA differs; see
+    /// [`Validator::validate_delete_data`].
     fn validate_insert_data(&mut self, insert: &InsertData) {
         self.validate_ground_quad_data(&insert.data, "INSERT DATA");
     }
 
-    /// Validate DELETE DATA - triples must be ground (no variables).
+    /// Validate DELETE DATA - triples must be ground (no variables), and
+    /// annotation tails must not mint anonymous reifiers (a `{| ... |}`
+    /// block or bare `~` with no explicit reifier id): an anonymous
+    /// reifier has no addressable identity to delete (SPARQL 1.1 §3.1.3
+    /// blank-node rule extended to RDF 1.2 reifiers; W3C sparql12
+    /// syntax-update-anonreifier-02). Mirrors the existing lowering-time
+    /// rejection in fluree-db-transact so the query never produces an AST
+    /// the API would act on.
     fn validate_delete_data(&mut self, delete: &DeleteData) {
         self.validate_ground_quad_data(&delete.data, "DELETE DATA");
+        for el in &delete.data.quads {
+            match el {
+                QuadPatternElement::Triple(triple) => {
+                    self.check_delete_data_annotation(triple);
+                }
+                QuadPatternElement::Graph { triples, .. } => {
+                    for triple in triples {
+                        self.check_delete_data_annotation(triple);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reject an annotation tail that mints an anonymous reifier inside
+    /// DELETE DATA (see [`Validator::validate_delete_data`]).
+    fn check_delete_data_annotation(&mut self, triple: &TriplePattern) {
+        if let Some(annotation) = &triple.annotation {
+            if annotation.reifier.is_none() {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        DiagCode::AnonymousAnnotationInGroundData,
+                        "anonymous annotation block ({| |}) in DELETE DATA — \
+                         no addressable identity to delete",
+                        annotation.span,
+                    )
+                    .with_help(
+                        "Name the reifier explicitly (s p o ~ <reifier> {| ... |}) \
+                         so the annotation to delete is addressable, or use \
+                         DELETE WHERE.",
+                    ),
+                );
+            }
+        }
     }
 
     /// Validate DELETE WHERE - patterns can have variables.
@@ -1022,6 +1070,45 @@ mod tests {
         let diags = validate_query("SELECT * WHERE { VALUES (?a ?b) { (1 1) } }");
         assert!(
             !has_code(&diags, DiagCode::DuplicateValuesVariable),
+            "{diags:?}"
+        );
+    }
+
+    // =========================================================================
+    // Anonymous annotation in DELETE DATA (SPARQL 1.2 negative update syntax)
+    // =========================================================================
+
+    #[test]
+    fn test_delete_data_anonymous_annotation_rejected() {
+        // W3C sparql12 syntax-update-anonreifier-02 (first operation).
+        let diags = validate_query(
+            "PREFIX : <http://example.com/ns#> DELETE DATA { :s :p :o1 {| :added 'Test' |} }",
+        );
+        assert!(has_code(&diags, DiagCode::AnonymousAnnotationInGroundData));
+    }
+
+    #[test]
+    fn test_delete_data_named_reifier_annotation_valid() {
+        // An explicit IRI reifier is addressable — allowed.
+        let diags = validate_query(
+            "PREFIX : <http://example.com/ns#> DELETE DATA { :s :p :o1 ~ :r {| :added 'Test' |} }",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::AnonymousAnnotationInGroundData),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_data_anonymous_annotation_still_allowed() {
+        // Fluree's committed SPARQL 1.2 transact surface (reviewed
+        // divergence): anonymous annotation blocks mint a fresh reifier in
+        // INSERT DATA.
+        let diags = validate_query(
+            "PREFIX : <http://example.com/ns#> INSERT DATA { :s :p :o2 {| :added 'Test' |} }",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::AnonymousAnnotationInGroundData),
             "{diags:?}"
         );
     }
