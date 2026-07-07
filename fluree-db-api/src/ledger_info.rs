@@ -32,13 +32,14 @@ use fluree_db_core::{
     Sid, Storage,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::{GraphSourceRecord, NsRecord};
+use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
 use fluree_db_novelty::{
     assemble_fast_stats, assemble_full_stats, StatsAssemblyError, StatsLookup,
 };
+use fluree_db_r2rml::{CompiledR2rmlMapping, ObjectMap, TermType};
 use fluree_graph_json_ld::ParsedContext;
 use serde_json::{json, Map, Value as JsonValue};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -640,6 +641,12 @@ pub fn gs_record_to_jsonld(record: &GraphSourceRecord) -> JsonValue {
         fluree_db_nameservice::GraphSourceKind::Ledger => "f:LedgerSource",
     };
 
+    // Redact any auth/credential leaves before exposing the config verbatim.
+    // A graph-source config may carry a resolved OAuth2 client secret / bearer
+    // token (an env-var reference is safe, but a literal secret must never reach
+    // a client). `redact_graph_source_config` returns the string unchanged when
+    // it holds no secrets, so non-secret configs stay byte-identical.
+    let redacted_config = redact_graph_source_config(&record.config);
     let mut obj = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },
         "@id": &canonical_id,
@@ -647,7 +654,7 @@ pub fn gs_record_to_jsonld(record: &GraphSourceRecord) -> JsonValue {
         "f:name": &record.name,
         "f:branch": &record.branch,
         "f:status": status,
-        "f:graphSourceConfig": { "@value": &record.config },
+        "f:graphSourceConfig": { "@value": &redacted_config },
         "f:graphSourceDependencies": &record.dependencies,
     });
 
@@ -657,6 +664,520 @@ pub fn gs_record_to_jsonld(record: &GraphSourceRecord) -> JsonValue {
     }
 
     obj
+}
+
+// ============================================================================
+// Graph-source config secret redaction (defense-in-depth)
+// ============================================================================
+
+/// Object keys whose values are secrets and must never reach a client. Matched
+/// case-insensitively anywhere in a stored graph-source config JSON tree. This
+/// mirrors the redacting `Debug` impls added at the config secret leaves
+/// (`ConfigValue`, `OAuth2Config`, bearer/vended) for the *serialized* form.
+///
+/// NOTE: `client_id`, `catalog uri`, `warehouse`, `scope`, and `audience` are
+/// intentionally NOT secret (they identify, not authenticate) and are preserved.
+const SECRET_CONFIG_KEYS: &[&str] = &[
+    "client_secret",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "access_key_id",
+    "secret_access_key",
+    "session_token",
+    "default_val",
+];
+
+fn is_secret_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
+}
+
+/// Recursively replace secret-bearing scalar values with `"[redacted]"`.
+///
+/// A secret held as an env-var reference object (`{"env_var": "...",
+/// "default_val": "..."}`) keeps its `env_var` name (safe, aids debugging) while
+/// the inline `default_val` fallback is masked by the recursive walk. Returns
+/// `true` when anything was redacted.
+fn redact_json_secrets(value: &mut JsonValue) -> bool {
+    let mut redacted = false;
+    match value {
+        JsonValue::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_secret_config_key(k) && !v.is_object() && !v.is_array() && !v.is_null() {
+                    *v = JsonValue::String("[redacted]".to_string());
+                    redacted = true;
+                } else if redact_json_secrets(v) {
+                    redacted = true;
+                }
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                if redact_json_secrets(v) {
+                    redacted = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    redacted
+}
+
+/// Redact auth/credential leaves from a stored graph-source config JSON string.
+///
+/// Returns the original string unchanged when it is not JSON or contains no
+/// secrets, so non-secret configs (e.g. BM25/Vector) stay byte-for-byte
+/// identical; otherwise returns a re-serialized, redacted JSON string.
+pub fn redact_graph_source_config(config: &str) -> String {
+    match serde_json::from_str::<JsonValue>(config) {
+        Ok(mut value) => {
+            if redact_json_secrets(&mut value) {
+                serde_json::to_string(&value).unwrap_or_else(|_| config.to_string())
+            } else {
+                config.to_string()
+            }
+        }
+        Err(_) => config.to_string(),
+    }
+}
+
+// ============================================================================
+// Virtual (query-in-place) dataset ledger-info
+// ============================================================================
+
+/// Human-readable label for a graph-source type (e.g. `"Iceberg"`, `"R2RML"`).
+fn graph_source_type_label(source_type: &GraphSourceType) -> String {
+    match source_type {
+        GraphSourceType::Bm25 => "BM25".to_string(),
+        GraphSourceType::Vector => "Vector".to_string(),
+        GraphSourceType::Geo => "Geo".to_string(),
+        GraphSourceType::R2rml => "R2RML".to_string(),
+        GraphSourceType::Iceberg => "Iceberg".to_string(),
+        GraphSourceType::Unknown(s) => format!("Unknown({s})"),
+    }
+}
+
+/// Non-secret source metadata for a virtual dataset, resolved from the
+/// graph-source record + compiled mapping + Iceberg table metadata.
+///
+/// This deliberately carries ONLY identifying metadata — never auth/credentials
+/// (no client_secret, token, or secret-ref ever lands here).
+#[derive(Debug, Clone, Default)]
+pub struct VirtualSourceMeta {
+    /// Source type label (`"Iceberg"` / `"R2RML"`).
+    pub source_type: String,
+    /// Catalog type identifier (e.g. `"polaris"`, `"rest"`) for REST catalogs.
+    pub catalog_type: Option<String>,
+    /// Catalog base URI for REST catalogs.
+    pub catalog_uri: Option<String>,
+    /// S3 table location for Direct-mode catalogs.
+    pub table_location: Option<String>,
+    /// Optional warehouse identifier.
+    pub warehouse: Option<String>,
+    /// Distinct logical tables referenced by the mapping/config.
+    pub tables: Vec<String>,
+    /// Current Iceberg snapshot id (used as the virtual dataset "version").
+    pub snapshot_id: Option<i64>,
+}
+
+fn opt_i64_json(value: Option<i64>) -> JsonValue {
+    match value {
+        Some(n) => json!(n),
+        None => JsonValue::Null,
+    }
+}
+
+/// Sum two optional row counts, treating `None` as "unknown" rather than zero:
+/// a known count on either side survives, and the result is `None` only when
+/// neither side is known.
+fn add_row_counts(acc: Option<i64>, rows: Option<i64>) -> Option<i64> {
+    match (acc, rows) {
+        (Some(a), Some(r)) => Some(a + r),
+        (Some(a), None) => Some(a),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
+}
+
+/// Compact a datatype IRI to a short form where possible (`xsd:*`, `@id`).
+fn compact_datatype_iri(datatype: &str) -> String {
+    if let Some(local) = datatype.strip_prefix("http://www.w3.org/2001/XMLSchema#") {
+        format!("xsd:{local}")
+    } else if datatype == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" {
+        "rdf:langString".to_string()
+    } else {
+        datatype.to_string()
+    }
+}
+
+fn term_type_datatype(term_type: TermType) -> String {
+    match term_type {
+        TermType::Iri | TermType::BlankNode => "@id".to_string(),
+        TermType::Literal => "xsd:string".to_string(),
+    }
+}
+
+/// Infer the datatype label an object map produces, from its R2RML term type /
+/// declared datatype (metadata only — no data is read).
+fn object_map_datatype(object_map: &ObjectMap) -> String {
+    use fluree_db_r2rml::mapping::ConstantValue;
+    match object_map {
+        ObjectMap::Column {
+            datatype: Some(dt), ..
+        } => compact_datatype_iri(dt),
+        ObjectMap::Column { term_type, .. } => term_type_datatype(*term_type),
+        ObjectMap::Constant { value } => match value {
+            ConstantValue::Iri(_) => "@id".to_string(),
+            ConstantValue::Literal {
+                datatype: Some(dt), ..
+            } => compact_datatype_iri(dt),
+            ConstantValue::Literal { .. } => "xsd:string".to_string(),
+        },
+        ObjectMap::Template {
+            datatype: Some(dt), ..
+        } => compact_datatype_iri(dt),
+        ObjectMap::Template { term_type, .. } => term_type_datatype(*term_type),
+        ObjectMap::RefObjectMap(_) => "@id".to_string(),
+    }
+}
+
+#[derive(Default)]
+struct PropertyAgg {
+    count: Option<i64>,
+    datatypes: BTreeMap<String, Option<i64>>,
+}
+
+/// Build native-shaped `ledger-info` JSON for a virtual (query-in-place)
+/// dataset, derived entirely from metadata: the compiled R2RML mapping supplies
+/// the classes/properties/datatypes, and `table_row_counts` (authoritative
+/// Iceberg manifest row counts — one row = one subject) supplies per-class /
+/// per-property counts. NEVER reads data, NEVER emits auth/credentials.
+///
+/// This is the pure derivation; the async orchestration that resolves the
+/// mapping + row counts lives in [`build_graph_source_info`].
+pub fn build_virtual_ledger_info(
+    record: &GraphSourceRecord,
+    mapping: Option<&CompiledR2rmlMapping>,
+    meta: &VirtualSourceMeta,
+    table_row_counts: &HashMap<String, i64>,
+) -> JsonValue {
+    let mut classes: BTreeMap<String, Option<i64>> = BTreeMap::new();
+    let mut properties: BTreeMap<String, PropertyAgg> = BTreeMap::new();
+
+    if let Some(mapping) = mapping {
+        for tm in mapping.triples_maps.values() {
+            // One row -> one subject: the class/property counts of a triples map
+            // are the row count of its logical table.
+            let rows = tm
+                .table_name()
+                .and_then(|t| table_row_counts.get(t).copied());
+
+            for class in tm.classes() {
+                let entry = classes.entry(class.clone()).or_insert(None);
+                *entry = add_row_counts(*entry, rows);
+            }
+
+            for pom in &tm.predicate_object_maps {
+                // Only constant predicates can be named without reading data.
+                let Some(pred) = pom.predicate_map.as_constant() else {
+                    continue;
+                };
+                let datatype = object_map_datatype(&pom.object_map);
+                let agg = properties.entry(pred.to_string()).or_default();
+                agg.count = add_row_counts(agg.count, rows);
+                let dt_entry = agg.datatypes.entry(datatype).or_insert(None);
+                *dt_entry = add_row_counts(*dt_entry, rows);
+            }
+        }
+    }
+
+    let classes_json: Map<String, JsonValue> = classes
+        .into_iter()
+        .map(|(iri, count)| (iri, json!({ "count": opt_i64_json(count) })))
+        .collect();
+
+    let properties_json: Map<String, JsonValue> = properties
+        .into_iter()
+        .map(|(iri, agg)| {
+            let datatypes: Map<String, JsonValue> = agg
+                .datatypes
+                .into_iter()
+                .map(|(dt, c)| (dt, opt_i64_json(c)))
+                .collect();
+            (
+                iri,
+                json!({
+                    "count": opt_i64_json(agg.count),
+                    "datatypes": JsonValue::Object(datatypes),
+                }),
+            )
+        })
+        .collect();
+
+    // Total subjects across the dataset (sum of distinct logical-table rows).
+    let total_rows: Option<i64> = if table_row_counts.is_empty() {
+        None
+    } else {
+        Some(table_row_counts.values().sum())
+    };
+
+    // Source metadata block (identifying only — no credentials).
+    let mut source = json!({
+        "virtual": true,
+        "type": meta.source_type,
+        "tables": meta.tables,
+        "snapshot": opt_i64_json(meta.snapshot_id),
+    });
+    if let Some(uri) = &meta.catalog_uri {
+        source["catalog"] = json!({
+            "type": meta.catalog_type,
+            "uri": uri,
+            "warehouse": meta.warehouse,
+        });
+    } else if let Some(location) = &meta.table_location {
+        source["catalog"] = json!({ "table_location": location });
+    }
+    let row_counts_json: Map<String, JsonValue> = table_row_counts
+        .iter()
+        .map(|(t, c)| (t.clone(), json!(c)))
+        .collect();
+    source["table-row-counts"] = JsonValue::Object(row_counts_json);
+
+    json!({
+        // Top-level parity with the native `/info` response (which the server
+        // route stamps `ledger_id`/`t` onto). For a virtual dataset the Iceberg
+        // snapshot id serves as the version `t`.
+        "ledger_id": record.graph_source_id,
+        "t": opt_i64_json(meta.snapshot_id),
+        "ledger": {
+            "alias": record.graph_source_id,
+            "t": opt_i64_json(meta.snapshot_id),
+            "commit-t": JsonValue::Null,
+            "index-t": JsonValue::Null,
+            "flakes": opt_i64_json(total_rows),
+            "size": 0,
+            "named-graphs": [{
+                "iri": "urn:default",
+                "g-id": 0,
+                "flakes": opt_i64_json(total_rows),
+                "size": 0,
+            }],
+        },
+        "graph": "urn:default",
+        "stats": {
+            "flakes": opt_i64_json(total_rows),
+            "size": 0,
+            "properties": JsonValue::Object(properties_json),
+            "classes": JsonValue::Object(classes_json),
+        },
+        // A virtual dataset has no commit/index chain.
+        "commit": JsonValue::Null,
+        // Redacted nameservice record (config secrets already masked).
+        "nameservice": gs_record_to_jsonld(record),
+        "source": source,
+    })
+}
+
+/// Thin (redacted) metadata view for a graph source that is not a virtual
+/// R2RML/Iceberg dataset (BM25 / Vector / Geo / Unknown). Preserves the
+/// historical `/info` stub shape but routes the config through
+/// [`redact_graph_source_config`] so no secret can leak.
+fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
+    let mut obj = json!({
+        "name": record.name,
+        "branch": record.branch,
+        "type": graph_source_type_label(&record.source_type),
+        "graph_source_id": record.graph_source_id,
+        "retracted": record.retracted,
+        "index_t": record.index_t,
+    });
+
+    if let Some(ref id) = record.index_id {
+        obj["index_id"] = JsonValue::String(id.to_string());
+    }
+    if !record.dependencies.is_empty() {
+        obj["dependencies"] = json!(record.dependencies);
+    }
+    if !record.config.is_empty() && record.config != "{}" {
+        let redacted = redact_graph_source_config(&record.config);
+        if let Ok(parsed) = serde_json::from_str::<JsonValue>(&redacted) {
+            obj["config"] = parsed;
+        }
+    }
+
+    obj
+}
+
+/// Build `ledger-info` for a graph source (virtual dataset), resolved from a
+/// nameservice [`GraphSourceRecord`].
+///
+/// For `Iceberg`/`R2RML` sources this returns the SAME JSON shape a native
+/// ledger's `info` returns — `classes`, `properties`, per-class counts — derived
+/// entirely from the compiled R2RML mapping and Iceberg table **metadata**
+/// (`loadTable` snapshot summary row counts: metadata-only, NEVER a Parquet/data
+/// scan) — and NEVER includes auth/credentials. Other graph-source types get the
+/// thin (redacted) record view.
+///
+/// This is the single shared builder behind the db-server `/info` route, the
+/// `LedgerInfoBuilder::execute` path (MCP `get_data_model`), and — by extension —
+/// solo's virtual-dataset panels.
+pub async fn build_graph_source_info(
+    fluree: &crate::Fluree,
+    record: &GraphSourceRecord,
+) -> crate::Result<JsonValue> {
+    match record.source_type {
+        GraphSourceType::Iceberg | GraphSourceType::R2rml => {
+            #[cfg(feature = "iceberg")]
+            {
+                build_iceberg_virtual_info(fluree, record).await
+            }
+            #[cfg(not(feature = "iceberg"))]
+            {
+                let _ = fluree;
+                Ok(build_generic_graph_source_info(record))
+            }
+        }
+        _ => Ok(build_generic_graph_source_info(record)),
+    }
+}
+
+/// Reconstruct a (metadata-preview) Iceberg connection from a stored config.
+/// Carries the catalog auth so the preview can authenticate, but the auth is
+/// used only to read metadata and is never serialized into the response.
+#[cfg(feature = "iceberg")]
+fn connection_from_stored_config(
+    cfg: &fluree_db_iceberg::IcebergGsConfig,
+) -> Option<crate::graph_source::IcebergConnectionConfig> {
+    use crate::graph_source::{CatalogMode, IcebergConnectionConfig, RestCatalogMode};
+    use fluree_db_iceberg::config::CatalogConfig;
+    let connection = match &cfg.catalog {
+        CatalogConfig::Rest {
+            uri,
+            warehouse,
+            auth,
+            ..
+        } => IcebergConnectionConfig {
+            catalog_mode: CatalogMode::Rest(Box::new(RestCatalogMode {
+                catalog_uri: uri.clone(),
+                warehouse: warehouse.clone(),
+                auth: auth.clone(),
+            })),
+            io: cfg.io.clone(),
+        },
+        CatalogConfig::Direct { table_location } => IcebergConnectionConfig {
+            catalog_mode: CatalogMode::Direct {
+                table_location: table_location.clone(),
+            },
+            io: cfg.io.clone(),
+        },
+    };
+    Some(connection)
+}
+
+/// Async orchestration for the Iceberg/R2RML virtual-info path: resolve the
+/// compiled mapping + best-effort per-table row counts, then derive the JSON via
+/// [`build_virtual_ledger_info`].
+#[cfg(feature = "iceberg")]
+async fn build_iceberg_virtual_info(
+    fluree: &crate::Fluree,
+    record: &GraphSourceRecord,
+) -> crate::Result<JsonValue> {
+    use fluree_db_iceberg::config::CatalogConfig;
+    use fluree_db_iceberg::IcebergGsConfig;
+    use fluree_db_query::r2rml::R2rmlProvider;
+
+    // Parse the stored config for source metadata (auth is never emitted).
+    let cfg = IcebergGsConfig::from_json(&record.config).ok();
+
+    // Resolve the compiled mapping (best-effort). A plain Iceberg source with no
+    // R2RML mapping yields no classes/properties but still lists its table.
+    let provider = crate::graph_source::FlureeR2rmlProvider::new(fluree);
+    let mapping = provider
+        .compiled_mapping(&record.graph_source_id, None)
+        .await
+        .ok();
+
+    let mut meta = VirtualSourceMeta {
+        source_type: graph_source_type_label(&record.source_type),
+        ..Default::default()
+    };
+
+    // Distinct tables: union of the mapping's tables and the config's own table.
+    let mut tables: Vec<String> = mapping
+        .as_deref()
+        .map(|m| m.table_names().into_iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    if let Some(cfg) = cfg.as_ref() {
+        match &cfg.catalog {
+            CatalogConfig::Rest {
+                catalog_type,
+                uri,
+                warehouse,
+                ..
+            } => {
+                meta.catalog_type = Some(catalog_type.clone());
+                meta.catalog_uri = Some(uri.clone());
+                meta.warehouse = warehouse.clone();
+            }
+            CatalogConfig::Direct { table_location } => {
+                meta.table_location = Some(table_location.clone());
+            }
+        }
+        let id = cfg.table.identifier();
+        if !id.is_empty() && !tables.contains(&id) {
+            tables.push(id);
+        }
+    }
+    tables.sort();
+    tables.dedup();
+    meta.tables = tables.clone();
+
+    // Best-effort per-table row counts + snapshot id via Iceberg metadata only
+    // (loadTable snapshot summary — reads no manifest/Parquet data). Any failure
+    // (catalog offline, missing creds) degrades counts to null while the schema
+    // (classes/properties) still renders from the mapping.
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    if let Some(conn) = cfg.as_ref().and_then(connection_from_stored_config) {
+        for table in &tables {
+            let Ok(id) = fluree_db_iceberg::catalog::parse_table_identifier(table) else {
+                continue;
+            };
+            let table_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
+            match fluree
+                .preview_iceberg_table(
+                    conn.clone(),
+                    table_id,
+                    crate::graph_source::StatsTier::Schema,
+                )
+                .await
+            {
+                Ok(preview) => {
+                    if let Some(row_count) = preview.schema.row_count {
+                        counts.insert(table.clone(), row_count);
+                    }
+                    if meta.snapshot_id.is_none() {
+                        meta.snapshot_id = Some(preview.schema.snapshot.id);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        table = %table,
+                        error = %e,
+                        "virtual ledger-info: row-count preview failed; counts omitted"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(build_virtual_ledger_info(
+        record,
+        mapping.as_deref(),
+        &meta,
+        &counts,
+    ))
 }
 
 // ============================================================================
@@ -1073,7 +1594,25 @@ impl<'a> LedgerInfoBuilder<'a> {
 
     /// Execute the ledger info request.
     pub async fn execute(self) -> crate::Result<JsonValue> {
-        let ledger = self.fluree.ledger(&self.ledger_id).await?;
+        // A committed ledger takes the native path (byte-identical output). When
+        // the id is not a committed ledger, fall back to a graph-source lookup so
+        // a virtual (query-in-place) R2RML/Iceberg dataset returns real
+        // classes/properties/counts derived from metadata rather than a stub.
+        let ledger = match self.fluree.ledger(&self.ledger_id).await {
+            Ok(ledger) => ledger,
+            Err(e) if e.is_not_found() => {
+                if let Ok(Some(gs)) = self
+                    .fluree
+                    .nameservice()
+                    .lookup_graph_source(&self.ledger_id)
+                    .await
+                {
+                    return build_graph_source_info(self.fluree, &gs).await;
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
 
         // Optional API-level cache: when ledger caching is enabled, a global LeafletCache
         // exists with a single memory budget (TinyLFU). We store ledger-info response
@@ -1314,5 +1853,239 @@ mod tests {
     fn test_graph_selector_by_name_config() {
         let sel = GraphSelector::ByName("config".to_string());
         assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 2);
+    }
+
+    // ── Virtual (R2RML/Iceberg) dataset ledger-info + secret redaction ──
+
+    const SECRET_PAT: &str = "SUPER_SECRET_PAT_do_not_leak";
+
+    /// An Iceberg/R2RML graph-source config carrying a literal OAuth2 secret —
+    /// exactly the shape whose verbatim emission was the P0 leak.
+    fn secret_bearing_config() -> String {
+        format!(
+            r#"{{"catalog":{{"type":"rest","uri":"https://polaris.example.com",
+               "auth":{{"type":"oauth2_client_credentials",
+               "token_url":"https://polaris.example.com/tokens",
+               "client_id":"svc-client","client_secret":"{SECRET_PAT}"}}}},
+               "table":"openflights.airlines"}}"#
+        )
+    }
+
+    fn virtual_record(config: &str) -> GraphSourceRecord {
+        GraphSourceRecord {
+            graph_source_id: "sales:main".to_string(),
+            name: "sales".to_string(),
+            branch: "main".to_string(),
+            source_type: GraphSourceType::Iceberg,
+            config: config.to_string(),
+            dependencies: vec![],
+            index_id: None,
+            index_t: 0,
+            retracted: false,
+        }
+    }
+
+    fn two_table_mapping() -> CompiledR2rmlMapping {
+        use fluree_db_r2rml::{PredicateMap, PredicateObjectMap, TriplesMap};
+        let airline = TriplesMap::new("#Airline", "openflights.airlines")
+            .with_subject_template("http://ex.org/airline/{id}")
+            .with_class("http://ex.org/Airline")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex.org/name"),
+                object_map: ObjectMap::column("name"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex.org/founded"),
+                object_map: ObjectMap::column_typed(
+                    "founded",
+                    "http://www.w3.org/2001/XMLSchema#integer",
+                ),
+            });
+        let route = TriplesMap::new("#Route", "openflights.routes")
+            .with_subject_template("http://ex.org/route/{id}")
+            .with_class("http://ex.org/Route")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex.org/distance"),
+                object_map: ObjectMap::column("distance"),
+            });
+        CompiledR2rmlMapping::new(vec![airline, route])
+    }
+
+    fn iceberg_meta() -> VirtualSourceMeta {
+        VirtualSourceMeta {
+            source_type: "Iceberg".to_string(),
+            catalog_type: Some("rest".to_string()),
+            catalog_uri: Some("https://polaris.example.com".to_string()),
+            table_location: None,
+            warehouse: Some("wh1".to_string()),
+            tables: vec![
+                "openflights.airlines".to_string(),
+                "openflights.routes".to_string(),
+            ],
+            snapshot_id: Some(42),
+        }
+    }
+
+    #[test]
+    fn test_build_virtual_ledger_info_classes_and_counts() {
+        let record = virtual_record(&secret_bearing_config());
+        let mapping = two_table_mapping();
+        let mut counts = HashMap::new();
+        counts.insert("openflights.airlines".to_string(), 100);
+        counts.insert("openflights.routes".to_string(), 50);
+
+        let info = build_virtual_ledger_info(&record, Some(&mapping), &iceberg_meta(), &counts);
+
+        // Non-empty classes with per-class counts = logical-table row counts.
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Airline"]["count"],
+            100
+        );
+        assert_eq!(info["stats"]["classes"]["http://ex.org/Route"]["count"], 50);
+
+        // Properties with inferred datatypes.
+        assert_eq!(
+            info["stats"]["properties"]["http://ex.org/name"]["count"],
+            100
+        );
+        assert_eq!(
+            info["stats"]["properties"]["http://ex.org/name"]["datatypes"]["xsd:string"],
+            100
+        );
+        assert_eq!(
+            info["stats"]["properties"]["http://ex.org/founded"]["datatypes"]["xsd:integer"],
+            100
+        );
+
+        // Totals + Iceberg snapshot as the version `t`.
+        assert_eq!(info["stats"]["flakes"], 150);
+        assert_eq!(info["ledger"]["flakes"], 150);
+        assert_eq!(info["t"], 42);
+        assert_eq!(info["ledger"]["t"], 42);
+
+        // Source metadata block (identifying only).
+        assert_eq!(info["source"]["type"], "Iceberg");
+        assert_eq!(info["source"]["snapshot"], 42);
+        assert_eq!(
+            info["source"]["catalog"]["uri"],
+            "https://polaris.example.com"
+        );
+        assert_eq!(info["source"]["virtual"], true);
+        assert_eq!(info["graph"], "urn:default");
+        assert_eq!(info["commit"], JsonValue::Null);
+
+        // The whole response — including the nameservice block that echoes the
+        // stored config — must carry NO secret.
+        let serialized = serde_json::to_string(&info).unwrap();
+        assert!(
+            !serialized.contains(SECRET_PAT),
+            "virtual ledger-info leaked the secret: {serialized}"
+        );
+    }
+
+    #[test]
+    fn test_build_virtual_ledger_info_unknown_counts_are_null() {
+        let record = virtual_record("{}");
+        let mapping = two_table_mapping();
+        let empty = HashMap::new();
+        let info = build_virtual_ledger_info(&record, Some(&mapping), &iceberg_meta(), &empty);
+
+        // Schema still renders (class present) but counts are null (no scan).
+        assert!(info["stats"]["classes"]
+            .get("http://ex.org/Airline")
+            .is_some());
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Airline"]["count"],
+            JsonValue::Null
+        );
+        assert_eq!(info["stats"]["flakes"], JsonValue::Null);
+    }
+
+    #[test]
+    fn test_redact_graph_source_config_masks_oauth_secret() {
+        let redacted = redact_graph_source_config(&secret_bearing_config());
+        assert!(!redacted.contains(SECRET_PAT), "secret leaked: {redacted}");
+        // Non-secret identifying fields survive.
+        assert!(redacted.contains("https://polaris.example.com"));
+        assert!(redacted.contains("svc-client"));
+        assert!(redacted.contains("[redacted]"));
+    }
+
+    #[test]
+    fn test_redact_graph_source_config_masks_env_default_but_keeps_var_name() {
+        let config = r#"{"catalog":{"type":"rest","uri":"https://c.example.com",
+            "auth":{"type":"bearer","token":{"env_var":"POLARIS_TOKEN",
+            "default_val":"fallback-secret-value"}}},"table":"ns.t"}"#;
+        let redacted = redact_graph_source_config(config);
+        assert!(
+            redacted.contains("POLARIS_TOKEN"),
+            "env var name should survive: {redacted}"
+        );
+        assert!(
+            !redacted.contains("fallback-secret-value"),
+            "inline default secret leaked: {redacted}"
+        );
+    }
+
+    #[test]
+    fn test_redact_graph_source_config_noop_for_nonsecret_is_byte_identical() {
+        // A BM25 config has no secret keys -> returned unchanged (preserves the
+        // exact `gs_record_to_jsonld` output the existing test locks in).
+        let bm25 = r#"{"k1":1.2,"b":0.75}"#;
+        assert_eq!(redact_graph_source_config(bm25), bm25);
+    }
+
+    #[test]
+    fn test_gs_record_to_jsonld_redacts_secret_config() {
+        let record = virtual_record(&secret_bearing_config());
+        let json = gs_record_to_jsonld(&record);
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(
+            !serialized.contains(SECRET_PAT),
+            "gs_record_to_jsonld leaked the secret: {serialized}"
+        );
+    }
+
+    /// The lossless storage serialization of a real `IcebergGsConfig` DOES carry
+    /// the secret (required for query-time catalog auth), but the redacted
+    /// emission MUST NOT — the exact invariant a client-facing response needs.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_real_iceberg_config_redacts_on_emit() {
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+        use fluree_db_iceberg::{ConfigValue, IcebergGsConfig};
+
+        let cfg = IcebergGsConfig {
+            catalog: CatalogConfig::Rest {
+                catalog_type: "rest".to_string(),
+                uri: "https://polaris.example.com".to_string(),
+                auth: AuthConfig::OAuth2ClientCredentials {
+                    token_url: "https://polaris.example.com/tokens".to_string(),
+                    client_id: ConfigValue::literal("svc-client"),
+                    client_secret: ConfigValue::literal(SECRET_PAT),
+                    scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+                    audience: None,
+                },
+                warehouse: None,
+            },
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig::default(),
+            mapping: None,
+        };
+
+        let stored = cfg.to_json().unwrap();
+        assert!(
+            stored.contains(SECRET_PAT),
+            "storage serialization must be lossless"
+        );
+
+        let redacted = redact_graph_source_config(&stored);
+        assert!(
+            !redacted.contains(SECRET_PAT),
+            "secret leaked on emit: {redacted}"
+        );
+        assert!(redacted.contains("https://polaris.example.com"));
+        assert!(redacted.contains("svc-client"));
     }
 }
