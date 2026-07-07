@@ -130,6 +130,11 @@ pub enum DiagCode {
     #[serde(rename = "F009")]
     VariableInGroundData,
 
+    /// Blank nodes not allowed in DELETE DATA / DELETE WHERE / DELETE templates
+    /// (SPARQL 1.1 Update §19.8 grammar note 8)
+    #[serde(rename = "F010")]
+    BlankNodeInDelete,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -177,6 +182,7 @@ impl DiagCode {
             Self::UnsupportedSelectReduced => "F007",
             Self::UnsupportedDistinctAggregate => "F008",
             Self::VariableInGroundData => "F009",
+            Self::BlankNodeInDelete => "F010",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

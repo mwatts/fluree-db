@@ -84,6 +84,17 @@ pub enum LowerError {
     /// Undefined prefix in IRI
     #[error("Undefined prefix '{prefix}:'")]
     UndefinedPrefix { prefix: String, span: SourceSpan },
+
+    /// Blank node in a DELETE context (SPARQL 1.1 Update §19.8 grammar note 8)
+    #[error(
+        "blank nodes are not allowed in {context}: a blank node denotes a fresh node and can \
+         never match existing data (use a variable bound by WHERE, a concrete IRI, or a Fluree \
+         stable _:fdb- id)"
+    )]
+    BlankNodeInDelete {
+        context: &'static str,
+        span: SourceSpan,
+    },
 }
 
 /// Counter for generating anonymous blank node labels.
@@ -480,6 +491,59 @@ fn reject_user_authored_reifies(
     Ok(())
 }
 
+/// Reject non-stable blank nodes in DELETE-side quad patterns (SPARQL 1.1
+/// Update §19.8 grammar note 8: no blank nodes in DELETE DATA nor in the
+/// DeleteClause template). A blank node here denotes a fresh node, so a
+/// retraction built from it skolemizes a brand-new SID and silently matches
+/// nothing. Mirrors the validator's `BlankNodeInDelete` rule so callers that
+/// lower without running `validate()` (the transact builders) get the same
+/// clear error, and matches [`AnnotationExpansionMode::rejects_blank_reifier`]
+/// (DeleteData | DeleteTemplate).
+///
+/// Two deliberate carve-outs:
+/// - Fluree stable ids (`_:fdb-...`) pass: they are constants addressing the
+///   existing stored node (see `it_stable_blank_nodes.rs`).
+/// - DELETE WHERE is NOT routed through this check at lowering: its blank
+///   nodes keep Fluree's documented existential-variable semantics
+///   ([`BlankNodeVarNamer`]); the strict SPARQL surface rejects them in
+///   `validate()`.
+fn reject_blank_nodes_in_delete_quad_pattern(
+    pattern: &QuadPattern,
+    context: &'static str,
+) -> Result<(), LowerError> {
+    fn check_blank_node(bn: &BlankNode, context: &'static str) -> Result<(), LowerError> {
+        if let BlankNodeValue::Labeled(l) = &bn.value {
+            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                return Ok(());
+            }
+        }
+        Err(LowerError::BlankNodeInDelete {
+            context,
+            span: bn.span,
+        })
+    }
+    fn check_triple(tp: &TriplePattern, context: &'static str) -> Result<(), LowerError> {
+        if let SubjectTerm::BlankNode(bn) = &tp.subject {
+            check_blank_node(bn, context)?;
+        }
+        if let Term::BlankNode(bn) = &tp.object {
+            check_blank_node(bn, context)?;
+        }
+        Ok(())
+    }
+    for el in &pattern.patterns {
+        match el {
+            QuadPatternElement::Triple(tp) => check_triple(tp, context)?,
+            QuadPatternElement::Graph { triples, .. } => {
+                for tp in triples {
+                    check_triple(tp, context)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Same firewall, but for QuadPattern (handles Triple + Graph blocks).
 fn reject_user_authored_reifies_in_quad_pattern(
     pattern: &QuadPattern,
@@ -751,6 +815,7 @@ fn lower_delete_data(
     // M4.4: same firewall + expansion as INSERT DATA, with the
     // DELETE DATA blank-node / variable rejections per SPARQL §3.1.3.
     let mut pattern = QuadPattern::new(data.quads.clone(), data.span);
+    reject_blank_nodes_in_delete_quad_pattern(&pattern, "DELETE DATA")?;
     reject_user_authored_reifies_in_quad_pattern(&pattern, prologue)?;
     expand_annotated_triples_in_quad_pattern(
         &mut pattern,
@@ -1126,6 +1191,7 @@ fn lower_modify(
     // first so synthetic f:reifies* triples (added by the expansion)
     // aren't mistaken for user input.
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
+        reject_blank_nodes_in_delete_quad_pattern(delete_clause, "DELETE templates")?;
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
         if default_template_graph_id.is_some() {
             reject_with_scoped_annotations(delete_clause)?;
@@ -2000,6 +2066,75 @@ mod tests {
             rendered.contains("_fluree_bn_x"),
             "WHERE pattern must reference the shared existential var: {rendered}"
         );
+    }
+
+    #[test]
+    fn test_lower_delete_data_blank_node_rejected() {
+        // SPARQL 1.1 Update §19.8 note 8: no blank nodes in DELETE DATA.
+        // Enforced at lowering too, since the transact builders lower
+        // without running validate().
+        let parsed =
+            fluree_db_sparql::parse_sparql("DELETE DATA { _:a <http://example.org/p> <urn:o> }");
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let err = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect_err("bnode in DELETE DATA must be rejected");
+        assert!(
+            matches!(
+                err,
+                LowerError::BlankNodeInDelete {
+                    context: "DELETE DATA",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_lower_modify_delete_template_blank_node_rejected() {
+        // Anonymous `[]` in a Modify DELETE template (W3C delete-insert-03
+        // family shape).
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE { ?a <http://example.org/knows> [] } WHERE { ?a <http://example.org/name> \"Alan\" }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let err = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect_err("bnode in a DELETE template must be rejected");
+        assert!(
+            matches!(
+                err,
+                LowerError::BlankNodeInDelete {
+                    context: "DELETE templates",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_lower_delete_forms_stable_blank_node_ids_allowed() {
+        // Fluree stable ids stay legal: they address the stored node.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE DATA { _:fdb-abc123 <http://example.org/p> <urn:o> }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect("stable blank-node id in DELETE DATA must lower");
+    }
+
+    #[test]
+    fn test_lower_insert_data_blank_node_still_allowed() {
+        // INSERT DATA keeps CONSTRUCT-style fresh-mint blank nodes.
+        let parsed =
+            fluree_db_sparql::parse_sparql("INSERT DATA { _:a <http://example.org/p> <urn:o> }");
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+            .expect("blank node in INSERT DATA must lower");
     }
 
     #[test]
