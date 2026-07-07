@@ -26,6 +26,7 @@ mod geo;
 mod hash;
 mod helpers;
 mod iter;
+pub(crate) use iter::eval_single_node_predicate;
 mod list;
 mod logical;
 mod metadata;

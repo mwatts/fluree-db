@@ -3,6 +3,7 @@
 //! the data lives.
 
 use super::triple::Ref;
+use crate::ir::Expression;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
@@ -286,6 +287,25 @@ pub struct ShortestPathPattern {
     /// a wildcard pattern resolves each found hop's predicate with a post-hoc
     /// probe.
     pub needs_relationships: bool,
+    /// Optional per-node predicate pushed in from a trailing
+    /// `WHERE all(x IN nodes(p) WHERE …)`. When set, the search only traverses
+    /// nodes that satisfy it (endpoints included), finding the shortest
+    /// *qualifying* path rather than post-filtering the unconstrained shortest
+    /// path. `None` = unconstrained.
+    pub node_filter: Option<PathNodeFilter>,
+}
+
+/// A per-node predicate pushed into a shortest-path search from an
+/// `all(x IN nodes(p) WHERE …)` filter over the path's nodes. A node qualifies
+/// iff `predicate` evaluates true with `var` bound to it — the same check the
+/// post-filter applies, moved into the search so BFS returns the shortest path
+/// whose every node passes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathNodeFilter {
+    /// The iteration variable (`x` in `all(x IN nodes(p) …)`).
+    pub var: VarId,
+    /// The boolean predicate evaluated per node.
+    pub predicate: Expression,
 }
 
 impl ShortestPathPattern {

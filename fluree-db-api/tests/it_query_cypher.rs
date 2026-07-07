@@ -4595,6 +4595,91 @@ async fn cypher_shortest_path_length_directed() {
 }
 
 #[tokio::test]
+async fn cypher_shortest_path_node_predicate_pushed_into_search() {
+    // A path predicate over `nodes(p)` must be evaluated DURING the search, not
+    // post-filtered on the unconstrained shortest path (Neo4j/openCypher
+    // semantics). The unconstrained shortest a→z is 2 hops through `bob` (a
+    // minor); the shortest ALL-ADULT path is 3 hops a→carol→dave→z. A
+    // post-filter would find a→bob→z, reject it, and wrongly return empty.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-node-pred");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "a",     "@type": "Person", "role": "start", "age": 30, "KNOWS": [{"@id": "bob"}, {"@id": "carol"}]},
+                    {"@id": "bob",   "@type": "Person", "age": 10, "KNOWS": {"@id": "z"}},
+                    {"@id": "carol", "@type": "Person", "age": 30, "KNOWS": {"@id": "dave"}},
+                    {"@id": "dave",  "@type": "Person", "age": 30, "KNOWS": {"@id": "z"}},
+                    {"@id": "z",     "@type": "Person", "role": "end", "age": 30},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Unconstrained shortest is 2 hops (a→bob→z); the shortest ALL-ADULT path
+    // is 3 hops (a→carol→dave→z). A correct search returns 3.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {role: "start"}), (z:Person {role: "end"})
+               WITH a, z
+               MATCH p = shortestPath((a)-[:KNOWS*..15]->(z))
+               WHERE all(x IN nodes(p) WHERE x.age >= 18)
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("filtered shortestPath")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out[0][0],
+        json!(3),
+        "filtered shortestPath must find the 3-hop all-adult path, not post-filter to empty: {out}"
+    );
+
+    // Raising the bar past every intermediate leaves no qualifying path: the
+    // search returns nothing (start/end still qualify, but no route does).
+    let none = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {role: "start"}), (z:Person {role: "end"})
+               WITH a, z
+               MATCH p = shortestPath((a)-[:KNOWS*..15]->(z))
+               WHERE all(x IN nodes(p) WHERE x.age >= 100)
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("no qualifying path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(none.as_array().map(|r| r.len()), Some(0), "no path: {none}");
+
+    // Unfiltered shortestPath is unchanged: the 2-hop path through the minor.
+    let two = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {role: "start"}), (z:Person {role: "end"})
+               WITH a, z
+               MATCH p = shortestPath((a)-[:KNOWS*..15]->(z))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("unfiltered")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(two[0][0], json!(2), "unfiltered shortest is 2 hops: {two}");
+}
+
+#[tokio::test]
 async fn cypher_shortest_path_batched_lane_respects_novelty() {
     // The raw-id shortestPath lane reads base index rows for clean nodes and
     // must fall back per node wherever novelty touches an expansion side:

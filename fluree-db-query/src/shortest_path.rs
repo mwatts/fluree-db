@@ -319,10 +319,33 @@ impl ShortestPathOperator {
         start: &Sid,
         end: &Sid,
     ) -> Result<Option<Vec<Sid>>> {
+        // Endpoints are part of `nodes(p)`: if either fails a pushed node
+        // predicate, no qualifying path exists.
+        if self.pattern.node_filter.is_some()
+            && !(self.node_qualifies(ctx, start)? && self.node_qualifies(ctx, end)?)
+        {
+            return Ok(None);
+        }
         if let Some(result) = self.bidirectional_ids(ctx, start, end).await? {
             return Ok(result);
         }
         self.bidirectional_sids(ctx, start, end).await
+    }
+
+    /// Whether `node` satisfies the pushed-in per-node predicate (an
+    /// `all(x IN nodes(p) WHERE …)` filter moved into the search). `true` when
+    /// there is no filter. Evaluated with the same member resolution as the
+    /// post-filter, so a returned path's every node passes the original `all`.
+    fn node_qualifies(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<bool> {
+        match &self.pattern.node_filter {
+            None => Ok(true),
+            Some(nf) => crate::eval::eval_single_node_predicate(
+                nf.var,
+                &nf.predicate,
+                Binding::sid(node.clone()),
+                ctx,
+            ),
+        }
     }
 
     /// Sid-keyed bidirectional BFS (per-node `range_with_overlay` probes).
@@ -381,6 +404,12 @@ impl ShortestPathOperator {
             for node in &frontier {
                 let nbrs = self.neighbors(ctx, node, expand_forward).await?;
                 for nb in nbrs {
+                    // Pushed node predicate: only traverse through qualifying
+                    // nodes, so BFS returns the shortest path whose nodes all
+                    // pass (endpoints checked up front in `bidirectional`).
+                    if self.pattern.node_filter.is_some() && !self.node_qualifies(ctx, &nb)? {
+                        continue;
+                    }
                     let (near, far) = if expand_forward {
                         (&mut fwd_prev, &bwd_next)
                     } else {
@@ -477,6 +506,12 @@ impl ShortestPathOperator {
             return Ok(None);
         };
         if !ctx.allow_unfiltered() || ctx.is_multi_ledger() {
+            return Ok(None);
+        }
+        // A pushed node predicate qualifies nodes by their properties; the
+        // raw-id lane never materializes a node's Sid. Decline to the Sid lane,
+        // which evaluates the predicate per node during expansion.
+        if self.pattern.node_filter.is_some() {
             return Ok(None);
         }
         let (_db, overlay, to_t) = ctx.require_single_graph()?;

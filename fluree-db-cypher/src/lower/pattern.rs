@@ -238,6 +238,9 @@ fn lower_shortest_path<E: IriEncoder>(
         // Conservatively build edges: Cypher's `relationships(p)` may read
         // them, and that usage isn't visible at pattern-lowering time.
         needs_relationships: true,
+        // A trailing `WHERE all(x IN nodes(p) …)` is absorbed into this field
+        // by a post-lowering pass (see `absorb_shortest_path_node_filter`).
+        node_filter: None,
     }));
     Ok(())
 }
