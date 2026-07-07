@@ -2648,11 +2648,23 @@ fn test_v1_doubled_dot_rejected() {
     // syn-bad-08..13
     assert_parse_error("SELECT * WHERE { ?s ?p ?o . . }", "unexpected '.'");
     assert_parse_error("SELECT * WHERE { ?s ?p ?o .. }", "unexpected '.'");
-    assert_parse_error("SELECT * WHERE { ?s ?p ?o . . ?s1 ?p1 ?o1 }", "unexpected '.'");
-    assert_parse_error("SELECT * WHERE { ?s ?p ?o .. ?s1 ?p1 ?o1 }", "unexpected '.'");
-    assert_parse_error("SELECT * WHERE { ?s ?p ?o . ?s1 ?p1 ?o1 .. }", "unexpected '.'");
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o . . ?s1 ?p1 ?o1 }",
+        "unexpected '.'",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o .. ?s1 ?p1 ?o1 }",
+        "unexpected '.'",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o . ?s1 ?p1 ?o1 .. }",
+        "unexpected '.'",
+    );
     // A doubled dot after a GraphPatternNotTriples: only ONE optional dot.
-    assert_parse_error("SELECT * WHERE { OPTIONAL { ?s ?p ?o } . . }", "unexpected '.'");
+    assert_parse_error(
+        "SELECT * WHERE { OPTIONAL { ?s ?p ?o } . . }",
+        "unexpected '.'",
+    );
 }
 
 #[test]
@@ -2686,9 +2698,7 @@ fn test_v2_filter_constraint_forms_still_parse() {
     assert_parses("SELECT * WHERE { ?s ?p ?o FILTER IF(?o, true, false) }");
     assert_parses("SELECT * WHERE { ?s ?p ?o FILTER COALESCE(?o, false) }");
     // FunctionCall (extension function by IRI / prefixed name)
-    assert_parses(
-        "PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:f(?o) }",
-    );
+    assert_parses("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:f(?o) }");
     assert_parses("SELECT * WHERE { ?s ?p ?o FILTER <http://example.org/f>(?o) }");
 }
 
@@ -2788,4 +2798,59 @@ fn test_subselect_trailing_values_clause() {
             panic!("expected SubSelect, got {:?}", q.where_clause.pattern);
         }
     }
+}
+
+// =========================================================================
+// Trailing-token / EOF assertion at the parse entry (issue #1438 / D-10a)
+// =========================================================================
+
+#[test]
+fn test_trailing_tokens_after_query_rejected() {
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o } ?x",
+        "unexpected trailing tokens",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o } <http://example.org/trailing>",
+        "unexpected trailing tokens",
+    );
+    // A stray ';' after a query form is trailing content too.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o } ;",
+        "unexpected trailing tokens",
+    );
+    assert_parse_error(
+        "ASK { ?s ?p ?o } SELECT * WHERE { ?s ?p ?o }",
+        "unexpected trailing tokens",
+    );
+}
+
+#[test]
+fn test_multi_operation_update_rejected_loudly() {
+    // Issue #1438: `INSERT ...; DELETE ...` used to parse as the INSERT
+    // alone, silently discarding every following operation (silent data
+    // loss at commit time). Until PR-U2 adds real multi-op support, the
+    // request must fail loudly (D-10a interim guard).
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { ex:s ex:p 1 } ; DELETE DATA { ex:s ex:p 1 }",
+        "multi-operation SPARQL UPDATE",
+    );
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { ex:s ex:p 1 } ; INSERT DATA { ex:s ex:p 2 }",
+        "multi-operation SPARQL UPDATE",
+    );
+}
+
+#[test]
+fn test_single_trailing_semicolon_after_update_is_legal() {
+    // Update ::= Prologue ( Update1 ( ';' Update )? )? — the recursive
+    // Update may be empty, so one trailing ';' is valid SPARQL.
+    assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
+    // ...but only one.
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ; ;",
+        "multi-operation SPARQL UPDATE",
+    );
 }

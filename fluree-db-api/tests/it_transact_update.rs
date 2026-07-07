@@ -2290,3 +2290,54 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
         })
         .await;
 }
+
+/// Issue #1438: a multi-operation SPARQL UPDATE request (`INSERT ...; DELETE
+/// ...`) used to execute ONLY the first operation, silently discarding
+/// everything after the first ';' — silent data loss through the public
+/// transact path. Until PR-U2 adds real multi-op support, such a request
+/// must fail loudly (D-10a interim guard: the trailing-token/EOF assertion
+/// at the parse entry, enforced because parse-error diagnostics are
+/// authoritative at the API seam).
+#[tokio::test]
+async fn multi_operation_sparql_update_rejected_loudly() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:main")
+        .await
+        .expect("create ledger");
+
+    let two_ops = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:s ex:p "first" } ;
+        DELETE DATA { ex:s ex:p "first" }
+    "#;
+
+    let err = fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(two_ops)
+        .commit()
+        .await
+        .expect_err("two-op update must be rejected loudly, not truncated to its first op");
+    assert!(
+        err.to_string().contains("multi-operation SPARQL UPDATE"),
+        "error should name the multi-op limitation, got: {err}"
+    );
+
+    // Control: one operation with the grammar's optional trailing ';'
+    // (Update ::= Prologue ( Update1 ( ';' Update )? )?) still commits —
+    // and lands at t=1, proving the rejected two-op request above staged
+    // nothing at all (not even its first operation).
+    let one_op = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:s ex:p "only" } ;
+    "#;
+    let result = fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(one_op)
+        .commit()
+        .await
+        .expect("single-op update with a trailing ';' is valid SPARQL and should commit");
+    assert_eq!(result.receipt.t, 1);
+}
