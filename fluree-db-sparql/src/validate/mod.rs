@@ -149,20 +149,11 @@ impl<'a> Validator<'a> {
     fn validate_delete_where(&mut self, delete_where: &DeleteWhere) {
         // DELETE WHERE allows variables - no ground validation needed.
         //
-        // Phase 1: GRAPH blocks in DELETE WHERE are not supported yet because the lowering
-        // path in `fluree-db-transact` currently targets triple-only patterns.
-        for el in &delete_where.pattern.patterns {
-            if let QuadPatternElement::Graph { span, .. } = el {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        DiagCode::UnsupportedGraphInUpdate,
-                        "GRAPH blocks are not supported in DELETE WHERE yet",
-                        *span,
-                    )
-                    .with_help("Rewrite using explicit triples in the default graph, or use DELETE/INSERT with WHERE once GRAPH template support is extended to DELETE WHERE."),
-                );
-            }
-        }
+        // The quad pattern doubles as the DELETE template (`DELETE WHERE { P }`
+        // is shorthand for `DELETE { P } WHERE { P }`), so the same template
+        // rules as Modify apply: `GRAPH <iri>` blocks are supported, graph
+        // variables are not (Phase 1).
+        self.validate_update_template_quad_pattern(&delete_where.pattern, "DELETE WHERE");
     }
 
     /// Validate Modify (INSERT/DELETE with WHERE).
@@ -543,6 +534,31 @@ mod tests {
                 .iter()
                 .any(|d| d.code == DiagCode::VariableInGroundData),
             "Variables should be allowed in DELETE WHERE"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_graph_iri_block_allowed() {
+        // W3C syntax-update-1 test_36: GRAPH <iri> blocks are valid in
+        // DELETE WHERE (the pattern doubles as a Modify-style template).
+        let diags =
+            validate_query("DELETE WHERE { GRAPH <urn:g> { <urn:s> <http://example.org/p> ?o } }");
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "GRAPH <iri> should be allowed in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_graph_variable_rejected() {
+        // Graph variables are unsupported in update templates (Phase 1), and
+        // the DELETE WHERE pattern is also the delete template.
+        let diags = validate_query("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
+            "GRAPH ?var should be rejected in DELETE WHERE: {diags:?}"
         );
     }
 
