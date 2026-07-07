@@ -391,3 +391,59 @@ async fn sparql_xsd_temporal_casts() {
         JsonValue::Bool(true)
     );
 }
+
+// =============================================================================
+// D9 — BNODE(label): per-solution identity
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_bnode_label_is_per_solution() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprsem/d9:sparql");
+    let tx = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:s1", "ex:str": "foo" },
+            { "@id": "ex:s3", "ex:str": "BAZ" }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.expect("insert").ledger;
+
+    // bnode01 shape: 2x2 cross product; equal args must share a bnode WITHIN
+    // a solution and get fresh bnodes ACROSS solutions.
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        r"PREFIX : <http://example.org/>
+SELECT ?s1 ?s2 (BNODE(?s1) AS ?b1) (BNODE(?s2) AS ?b2)
+WHERE {
+  ?a :str ?s1 .
+  ?b :str ?s2 .
+  FILTER (?a = :s1 || ?a = :s3)
+  FILTER (?b = :s1 || ?b = :s3)
+}",
+    )
+    .await;
+
+    let rows = rows.as_array().expect("rows array");
+    assert_eq!(rows.len(), 4);
+    let mut all_bnodes: Vec<String> = Vec::new();
+    for row in rows {
+        let (s1, s2) = (row[0].as_str().unwrap(), row[1].as_str().unwrap());
+        let (b1, b2) = (
+            row[2].as_str().expect("b1 bound").to_string(),
+            row[3].as_str().expect("b2 bound").to_string(),
+        );
+        assert!(b1.starts_with("_:") && b2.starts_with("_:"));
+        if s1 == s2 {
+            assert_eq!(b1, b2, "same label within one solution shares the bnode");
+        } else {
+            assert_ne!(b1, b2, "different labels get different bnodes");
+        }
+        all_bnodes.push(b1);
+    }
+    // The per-row ?b1 bnodes must be distinct across the four solutions.
+    all_bnodes.sort();
+    all_bnodes.dedup();
+    assert_eq!(all_bnodes.len(), 4, "b1 must be fresh per solution");
+}

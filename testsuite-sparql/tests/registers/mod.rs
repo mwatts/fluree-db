@@ -153,8 +153,7 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 ];
 
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
-    // result mismatch (4)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01",
+    // result mismatch (3)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",

@@ -344,6 +344,56 @@ pub fn eval_iri<R: RowAccess>(
     }
 }
 
+/// Commutative hash of a solution's bound values, identifying the solution
+/// for `BNODE(label)`.
+///
+/// - Blank-node-valued bindings are skipped, so a BNODE-produced column bound
+///   between two `BNODE(label)` calls on the same solution does not change
+///   the solution's identity (`bnode01` binds two per-row bnodes that must
+///   agree within a row). Generated bnodes reach the row either as
+///   `Binding::Iri("_:…")` or, once the snapshot encodes them, as a
+///   `Binding::Sid` in the blank-node namespace — both forms are excluded
+///   (mirroring `eval_is_blank`).
+/// - Unbound/poisoned slots are skipped for the same reason (schema widening
+///   without new values must not change identity).
+/// - The per-pair hashes are XOR-folded, so operator schema order is
+///   irrelevant.
+///
+/// Runs only for `BNODE(label)` — never on general filter/bind paths.
+fn solution_identity_hash<R: RowAccess>(row: &R) -> u64 {
+    use fluree_db_core::SubjectId;
+    use fluree_vocab::namespaces;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut acc = 0u64;
+    row.for_each_binding(&mut |var, b| {
+        match b {
+            Binding::Unbound | Binding::Poisoned => return,
+            Binding::Iri(iri) if iri.starts_with("_:") => return,
+            Binding::Sid { sid, .. } if sid.namespace_code == namespaces::BLANK_NODE => return,
+            Binding::IriMatch {
+                iri, primary_sid, ..
+            } if primary_sid.namespace_code == namespaces::BLANK_NODE
+                || iri.as_ref().starts_with("_:") =>
+            {
+                return;
+            }
+            Binding::EncodedSid { s_id, .. }
+                if SubjectId::from_u64(*s_id).ns_code() == namespaces::BLANK_NODE =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        let mut h = DefaultHasher::new();
+        var.hash(&mut h);
+        b.hash(&mut h);
+        acc ^= h.finish();
+    });
+    acc
+}
+
 pub fn eval_bnode<R: RowAccess>(
     args: &[Expression],
     row: &R,
@@ -358,7 +408,10 @@ pub fn eval_bnode<R: RowAccess>(
             )))))
         }
         1 => {
-            // Label arg: deterministic blank node for the same label within a query
+            // Label arg (SPARQL 1.1 §17.4.2.9): the same label maps to the
+            // same blank node WITHIN one solution, but to distinct blank
+            // nodes ACROSS solutions. Fold the solution's identity (its bound
+            // values) into the label hash.
             match args[0].eval_to_comparable(row, ctx)? {
                 Some(v) => match v.as_str() {
                     Some(label) => {
@@ -366,6 +419,7 @@ pub fn eval_bnode<R: RowAccess>(
                         use std::hash::{Hash, Hasher};
                         let mut hasher = DefaultHasher::new();
                         label.hash(&mut hasher);
+                        solution_identity_hash(row).hash(&mut hasher);
                         let hash = hasher.finish();
                         Ok(Some(ComparableValue::Iri(Arc::from(format!(
                             "_:b{hash:x}"

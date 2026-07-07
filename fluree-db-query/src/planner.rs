@@ -1289,20 +1289,31 @@ pub fn reorder_patterns(
             PatternEstimate::Deferred => {
                 let mut required_vars: HashSet<VarId> =
                     deferred_required_vars(pattern).into_iter().collect();
-                // A variable-free FILTER (e.g. `FILTER(1 = 1)`,
-                // `FILTER(RAND() < 0.5)`) has an empty dependency set, so
-                // dependency-based placement would hoist it to the very front —
-                // where it gates the synthetic unit seed row instead of the
-                // group's solutions and wipes out the whole group (#1439).
-                // Anchor it after the patterns that precede it, the same order
-                // preservation MINUS/EXISTS get above. Filters that do
-                // reference variables keep the existing dependency placement
-                // byte-identically.
-                if required_vars.is_empty() && matches!(pattern, Pattern::Filter(_)) {
-                    required_vars = patterns[..i]
-                        .iter()
-                        .flat_map(super::ir::Pattern::produced_vars)
-                        .collect();
+                // Two placements must stay order-preserving (like MINUS/EXISTS
+                // above), not dependency-driven:
+                //
+                // - A variable-free FILTER (e.g. `FILTER(1 = 1)`) has an empty
+                //   dependency set, so dependency placement would hoist it to
+                //   the very front — where it gates the synthetic unit seed
+                //   row instead of the group's solutions and wipes out the
+                //   whole group (#1439).
+                // - A BIND containing `BNODE(...)` is solution-scoped: its
+                //   result identity depends on the solution it is evaluated
+                //   against, so it must not run against a partial join prefix.
+                //
+                // All other filters/binds keep the existing dependency
+                // placement byte-identically.
+                let order_sensitive = match pattern {
+                    Pattern::Filter(_) => required_vars.is_empty(),
+                    Pattern::Bind { expr, .. } => expr.contains_bnode(),
+                    _ => false,
+                };
+                if order_sensitive {
+                    required_vars.extend(
+                        patterns[..i]
+                            .iter()
+                            .flat_map(super::ir::Pattern::produced_vars),
+                    );
                 }
                 deferred.push(DeferredPattern {
                     orig_index: i,
