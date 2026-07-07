@@ -2004,118 +2004,183 @@ fn test_modify_full() {
 }
 
 // ========================================================================
-// RDF Collection (List) Syntax — Error Recovery Tests
+// RDF Collection (List) Syntax — Desugaring Tests (SPARQL 1.1 §4.2.4)
 // ========================================================================
+
+/// Extract the triple patterns of a WHERE clause that is a single BGP.
+fn where_bgp_triples(ast: &SparqlAst) -> &[crate::ast::TriplePattern] {
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    match &q.where_clause.pattern {
+        GraphPattern::Bgp { patterns, .. } => patterns,
+        other => panic!("expected a single BGP, got {other:?}"),
+    }
+}
+
+fn is_full_iri(term_iri: &crate::ast::Iri, expected: &str) -> bool {
+    matches!(&term_iri.value, IriValue::Full(s) if &**s == expected)
+}
 
 #[test]
 fn test_rdf_collection_in_subject_position() {
-    // RDF collection syntax in subject position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { (1 2 3) ?p ?o }");
-    assert!(
-        result.has_errors(),
-        "RDF collection in subject position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
-    );
+    // `(1 2 3) ?p ?o` desugars to 3 rdf:first + 3 rdf:rest triples plus the
+    // main triple, all in one BGP; the subject is the first list cell.
+    let ast = assert_parses("SELECT * WHERE { (1 2 3) ?p ?o }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 7, "3 first + 3 rest + main triple");
+    let firsts = triples
+        .iter()
+        .filter(|t| {
+            matches!(&t.predicate, PredicateTerm::Iri(i) if is_full_iri(i, fluree_vocab::rdf::FIRST))
+        })
+        .count();
+    let rests = triples
+        .iter()
+        .filter(|t| {
+            matches!(&t.predicate, PredicateTerm::Iri(i) if is_full_iri(i, fluree_vocab::rdf::REST))
+        })
+        .count();
+    assert_eq!((firsts, rests), (3, 3));
+    // The chain terminates in rdf:nil.
+    assert!(triples
+        .iter()
+        .any(|t| { matches!(&t.object, Term::Iri(i) if is_full_iri(i, fluree_vocab::rdf::NIL)) }));
+    // The main triple's subject is the head list cell (a blank node).
+    assert!(triples
+        .iter()
+        .any(|t| matches!(&t.subject, SubjectTerm::BlankNode(_))
+            && matches!(&t.predicate, PredicateTerm::Var(v) if &*v.name == "p")));
 }
 
 #[test]
 fn test_rdf_collection_in_object_position() {
-    // RDF collection syntax in object position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { ?s ?p (1 2 3) }");
-    assert!(
-        result.has_errors(),
-        "RDF collection in object position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
-    );
+    let ast = assert_parses("SELECT * WHERE { ?s ?p (1 2 3) }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 7, "main triple + 3 first + 3 rest");
+    // The main triple's object is the head list cell.
+    assert!(triples.iter().any(
+        |t| matches!(&t.predicate, PredicateTerm::Var(v) if &*v.name == "p")
+            && matches!(&t.object, Term::BlankNode(_))
+    ));
 }
 
 #[test]
 fn test_rdf_nil_in_subject_position() {
-    // Empty list () in subject position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { () ?p ?o }");
+    // `()` is the IRI rdf:nil — no list triples.
+    let ast = assert_parses("SELECT * WHERE { () ?p ?o }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 1);
     assert!(
-        result.has_errors(),
-        "Nil in subject position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
+        matches!(&triples[0].subject, SubjectTerm::Iri(i) if is_full_iri(i, fluree_vocab::rdf::NIL))
     );
 }
 
 #[test]
 fn test_rdf_nil_in_object_position() {
-    // Empty list () in object position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { ?s ?p () }");
-    assert!(
-        result.has_errors(),
-        "Nil in object position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
-    );
+    let ast = assert_parses("SELECT * WHERE { ?s ?p () }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 1);
+    assert!(matches!(&triples[0].object, Term::Iri(i) if is_full_iri(i, fluree_vocab::rdf::NIL)));
 }
 
 #[test]
-fn test_nested_rdf_collection_no_hang() {
-    // Nested collections should be skipped without hanging.
-    let result = parse("SELECT * WHERE { ((1 2) (3 4)) ?p ?o }");
-    assert!(
-        result.has_errors(),
-        "Nested collections should produce errors"
-    );
+fn test_nested_rdf_collection() {
+    // `((1 2) (3 4))` — each inner list desugars to 4 triples, the outer
+    // list to 4 more, plus the main triple.
+    let ast = assert_parses("SELECT * WHERE { ((1 2) (3 4)) ?p ?o }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 13);
 }
 
 #[test]
-fn test_rdf_collection_parser_recovers() {
-    // After skipping a collection, the parser should recover and parse
-    // subsequent triple patterns.
-    let result = parse("SELECT * WHERE { ?s ?p (1 2) . ?x ?y ?z }");
-    assert!(result.has_errors(), "Collection should produce an error");
-    // The AST should still be produced (error recovery, not fatal).
-    assert!(
-        result.ast.is_some(),
-        "Parser should recover and produce an AST despite collection error"
-    );
+fn test_rdf_collection_bare_subject() {
+    // `TriplesNode PropertyList` — the predicate-object list is optional for
+    // a collection subject (W3C syntax-lists-03: `SELECT * WHERE { ( ?z ) }`).
+    let ast = assert_parses("SELECT * WHERE { ( ?z ) }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 2, "one first + one rest");
+}
+
+#[test]
+fn test_rdf_collection_then_more_triples() {
+    // The parser continues normally after a collection.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p (1 2) . ?x ?y ?z }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 6, "main + 2 first + 2 rest + second triple");
+}
+
+#[test]
+fn test_property_path_inside_blank_node_property_list() {
+    // `[ :p|:q ?X ]` — a VerbPath inside a blank-node property list emits a
+    // Path pattern whose subject is the fresh blank node (W3C test_63).
+    let ast = assert_parses("PREFIX : <http://example.org/> SELECT ?X WHERE { [ :p|:q|:r ?X ] }");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    match &q.where_clause.pattern {
+        GraphPattern::Path {
+            subject, object, ..
+        } => {
+            assert!(matches!(subject, SubjectTerm::BlankNode(_)));
+            assert!(matches!(object, Term::Var(v) if &*v.name == "X"));
+        }
+        other => panic!("expected a Path pattern, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_values_nil_variable_list() {
+    // `VALUES () { }` and `VALUES () { () }` (W3C test_35a / test_36a).
+    let ast = assert_parses("SELECT * { } VALUES () { }");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let values = q.values.as_ref().expect("trailing VALUES clause");
+    let GraphPattern::Values { vars, data, .. } = &**values else {
+        panic!("expected Values pattern");
+    };
+    assert!(vars.is_empty());
+    assert!(data.is_empty());
+
+    let ast = assert_parses("SELECT * { } VALUES () { () }");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let values = q.values.as_ref().expect("trailing VALUES clause");
+    let GraphPattern::Values { vars, data, .. } = &**values else {
+        panic!("expected Values pattern");
+    };
+    assert!(vars.is_empty());
+    assert_eq!(data.len(), 1, "one empty row");
+    assert!(data[0].is_empty());
+}
+
+#[test]
+fn test_extension_function_nil_arg_list() {
+    // `f()` — an ArgList may be NIL (W3C syntax-function-01..03).
+    assert_parses("PREFIX q: <http://example.org/> SELECT * WHERE { FILTER (q:name()) }");
+    assert_parses("PREFIX q: <http://example.org/> SELECT * WHERE { FILTER (q:name( )) }");
+    assert_parses("PREFIX q: <http://example.org/> SELECT * WHERE { FILTER (q:name(\n)) }");
+}
+
+#[test]
+fn test_order_by_bare_builtin_call() {
+    // `OrderCondition ::= … | Constraint | Var` — a bare BuiltInCall is a
+    // valid ordering condition (W3C syntax-order-07).
+    let ast = assert_parses("SELECT * { ?s ?p ?o } ORDER BY str(?o)");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let order_by = q.modifiers.order_by.as_ref().expect("ORDER BY clause");
+    assert_eq!(order_by.conditions.len(), 1);
+    assert!(matches!(order_by.conditions[0].expr, OrderExpr::Expr(_)));
+}
+
+#[test]
+fn test_empty_iriref() {
+    // `<>` is a valid (empty, relative) IRI reference (W3C syntax-qname-05).
+    assert_parses("PREFIX : <> SELECT * WHERE { : : : . }");
 }
 
 // ── SERVICE pattern tests ──────────────────────────────────────────
