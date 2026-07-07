@@ -540,3 +540,108 @@ async fn folds_stay_correct_on_incremental_index() {
     let rows = hist["results"][0]["data"].as_array().expect("rows");
     assert_eq!(rows.len(), 2, "{hist}");
 }
+
+/// Companion to `folds_stay_correct_on_incremental_index` that exercises the
+/// COUNT(DISTINCT ?p) *stats shortcut* rather than the PSOT scan. The sibling
+/// test adds a reified edge, which trips the hidden-predicate gate and makes the
+/// operator decline to the pipeline — so it never reaches the predicate arm.
+/// Here there is no reifier, so the gate passes and the arm reads
+/// `distinct_predicates_from_graph_stats`. It drives the same delta-only
+/// corruption trigger (import base, then a new predicate + net-zero churn, then
+/// an incremental index) and pins the stats count to the general pipeline: if
+/// the incremental build ever drops base property entries again, the shortcut's
+/// count diverges from the pipeline and this fails.
+#[tokio::test]
+async fn distinct_predicate_stats_shortcut_matches_pipeline_after_incremental() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:incremental-distinct-preds";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx = json!({"ex": ""});
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "age": 30, "score": 1},
+                    {"@id": "bob",   "@type": "Person", "age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Post-index novelty: a brand-new predicate...
+    let ledger2 = fluree
+        .insert(
+            ledger1,
+            &json!({
+                "@context": ctx,
+                "@id": "w1", "@type": "Widget", "brandnew": 7
+            }),
+        )
+        .await
+        .expect("new predicate")
+        .ledger;
+    // ...and net-zero churn on ex:score (retract 1, assert 2 — count unchanged).
+    // No reified edge: the hidden-predicate gate stays clear so the fold runs.
+    let _ledger3 = fluree
+        .update(
+            ledger2,
+            &json!({
+                "@context": ctx,
+                "delete": [{"@id": "alice", "score": 1}],
+                "insert": [{"@id": "alice", "score": 2}]
+            }),
+        )
+        .await
+        .expect("churn")
+        .ledger;
+
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("incremental view");
+
+    // Stats present → the predicate arm takes the in-memory shortcut, not the
+    // PSOT-scan fallback. (Fallback would still be correct, but then this test
+    // would not be guarding the shortcut.)
+    assert!(
+        db.snapshot
+            .stats
+            .as_ref()
+            .and_then(|s| s.graphs.as_ref())
+            .is_some_and(|g| !g.is_empty()),
+        "incremental index must publish per-graph stats for the shortcut"
+    );
+
+    let folded = fluree
+        .query(
+            &db,
+            fluree_db_api::QueryInput::Sparql(
+                "SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }",
+            ),
+        )
+        .await
+        .expect("distinct preds")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let truth = fluree
+        .query(
+            &db,
+            fluree_db_api::QueryInput::Sparql("SELECT ?p WHERE { ?s ?p ?o } GROUP BY ?p"),
+        )
+        .await
+        .expect("preds truth")
+        .row_count();
+    // rdf:type, ex:age, ex:score, ex:brandnew.
+    assert_eq!(truth, 4, "expected 4 distinct predicates, got {truth}");
+    assert_eq!(
+        folded[0][0].as_i64(),
+        Some(truth as i64),
+        "COUNT(DISTINCT ?p) stats shortcut vs pipeline: {folded} vs {truth}"
+    );
+}
