@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use fluree_db_iceberg::FieldType;
@@ -41,6 +42,14 @@ use crate::Result;
 pub use fluree_db_r2rml::emit::{
     Diagnostic, StructuredR2rmlMapping, SubjectStrategy, TableOverride,
 };
+
+/// Max in-flight per-table preview fetches during a multi-table generate. Each
+/// preview is network-bound (OAuth + REST `loadTable` + manifest Avro reads) and
+/// independent, so overlapping them keeps a full-catalog generate well under
+/// solo's synchronous invoke ceiling. Bounded (rather than unbounded `join_all`)
+/// to stay polite to the catalog / OAuth endpoint; 8 clears a 16-table star
+/// schema in two waves. Matches the concurrency the merge-preview fan-out uses.
+const PREVIEW_FETCH_CONCURRENCY: usize = 8;
 
 // =============================================================================
 // Request / response
@@ -328,18 +337,37 @@ impl crate::Fluree {
             ));
         }
 
-        // Fetch each requested table's Tier-A+B preview (metadata-only). Pinning:
-        // the response snapshot is taken from the first table (see
-        // `assemble_generate_response`); each preview reads its table's current
-        // snapshot at fetch time.
-        let mut previews: Vec<(TableIdentifier, TablePreview)> =
-            Vec::with_capacity(req.tables.len());
-        for table in &req.tables {
-            let preview =
-                preview_iceberg_table(req.connection.clone(), table.clone(), StatsTier::Stats)
-                    .await?;
-            previews.push((table.clone(), preview));
-        }
+        // Fetch each requested table's Tier-A+B preview (metadata-only) with
+        // BOUNDED CONCURRENCY. Each preview is an independent chain of network
+        // round trips (OAuth token exchange + REST `loadTable` + manifest-list /
+        // manifest Avro reads for the Tier-B stats), so overlapping them collapses
+        // a multi-table generate from the SUM of every table's latency to roughly
+        // the slowest table's. `buffered` (not `buffer_unordered`) yields results
+        // in REQUEST ORDER, so the emitted mapping order and the first-table
+        // snapshot pin (see `assemble_generate_response`) stay byte-for-byte
+        // deterministic; each preview still reads its own table's current snapshot.
+        //
+        // Fetching sequentially made a full 16-table star-schema generate take
+        // ~47s live (measured; concurrency 8 → ~10s) — an order of magnitude
+        // slower than single-table (~3s) and past solo's synchronous generate
+        // invoke / gateway timeouts (30s router poll, 60s CloudFront origin read),
+        // so the router returned an opaque `UpstreamError` even though every
+        // per-table preview succeeded. Single-table generate stayed under the
+        // ceiling, which is why only the multi-table path failed.
+        let previews: Vec<(TableIdentifier, TablePreview)> =
+            futures::stream::iter(req.tables.iter().cloned())
+                .map(|table| {
+                    let connection = req.connection.clone();
+                    async move {
+                        let preview =
+                            preview_iceberg_table(connection, table.clone(), StatsTier::Stats)
+                                .await?;
+                        Ok::<_, crate::ApiError>((table, preview))
+                    }
+                })
+                .buffered(PREVIEW_FETCH_CONCURRENCY)
+                .try_collect()
+                .await?;
 
         assemble_generate_response(&previews, &req)
     }
