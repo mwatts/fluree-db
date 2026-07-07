@@ -58,16 +58,18 @@ pub(super) fn collect_template_bnode_labels(
             }
         }
         if let Some(annotation) = &tp.annotation {
-            if let Some(crate::ast::annotation::ReifierId::BlankNode(bn)) = &annotation.reifier {
-                if let BlankNodeValue::Labeled(label) = &bn.value {
-                    out.push((label.clone(), bn.span));
+            for unit in &annotation.units {
+                if let Some(crate::ast::annotation::ReifierId::BlankNode(bn)) = &unit.reifier {
+                    if let BlankNodeValue::Labeled(label) = &bn.value {
+                        out.push((label.clone(), bn.span));
+                    }
                 }
-            }
-            if let Some(block) = &annotation.block {
-                for entry in &block.entries {
-                    if let Term::BlankNode(bn) = &entry.object {
-                        if let BlankNodeValue::Labeled(label) = &bn.value {
-                            out.push((label.clone(), bn.span));
+                if let Some(block) = &unit.block {
+                    for entry in &block.entries {
+                        if let Term::BlankNode(bn) = &entry.object {
+                            if let BlankNodeValue::Labeled(label) = &bn.value {
+                                out.push((label.clone(), bn.span));
+                            }
                         }
                     }
                 }
