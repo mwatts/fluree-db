@@ -273,23 +273,31 @@ pub struct CachingCommitter<C: Committer = LocalCommitter> {
     per_ledger_limit: usize,
 }
 
-/// RAII guard holding a submission's two admission permits — the
-/// per-ledger slot (acquired first) and the global slot. Dropping it
-/// releases both and, when the ledger's semaphore goes idle, evicts
-/// that semaphore from [`CachingCommitter::per_ledger_admission`] so
-/// the map stays bounded by the count of ledgers with in-flight
-/// submissions (itself bounded by the global permit pool).
-struct AdmissionPermits {
-    _global: OwnedSemaphorePermit,
+/// RAII guard for a submission's per-ledger admission slot. Dropping
+/// it releases the permit and, when the ledger's semaphore goes idle,
+/// evicts that semaphore from
+/// [`CachingCommitter::per_ledger_admission`] so the map stays bounded
+/// by the count of ledgers with in-flight submissions (itself bounded
+/// by the global permit pool).
+///
+/// The eviction is bound to *this* guard rather than the composite
+/// [`AdmissionPermits`] because the map entry is created the moment
+/// the per-ledger permit is acquired — before the global permit. If
+/// the global acquire then fails, this guard still drops (and evicts
+/// the now-idle entry); tying eviction to the composite guard, which
+/// is only built once *both* permits succeed, would leak one entry
+/// per distinct ledger name whenever the global pool is saturated —
+/// exactly the flood the bound defends against.
+struct PerLedgerPermit {
     /// `Option` so [`Drop`] can release this permit *before* testing
     /// whether the semaphore is idle.
-    per_ledger: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
     admission_map: Arc<DashMap<String, Arc<Semaphore>>>,
     ledger_id: String,
     per_ledger_limit: usize,
 }
 
-impl Drop for AdmissionPermits {
+impl Drop for PerLedgerPermit {
     fn drop(&mut self) {
         // Release this submission's per-ledger permit, then drop the
         // semaphore entry iff no other submission for the same ledger
@@ -299,11 +307,19 @@ impl Drop for AdmissionPermits {
         // the `Arc`, which stays valid regardless — a bounded,
         // transient relaxation of the soft per-ledger cap, never a
         // leaked map entry.
-        drop(self.per_ledger.take());
+        drop(self.permit.take());
         self.admission_map.remove_if(&self.ledger_id, |_, semaphore| {
             semaphore.available_permits() == self.per_ledger_limit
         });
     }
+}
+
+/// RAII guard holding a submission's two admission permits — the
+/// per-ledger slot (acquired first) and the global slot. Dropping it
+/// releases both; the per-ledger slot's [`Drop`] handles map eviction.
+struct AdmissionPermits {
+    _global: OwnedSemaphorePermit,
+    _per_ledger: PerLedgerPermit,
 }
 
 impl CachingCommitter<LocalCommitter> {
@@ -424,19 +440,26 @@ impl<C: Committer> CachingCommitter<C> {
     /// so retries that elide the default branch resolve to the same
     /// semaphore.
     fn try_admit(&self, ledger_id: &str) -> Result<AdmissionPermits, SubmissionError> {
-        let per_ledger = self
-            .ledger_semaphore(ledger_id)
-            .try_acquire_owned()
-            .map_err(|_| SubmissionError::Overloaded)?;
+        // Acquiring the per-ledger permit creates the map entry;
+        // wrapping it in its evicting guard *before* the global
+        // acquire ensures a global-tier rejection still tears the
+        // entry back down (see [`PerLedgerPermit`]).
+        let per_ledger = PerLedgerPermit {
+            permit: Some(
+                self.ledger_semaphore(ledger_id)
+                    .try_acquire_owned()
+                    .map_err(|_| SubmissionError::Overloaded)?,
+            ),
+            admission_map: Arc::clone(&self.per_ledger_admission),
+            ledger_id: ledger_id.to_string(),
+            per_ledger_limit: self.per_ledger_limit,
+        };
         let global = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| SubmissionError::Overloaded)?;
         Ok(AdmissionPermits {
             _global: global,
-            per_ledger: Some(per_ledger),
-            admission_map: Arc::clone(&self.per_ledger_admission),
-            ledger_id: ledger_id.to_string(),
-            per_ledger_limit: self.per_ledger_limit,
+            _per_ledger: per_ledger,
         })
     }
 
@@ -1717,6 +1740,39 @@ mod tests {
         );
         drop(s2);
         assert_eq!(committer.per_ledger_admission.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn global_tier_rejections_do_not_leak_per_ledger_entries() {
+        // The dangerous path: the per-ledger permit (which creates the
+        // map entry) succeeds but the GLOBAL permit is exhausted, so
+        // `try_admit` returns `Overloaded`. A flood of distinct ledger
+        // names under global saturation hits this every request — the
+        // rejection must still evict the entry it created, or the DoS
+        // reopens.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(2) // global cap = 2
+            .with_per_ledger_pending_limit(5); // per-ledger never the limiter here
+
+        // Saturate the global pool with two submissions on one ledger.
+        let _g1 = committer.try_admit("busy:main").expect("g1");
+        let _g2 = committer.try_admit("busy:main").expect("g2");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+
+        // Each distinct name now fails at the global tier (per-ledger
+        // acquire succeeds on a fresh semaphore, global is full).
+        for i in 0..1000 {
+            assert!(matches!(
+                committer.try_admit(&format!("flood-{i}:main")),
+                Err(SubmissionError::Overloaded)
+            ));
+        }
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            1,
+            "global-tier rejections must evict the entry they created; only the busy ledger remains"
+        );
     }
 
     #[test]
