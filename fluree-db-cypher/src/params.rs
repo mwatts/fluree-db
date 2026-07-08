@@ -50,6 +50,11 @@ impl std::error::Error for ParamError {}
 /// from `params`. No-op when `params` is empty (but still errors if the query
 /// references a `$param` that isn't supplied).
 pub fn substitute_params(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    // A constant inline UNWIND source on a write statement (`UNWIND
+    // range(1, 100) AS x`, `UNWIND [1, 2, 3] AS x`) folds into a synthetic
+    // list parameter so the `$param` desugars below apply unchanged.
+    let augmented = inline_constant_unwind(ast, params)?;
+    let params = augmented.as_ref().unwrap_or(params);
     // Compile-time unroll of `UNWIND $list AS row CREATE (...)` (pure node
     // batch) and the VALUES desugaring of `UNWIND $list AS row MATCH … CREATE`
     // (batched edge insert) both run first, so the generic substitution below
@@ -57,6 +62,109 @@ pub fn substitute_params(ast: &mut CypherAst, params: &ParamMap) -> Result<(), P
     expand_unwind_create(ast, params)?;
     expand_unwind_match(ast, params)?;
     subst_statement(&mut ast.statement, params)
+}
+
+/// Upper bound on rows a constant inline `UNWIND` may expand to on the write
+/// path (each row unrolls to its own CREATE / VALUES row).
+const MAX_INLINE_UNWIND_ROWS: usize = 10_000;
+
+/// Rewrite `UNWIND <constant list> AS x` on a *write* statement into
+/// `UNWIND $#__cy_inline_unwind_N AS x` with the value synthesized into a
+/// cloned params map. Supports inline list literals of scalars and `range()`
+/// with integer literal arguments. Read-path UNWIND evaluates natively and is
+/// left alone; non-constant sources fall through to the generic rejection.
+fn inline_constant_unwind(
+    ast: &mut CypherAst,
+    params: &ParamMap,
+) -> Result<Option<ParamMap>, ParamError> {
+    let Statement::Update(u) = &mut ast.statement else {
+        return Ok(None);
+    };
+    let mut augmented: Option<ParamMap> = None;
+    for (i, c) in u.read_clauses.iter_mut().enumerate() {
+        let ReadClause::Unwind(uw) = c else { continue };
+        if matches!(uw.expr, Expr::Param(_)) {
+            continue;
+        }
+        let Some(values) = const_list_value(&uw.expr)? else {
+            continue;
+        };
+        // `#` can't appear in a user Cypher identifier, so this name can't be
+        // referenced from the query text.
+        let name = format!("#__cy_inline_unwind_{i}");
+        augmented
+            .get_or_insert_with(|| params.clone())
+            .insert(name.clone(), JsonValue::Array(values));
+        uw.expr = Expr::Param(crate::ast::ParamRef {
+            name,
+            span: uw.span,
+        });
+    }
+    Ok(augmented)
+}
+
+/// Evaluate a constant list expression to JSON values: a list literal of
+/// scalar literals, or `range(start, end[, step])` over integer literals
+/// (inclusive bounds, Cypher semantics). Returns `None` for anything else.
+fn const_list_value(e: &Expr) -> Result<Option<Vec<JsonValue>>, ParamError> {
+    match e {
+        Expr::List(items, _) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Expr::Lit(lit) = item else {
+                    return Ok(None);
+                };
+                out.push(lit_to_json(lit));
+            }
+            Ok(Some(out))
+        }
+        Expr::Call(call) if call.name.eq_ignore_ascii_case("range") => {
+            let ints: Option<Vec<i64>> = call
+                .args
+                .iter()
+                .map(|a| match a {
+                    Expr::Lit(Literal::Integer(n, _)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            let (start, end, step) = match ints.as_deref() {
+                Some([s, e]) => (*s, *e, 1i64),
+                Some([s, e, st]) => (*s, *e, *st),
+                _ => return Ok(None),
+            };
+            if step == 0 {
+                return Err(unsupported_param("range", "range() step must be non-zero"));
+            }
+            let mut out = Vec::new();
+            let mut v = start;
+            while (step > 0 && v <= end) || (step < 0 && v >= end) {
+                out.push(JsonValue::from(v));
+                if out.len() > MAX_INLINE_UNWIND_ROWS {
+                    return Err(unsupported_param(
+                        "range",
+                        "inline UNWIND range() on a write is capped at 10000 rows — \
+                         batch via a `$param` list instead",
+                    ));
+                }
+                let Some(next) = v.checked_add(step) else {
+                    break;
+                };
+                v = next;
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lit_to_json(lit: &Literal) -> JsonValue {
+    match lit {
+        Literal::Integer(n, _) => JsonValue::from(*n),
+        Literal::Float(f, _) => JsonValue::from(*f),
+        Literal::String(s, _) => JsonValue::from(s.as_str()),
+        Literal::Bool(b, _) => JsonValue::from(*b),
+        Literal::Null(_) => JsonValue::Null,
+    }
 }
 
 fn unsupported_param(name: &str, reason: &str) -> ParamError {

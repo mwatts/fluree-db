@@ -347,9 +347,19 @@ ORDER BY / SKIP / LIMIT
   resolution keys off the raw MATCH variables and can't honor a rename/horizon —
   `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
   `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
+- **`… RETURN <created>`** — a trailing `RETURN` of *created* entities:
+  `CREATE (n:Person {name: "Alice"}) RETURN n`,
+  `MATCH (a), (b) CREATE (a)-[e:KNOWS]->(b) RETURN e` (one row per matched
+  pair). Answered as the read path's Cypher-JSON tabular envelope; each entity
+  serializes as its identifier string. v1 surface: bare variables (optionally
+  aliased) naming a fresh `CREATE` node or relationship variable. Deferred:
+  expressions, `RETURN` modifiers, `MATCH`-bound variables, and `RETURN` with
+  `MERGE` (the matched branch's node isn't a created entity).
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;
+// or, when the statement ends in RETURN:
+let (committed, rows) = fluree.transact_cypher_returning(ledger, cypher, None).await?;
 ```
 
 Writes default to LPG mode, where every relationship reifies (carries an
@@ -381,18 +391,31 @@ on its properties — which in turn decides the cardinality and whether plain
 | Pattern | Lowers to | Cardinality | Sees plain RDF? |
 |---|---|---|---|
 | `(a)-[:T]->(b)` | Plain triple `(a, <T>, b)` | Set | Yes |
-| `(a)-[r:T]->(b)` | `EdgeAnnotation { edge, annotation: ?r, body: [] }` | Bag | No — only reifier-bundled edges |
+| `(a)-[r:T]->(b)`, `r` **value-only** | Plain triple + `OPTIONAL { EdgeAnnotation }` + `r = coalesce(annotation, MakeRel(a, T, b))` | Bag over annotations; one row for an unreified edge | Yes |
+| `(a)-[r:T]->(b)`, `r` **property-read** | `EdgeAnnotation { edge, annotation: ?r, body: [] }` | Bag | No — only reifier-bundled edges |
 | `(a)-[:T {p:v}]->(b)` | `EdgeAnnotation { edge, annotation: ?#__anon, body: [(?#__anon, p, v)] }` | Bag | No |
 
-**Consequence.** If your data was loaded via JSON-LD without
-`@annotation` (or any other path that doesn't produce reifier
-bundles), `MATCH (a)-[r:T]->(b)` returns zero rows even though the
-base triples exist. Drop the `r` to get plain-RDF-visible set
-semantics:
+A bound relationship variable is **value-only** when the statement never reads
+its properties — no `r.prop`, `properties(r)`, `keys(r)`, or map projection
+`r{…}` anywhere (a statement-wide scan decides this at lowering). Value-only
+uses (`RETURN r`, `type(r)`, `startNode(r)` / `endNode(r)`, comparisons,
+`collect(r)`) are satisfied by a relationship value synthesized from the base
+triple, so plain (un-annotated) RDF edges match too; edges that *do* carry
+reifier bundles still bind one row per annotation (parallel relationships stay
+distinct).
+
+**Consequence.** Only a *property-reading* relationship variable requires
+reifier bundles. If your data was loaded via JSON-LD without `@annotation`
+(or any other path that doesn't produce reifier bundles),
+`MATCH (a)-[r:T]->(b) RETURN r.since` returns zero rows even though the base
+triples exist — there is no annotation node to read `since` from:
 
 ```cypher
--- bag semantics, requires reifier bundles
-MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r, o
+-- value-only r: sees all base edges, plus per-annotation rows where reified
+MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, type(r), o
+
+-- property read on r: requires reifier bundles
+MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r.since, o
 
 -- set semantics, sees all base edges
 MATCH (a:Person)-[:WORKS_FOR]->(o:Organization) RETURN a, o

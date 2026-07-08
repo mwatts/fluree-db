@@ -152,12 +152,25 @@ pub(crate) fn lower_cypher_ast_to_ir(
     let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
 
     let mut vars = VarRegistry::new();
-    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars).with_vocab(vocab);
+    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
+        .with_vocab(vocab)
+        .with_allow_full_scan(cypher_full_scan_enabled());
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
     let parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
     Ok((vars, parsed))
+}
+
+/// Whether bare `MATCH (n)` whole-graph scans are opted in for Cypher
+/// (`FLUREE_CYPHER_ALLOW_FULL_SCAN=1|true`). Read once per process.
+fn cypher_full_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FLUREE_CYPHER_ALLOW_FULL_SCAN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Extract `@vocab` and bare-identifier → IRI overrides from a

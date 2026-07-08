@@ -154,6 +154,7 @@ A few operational knobs are environment-only (no CLI flag):
 |----------|---------|---------|
 | `FLUREE_REASONING_MAX_FACTS` | 1,000,000 | Server-wide default OWL2-RL materialization budget (max derived facts). Overridden per ledger by `f:reasoningMaxFacts` and per query by `"reasoningBudget"`; see [Reasoning](../query/reasoning.md#materialization-budget). |
 | `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
+| `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
 
 ### Precedence
 

@@ -53,7 +53,7 @@ pub const DEFAULT_MAX_VISITED: usize = 10_000;
 /// edge-annotation sidecar, hidden from variable-predicate reads). Data
 /// properties are already excluded by the `Ref`-object filter in the scan.
 #[inline]
-fn is_reserved_edge_predicate(p: &Sid) -> bool {
+pub(crate) fn is_reserved_edge_predicate(p: &Sid) -> bool {
     fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
 }
 

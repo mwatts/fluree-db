@@ -362,3 +362,68 @@ async fn connection_scoped_cypher_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// A trailing RETURN on a write answers with the created entities as a
+/// Cypher-JSON envelope (benchgraph `arango__single_vertex_write` /
+/// `arango__single_edge_write` round trips).
+#[tokio::test]
+async fn cypher_http_write_with_return() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherwriteret").await;
+
+    // Node create with RETURN.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "CREATE (n:UserTemp {id: 4112}) RETURN n",
+    )
+    .await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("cypher-json envelope");
+    assert_eq!(json["results"][0]["columns"], json!(["n"]), "{body}");
+    let data = json["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{body}");
+    assert!(
+        data[0]["row"][0]
+            .as_str()
+            .is_some_and(|s| s.starts_with("_:fdb-")),
+        "{body}"
+    );
+
+    // Edge create with RETURN (anchored MATCH).
+    let (status, _b) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "CREATE (n:UserTemp {id: 5721})",
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "MATCH (a:UserTemp {id: 4112}), (b:UserTemp {id: 5721})
+           CREATE (a)-[e:Temp]->(b) RETURN e",
+    )
+    .await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("cypher-json envelope");
+    assert_eq!(json["results"][0]["columns"], json!(["e"]), "{body}");
+    let data = json["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{body}");
+    assert!(
+        data[0]["row"][0]
+            .as_str()
+            .is_some_and(|s| s.contains("cy_rel_e")),
+        "{body}"
+    );
+
+    // A no-RETURN write still answers with the commit receipt.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "CREATE (n:UserTemp {id: 9})",
+    )
+    .await;
+    assert!(status.is_success());
+    assert!(body.contains("commit"), "receipt shape unchanged: {body}");
+}

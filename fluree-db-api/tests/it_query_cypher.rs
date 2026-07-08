@@ -14,7 +14,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, graphdb_from_ledger};
+use support::{genesis_ledger, graphdb_from_ledger, rebuild_and_publish_index};
 
 fn ctx() -> JsonValue {
     json!({
@@ -50,6 +50,190 @@ async fn cypher_match_labeled_node_finds_jsonld_typed_subject() {
         result.row_count(),
         1,
         "expected exactly one row for the lone Person"
+    );
+}
+
+#[tokio::test]
+async fn cypher_untyped_single_hop_excludes_labels_and_data_properties() {
+    // `-->` must follow only relationships: not `rdf:type` (the class node is
+    // not a neighbor) and not data properties (literals are not nodes).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-hop-edge-set");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:knows": {"@id": "ex:bob"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let jsonld = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {name: "Alice"})-->(m) RETURN m"#)
+        .await
+        .expect("untyped hop query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    let rows = jsonld.as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the ex:knows edge is a relationship: {jsonld}"
+    );
+    assert_eq!(
+        rows[0][0].as_str(),
+        Some("http://example.org/bob"),
+        "{jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_untyped_undirected_hop_excludes_labels_and_data_properties() {
+    // Same edge-set rule for the undirected `--` (forward ∪ reverse union).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-undirected-edge-set");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:knows": {"@id": "ex:bob"}
+                    },
+                    {
+                        "@id": "ex:carol",
+                        "@type": "ex:Person",
+                        "ex:name": "Carol",
+                        "ex:knows": {"@id": "ex:alice"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name: "Alice"})--(m) RETURN m ORDER BY m"#,
+        )
+        .await
+        .expect("untyped undirected hop query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    let rows = jsonld.as_array().expect("rows");
+    let neighbors: Vec<&str> = rows.iter().filter_map(|r| r[0].as_str()).collect();
+    assert_eq!(
+        neighbors,
+        ["http://example.org/bob", "http://example.org/carol"],
+        "both edge orientations, no class node / literals: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_value_only_rel_var_matches_unreified_edges() {
+    // A bound relationship variable used only for its value surface
+    // (`RETURN e`, `type(e)`) must match plain-RDF edges that carry no
+    // `f:reifies*` bundle (benchgraph `match__pattern_*` on imported data).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:value-only-rel-var");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:knows": {"@id": "ex:bob"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // Typed bound rel var.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[e:knows]->(b) RETURN type(e) AS t, b"#,
+        )
+        .await
+        .expect("typed rel var over plain triple")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "plain edge must match: {cj}");
+    assert_eq!(data[0]["row"][0], json!("knows"), "type(e): {cj}");
+
+    // Untyped bound rel var: same edge-set rule as `-->` (no rdf:type /
+    // data properties), and the synthesized value still answers type(e).
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[e]->(b) RETURN type(e) AS t"#,
+        )
+        .await
+        .expect("untyped rel var over plain triple")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "only ex:knows is a relationship: {cj}");
+    assert_eq!(data[0]["row"][0], json!("knows"), "type(e): {cj}");
+}
+
+#[tokio::test]
+async fn cypher_value_only_rel_var_keeps_parallel_reified_edges_distinct() {
+    // Reified parallel edges (Cypher-created) share one base triple; a
+    // value-only rel var must still yield one row per relationship.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:value-only-parallel");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2010}]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("parallel edges")
+            .row_count(),
+        2,
+        "one row per reified relationship"
     );
 }
 
@@ -666,6 +850,233 @@ async fn transact_cypher_unwind_map_param_batches_node_inserts() {
             .row_count(),
         1,
         "Bob's name and age stayed on the same node"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_inline_range_batches_node_inserts() {
+    // Inline constant UNWIND source on a write (`UNWIND range(1, 100) AS x`,
+    // benchgraph `arango__unwind_range_vertex_write`) — desugars through the
+    // same path as `UNWIND $list`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-range");
+
+    let result = fluree
+        .transact_cypher(
+            ledger0,
+            r#"UNWIND range(1, 100) AS x CREATE (n:L1:L2 {p1: true, p5: x})"#,
+        )
+        .await
+        .expect("inline range batched insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:L1) RETURN n")
+            .await
+            .expect("count")
+            .row_count(),
+        100,
+        "one node per range element"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:L2) WHERE n.p5 = 42 RETURN n")
+            .await
+            .expect("p5")
+            .row_count(),
+        1,
+        "each node carries its own range value"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_inline_list_batches_node_inserts() {
+    // Inline list-literal UNWIND on a write.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-inline-list");
+
+    let result = fluree
+        .transact_cypher(
+            ledger0,
+            r#"UNWIND ["Alice", "Bob", "Carol"] AS name CREATE (n:Person {name: name})"#,
+        )
+        .await
+        .expect("inline list batched insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("count")
+            .row_count(),
+        3
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {name: "Bob"}) RETURN n"#)
+            .await
+            .expect("bob")
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_create_return_node() {
+    // `CREATE (n:UserTemp {id: 1}) RETURN n` (benchgraph
+    // `arango__single_vertex_write`) — one row carrying the created node id.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-return-node");
+    let (result, rows) = fluree
+        .transact_cypher_returning(ledger0, r#"CREATE (n:UserTemp {id: 1}) RETURN n"#, None)
+        .await
+        .expect("create with RETURN");
+    let rows = rows.expect("RETURN produces rows");
+    assert_eq!(rows["results"][0]["columns"], json!(["n"]), "{rows}");
+    let data = rows["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{rows}");
+    let id = data[0]["row"][0].as_str().expect("node id string");
+    assert!(id.starts_with("_:fdb-"), "skolemized node id: {rows}");
+
+    // The returned identity is the committed node: it must have the label.
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:UserTemp) RETURN n")
+            .await
+            .expect("verify")
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_match_create_return_edge() {
+    // `MATCH (a),(b) CREATE (a)-[e:Temp]->(b) RETURN e` (benchgraph
+    // `arango__single_edge_write`) — one row per WHERE solution.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:create-return-edge");
+    for stmt in [
+        r#"CREATE (a:User {id: 1})"#,
+        r#"CREATE (b:User {id: 2})"#,
+        r#"CREATE (c:User {id: 3})"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let (result, rows) = fluree
+        .transact_cypher_returning(
+            l,
+            r#"MATCH (a:User {id: 1}), (b:User {id: 2}) CREATE (a)-[e:Temp]->(b) RETURN e"#,
+            None,
+        )
+        .await
+        .expect("edge create with RETURN");
+    let rows = rows.expect("RETURN produces rows");
+    assert_eq!(rows["results"][0]["columns"], json!(["e"]), "{rows}");
+    let data = rows["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "one solution → one created edge: {rows}");
+    assert!(
+        data[0]["row"][0]
+            .as_str()
+            .expect("edge id")
+            .contains("cy_rel_e"),
+        "{rows}"
+    );
+
+    // Multi-solution: a broader MATCH creates one edge per pair and RETURN
+    // reports each.
+    let (_, rows) = fluree
+        .transact_cypher_returning(
+            result.ledger,
+            r#"MATCH (a:User {id: 3}), (b:User) CREATE (a)-[e:Linked]->(b) RETURN e AS edge"#,
+            None,
+        )
+        .await
+        .expect("batch edge create with RETURN");
+    let rows = rows.expect("rows");
+    assert_eq!(rows["results"][0]["columns"], json!(["edge"]), "{rows}");
+    assert_eq!(
+        rows["results"][0]["data"].as_array().expect("data").len(),
+        3,
+        "three matched targets → three created edges: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_return_of_matched_var_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:write-return-matched");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (a:User {id: 1})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let err = fluree
+        .transact_cypher_returning(l, r#"MATCH (a:User {id: 1}) SET a.x = 1 RETURN a"#, None)
+        .await
+        .expect_err("RETURN of a MATCH-bound var must be rejected");
+    assert!(format!("{err}").contains("created"), "{err}");
+}
+
+#[tokio::test]
+async fn transact_cypher_create_bare_anonymous_node() {
+    // `CREATE ()` (benchgraph `create__vertex`) — an anonymous propertyless
+    // node commits (via the hidden db:Node marker) and stays invisible to
+    // labeled matches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-bare");
+    let result = fluree
+        .transact_cypher(ledger0, "CREATE ()")
+        .await
+        .expect("bare CREATE ()");
+    assert!(result.receipt.t >= 1, "committed");
+
+    // `CREATE ()-[:TempEdge]->()` (benchgraph `create__pattern`).
+    let result = fluree
+        .transact_cypher(result.ledger, "CREATE ()-[:TempEdge]->()")
+        .await
+        .expect("bare CREATE pattern");
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[:TempEdge]->(b) RETURN a, b")
+            .await
+            .expect("edge query")
+            .row_count(),
+        1,
+        "anonymous endpoints exist via the edge"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_create_var_only_node_has_empty_labels() {
+    // `CREATE (n)` — fresh node, no labels/props; labels(n) must hide the
+    // db:Node existence marker.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:create-var-only");
+    let l = fluree
+        .transact_cypher(ledger0, "CREATE (n)")
+        .await
+        .expect("CREATE (n)")
+        .ledger;
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (m:Person {name: "Alice"})"#)
+        .await
+        .expect("labeled sibling")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // The labeled match must not see the bare node.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("person")
+            .row_count(),
+        1
     );
 }
 
@@ -1533,7 +1944,10 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
     let ledger_id = "it/cypher:detach-delete-indexed";
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        std::sync::Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4308,6 +4722,116 @@ async fn cypher_var_length_rel_and_path_binding() {
 }
 
 #[tokio::test]
+async fn cypher_shortest_path_untyped_wildcard() {
+    // Untyped shortestPath (benchgraph `arango__shortest_path`): follows any
+    // relationship type, skipping rdf:type and data properties. The chain
+    // mixes KNOWS and LIKES edges, so a single-type search can't reach Dave.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:sp-untyped");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"CREATE (c:Person {name: "Carol"})"#,
+        r#"CREATE (d:Person {name: "Dave"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        r#"MATCH (b:Person {name: "Bob"}), (c:Person {name: "Carol"}) CREATE (b)-[:LIKES]->(c)"#,
+        r#"MATCH (c:Person {name: "Carol"}), (d:Person {name: "Dave"}) CREATE (c)-[:KNOWS]->(d)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+               MATCH p = shortestPath((a)-[*..15]->(d))
+               RETURN length(p) AS len, [r IN relationships(p) | type(r)] AS types"#,
+        )
+        .await
+        .expect("untyped shortestPath")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!(3), "Alice→Dave is 3 mixed hops: {cj}");
+    assert_eq!(
+        row[1],
+        json!(["KNOWS", "LIKES", "KNOWS"]),
+        "per-hop types resolved post-hoc: {cj}"
+    );
+
+    // Typed search over the same pair finds nothing (LIKES breaks the chain).
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+                   MATCH p = shortestPath((a)-[:KNOWS*..15]->(d))
+                   RETURN length(p)"#,
+            )
+            .await
+            .expect("typed control")
+            .row_count(),
+        0,
+        "typed-only search must not cross the LIKES hop"
+    );
+
+    // allShortestPaths untyped (benchgraph `arango__allshortest_paths`).
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+                   MATCH p = allShortestPaths((a)-[*..15]->(d))
+                   RETURN length(p)"#,
+            )
+            .await
+            .expect("untyped allShortestPaths")
+            .row_count(),
+        1,
+        "exactly one minimal path"
+    );
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_untyped_skips_type_and_data_edges() {
+    // The wildcard edge-set must not treat rdf:type or a data property as a
+    // hop: two nodes sharing only a class have no path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-untyped-edge-set");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+                   MATCH p = shortestPath((a)-[*..15]->(b))
+                   RETURN length(p)"#,
+            )
+            .await
+            .expect("no path via class node")
+            .row_count(),
+        0,
+        "rdf:type must not connect nodes through their shared class"
+    );
+}
+
+#[tokio::test]
 async fn cypher_shortest_path_length_undirected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:sp-undirected").await;
@@ -6172,4 +6696,491 @@ async fn cypher_power_binds_tighter_than_unary_minus() {
             "`{expr}` evaluated to {got}, expected {want}"
         );
     }
+}
+
+#[tokio::test]
+async fn cypher_explain_reports_sid_encoded_plan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:explain");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:id": 7,
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let explain = fluree_db_api::explain::explain_cypher(
+        &db.snapshot,
+        "MATCH (n:Person {id: 7}) RETURN n",
+        db.default_context.as_ref(),
+    )
+    .await
+    .expect("explain");
+
+    // The lowering must encode registered-namespace IRIs to SIDs (parity
+    // with SPARQL) — Sid-gated planner analyses and batched join lanes
+    // depend on it. The physical PropertyJoin renders Sid predicates in
+    // `ns:name` form; an unencoded pattern would render the full IRI.
+    let physical = serde_json::to_string(&explain["plan"]["physical"]).expect("physical");
+    assert!(physical.contains("PropertyJoinOperator"), "{explain}");
+    assert!(
+        physical.contains("3:type"),
+        "rdf:type not SID-encoded: {explain}"
+    );
+    assert!(
+        !physical.contains("http://example.org/id"),
+        "id not SID-encoded: {explain}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_with_where_property_equality_folds_to_seek() {
+    // `WITH n WHERE n.id = k` lowers the accessor to OPTIONAL + FILTER; the
+    // optional-filter fold must turn it into a required triple (seek) without
+    // changing rows — including multi-valued properties and absent properties.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:with-where-fold");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:id": 7, "ex:age": [25, 30]},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:id": 8},
+                    {"@id": "ex:c", "@type": "ex:Person"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let rows = |r: fluree_db_api::QueryResult| r.row_count();
+
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WITH n WHERE n.id = 7 RETURN n")
+        .await
+        .expect("with-where eq");
+    assert_eq!(rows(r), 1);
+
+    // Absent property: no rows (c has no id) — the fold preserves this.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WITH n WHERE n.id = 99 RETURN n")
+        .await
+        .expect("no match");
+    assert_eq!(rows(r), 0);
+
+    // Multi-valued property through a range comparison: one row per passing
+    // value.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age > 26 RETURN n, n.age")
+        .await
+        .expect("range");
+    assert_eq!(rows(r), 1);
+
+    // IS NULL keeps its OPTIONAL (bound-check is not error-rejecting):
+    // only c lacks id.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.id IS NULL RETURN n")
+        .await
+        .expect("is null");
+    assert_eq!(rows(r), 1);
+}
+
+#[tokio::test]
+async fn cypher_anonymous_hop_chain_fuses_to_reachability_under_distinct() {
+    // Diamond + tail: a→b1→c, a→b2→c, c→d. Two 2-hop walks reach c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:chain-fusion");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:User", "ex:id": 1,
+                     "ex:knows": [{"@id": "ex:b1"}, {"@id": "ex:b2"}]},
+                    {"@id": "ex:b1", "@type": "ex:User", "ex:knows": {"@id": "ex:c"}},
+                    {"@id": "ex:b2", "@type": "ex:User", "ex:knows": {"@id": "ex:c"}},
+                    {"@id": "ex:c", "@type": "ex:User", "ex:id": 3,
+                     "ex:knows": {"@id": "ex:d"}},
+                    {"@id": "ex:d", "@type": "ex:User", "ex:id": 4},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // DISTINCT endpoints via 2 anonymous hops: just c (one row despite two
+    // walks) — the fused frontier-BFS form must agree with join semantics
+    // after dedup.
+    let r = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->()-->(n:User) RETURN DISTINCT n.id",
+        )
+        .await
+        .expect("fused distinct");
+    assert_eq!(r.row_count(), 1);
+
+    // WITHOUT DISTINCT the chain must keep one row per walk (2 rows) — the
+    // fusion is gated off.
+    let r = fluree
+        .query_cypher(&db, "MATCH (s:User {id: 1})-->()-->(n:User) RETURN n.id")
+        .await
+        .expect("walk multiplicity");
+    assert_eq!(r.row_count(), 2, "non-DISTINCT keeps per-walk rows");
+
+    // Aggregates observe walk multiplicity: count(*) = 2 even with DISTINCT
+    // elsewhere — gated off.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->()-->(n:User) RETURN count(*) AS c",
+        )
+        .await
+        .expect("count walks")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(2), "{cj}");
+
+    // A named intermediate node is observable — not fused; DISTINCT (m, n)
+    // pairs: (b1,c) and (b2,c).
+    let r = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->(m)-->(n:User) RETURN DISTINCT m, n",
+        )
+        .await
+        .expect("named middle");
+    assert_eq!(r.row_count(), 2);
+
+    // 3-hop chain: only d.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            "MATCH (s:User {id: 1})-->()-->()-->(n:User) RETURN DISTINCT n.id",
+        )
+        .await
+        .expect("3-hop")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(4), "{cj}");
+}
+
+/// Class-anchored aggregate folds (`MATCH (n:C) …`): the histogram
+/// (`RETURN n.age, COUNT(*)`) folds to a POST group count + null-group row,
+/// and the scalar family reuses the whole-graph folds under the containment
+/// proof. Indexed (fold) and novelty (pipeline) must agree.
+#[tokio::test]
+async fn cypher_class_anchored_histogram_and_scalars_match_pipeline() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:class-agg";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    // alice multi-valued: contributes to two histogram groups.
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": [25, 30]},
+                    {"@id": "ex:bob",   "@type": "ex:Person"},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 30},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let histogram = |cj: &JsonValue| -> Vec<(JsonValue, JsonValue)> {
+        let mut rows: Vec<(JsonValue, JsonValue)> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| (r["row"][0].clone(), r["row"][1].clone()))
+            .collect();
+        rows.sort_by_key(|(k, _)| k.to_string());
+        rows
+    };
+
+    for db in [&novelty_db, &indexed_db] {
+        let cj = fluree
+            .query_cypher(db, "MATCH (n:Person) RETURN n.age, COUNT(*)")
+            .await
+            .expect("histogram")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        // Groups: 25→1 (alice), 30→2 (alice+carol), 40→1 (dave),
+        // null→1 (bob).
+        assert_eq!(
+            histogram(&cj),
+            vec![
+                (json!(25), json!(1)),
+                (json!(30), json!(2)),
+                (json!(40), json!(1)),
+                (json!(null), json!(1)),
+            ],
+            "{cj}"
+        );
+
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) RETURN COUNT(DISTINCT n.age) AS d, count(n) AS c",
+            )
+            .await
+            .expect("scalars")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let row = &cj["results"][0]["data"][0]["row"];
+        assert_eq!(row[0], json!(3), "distinct ages: {cj}");
+        // count(n) over the left join: alice 2 rows + bob 1 + carol 1 + dave 1.
+        assert_eq!(row[1], json!(5), "count rows: {cj}");
+    }
+}
+
+/// The containment proof must fail when a non-class subject bears the
+/// property — the fold defers and the pipeline restricts to the class.
+#[tokio::test]
+async fn cypher_class_anchored_fold_declines_without_containment() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:class-agg-decline";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 30},
+                    // A Robot with an age: age is NOT contained in Person.
+                    {"@id": "ex:r2d2", "@type": "ex:Robot", "ex:age": 200},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    for db in [&novelty_db, &indexed_db] {
+        let cj = fluree
+            .query_cypher(db, "MATCH (n:Person) RETURN n.age, COUNT(*)")
+            .await
+            .expect("histogram")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows = cj["results"][0]["data"].as_array().expect("rows");
+        // Only alice's age — the Robot's 200 must not leak in.
+        assert_eq!(rows.len(), 1, "{cj}");
+        assert_eq!(rows[0]["row"], json!([30, 1]), "{cj}");
+
+        let cj = fluree
+            .query_cypher(db, "MATCH (n:Person) RETURN max(n.age) AS m")
+            .await
+            .expect("max")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(30), "{cj}");
+    }
+}
+
+/// Filtered histogram: the WHERE predicate references only the group key, so
+/// the fold evaluates it once per group (null group included) — identical to
+/// the pipeline's per-row filtering.
+#[tokio::test]
+async fn cypher_class_anchored_filtered_histogram_matches_pipeline() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:class-agg-filtered";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:age": [15, 30]},
+                    {"@id": "ex:bob",   "@type": "ex:Person"},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 30},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:age": 40},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let rows_of = |cj: &JsonValue| -> Vec<(JsonValue, JsonValue)> {
+        let mut rows: Vec<(JsonValue, JsonValue)> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| (r["row"][0].clone(), r["row"][1].clone()))
+            .collect();
+        rows.sort_by_key(|(k, _)| k.to_string());
+        rows
+    };
+
+    for db in [&novelty_db, &indexed_db] {
+        // Range filter: groups >= 18 only, no null group (unbound rejected).
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) WHERE n.age >= 18 RETURN n.age, COUNT(*)",
+            )
+            .await
+            .expect("filtered histogram")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(
+            rows_of(&cj),
+            vec![(json!(30), json!(2)), (json!(40), json!(1))],
+            "{cj}"
+        );
+
+        // Filter that rejects every group: empty result, not an error.
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) WHERE n.age > 100 RETURN n.age, COUNT(*)",
+            )
+            .await
+            .expect("all rejected")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(
+            cj["results"][0]["data"].as_array().expect("rows").len(),
+            0,
+            "{cj}"
+        );
+
+        // IS NULL keeps ONLY the null group (bound-check passes Unbound).
+        let cj = fluree
+            .query_cypher(
+                db,
+                "MATCH (n:Person) WHERE n.age IS NULL RETURN n.age, COUNT(*)",
+            )
+            .await
+            .expect("null group only")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(rows_of(&cj), vec![(json!(null), json!(1))], "{cj}");
+    }
+}
+
+/// A specific-value lookup (`WHERE n.id = k`, equality object bounds) must
+/// stay a point seek under live novelty on the same predicate — seeking the
+/// index AND the overlay — and must decline the narrowed seek when the
+/// predicate holds mixed numeric types (cross-type equality would miss rows).
+#[tokio::test]
+async fn cypher_equality_seek_correct_under_predicate_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:eq-seek-novelty";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx_json = json!({"ex": "http://example.org/"});
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx_json,
+                "@graph": (1..=50).map(|i| json!({
+                    "@id": format!("ex:u{i}"), "@type": "ex:User", "ex:id": i
+                })).collect::<Vec<_>>()
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Live novelty on the SAME predicate: a new subject with a new id value
+    // and another with a duplicate of an existing value.
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload indexed ledger");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx_json,
+                "@graph": [
+                    {"@id": "ex:t1", "@type": "ex:UserTemp", "ex:id": 999},
+                    {"@id": "ex:t2", "@type": "ex:UserTemp", "ex:id": 7},
+                ]
+            }),
+        )
+        .await
+        .expect("novelty writes")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+
+    // Indexed value still found.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:User) WITH n WHERE n.id = 7 RETURN n")
+        .await
+        .expect("indexed value");
+    assert_eq!(r.row_count(), 1);
+
+    // Novelty-only value found through the narrowed seek (index ∪ overlay).
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:UserTemp) WITH n WHERE n.id = 999 RETURN n")
+        .await
+        .expect("novelty value");
+    assert_eq!(r.row_count(), 1);
+
+    // The novelty duplicate of an indexed value is also visible.
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:UserTemp) WHERE n.id = 7 RETURN n")
+        .await
+        .expect("novelty duplicate");
+    assert_eq!(r.row_count(), 1);
+
+    // Mixed numeric types on the predicate: cross-type equality must still
+    // match (the narrowed seek declines; the decoded filter coerces).
+    let ledger = fluree.ledger(ledger_id).await.expect("reload for mixed dt");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx_json,
+                "@id": "ex:t3", "@type": "ex:UserTemp",
+                "ex:id": {"@value": "7", "@type": "http://www.w3.org/2001/XMLSchema#double"}
+            }),
+        )
+        .await
+        .expect("double id")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let r = fluree
+        .query_cypher(&db, "MATCH (n:UserTemp) WHERE n.id = 7 RETURN n")
+        .await
+        .expect("cross-type equality");
+    assert_eq!(r.row_count(), 2, "double 7.0 must match integer equality");
 }

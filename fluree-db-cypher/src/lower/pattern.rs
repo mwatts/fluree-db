@@ -47,8 +47,13 @@ fn lower_part<E: IriEncoder>(
 
     // Head node anchored. If tail is empty (single node) and the node
     // has no labels, no inline props, no participating relationships,
-    // reject.
+    // reject — unless whole-graph scans are opted in, in which case the
+    // node binds every distinct subject in the graph.
     if part.tail.is_empty() {
+        if part.head.labels.is_empty() && part.head.props.is_none() && ctx.allow_full_scan {
+            out.push(all_subjects_scan(ctx, &part.head));
+            return Ok(());
+        }
         require_node_anchored(&part.head)?;
         lower_node(ctx, &part.head, out)?;
         return Ok(());
@@ -70,7 +75,36 @@ fn lower_part<E: IriEncoder>(
     }
 
     let mut prev = part.head.clone();
-    for (rel, next) in &part.tail {
+    let mut i = 0;
+    while i < part.tail.len() {
+        // Reachability fusion: a run of ≥2 anonymous untyped outgoing hops
+        // (`-->()-->()-->x`) collapses to one exact-depth wildcard path —
+        // frontier BFS with per-level dedup instead of per-walk join rows.
+        // Gated statement-wide (`fuse_reachability_chains`: DISTINCT output,
+        // no aggregates, interior nodes unreferenced by construction).
+        if ctx.fuse_reachability_chains && part.path_var.is_none() {
+            let run = fusible_run_len(&part.tail[i..]);
+            if run >= 2 {
+                let end_node = &part.tail[i + run - 1].1;
+                lower_node(ctx, end_node, out)?;
+                let s_ref = lookup_node_ref(ctx, &prev);
+                let o_ref = lookup_node_ref(ctx, end_node);
+                out.push(Pattern::PropertyPath(
+                    fluree_db_query::ir::PropertyPathPattern::new_wildcard(
+                        s_ref,
+                        fluree_db_query::ir::PathModifier::OneOrMore,
+                        Some(run as u32),
+                        Some(run as u32),
+                        o_ref,
+                    ),
+                ));
+                prev = end_node.clone();
+                i += run;
+                continue;
+            }
+        }
+
+        let (rel, next) = &part.tail[i];
         lower_node(ctx, next, out)?;
         let pv = if single_var_length {
             part.path_var.as_ref()
@@ -79,8 +113,36 @@ fn lower_part<E: IriEncoder>(
         };
         lower_rel(ctx, &prev, rel, next, out, pv)?;
         prev = next.clone();
+        i += 1;
     }
     Ok(())
+}
+
+/// Length of the maximal fusible hop run at the start of `tail`: consecutive
+/// plain anonymous untyped outgoing hops (no rel var/props/types/length)
+/// whose *interior* nodes are fully anonymous (`()` — no var, label, or
+/// props). The run's final node may be anything (it is lowered normally as
+/// the path endpoint).
+fn fusible_run_len(tail: &[(RelPattern, NodePattern)]) -> usize {
+    let mut run = 0;
+    for (idx, (rel, node)) in tail.iter().enumerate() {
+        let rel_fusible = rel.length.is_none()
+            && rel.types.is_empty()
+            && rel.var.is_none()
+            && rel.props.is_none()
+            && rel.direction == Direction::Outgoing;
+        if !rel_fusible {
+            break;
+        }
+        run = idx + 1;
+        // The node just reached is interior only if another hop follows; an
+        // interior node must be fully anonymous to stay unobservable.
+        let is_anonymous = node.var.is_none() && node.labels.is_empty() && node.props.is_none();
+        if !is_anonymous {
+            break;
+        }
+    }
+    run
 }
 
 /// Lower `p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` into a
@@ -117,10 +179,10 @@ fn lower_shortest_path<E: IriEncoder>(
             "property filters on a shortestPath relationship are deferred",
         ));
     }
-    if rel.types.len() != 1 {
+    if rel.types.len() > 1 {
         return Err(LowerError::unsupported(
-            "shortestPath needs exactly one relationship type (`-[:T*]-`); untyped and \
-             alternation forms are deferred",
+            "shortestPath over a type alternation (`-[:A|B*]-`) is deferred; use a single \
+             type or the untyped form",
         ));
     }
 
@@ -147,27 +209,60 @@ fn lower_shortest_path<E: IriEncoder>(
         None => (Some(1), Some(1)),
     };
 
-    let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
-    match ctx.encoder.encode_iri(&type_iri) {
-        Some(predicate) => out.push(Pattern::ShortestPath(ShortestPathPattern {
-            start: start_ref,
-            end: end_ref,
-            predicate,
-            direction,
-            mode,
-            path_var: path_var_id,
-            min_hops,
-            max_hops,
-            // Conservatively build edges: Cypher's `relationships(p)` may read
-            // them, and that usage isn't visible at pattern-lowering time.
-            needs_relationships: true,
-        })),
-        // Unknown relationship type ⇒ no edges ⇒ no path. An empty result over
-        // the endpoints yields no rows (mandatory MATCH drops; an OPTIONAL
-        // wrapper restores the row with the path var null).
-        None => out.push(empty_path_result(&start_ref, &end_ref)),
-    }
+    // Untyped (`-[*..15]->`) → wildcard edge-set; typed → the named predicate.
+    // An unknown relationship type ⇒ no edges ⇒ no path: an empty result over
+    // the endpoints yields no rows (mandatory MATCH drops; an OPTIONAL wrapper
+    // restores the row with the path var null).
+    let predicate = match rel.types.first() {
+        None => None,
+        Some(t) => {
+            let type_iri = ctx.resolve_predicate(&t.name)?;
+            match ctx.encoder.encode_iri(&type_iri) {
+                Some(sid) => Some(sid),
+                None => {
+                    out.push(empty_path_result(&start_ref, &end_ref));
+                    return Ok(());
+                }
+            }
+        }
+    };
+    out.push(Pattern::ShortestPath(ShortestPathPattern {
+        start: start_ref,
+        end: end_ref,
+        predicate,
+        direction,
+        mode,
+        path_var: path_var_id,
+        min_hops,
+        max_hops,
+        // Conservatively build edges: Cypher's `relationships(p)` may read
+        // them, and that usage isn't visible at pattern-lowering time.
+        needs_relationships: true,
+    }));
     Ok(())
+}
+
+/// Whole-graph node scan for an opted-in bare `MATCH (n)`: an uncorrelated
+/// `SELECT DISTINCT ?n { ?n ?p ?o }` subquery. Nodes are distinct subjects —
+/// an IRI referenced only as an object (never described) is not matched.
+fn all_subjects_scan<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    node: &NodePattern,
+) -> Pattern {
+    let subj = lookup_node_ref(ctx, node);
+    let n = match &subj {
+        Ref::Var(v) => *v,
+        // `lookup_node_ref` always yields a variable (named or anonymous).
+        _ => unreachable!("node refs are variables"),
+    };
+    let p = ctx.fresh_synth();
+    let o = ctx.fresh_synth();
+    let scan = Pattern::Triple(TriplePattern::new(subj, Ref::Var(p), Term::Var(o)));
+    Pattern::Subquery(
+        fluree_db_query::ir::SubqueryPattern::new(vec![n], vec![scan])
+            .with_distinct()
+            .with_uncorrelated(),
+    )
 }
 
 fn require_node_anchored(node: &NodePattern) -> Result<()> {
@@ -199,8 +294,8 @@ fn lower_node<E: IriEncoder>(
     // Labels — emit `s rdf:type <label-iri>` for each.
     for Label { name, .. } in &n.labels {
         let iri = ctx.resolve_iri(name);
-        let pred = Ref::Iri(ctx.rdf_type_iri().into());
-        let obj = Term::Iri(iri.into());
+        let pred = ctx.iri_ref(ctx.rdf_type_iri().to_string());
+        let obj = ctx.iri_term(iri);
         out.push(Pattern::Triple(TriplePattern::new(subj.clone(), pred, obj)));
     }
 
@@ -220,7 +315,7 @@ fn lower_inline_props<E: IriEncoder>(
 ) -> Result<()> {
     for (key, val_expr) in &props.entries {
         let pred_iri = ctx.resolve_predicate(key)?;
-        let pred = Ref::Iri(pred_iri.into());
+        let pred = ctx.iri_ref(pred_iri);
         let obj = expr_to_object_term(ctx, val_expr)?;
         out.push(Pattern::Triple(TriplePattern::new(subj.clone(), pred, obj)));
     }
@@ -290,12 +385,17 @@ fn build_rel_hop<E: IriEncoder>(
     let pred = match rel.types.len() {
         0 => {
             // Untyped — var predicate; the executor's system-fact filter
-            // (`Query.include_system_facts = false`) hides `f:reifies*`.
+            // (`Query.include_system_facts = false`) hides `f:reifies*`, but
+            // `rdf:type` (labels) and data properties are ordinary facts and
+            // must be excluded too — Cypher `-->` follows only relationships.
+            // The edge-set filter below handles that for the plain-triple
+            // shape; annotation shapes match reified edges only, which are
+            // relationships by construction.
             Ref::Var(ctx.fresh_synth())
         }
         1 => {
             let iri = ctx.resolve_predicate(&rel.types[0].name)?;
-            Ref::Iri(iri.into())
+            ctx.iri_ref(iri)
         }
         _ => {
             // Alternation — a `Union` of one concrete-predicate branch per
@@ -304,12 +404,13 @@ fn build_rel_hop<E: IriEncoder>(
             let mut branches: Vec<Vec<Pattern>> = Vec::with_capacity(rel.types.len());
             for t in &rel.types {
                 let iri = ctx.resolve_predicate(&t.name)?;
+                let pred = ctx.iri_ref(iri);
                 let mut branch = Vec::new();
                 push_rel_triple(
                     ctx,
                     &rel.var,
                     &rel.props,
-                    Ref::Iri(iri.into()),
+                    pred,
                     s.clone(),
                     o.clone(),
                     &mut branch,
@@ -323,6 +424,60 @@ fn build_rel_hop<E: IriEncoder>(
 
     push_rel_triple(ctx, &rel.var, &rel.props, pred, s, o, &mut out)?;
     Ok(out)
+}
+
+/// `MakeRel(start, pred, end)` for a value-only relationship variable, or
+/// `None` when a term isn't expressible as an expression (an IRI-anchored
+/// endpoint, or a typed predicate absent from the dictionary — which has no
+/// edges anyway); callers then keep the annotation lowering.
+fn make_rel_expr<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    pred: &Ref,
+    s: &Ref,
+    o: &Ref,
+) -> Option<Expression> {
+    let p = match pred {
+        Ref::Var(v) => Expression::Var(*v),
+        Ref::Sid(sid) => Expression::Const(FlakeValue::Ref(sid.clone())),
+        Ref::Iri(iri) => Expression::Const(FlakeValue::Ref(ctx.encoder.encode_iri(iri)?)),
+    };
+    Some(Expression::call(
+        Function::MakeRel,
+        vec![ref_to_expr(s)?, p, ref_to_expr(o)?],
+    ))
+}
+
+/// The relationship edge-set constraint for an untyped single-hop pattern
+/// (`-->`): the predicate must not be `rdf:type` (a label, not a relationship)
+/// and a variable object must be a node (data properties bind literals).
+/// Matches the edge-set the untyped var-length wildcard path traverses.
+fn untyped_edge_set_filter<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    pvar: fluree_db_query::var_registry::VarId,
+    o: &Ref,
+) -> Expression {
+    let not_type = Expression::ne(
+        Expression::Var(pvar),
+        Expression::call(
+            Function::Iri,
+            vec![Expression::Const(FlakeValue::String(
+                ctx.rdf_type_iri().to_string(),
+            ))],
+        ),
+    );
+    match o {
+        Ref::Var(ov) => Expression::binary(
+            Function::And,
+            not_type,
+            Expression::binary(
+                Function::Or,
+                Expression::call(Function::IsIri, vec![Expression::Var(*ov)]),
+                Expression::call(Function::IsBlank, vec![Expression::Var(*ov)]),
+            ),
+        ),
+        // An anchored object is a node by construction.
+        _ => not_type,
+    }
 }
 
 /// Lower a variable-length relationship `-[:T*m..n]->`. Anonymous, single-typed
@@ -605,7 +760,13 @@ fn build_fixed_chain<E: IriEncoder>(
         } else {
             Ref::Var(ctx.fresh_synth())
         };
-        push_hop(&prev, &next, type_iri, direction, &mut chain);
+        push_hop(
+            &prev,
+            &next,
+            ctx.iri_ref(type_iri.to_string()),
+            direction,
+            &mut chain,
+        );
         nodes.push(next.clone());
         prev = next;
     }
@@ -755,8 +916,7 @@ fn empty_path_result(s: &Ref, o: &Ref) -> Pattern {
 
 /// Push one hop between `a` and `b`. Directed hops emit a single triple;
 /// undirected hops emit a forward∪reverse `Union`.
-fn push_hop(a: &Ref, b: &Ref, type_iri: &str, direction: Direction, out: &mut Vec<Pattern>) {
-    let pred = Ref::Iri(type_iri.into());
+fn push_hop(a: &Ref, b: &Ref, pred: Ref, direction: Direction, out: &mut Vec<Pattern>) {
     let fwd = || {
         Pattern::Triple(TriplePattern::new(
             a.clone(),
@@ -810,11 +970,57 @@ fn push_rel_triple<E: IriEncoder>(
     o: Ref,
     out: &mut Vec<Pattern>,
 ) -> Result<()> {
-    let edge_o: Term = o.into();
+    let edge_o: Term = o.clone().into();
+
+    // Value-only bound relationship variable — the statement never reads the
+    // relationship's *properties*, only its value surface (`RETURN e`,
+    // `type(e)`, `startNode(e)`, …). Match the plain base triple so unreified
+    // (plain-RDF) edges count too, and bind the variable per annotation when
+    // the edge is reified (parallel edges stay distinct) or to a synthesized
+    // relationship value when it isn't. Property-reading statements keep the
+    // annotation-only lowering below.
+    if let (Some(v), None) = (rel_var, rel_props) {
+        if !ctx.is_annotation_dependent(&v.name) {
+            if let Some(rel_value) = make_rel_expr(ctx, &pred, &s, &o) {
+                let var = ctx.intern_var(&v.name);
+                out.push(Pattern::Triple(TriplePattern::new(
+                    s.clone(),
+                    pred.clone(),
+                    edge_o.clone(),
+                )));
+                if let Ref::Var(pv) = &pred {
+                    out.push(Pattern::Filter(untyped_edge_set_filter(ctx, *pv, &o)));
+                }
+                // `f:reifies*` absent from the dictionary ⇒ no edge in this
+                // ledger is reified ⇒ skip the per-edge annotation probe.
+                let expr = if ctx
+                    .encoder
+                    .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
+                    .is_some()
+                {
+                    let ann = ctx.fresh_synth();
+                    out.push(Pattern::Optional(vec![Pattern::EdgeAnnotation {
+                        edge: TriplePattern::new(s, pred, edge_o),
+                        annotation: Ref::Var(ann),
+                        body: Vec::new(),
+                    }]));
+                    Expression::call(Function::Coalesce, vec![Expression::Var(ann), rel_value])
+                } else {
+                    rel_value
+                };
+                out.push(Pattern::Bind { var, expr });
+                return Ok(());
+            }
+        }
+    }
+
     match (rel_var, rel_props) {
         (None, None) => {
             // Shape 1 — plain triple, set semantics.
-            out.push(Pattern::Triple(TriplePattern::new(s, pred, edge_o)));
+            out.push(Pattern::Triple(TriplePattern::new(s, pred.clone(), edge_o)));
+            if let Ref::Var(pv) = &pred {
+                out.push(Pattern::Filter(untyped_edge_set_filter(ctx, *pv, &o)));
+            }
             Ok(())
         }
         (Some(v), props) => {
@@ -853,7 +1059,7 @@ fn build_annotation_body<E: IriEncoder>(
     if let Some(map) = props {
         for (key, val_expr) in &map.entries {
             let pred_iri = ctx.resolve_predicate(key)?;
-            let pred = Ref::Iri(pred_iri.into());
+            let pred = ctx.iri_ref(pred_iri);
             let obj = expr_to_object_term(ctx, val_expr)?;
             body.push(Pattern::Triple(TriplePattern::new(ann.clone(), pred, obj)));
         }

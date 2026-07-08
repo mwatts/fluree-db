@@ -162,7 +162,7 @@ fn encoded_lit_from_otype(
 /// candidate, so no per-region bookkeeping is needed.
 ///
 /// Returns `None` when any object is not string-dict-backed.
-fn minmax_string_dict_post(
+pub(crate) fn minmax_string_dict_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
@@ -255,7 +255,7 @@ fn consider_string_candidate(
     true
 }
 
-fn minmax_numeric_post(
+pub(crate) fn minmax_numeric_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,

@@ -3484,8 +3484,52 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<TransactResult> {
+        Ok(self
+            .transact_cypher_returning(ledger, cypher, params)
+            .await?
+            .0)
+    }
+
+    /// Like [`transact_cypher_with_params`](Self::transact_cypher_with_params)
+    /// but also answers a trailing `RETURN` on the write statement: the second
+    /// tuple element is the Cypher-JSON envelope of the created entities
+    /// (`None` when the statement has no RETURN clause). See
+    /// [`crate::cypher_write::plan_write_return`] for the v1 surface.
+    pub async fn transact_cypher_returning(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<(TransactResult, Option<serde_json::Value>)> {
+        // Plan the RETURN from the same parse+substitution the write plan
+        // uses; a Some plan needs a caller-known skolem id so the created
+        // Sids are reconstructible post-commit.
+        let return_plan = {
+            let out = fluree_db_cypher::parse_cypher(cypher);
+            match out.ast {
+                Some(mut ast) if !out.has_errors() => {
+                    let empty = fluree_db_cypher::ParamMap::new();
+                    fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+                        .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+                    crate::cypher_write::plan_write_return(&ast)
+                        .map_err(|e| ApiError::cypher(e, Vec::new()))?
+                }
+                // Parse errors surface with full diagnostics below.
+                _ => None,
+            }
+        };
+        let skolem_txn_id = return_plan
+            .as_ref()
+            .map(|_| fluree_db_transact::generate_txn_id());
+
         let plan = self
-            .cypher_write_plan(cypher, params, ledger.ledger_id(), &ledger.snapshot)
+            .cypher_write_plan_with_skolem(
+                cypher,
+                params,
+                ledger.ledger_id(),
+                &ledger.snapshot,
+                skolem_txn_id.clone(),
+            )
             .await?;
         let txn = match plan {
             crate::cypher_write::WritePlan::Single(txn) => *txn,
@@ -3496,7 +3540,15 @@ impl Fluree {
                     .await?
             }
         };
-        self.stage_owned(ledger).txn(txn).execute().await
+        let result = self.stage_owned(ledger).txn(txn).execute().await?;
+
+        let rows = match (&return_plan, &skolem_txn_id) {
+            (Some(plan), Some(id)) => {
+                Some(crate::cypher_write::write_return_rows(plan, id, &result.ledger).await?)
+            }
+            _ => None,
+        };
+        Ok((result, rows))
     }
 
     /// Parse + param-substitute a Cypher write and classify it as a single
@@ -3507,6 +3559,22 @@ impl Fluree {
         params: Option<&fluree_db_cypher::ParamMap>,
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<crate::cypher_write::WritePlan> {
+        self.cypher_write_plan_with_skolem(cypher, params, ledger_id, snapshot, None)
+            .await
+    }
+
+    /// [`cypher_write_plan`](Self::cypher_write_plan) with a caller-supplied
+    /// skolemization id (`TxnOpts::skolem_txn_id`), which makes the write's
+    /// created-entity Sids reconstructible — the mechanism behind
+    /// `CREATE … RETURN n` (see [`crate::cypher_write::write_return_rows`]).
+    pub async fn cypher_write_plan_with_skolem(
+        &self,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        skolem_txn_id: Option<String>,
     ) -> Result<crate::cypher_write::WritePlan> {
         let out = fluree_db_cypher::parse_cypher(cypher);
         if out.has_errors() {
@@ -3525,12 +3593,19 @@ impl Fluree {
         fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
             .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
 
+        // Validate a trailing RETURN up front (lowering ignores it): the v1
+        // surface is bare created-entity variables, and it never combines with
+        // the conditional (probe-based) shapes.
+        crate::cypher_write::plan_write_return(&ast)
+            .map_err(|e| ApiError::cypher(e, Vec::new()))?;
+
         if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
             return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
         }
-        let txn = self
+        let mut txn = self
             .lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await?;
+        txn.opts.skolem_txn_id = skolem_txn_id;
         Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
     }
 

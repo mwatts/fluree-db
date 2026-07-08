@@ -6,7 +6,6 @@
 //! operator tree for correctness.
 
 use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
-use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
@@ -29,7 +28,7 @@ use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
-use fluree_db_core::{FlakeValue, GraphId, OverlayProvider};
+use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
 
@@ -69,7 +68,7 @@ pub fn count_rows_operator(
 
             // Lane 1 — metadata-only predicate row count (instant) when there is
             // no novelty overlay and the target is the indexed head.
-            let overlay_free = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0) == 0;
+            let overlay_free = !crate::fast_path_common::overlay_has_novelty(ctx);
             if overlay_free && ctx.to_t == store.max_t() {
                 let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 return Ok(Some(build_count_batch(
@@ -1072,6 +1071,15 @@ pub fn count_distinct_position_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
+            // The variable-predicate scan hides `f:reifies*` (and default-graph
+            // `f:`) facts, but the SPOT/PSOT/OPST directories these folds read
+            // include them — a graph with a reified edge would over-count in
+            // every position (its reifier subject, the reifies predicates, and
+            // the annotation objects are all pipeline-invisible). Decline to
+            // the general pipeline when any such predicate exists.
+            if crate::fast_whole_graph_agg::graph_has_scan_hidden_predicates(ctx, store)? {
+                return Ok(None);
+            }
             let (count, overflow_label) = match position {
                 // SPOT key layout: s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(4).
                 // Distinct subjects = lead bytes [0..8].
@@ -1080,14 +1088,15 @@ pub fn count_distinct_position_operator(
                     "COUNT(DISTINCT) subjects",
                 ),
                 DistinctPosition::Predicates => (
-                    // Prefer the in-memory per-graph stats (number of predicates
-                    // with a positive current count) — O(#predicates), no leaf
-                    // opens. Falls back to the PSOT `p_const` scan when the graph
-                    // stats are unavailable.
-                    match distinct_predicates_from_graph_stats(ctx) {
-                        Some(c) => c,
-                        None => count_distinct_predicates_psot(store, ctx.binary_g_id)?,
-                    },
+                    // Always the PSOT `p_const` directory scan — exact from
+                    // leaflet metadata. A per-graph-stats shortcut used to
+                    // answer this in-memory, but the incremental index build
+                    // persists delta-only per-graph property stats (base
+                    // entries lost, net-zero deltas kept at count 0), which
+                    // made the shortcut return wrong counts after any
+                    // incremental index. Reinstate only after the incremental
+                    // stats merge is fixed AND covered by a regression test.
+                    count_distinct_predicates_psot(store, ctx.binary_g_id)?,
                     "COUNT(DISTINCT) predicates",
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
@@ -1103,21 +1112,6 @@ pub fn count_distinct_position_operator(
         fallback,
         label,
     )
-}
-
-/// Current-state distinct-predicate count from the per-graph index stats: the
-/// number of properties with a positive current flake count.
-///
-/// `GraphPropertyStatEntry.count` is "after dedup; retractions decrement", so a
-/// predicate has a current PSOT leaflet iff its count is `> 0` — this matches
-/// `count_distinct_predicates_psot` exactly but reads the in-memory stats instead
-/// of opening every leaf. Returns `None` when the graph stats are unavailable
-/// (older index / not computed). Only correct at HEAD with no overlay; the caller
-/// gates that via `fast_path_store`.
-fn distinct_predicates_from_graph_stats(ctx: &ExecutionContext<'_>) -> Option<u64> {
-    let graphs = ctx.active_snapshot.stats.as_ref()?.graphs.as_ref()?;
-    let g = graphs.iter().find(|g| g.g_id == ctx.binary_g_id)?;
-    Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
 /// Per-chunk partial for the distinct-lead count: groups counted within the
@@ -1142,7 +1136,7 @@ struct LeadGroupPartial {
 /// `lead_len` is the number of leading key bytes that define the grouping:
 /// - SPOT distinct subjects: 8 bytes (s_id)
 /// - OPST distinct objects: 10 bytes (o_type + o_key)
-fn count_distinct_lead_groups(
+pub(crate) fn count_distinct_lead_groups(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,

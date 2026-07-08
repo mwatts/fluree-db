@@ -1997,6 +1997,64 @@ mem:fact-01ktys13s07fm2mphwxqnr339h a mem:Fact ;
     mem:createdAt "2026-06-12T20:40:28.192512+00:00"^^xsd:dateTime ;
     mem:rationale "46 panel-confirmed findings from a 260-agent audit; fixing engine lanes is pointless until ingestion stops corrupting values — any future decimal work should start from DECIMAL_AUDIT.md's priority list." .
 
+mem:fact-01kwstgh1vshsahk63r0dzdkdt a mem:Fact ;
+    mem:content "Cypher bound rel var `-[e]->` is now dual-mode (benchgraph D1 fix): a statement-wide scan (fluree-db-cypher lower/annotation_use.rs) classifies vars; value-only vars (no e.prop/properties/keys/map-projection anywhere) lower to plain base triple + OPTIONAL EdgeAnnotation + Bind e=coalesce(ann, MakeRel(s,p,o)) so unreified edges match while reified parallel edges keep per-annotation rows; property-reading vars keep annotation-only lowering. The OPTIONAL probe is skipped entirely when encode_iri(f:reifiesSubject) fails (no reified edge exists in the ledger). Engine prereq: Coalesce got a binding-path arm in eval/list.rs eval_list_fn_to_binding — the scalar ComparableValue path collapses Rel/List/Map to Unbound." ;
+    mem:tag "coalesce" ;
+    mem:tag "cypher" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "lowering" ;
+    mem:tag "rel-var" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/lower/annotation_use.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/list.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:01:33.371634+00:00"^^xsd:dateTime .
+
+mem:fact-01kwstgvy9sfntgk0w8vydzkyf a mem:Fact ;
+    mem:content "Untyped shortestPath/allShortestPaths (benchgraph F2): ShortestPathPattern.predicate is now Option<Sid> — None = wildcard edge-set (Ref objects only, excludes rdf:type + f:reifies* via property_path::is_reserved_edge_predicate, now pub(crate)). Wildcard backward hops probe OPST (POST needs a predicate prefix). Per-hop predicates for relationships(p) are NOT threaded through BFS — build_edges resolves each found hop post-hoc via a SPOT probe (hop_predicate), trying both orientations under Either. JSON-LD lowering wraps Some(pred); the sparql firewall (lower/mod.rs) guards Some only." ;
+    mem:tag "cypher" ;
+    mem:tag "property-path" ;
+    mem:tag "query" ;
+    mem:tag "shortest-path" ;
+    mem:tag "wildcard" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-query/src/ir/path.rs" ;
+    mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:01:44.521231+00:00"^^xsd:dateTime .
+
+mem:fact-01kwsthd6k6xagy4tdtre2ncew a mem:Fact ;
+    mem:content "Benchgraph gap fixes round 1 (2026-07-05): B2 unary-minus folded at parse (parse_unary); B1 untyped single-hop --> gets edge-set filter (pred != rdf:type AND isIri||isBlank(o)) in push_rel_triple; F3 bare MATCH (n) opt-in via FLUREE_CYPHER_ALLOW_FULL_SCAN env → uncorrelated SELECT DISTINCT subject subquery; F4 bare CREATE () asserts hidden rdf:type db:Node marker (fluree_vocab::fluree::NODE, filtered from labels()); F5 inline UNWIND range()/[list] before writes folds to a synthetic $param (inline_constant_unwind, 10k cap)." ;
+    mem:tag "benchgraph" ;
+    mem:tag "cypher" ;
+    mem:tag "full-scan" ;
+    mem:tag "unwind" ;
+    mem:tag "write-path" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_cypher_update.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:02:02.195415+00:00"^^xsd:dateTime .
+
+mem:fact-01kwsthhc6fkb931xyd6anfjye a mem:Fact ;
+    mem:content "Cypher RETURN-on-write (benchgraph F1) is still deferred; the viable design: expose the staging skolem txn_id + WHERE solution count through CommitReceipt/TransactionReceipt (6 construction sites + Raft path), OR pre-supply txn_id via TxnOpts derived from the request tx-id. Created-node Sids are then reconstructible statelessly: Sid::new(BLANK_NODE, \"fdb-{txn_id}-{solution}-{label-sans-_:}\") — blank_node_sid needs no registry state. Server side then swaps the commit-receipt body for the cypher-json envelope (fluree-db-api/src/format/cypher.rs) when the statement had RETURN." ;
+    mem:tag "consensus" ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "return-on-write" ;
+    mem:tag "skolemization" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-consensus/src/lib.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:artifactRef "fluree-db-transact/src/generate/flakes.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:02:06.470017+00:00"^^xsd:dateTime .
+
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
     mem:tag "iri" ;

@@ -23,6 +23,7 @@ use fluree_db_cypher::ast::{
     NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause,
     Statement, Update, Variable, WithClause, WriteClause,
 };
+use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
 
 /// A lowered Cypher write: either a ready-to-stage `Txn`, or a conditional
@@ -375,4 +376,287 @@ pub(crate) fn build_create_ast(merge: &MergeClause) -> CypherAst {
         }),
         span,
     }
+}
+
+// ---- Write-statement RETURN (created entities) ------------------------------
+
+/// One column of a validated write-statement `RETURN`: the display name and
+/// the blank-node label (sans `_:`) of the created entity the variable names.
+#[derive(Debug, Clone)]
+pub struct CypherReturnColumn {
+    pub name: String,
+    /// The `{label}` component of the skolem key `fdb-{txn_id}-{solution}-{label}`.
+    pub label: String,
+}
+
+/// A validated plan for answering `CREATE … RETURN …` after the commit. The
+/// created entities' Sids are fully determined by the transaction's skolem id
+/// (supplied via `TxnOpts::skolem_txn_id`) plus the WHERE solution index, so
+/// the rows are reconstructed post-commit without threading state out of
+/// staging.
+#[derive(Debug, Clone)]
+pub struct CypherWriteReturnPlan {
+    pub columns: Vec<CypherReturnColumn>,
+    /// With no read clauses the templates fire exactly once (one solution);
+    /// otherwise the solution count is discovered by existence probes.
+    pub has_read_clauses: bool,
+}
+
+/// Upper bound on WHERE solutions a write RETURN will reconstruct. Exceeding
+/// it errors rather than silently truncating.
+const MAX_WRITE_RETURN_SOLUTIONS: u64 = 4096;
+
+/// Validate and plan a trailing `RETURN` on a Cypher write statement.
+/// `Ok(None)` when the statement is a read or has no RETURN. v1 surface: bare
+/// variables (optionally aliased) naming entities *created* by this
+/// statement — a fresh CREATE node variable or a CREATE relationship
+/// variable. Everything else gets a clear deferred error.
+pub fn plan_write_return(ast: &CypherAst) -> Result<Option<CypherWriteReturnPlan>, String> {
+    let Statement::Update(u) = &ast.statement else {
+        return Ok(None);
+    };
+    let Some(rc) = &u.return_clause else {
+        return Ok(None);
+    };
+    if rc.distinct || !rc.order_by.is_empty() || rc.skip.is_some() || rc.limit.is_some() {
+        return Err(
+            "DISTINCT / ORDER BY / SKIP / LIMIT on a write-statement RETURN are deferred"
+                .to_string(),
+        );
+    }
+    if u.write_clauses
+        .iter()
+        .any(|w| matches!(w, WriteClause::Merge(_)))
+    {
+        return Err(
+            "RETURN with MERGE is deferred — the matched branch's node is not a created \
+             entity, so it can't be reconstructed post-commit"
+                .to_string(),
+        );
+    }
+
+    // Variables bound by the read side (MATCH / WITH / UNWIND / InlineRows) —
+    // these reference existing data, not created entities.
+    let mut read_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &u.read_clauses {
+        match c {
+            ReadClause::Match(m) | ReadClause::OptionalMatch(m) => {
+                for part in &m.pattern.parts {
+                    collect_part_vars(part, &mut read_bound);
+                }
+            }
+            ReadClause::With(w) => {
+                for item in &w.items {
+                    if let Some(a) = &item.alias {
+                        read_bound.insert(a.name.as_str());
+                    } else if let Expr::Var(v) = &item.expr {
+                        read_bound.insert(v.name.as_str());
+                    }
+                }
+            }
+            ReadClause::Unwind(uw) => {
+                read_bound.insert(uw.alias.name.as_str());
+            }
+            ReadClause::InlineRows { vars, .. } => {
+                for v in vars {
+                    read_bound.insert(v.name.as_str());
+                }
+            }
+            ReadClause::CallSubquery(_) => {}
+        }
+    }
+
+    // Entities created by CREATE clauses.
+    let mut created_nodes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut created_rels: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for w in &u.write_clauses {
+        let WriteClause::Create(c) = w else { continue };
+        for part in &c.pattern.parts {
+            for node in std::iter::once(&part.head).chain(part.tail.iter().map(|(_, n)| n)) {
+                if let Some(v) = &node.var {
+                    if !read_bound.contains(v.name.as_str()) {
+                        created_nodes.insert(v.name.as_str());
+                    }
+                }
+            }
+            for (rel, _) in &part.tail {
+                if let Some(v) = &rel.var {
+                    created_rels.insert(v.name.as_str());
+                }
+            }
+        }
+    }
+
+    let mut columns = Vec::with_capacity(rc.items.len());
+    for item in &rc.items {
+        let Expr::Var(v) = &item.expr else {
+            return Err(
+                "a write-statement RETURN supports bare created-entity variables in v1 \
+                 (expressions are deferred)"
+                    .to_string(),
+            );
+        };
+        let name = item
+            .alias
+            .as_ref()
+            .map_or_else(|| v.name.clone(), |a| a.name.clone());
+        let label = if created_rels.contains(v.name.as_str()) {
+            format!("cy_rel_{}", v.name)
+        } else if created_nodes.contains(v.name.as_str()) {
+            format!("cy_{}", v.name)
+        } else {
+            return Err(format!(
+                "RETURN of `{}` on a write statement is deferred — only entities created \
+                 by this statement (a fresh CREATE node or relationship variable) can be \
+                 returned in v1",
+                v.name
+            ));
+        };
+        columns.push(CypherReturnColumn { name, label });
+    }
+
+    Ok(Some(CypherWriteReturnPlan {
+        columns,
+        has_read_clauses: !u.read_clauses.is_empty(),
+    }))
+}
+
+fn collect_part_vars<'a>(part: &'a PatternPart, out: &mut std::collections::HashSet<&'a str>) {
+    for node in std::iter::once(&part.head).chain(part.tail.iter().map(|(_, n)| n)) {
+        if let Some(v) = &node.var {
+            out.insert(v.name.as_str());
+        }
+    }
+    for (rel, _) in &part.tail {
+        if let Some(v) = &rel.var {
+            out.insert(v.name.as_str());
+        }
+    }
+}
+
+/// The skolemized Sid a created entity resolves to (mirrors
+/// `FlakeGenerator::skolemize_blank_node`: key `{txn_id}-{solution}-{label}`,
+/// blank-node local `fdb-{key}`).
+fn skolem_sid(skolem_txn_id: &str, solution: u64, label: &str) -> fluree_db_core::Sid {
+    let local = format!(
+        "{}-{skolem_txn_id}-{solution}-{label}",
+        fluree_db_transact::BLANK_NODE_ID_PREFIX
+    );
+    fluree_db_core::Sid::new(fluree_vocab::namespaces::BLANK_NODE, local)
+}
+
+/// Reconstruct the rows for a write-statement RETURN against the post-commit
+/// ledger state, as a Cypher-JSON envelope
+/// (`{"results":[{"columns":[…],"data":[{"row":[…],"meta":[…]}]}]}`).
+///
+/// Solutions are contiguous indices `0..n`; with read clauses present, `n` is
+/// discovered by probing the first column's skolem Sid per solution (a
+/// one-flake SPOT range). Entities serialize as their blank-node identifier
+/// string (`_:fdb-…`), matching the minimal node serialization of the read
+/// path.
+pub async fn write_return_rows(
+    plan: &CypherWriteReturnPlan,
+    skolem_txn_id: &str,
+    ledger: &LedgerState,
+) -> Result<serde_json::Value, crate::error::ApiError> {
+    use fluree_db_core::{IndexType, RangeMatch, RangeOptions, RangeTest};
+
+    let solutions: u64 = if plan.has_read_clauses {
+        let probe_col = &plan.columns[0];
+        let overlay: &dyn fluree_db_core::OverlayProvider = ledger.novelty.as_ref();
+        let mut n = 0u64;
+        loop {
+            if n >= MAX_WRITE_RETURN_SOLUTIONS {
+                return Err(crate::error::ApiError::cypher(
+                    format!(
+                        "write RETURN is capped at {MAX_WRITE_RETURN_SOLUTIONS} rows — drop \
+                         the RETURN clause for larger batches"
+                    ),
+                    Vec::new(),
+                ));
+            }
+            let sid = skolem_sid(skolem_txn_id, n, &probe_col.label);
+            let db = fluree_db_core::GraphDbRef::new(
+                &ledger.snapshot,
+                fluree_db_core::DEFAULT_GRAPH_ID,
+                overlay,
+                ledger.t(),
+            );
+            let flakes = db
+                .range_with_opts(
+                    IndexType::Spot,
+                    RangeTest::Eq,
+                    RangeMatch::subject(sid),
+                    RangeOptions::default().with_flake_limit(1),
+                )
+                .await
+                .map_err(|e| {
+                    crate::error::ApiError::internal(format!(
+                        "write RETURN existence probe failed: {e}"
+                    ))
+                })?;
+            if flakes.is_empty() {
+                break;
+            }
+            n += 1;
+        }
+        n
+    } else {
+        // No WHERE: templates fire once against the single empty solution.
+        1
+    };
+
+    let columns: Vec<&str> = plan.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut data = Vec::with_capacity(solutions as usize);
+    for s in 0..solutions {
+        let row: Vec<serde_json::Value> = plan
+            .columns
+            .iter()
+            .map(|c| {
+                serde_json::Value::String(format!(
+                    "{}{}-{skolem_txn_id}-{s}-{}",
+                    fluree_db_transact::BLANK_NODE_PREFIX,
+                    fluree_db_transact::BLANK_NODE_ID_PREFIX,
+                    c.label
+                ))
+            })
+            .collect();
+        let meta: Vec<serde_json::Value> = plan
+            .columns
+            .iter()
+            .map(|_| serde_json::Value::Null)
+            .collect();
+        data.push(serde_json::json!({"row": row, "meta": meta}));
+    }
+    Ok(serde_json::json!({
+        "results": [{"columns": columns, "data": data}]
+    }))
+}
+
+/// Parse + param-substitute Cypher source and plan its write-statement
+/// RETURN. Parse and parameter errors return `Ok(None)` — the consensus
+/// lowering path reports those with full diagnostics; only RETURN-shape
+/// validation errors surface here.
+pub fn plan_write_return_source(
+    cypher: &str,
+    params: Option<&fluree_db_cypher::ParamMap>,
+) -> Result<Option<CypherWriteReturnPlan>, crate::error::ApiError> {
+    let out = fluree_db_cypher::parse_cypher(cypher);
+    if out.has_errors() {
+        return Ok(None);
+    }
+    let Some(mut ast) = out.ast else {
+        return Ok(None);
+    };
+    let empty = fluree_db_cypher::ParamMap::new();
+    if fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty)).is_err() {
+        return Ok(None);
+    }
+    plan_write_return(&ast).map_err(|e| crate::error::ApiError::cypher(e, Vec::new()))
+}
+
+/// A fresh unique skolemization id for [`TxnOpts::skolem_txn_id`]
+/// (`fluree_db_transact::ir::TxnOpts`).
+pub fn fresh_skolem_txn_id() -> String {
+    fluree_db_transact::generate_txn_id()
 }

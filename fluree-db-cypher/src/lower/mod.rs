@@ -4,6 +4,7 @@
 //! `fluree-db-transact/src/lower_cypher_update.rs`. See
 //! `docs/concepts/cypher.md` for how Cypher maps onto the RDF model.
 
+mod annotation_use;
 mod context;
 mod expr;
 mod pattern;
@@ -83,7 +84,10 @@ fn lower_with_context<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
 ) -> Result<Query> {
     match &ast.statement {
-        Statement::Query(q) => stmt::lower_query(ctx, q),
+        Statement::Query(q) => {
+            ctx.set_annotation_dependent(annotation_use::annotation_dependent_vars(q));
+            stmt::lower_query(ctx, q)
+        }
         Statement::Update(_) => Err(LowerError::WriteOnQueryPath),
     }
 }

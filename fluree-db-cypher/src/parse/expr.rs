@@ -185,7 +185,16 @@ fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     let result = if s.eat(&TokenKind::Minus).is_some() {
         parse_unary(s).map(|e| {
             let span = start.union(e.span());
-            Expr::UnaryOp(UnaryOp::Neg, Box::new(e), span)
+            // Fold a negated numeric literal into a literal so `-1` is a
+            // plain constant wherever a literal is required (inline pattern
+            // properties, SET/CREATE values). `- -1` folds twice to `1`.
+            match e {
+                Expr::Lit(Literal::Integer(n, _)) if n.checked_neg().is_some() => {
+                    Expr::Lit(Literal::Integer(-n, span))
+                }
+                Expr::Lit(Literal::Float(f, _)) => Expr::Lit(Literal::Float(-f, span)),
+                other => Expr::UnaryOp(UnaryOp::Neg, Box::new(other), span),
+            }
         })
     } else {
         parse_power(s)

@@ -94,6 +94,7 @@
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
   - [Raft command queue and replicated state machine](design/raft-command-queue.md)
+  - [Bolt protocol adapter (proposed)](design/bolt-adapter.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)
