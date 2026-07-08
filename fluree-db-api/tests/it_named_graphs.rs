@@ -1186,6 +1186,128 @@ async fn test_update_from_multiple_default_graphs_merge_where() {
         .await;
 }
 
+/// Count the (s, p, o) triples visible in a single named graph, addressed by
+/// its composite `<ledger_id>#<graph-iri>` key. Borrows `fluree` so it can be
+/// called repeatedly between updates without moving it out of the test scope.
+async fn count_named_graph_triples(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    named_graph_from: &str,
+) -> usize {
+    let query = json!({
+        "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+        "from": named_graph_from,
+        "select": ["?s", "?p", "?o"],
+        "where": { "@id": "?s", "?p": "?o" }
+    });
+    let results = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph count query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let results = results.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    results.as_array().expect("array").len()
+}
+
+#[tokio::test]
+async fn test_update_delete_where_graph_block_restricted_to_from_named() {
+    // JSON-LD parity for the SPARQL USING + explicit-GRAPH over-delete fix
+    // (W3C dawg-delete-using-02a/06a, #1441). `fromNamed` is the JSON-LD
+    // `USING NAMED` equivalent: it defines the set of named graphs visible to
+    // WHERE evaluation exactly. An explicit `["graph", <g>, ...]` block in the
+    // WHERE must therefore match nothing when `<g>` is NOT in `fromNamed` — it
+    // must not "override" the dataset scoping and over-reach into `<g>`. This
+    // exercises the same shared runtime-dataset named-graph restriction in
+    // `stream_where_into_accumulator` that SPARQL `USING` now routes through.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/update-delete-where-graph-restricted:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // g2 holds Chris (name + email) and Eve (name); g3 holds Dan.
+            let seed = json!({
+                "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+                "insert": [
+                    ["graph", "http://example.org/g2", { "@id": "ex:c", "schema:name": "Chris" }],
+                    ["graph", "http://example.org/g2", { "@id": "ex:c", "schema:email": "chris@example.org" }],
+                    ["graph", "http://example.org/g2", { "@id": "ex:e", "schema:name": "Eve" }],
+                    ["graph", "http://example.org/g3", { "@id": "ex:d", "schema:name": "Dan" }]
+                ]
+            });
+            let result = fluree.update(ledger, &seed).await.expect("seed");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            // Count the triples currently in g2 (queried via the composite key).
+            let named_g2 = format!("{ledger_id}#http://example.org/g2");
+
+            assert_eq!(
+                count_named_graph_triples(&fluree, ledger_id, &named_g2).await,
+                3,
+                "g2 should start with 3 triples (Chris name+email, Eve name)"
+            );
+
+            // Restricted case: fromNamed lists ONLY g3, so the explicit
+            // `["graph", g2, ...]` WHERE block must match nothing even though g2
+            // physically contains a matching `schema:name "Chris"` row. Nothing
+            // is deleted — the graph block does not override the fromNamed scope.
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            let restricted = json!({
+                "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+                "fromNamed": [ { "graph": "http://example.org/g3" } ],
+                "delete": [ ["graph", "http://example.org/g2", { "@id": "?s", "?p": "?o" }] ],
+                "where":  [ ["graph", "http://example.org/g2", { "@id": "?s", "schema:name": "Chris", "?p": "?o" }] ]
+            });
+            let result = fluree
+                .update(ledger, &restricted)
+                .await
+                .expect("restricted delete-where");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            assert_eq!(
+                count_named_graph_triples(&fluree, ledger_id, &named_g2).await,
+                3,
+                "g2 must be UNCHANGED: the graph-scoped WHERE block on g2 was \
+                 scoped out by fromNamed=[g3] and must not over-delete"
+            );
+
+            // Positive control: with g2 IN fromNamed, the identical delete-where
+            // now sees g2 and removes exactly Chris's two triples, leaving Eve.
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            let in_scope = json!({
+                "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+                "fromNamed": [ { "graph": "http://example.org/g2" } ],
+                "delete": [ ["graph", "http://example.org/g2", { "@id": "?s", "?p": "?o" }] ],
+                "where":  [ ["graph", "http://example.org/g2", { "@id": "?s", "schema:name": "Chris", "?p": "?o" }] ]
+            });
+            let result = fluree
+                .update(ledger, &in_scope)
+                .await
+                .expect("in-scope delete-where");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            assert_eq!(
+                count_named_graph_triples(&fluree, ledger_id, &named_g2).await,
+                1,
+                "with g2 in fromNamed the delete-where fires: Chris's name+email \
+                 are removed, leaving only Eve's name"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn test_update_from_named_alias_usable_in_templates() {
     // Ensure `fromNamed.alias` can be used consistently in UPDATE templates
