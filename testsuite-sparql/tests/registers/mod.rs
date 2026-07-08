@@ -97,9 +97,8 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 ];
 
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
-    // result mismatch (3)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
+    // fully green: concat02 (CONCAT type-errors on a non-string argument) and
+    // strlang03-rdf11 (case-insensitive language-tag comparison) — PR-X2
 ];
 
 pub const SPARQL11_GROUPING: &[&str] = &[];
@@ -152,12 +151,14 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
+    // dawg-lang-3: pattern-object language tag dropped on the scan path
+    // (`?x :p "string"@EN` matches every lexical "string" regardless of @lang)
+    // — D5b scan-path family, PR-X2 (owned with open-eq-02 / quotes-3/4)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-3",
+    // dawg-langMatches-4: `!langMatches(lang(?v),"*")` where ?v is an IRI —
+    // LANG of a non-literal must raise a type error that excludes the row (the
+    // negation of an error is an error), not evaluate to "" — PR-X2 follow-up
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-basic",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-str-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-str-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-eq",
