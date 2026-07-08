@@ -56,6 +56,7 @@ pub fn eval_negate<R: RowAccess>(
     match args[0].eval_to_comparable(row, ctx)? {
         Some(ComparableValue::Long(n)) => Ok(Some(ComparableValue::Long(-n))),
         Some(ComparableValue::Double(d)) => Ok(Some(ComparableValue::Double(-d))),
+        Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(-f))),
         Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(Box::new(-(*n))))),
         Some(ComparableValue::Decimal(d)) => Ok(Some(ComparableValue::Decimal(Box::new(-(*d))))),
         None => Ok(None),

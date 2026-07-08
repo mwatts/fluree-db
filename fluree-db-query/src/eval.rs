@@ -48,6 +48,7 @@ use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FlakeValue};
+use fluree_db_core::DatatypeConstraint;
 use crate::var_registry::VarId;
 use helpers::eval_cached_bool_predicate;
 use std::sync::Arc;
@@ -144,7 +145,7 @@ impl Expression {
     ) -> Result<Option<ComparableValue>> {
         match self {
             Expression::Var(var) => match row.get(*var) {
-                Some(Binding::Lit { val, .. }) => Ok(ComparableValue::try_from(val).ok()),
+                Some(Binding::Lit { val, dtc, .. }) => Ok(lit_to_comparable(val, dtc)),
                 Some(Binding::EncodedLit {
                     o_kind,
                     o_key,
@@ -427,6 +428,31 @@ pub fn passes_filters(
         }
     }
     Ok(true)
+}
+
+/// Convert a literal binding's value to a `ComparableValue`, recovering the
+/// xsd:float type (stored as an f64, tagged only by its datatype) so numeric
+/// promotion keeps a float result float. The Long/String fast paths are
+/// byte-identical to `TryFrom<&FlakeValue>`; only the xsd:double path pays the
+/// single, cheap datatype check that distinguishes float from double.
+fn lit_to_comparable(val: &FlakeValue, dtc: &DatatypeConstraint) -> Option<ComparableValue> {
+    match val {
+        FlakeValue::Long(n) => Some(ComparableValue::Long(*n)),
+        FlakeValue::Double(d) if is_xsd_float(dtc) => Some(ComparableValue::Float(*d as f32)),
+        FlakeValue::Double(d) => Some(ComparableValue::Double(*d)),
+        FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+        _ => ComparableValue::try_from(val).ok(),
+    }
+}
+
+/// Whether a datatype constraint is exactly xsd:float.
+fn is_xsd_float(dtc: &DatatypeConstraint) -> bool {
+    matches!(
+        dtc,
+        DatatypeConstraint::Explicit(sid)
+            if sid.namespace_code == fluree_vocab::namespaces::XSD
+                && sid.name.as_ref() == fluree_vocab::xsd_names::FLOAT
+    )
 }
 
 fn decode_lookup_error(
