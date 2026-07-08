@@ -880,7 +880,7 @@ fn overlay_dirty_ids(
     store: &Arc<BinaryIndexStore>,
 ) -> Option<Arc<DirtyIds>> {
     use std::sync::OnceLock;
-    type Cache = parking_lot::Mutex<lru::LruCache<(u64, u16, usize), Arc<DirtyIds>>>;
+    type Cache = parking_lot::Mutex<lru::LruCache<(u64, u16, u64), Arc<DirtyIds>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
 
     if overlay.is_effectively_empty() {
@@ -893,7 +893,10 @@ fn overlay_dirty_ids(
         })));
     }
     let version = overlay.content_version()?;
-    let store_key = Arc::as_ptr(store) as usize;
+    // Store-instance id, not the raw pointer: a dropped store can be
+    // reallocated at the same address, so a pointer-keyed cache is subject to
+    // an ABA misread (ABA on the store, not just a coinciding version/g_id).
+    let store_key = store.store_id();
     let cache = CACHE.get_or_init(|| {
         parking_lot::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(8).expect("nonzero"),
