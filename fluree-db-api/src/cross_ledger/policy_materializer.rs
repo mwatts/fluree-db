@@ -326,6 +326,7 @@ fn restriction_to_wire(
         PolicyValue::Query(q) => WirePolicyValue::Query {
             source: q.source.clone(),
             language: q.language,
+            state: q.state,
         },
     };
 

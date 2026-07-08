@@ -2060,6 +2060,17 @@ pub mod policy_iris {
     /// `https://ns.flur.ee/db#query` - policy query predicate
     pub const QUERY: &str = "https://ns.flur.ee/db#query";
 
+    /// `https://ns.flur.ee/db#queryState` - which transaction state the
+    /// policy's `f:query` condition evaluates against
+    pub const QUERY_STATE: &str = "https://ns.flur.ee/db#queryState";
+
+    /// `https://ns.flur.ee/db#preState` - pre-transaction state (default)
+    pub const PRE_STATE: &str = "https://ns.flur.ee/db#preState";
+
+    /// `https://ns.flur.ee/db#postState` - post-transaction state
+    /// (committed + staged flakes)
+    pub const POST_STATE: &str = "https://ns.flur.ee/db#postState";
+
     /// `https://ns.flur.ee/db#required` - required flag
     pub const REQUIRED: &str = "https://ns.flur.ee/db#required";
 

@@ -1300,8 +1300,30 @@ async fn enforce_modify_policies(
         }
     }
 
+    // f:queryState f:postState conditions read committed + staged state; the
+    // StagedLedger overlay (the same view SHACL validates against) provides
+    // it. Built only when such a condition is loaded.
+    let staged_view = if policy.wrapper().has_post_state_conditions() {
+        Some(StagedLedger::new(
+            ledger.clone(),
+            flakes.to_vec(),
+            reverse_graph,
+        )?)
+    } else {
+        None
+    };
+
     // Enforce modify policies with full f:query support
-    enforce_modify_policy_per_flake(flakes, policy, ledger, tracker, reverse_graph, &states).await
+    enforce_modify_policy_per_flake(
+        flakes,
+        policy,
+        ledger,
+        tracker,
+        reverse_graph,
+        &states,
+        staged_view.as_ref(),
+    )
+    .await
 }
 
 /// Classify a subject's lifecycle within this transaction:
@@ -1373,7 +1395,10 @@ async fn classify_subject_lifecycle(
 /// the policy's f:exMessage if any flake is denied.
 ///
 /// This function supports f:query policies by executing them against
-/// the pre-transaction ledger view (db + novelty at current t).
+/// the pre-transaction ledger view (db + novelty at current t); conditions
+/// declaring `f:queryState f:postState` execute against `staged_view`
+/// (committed + this transaction's staged flakes) instead.
+#[allow(clippy::too_many_arguments)]
 async fn enforce_modify_policy_per_flake(
     flakes: &[Flake],
     policy: &PolicyContext,
@@ -1381,6 +1406,7 @@ async fn enforce_modify_policy_per_flake(
     tracker: Option<&Tracker>,
     reverse_graph: &HashMap<Sid, GraphId>,
     states: &HashMap<(GraphId, Sid), SubjectWriteState>,
+    staged_view: Option<&StagedLedger>,
 ) -> Result<()> {
     // Build per-graph QueryPolicyExecutors so f:query policies execute against
     // the correct graph. Cache executors to avoid rebuilding for every flake.
@@ -1401,9 +1427,19 @@ async fn enforce_modify_policy_per_flake(
         // Resolve the graph for this flake and get/create a cached executor.
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
         let executor = executors.entry(g_id).or_insert_with(|| {
-            // Modify policy queries see the state *before* this transaction.
-            QueryPolicyExecutor::with_overlay(&ledger.snapshot, ledger.novelty.as_ref(), ledger.t())
-                .with_graph_id(g_id)
+            // Modify policy queries see the state *before* this transaction
+            // by default; f:postState conditions read through the staged
+            // overlay when one was built.
+            let mut ex = QueryPolicyExecutor::with_overlay(
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                ledger.t(),
+            )
+            .with_graph_id(g_id);
+            if let Some(staged) = staged_view {
+                ex = ex.with_post_state(staged, staged.staged_t());
+            }
+            ex
         });
 
         // Per-subject write state (absent when no class/verb policies are
@@ -1411,6 +1447,7 @@ async fn enforce_modify_policy_per_flake(
         let state = states.get(&(g_id, flake.s.clone()));
         let write = WriteFlakeInfo {
             lifecycle: state.map_or(WriteVerb::Update, |st| st.lifecycle),
+            op: flake.op,
             pre_classes: state.map_or(&empty_classes, |st| &st.pre_classes),
             union_classes: state.map_or(&empty_classes, |st| &st.union_classes),
             type_object_class: if fluree_db_core::is_rdf_type(&flake.p) {

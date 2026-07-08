@@ -7,11 +7,15 @@ use crate::context::ExecutionContext;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
 use crate::var_registry::VarRegistry;
-use fluree_db_core::{GraphId, LedgerSnapshot, OverlayProvider, Sid};
-use fluree_db_policy::{
-    PolicyQuery, PolicyQueryExecutor, PolicyQueryFut, PolicyQueryLanguage, Result as PolicyResult,
-    UNBOUND_IDENTITY_PREFIX,
+use fluree_db_core::{
+    DatatypeConstraint, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid,
 };
+use fluree_db_policy::{
+    ConditionState, PolicyQuery, PolicyQueryExecutor, PolicyQueryFut, PolicyQueryLanguage,
+    Result as PolicyResult, UNBOUND_IDENTITY_PREFIX,
+};
+use fluree_vocab::namespaces::XSD;
+use fluree_vocab::xsd_names;
 use std::collections::HashMap;
 
 /// Policy query executor that runs queries against a database
@@ -27,6 +31,13 @@ pub struct QueryPolicyExecutor<'a> {
     pub to_t: i64,
     /// Graph ID for range queries (default: 0 = default graph)
     pub g_id: GraphId,
+    /// Post-state overlay for `f:queryState f:postState` conditions:
+    /// committed state plus the transaction's staged flakes. Absent on read
+    /// paths (no transaction in flight — post-state conditions then evaluate
+    /// against current state, which pre and post coincide with).
+    pub post_overlay: Option<&'a dyn OverlayProvider>,
+    /// Target transaction time for the post-state overlay (the staged t)
+    pub post_to_t: i64,
 }
 
 impl<'a> QueryPolicyExecutor<'a> {
@@ -37,6 +48,8 @@ impl<'a> QueryPolicyExecutor<'a> {
             overlay: None,
             to_t: snapshot.t,
             g_id: 0,
+            post_overlay: None,
+            post_to_t: snapshot.t,
         }
     }
 
@@ -51,6 +64,8 @@ impl<'a> QueryPolicyExecutor<'a> {
             overlay: Some(overlay),
             to_t,
             g_id: 0,
+            post_overlay: None,
+            post_to_t: to_t,
         }
     }
 
@@ -61,13 +76,21 @@ impl<'a> QueryPolicyExecutor<'a> {
         self.g_id = g_id;
         self
     }
+
+    /// Attach a post-state overlay (committed + staged flakes) for
+    /// `f:queryState f:postState` conditions, with the staged t.
+    pub fn with_post_state(mut self, overlay: &'a dyn OverlayProvider, to_t: i64) -> Self {
+        self.post_overlay = Some(overlay);
+        self.post_to_t = to_t;
+        self
+    }
 }
 
 impl PolicyQueryExecutor for QueryPolicyExecutor<'_> {
     fn evaluate_policy_query<'b>(
         &'b self,
         query: &'b PolicyQuery,
-        bindings: &'b HashMap<String, Sid>,
+        bindings: &'b HashMap<String, FlakeValue>,
     ) -> PolicyQueryFut<'b> {
         Box::pin(self.evaluate_async(query, bindings))
     }
@@ -86,17 +109,77 @@ fn sparql_var_name(json_ld_name: &str) -> String {
     }
 }
 
+/// True when a binding value is the never-match unbound-identity marker.
+fn is_unbound_marker(value: &FlakeValue) -> bool {
+    matches!(value, FlakeValue::Ref(sid) if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX))
+}
+
+/// Convert a binding value to a seeded `Binding`: refs as `Binding::Sid`
+/// (no decode/re-encode round trip), literals with a faithful default
+/// datatype as `Binding::Lit`, everything else — including the
+/// unbound-identity marker — as UNDEF (conditions on it never hold,
+/// failing closed).
+fn binding_for_value(value: &FlakeValue) -> Binding {
+    if is_unbound_marker(value) {
+        return Binding::Unbound;
+    }
+    match value {
+        FlakeValue::Ref(sid) => Binding::Sid {
+            sid: sid.clone(),
+            t: None,
+            op: None,
+        },
+        literal => match default_literal_datatype(literal) {
+            Some(dt_sid) => Binding::Lit {
+                val: literal.clone(),
+                dtc: DatatypeConstraint::Explicit(dt_sid),
+                t: None,
+                op: None,
+                p_id: None,
+            },
+            None => Binding::Unbound,
+        },
+    }
+}
+
+/// Default XSD datatype Sid for a literal binding value, for seeding
+/// VALUES rows (`Binding::Lit` equality includes the datatype). Mirrors the
+/// datatypes the SPARQL literal lowering assigns, so seeded values compare
+/// like written literals. Returns `None` for kinds with no faithful default
+/// (those seed as UNDEF — conditions on them never hold, failing closed).
+fn default_literal_datatype(value: &FlakeValue) -> Option<Sid> {
+    let name = match value {
+        FlakeValue::String(_) => xsd_names::STRING,
+        FlakeValue::Boolean(_) => xsd_names::BOOLEAN,
+        FlakeValue::Long(_) | FlakeValue::BigInt(_) => xsd_names::INTEGER,
+        FlakeValue::Double(_) => xsd_names::DOUBLE,
+        FlakeValue::Decimal(_) => xsd_names::DECIMAL,
+        FlakeValue::DateTime(_) => xsd_names::DATE_TIME,
+        FlakeValue::Date(_) => xsd_names::DATE,
+        FlakeValue::Time(_) => xsd_names::TIME,
+        _ => return None,
+    };
+    Some(Sid::new(XSD, name))
+}
+
 impl QueryPolicyExecutor<'_> {
     /// Async implementation of policy query evaluation
     async fn evaluate_async(
         &self,
         query: &PolicyQuery,
-        bindings: &HashMap<String, Sid>,
+        bindings: &HashMap<String, FlakeValue>,
     ) -> PolicyResult<bool> {
+        let state = query.state;
         match query.language {
-            PolicyQueryLanguage::JsonLd => self.evaluate_jsonld(&query.source, bindings).await,
-            PolicyQueryLanguage::Sparql => self.evaluate_sparql(&query.source, bindings).await,
-            PolicyQueryLanguage::Cypher => self.evaluate_cypher(&query.source, bindings).await,
+            PolicyQueryLanguage::JsonLd => {
+                self.evaluate_jsonld(&query.source, bindings, state).await
+            }
+            PolicyQueryLanguage::Sparql => {
+                self.evaluate_sparql(&query.source, bindings, state).await
+            }
+            PolicyQueryLanguage::Cypher => {
+                self.evaluate_cypher(&query.source, bindings, state).await
+            }
             // `PolicyQueryLanguage` is non_exhaustive; an unknown language
             // fails closed (error → deny), never open.
             other => Err(fluree_db_policy::PolicyError::QueryExecution {
@@ -107,15 +190,17 @@ impl QueryPolicyExecutor<'_> {
 
     /// Evaluate a Cypher policy query via the registered lowering hook.
     ///
-    /// Bindings become Cypher **parameters** (`?$this` → `$this`) carrying
-    /// IRI strings, substituted into the AST before lowering — no variable
-    /// seeding. An unbound identity substitutes as `null`, which never
-    /// compares equal, so identity-referencing conditions cannot hold.
-    /// Fails closed when no Cypher support is registered.
+    /// Bindings become Cypher **parameters** (`?$this` → `$this`): refs
+    /// carry IRI strings, literals (`$value`) carry their scalar values —
+    /// substituted into the AST before lowering, no variable seeding. An
+    /// unbound identity substitutes as `null`, which never compares equal,
+    /// so identity-referencing conditions cannot hold. Fails closed when no
+    /// Cypher support is registered.
     async fn evaluate_cypher(
         &self,
         source: &str,
-        bindings: &HashMap<String, Sid>,
+        bindings: &HashMap<String, FlakeValue>,
+        state: ConditionState,
     ) -> PolicyResult<bool> {
         let Some(support) = crate::lang_support::cypher_support() else {
             return Err(fluree_db_policy::PolicyError::QueryExecution {
@@ -124,23 +209,34 @@ impl QueryPolicyExecutor<'_> {
         };
 
         let mut params = serde_json::Map::new();
-        for (name, sid) in bindings {
+        for (name, value) in bindings {
             // "?$this" → parameter name "this"; custom "?myVar" → "myVar".
             let key = name
                 .strip_prefix("?$")
                 .or_else(|| name.strip_prefix('?'))
                 .unwrap_or(name)
                 .to_string();
-            let value = if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX) {
+            let json = if is_unbound_marker(value) {
                 serde_json::Value::Null
             } else {
-                let iri = self
-                    .snapshot
-                    .decode_sid(sid)
-                    .unwrap_or_else(|| sid.name.to_string());
-                serde_json::Value::String(iri)
+                match value {
+                    FlakeValue::Ref(sid) => {
+                        let iri = self
+                            .snapshot
+                            .decode_sid(sid)
+                            .unwrap_or_else(|| sid.name.to_string());
+                        serde_json::Value::String(iri)
+                    }
+                    FlakeValue::String(s) => serde_json::Value::String(s.clone()),
+                    FlakeValue::Long(l) => serde_json::Value::from(*l),
+                    FlakeValue::Double(d) => serde_json::Value::from(*d),
+                    FlakeValue::Boolean(b) => serde_json::Value::from(*b),
+                    // No faithful Cypher parameter representation: null never
+                    // compares equal, so conditions on it fail closed.
+                    _ => serde_json::Value::Null,
+                }
             };
-            params.insert(key, value);
+            params.insert(key, json);
         }
 
         let mut vars = VarRegistry::new();
@@ -149,14 +245,15 @@ impl QueryPolicyExecutor<'_> {
                 message: format!("Failed to lower Cypher policy query: {e}"),
             })?;
 
-        self.run_existence_check(&vars, &patterns).await
+        self.run_existence_check(&vars, &patterns, state).await
     }
 
     /// Evaluate a JSON-LD policy query (the historical default).
     async fn evaluate_jsonld(
         &self,
         source: &str,
-        bindings: &HashMap<String, Sid>,
+        bindings: &HashMap<String, FlakeValue>,
+        state: ConditionState,
     ) -> PolicyResult<bool> {
         // Parse and lower the policy's f:query using the main query parser/IR.
         //
@@ -199,12 +296,23 @@ impl QueryPolicyExecutor<'_> {
         );
         obj.insert("limit".to_string(), serde_json::Value::from(1));
 
-        // Build VALUES clause JSON for special variables.
-        // Inject VALUES into WHERE clause BEFORE parsing.
-        // This ensures even empty queries (no WHERE) work - the VALUES provides the pattern.
+        // Build VALUES clause JSON for the ref-valued special variables
+        // (?$this, ?$identity, custom policy values). Inject VALUES into
+        // WHERE BEFORE parsing — this ensures even empty queries (no WHERE)
+        // work, the VALUES provides the pattern.
+        //
+        // ?$value / ?$op are NOT JSON-injected: the flake's object can be a
+        // ref whose decoded IRI doesn't round-trip through the strict
+        // compact-IRI parser (e.g. ledger-scoped `ledger:...` IRIs), and a
+        // literal can carry a datatype JSON can't express. They seed as
+        // direct Bindings after parsing (same mechanism as the SPARQL path).
         //
         // Format: ["values", [["?$this", "?$identity", ...], [[iri1, iri2, ...]]]]
-        let mut var_names: Vec<String> = bindings.keys().cloned().collect();
+        let mut var_names: Vec<String> = bindings
+            .keys()
+            .filter(|name| *name != "?$value" && *name != "?$op")
+            .cloned()
+            .collect();
         var_names.sort();
 
         // Build VALUES row with IRIs for each variable
@@ -212,18 +320,25 @@ impl QueryPolicyExecutor<'_> {
         let values_row: Vec<serde_json::Value> = var_names
             .iter()
             .map(|name| {
-                let sid = bindings.get(name).expect("binding value exists");
-                // Check if this is an unbound identity - use null (UNDEF) instead of IRI
-                // This ensures patterns referencing ?$identity won't match anything
-                if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX) {
+                let value = bindings.get(name).expect("binding value exists");
+                if is_unbound_marker(value) {
                     return serde_json::Value::Null;
                 }
-                // Decode SID to IRI for JSON representation
-                let iri = self
-                    .snapshot
-                    .decode_sid(sid)
-                    .unwrap_or_else(|| sid.name.to_string());
-                serde_json::json!({"@id": iri})
+                match value {
+                    FlakeValue::Ref(sid) => {
+                        // Decode SID to IRI for JSON representation
+                        let iri = self
+                            .snapshot
+                            .decode_sid(sid)
+                            .unwrap_or_else(|| sid.name.to_string());
+                        serde_json::json!({"@id": iri})
+                    }
+                    FlakeValue::String(s) => serde_json::Value::String(s.clone()),
+                    FlakeValue::Long(l) => serde_json::Value::from(*l),
+                    FlakeValue::Double(d) => serde_json::Value::from(*d),
+                    FlakeValue::Boolean(b) => serde_json::Value::from(*b),
+                    _ => serde_json::Value::Null,
+                }
             })
             .collect();
 
@@ -265,7 +380,28 @@ impl QueryPolicyExecutor<'_> {
                 message: format!("Failed to parse policy query: {e}"),
             })?;
 
-        self.run_existence_check(&vars, &parsed.patterns).await
+        // Seed ?$value / ?$op as direct Bindings (no JSON round-trip).
+        let mut patterns = parsed.patterns;
+        let mut extra_vars = Vec::new();
+        let mut extra_row = Vec::new();
+        for name in ["?$value", "?$op"] {
+            let Some(value) = bindings.get(name) else {
+                continue;
+            };
+            extra_vars.push(vars.get_or_insert(name));
+            extra_row.push(binding_for_value(value));
+        }
+        if !extra_vars.is_empty() {
+            patterns.insert(
+                0,
+                Pattern::Values {
+                    vars: extra_vars,
+                    rows: vec![extra_row],
+                },
+            );
+        }
+
+        self.run_existence_check(&vars, &patterns, state).await
     }
 
     /// Evaluate a SPARQL policy query (`f:query` stored with the `f:sparql`
@@ -277,7 +413,8 @@ impl QueryPolicyExecutor<'_> {
     async fn evaluate_sparql(
         &self,
         source: &str,
-        bindings: &HashMap<String, Sid>,
+        bindings: &HashMap<String, FlakeValue>,
+        state: ConditionState,
     ) -> PolicyResult<bool> {
         let support = crate::lang_support::sparql_support().ok_or_else(|| {
             fluree_db_policy::PolicyError::QueryExecution {
@@ -309,19 +446,11 @@ impl QueryPolicyExecutor<'_> {
             if var_ids.contains(&var_id) {
                 continue;
             }
-            let sid = bindings.get(name).expect("binding value exists");
+            let value = bindings.get(name).expect("binding value exists");
             var_ids.push(var_id);
-            // Unbound identity uses UNDEF (Binding::Unbound), same as the
-            // JSON-LD path's null VALUES cell.
-            if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX) {
-                row.push(Binding::Unbound);
-            } else {
-                row.push(Binding::Sid {
-                    sid: sid.clone(),
-                    t: None,
-                    op: None,
-                });
-            }
+            // Unbound identity seeds as UNDEF, same as the JSON-LD path's
+            // null VALUES cell.
+            row.push(binding_for_value(value));
         }
         patterns.insert(
             0,
@@ -331,7 +460,7 @@ impl QueryPolicyExecutor<'_> {
             },
         );
 
-        self.run_existence_check(&vars, &patterns).await
+        self.run_existence_check(&vars, &patterns, state).await
     }
 
     /// Execute WHERE patterns with a root (policy-free) context and report
@@ -340,22 +469,33 @@ impl QueryPolicyExecutor<'_> {
         &self,
         vars: &VarRegistry,
         patterns: &[Pattern],
+        state: ConditionState,
     ) -> PolicyResult<bool> {
+        // Per-condition state selection: `f:postState` reads through the
+        // staged overlay when one is attached; otherwise (read paths, no
+        // transaction in flight) pre and post coincide with current state.
+        let (overlay, to_t) = match state {
+            ConditionState::Post => match self.post_overlay {
+                Some(post) => (Some(post), self.post_to_t),
+                None => (self.overlay, self.to_t),
+            },
+            ConditionState::Pre => (self.overlay, self.to_t),
+        };
+
         // Create the execution context WITHOUT policy (root context)
         // This is critical - policy queries must not be filtered by policy
-        let ctx = if let Some(overlay) = self.overlay {
-            ExecutionContext::with_time_and_overlay(self.snapshot, vars, self.to_t, None, overlay)
+        let ctx = if let Some(overlay) = overlay {
+            ExecutionContext::with_time_and_overlay(self.snapshot, vars, to_t, None, overlay)
                 .with_graph_id(self.g_id)
         } else {
-            ExecutionContext::with_time(self.snapshot, vars, self.to_t, None)
-                .with_graph_id(self.g_id)
+            ExecutionContext::with_time(self.snapshot, vars, to_t, None).with_graph_id(self.g_id)
         };
 
         // Build the where clause operators (VALUES is now part of the patterns).
         //
-        // Root: policy queries always evaluate at `self.to_t` for current state —
-        // they're access-control predicates, not history-range queries. Always
-        // plan as `Current`.
+        // Root: policy queries always evaluate at the selected state's t for
+        // current state — they're access-control predicates, not
+        // history-range queries. Always plan as `Current`.
         let mut operator = build_where_operators_seeded(
             None,
             patterns,

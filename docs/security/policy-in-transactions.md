@@ -129,7 +129,7 @@ With `default-allow: false`, the holder can insert new `ex:Lead` subjects (any o
 
 - A subject can be hollowed out by an `f:update` holder — values removed one by one — but never fully removed: retracting its last flakes classifies as `f:delete`. Use SHACL `sh:minCount` on required properties to prevent degrading below the shape's minimum.
 - Retract-only writes against a nonexistent subject net to nothing and classify as `f:update` (no create/delete grant is consumed by a no-op).
-- Property-level append-only policies ("may add tags but never remove them") are below the verbs' resolution; they are a planned condition-binding feature (`$op` in `f:query`), not a verb.
+- Property-level append-only policies ("may add tags but never remove them") are below the verbs' resolution; express them as a condition on `?$op`: a required `f:onProperty` policy with `ASK { FILTER($op = "assert") }`.
 
 ## Config-driven write enforcement
 

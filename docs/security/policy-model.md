@@ -28,6 +28,7 @@ Every policy is a JSON-LD node. Required `@type`: `f:AccessPolicy` (the IRI is `
 | `f:action` | array of IRIs (or single IRI string) | yes | Which operations the policy governs. Values: `f:view` (queries), `f:modify` (transactions). |
 | `f:allow` | boolean | one of `f:allow` / `f:query` | Static decision. `true` permits, `false` denies. Takes precedence over `f:query` if both are present. |
 | `f:query` | string (JSON-encoded JSON-LD WHERE, or SPARQL with the `f:sparql` datatype) | one of `f:allow` / `f:query` | Dynamic decision. The targeted flake is permitted when the query returns at least one row. `?$this` and `?$identity` are pre-bound (`$this` / `$identity` in SPARQL). |
+| `f:queryState` | IRI | no, defaults to `f:preState` | Which transaction state `f:query` evaluates against: `f:preState` (committed state before the transaction) or `f:postState` (committed + this transaction's staged flakes). See [Condition state](#condition-state-fquerystate). |
 | `f:onProperty` | array of `@id` references | no | Restrict the policy to flakes whose predicate is one of these IRIs. |
 | `f:onClass` | array of `@id` references | no | Restrict the policy to flakes whose subject has one of these `rdf:type`s. |
 | `f:onSubject` | array of `@id` references | no | Restrict the policy to flakes whose subject IRI is one of these. |
@@ -79,8 +80,12 @@ A condition carrying both `ask` and `where` is ambiguous and fails closed (deny)
 |----------|---------|
 | `?$this` | The IRI of the subject being read or written. |
 | `?$identity` | The IRI of the requesting identity (resolved from `opts.identity`, `policy_values["?$identity"]`, or the verified bearer-token subject). |
+| `?$value` | The object of the flake being authorized — an IRI ref or a literal. Lets a condition constrain the value being written ("stage may only be set to `qualified`"). |
+| `?$op` | `"assert"` or `"retract"` (reads always bind `"assert"`). A value gate typically exempts retractions — a value change retracts the old value, whose `?$value` would otherwise fail the constraint: `FILTER($op = "retract" || $value = "qualified")`. |
 
 Anything else binds via the embedded WHERE just like a normal Fluree query.
+In SPARQL these bind as `$this` / `$identity` / `$value` / `$op`; in Cypher
+they are supplied as the parameters `$this` / `$identity` / `$value` / `$op`.
 
 Because RDF can't carry structured JSON values natively, stored policies must JSON-encode the query (`serde_json::to_string`). For inline policies passed via `opts.policy`, you can also use the JSON-LD typed-literal form `{"@type": "@json", "@value": {...}}` to avoid manually escaping.
 
@@ -128,7 +133,8 @@ Rules for SPARQL policy queries:
   policy falls back to **deny** (same fail-closed behavior as unparseable
   JSON).
 - Special variables follow the SHACL-SPARQL convention: **`$this`** is the
-  subject being read or written, **`$identity`** is the requesting identity.
+  subject being read or written, **`$identity`** is the requesting identity,
+  **`$value`** is the flake's object, **`$op`** is `"assert"` / `"retract"`.
   (`?this` / `?identity` are equivalent spellings; SPARQL variable names
   cannot contain `$`, so the JSON-LD names `?$this` / `?$identity` map to
   `$this` / `$identity`.)
@@ -157,7 +163,9 @@ Rules for Cypher policy queries:
   the same existence semantics as every other condition language.
 - **`$this`** and **`$identity`** are supplied as Cypher **parameters**
   carrying the subject / identity IRI strings — compare them with
-  `id(n)` / `elementId(n)` or use them as property values. A request with
+  `id(n)` / `elementId(n)` or use them as property values. **`$value`**
+  (the flake's object — an IRI string for refs, a scalar for literals) and
+  **`$op`** (`"assert"` / `"retract"`) are also supplied. A request with
   no identity substitutes `$identity` as `null`, which never compares
   equal, so identity-referencing conditions cannot hold.
 - Conditions lower without a ledger `@vocab`: write labels, relationship
@@ -168,6 +176,44 @@ Rules for Cypher policy queries:
 The condition's language is independent of the request's protocol: a Cypher
 condition governs JSON-LD and SPARQL reads and writes identically, because
 enforcement operates on flakes.
+
+## Condition state (`f:queryState`)
+
+By default a condition evaluates against **pre-transaction state** — the
+committed data before the write ("orders must currently be in draft",
+owner checks against existing records). Declaring `f:queryState
+f:postState` evaluates the whole condition against **post-transaction
+state** (committed + this transaction's staged flakes) instead. That is
+what "may create Leads owned by the requester" needs — the `ex:owner`
+value is being asserted in the same transaction and is invisible to
+pre-state:
+
+```json
+{
+  "@id": "ex:leadCreatorsOwnOnly",
+  "@type": "f:AccessPolicy",
+  "f:onClass": [{"@id": "http://example.org/ns/Lead"}],
+  "f:action": {"@id": "f:create"},
+  "f:queryState": {"@id": "f:postState"},
+  "f:query": {
+    "@type": "f:sparql",
+    "@value": "ASK { $this <http://example.org/ns/owner> $identity }"
+  }
+}
+```
+
+Notes:
+
+- On the read path there is no transaction in flight, so `f:preState` and
+  `f:postState` coincide with current state — a policy governing both
+  actions stays portable.
+- Many "transition" constraints don't need post-state at all: `?$value`
+  carries the proposed value while the condition reads pre-state, so
+  *"may set status to approved only from draft"* is
+  `ASK { $this ex:status "draft" . FILTER($op = "retract" || $value = "approved") }`.
+- The selector applies to the whole condition. Mixing both states inside
+  one condition (relational transition constraints) is a planned SPARQL
+  extension (`GRAPH f:postState { ... }`), not yet available.
 
 ## RDFS entailment
 

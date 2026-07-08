@@ -1750,6 +1750,22 @@ mem:fact-01kx0tafnf825th2w2q4z46a66 a mem:Fact ;
     mem:branch "feature/policy-write-intents" ;
     mem:createdAt "2026-07-08T12:12:56.367344+00:00"^^xsd:dateTime .
 
+mem:fact-01kx0wpcatfkav62h6ng3nw4dp a mem:Fact ;
+    mem:content "Cypher policy conditions LANDED (0ddc990e9): f:cypher datatype on f:query; read-only MATCH...RETURN, ≥1 row = allow; write/schema/procedure statements rejected at build → Deny. $this/$identity are Cypher PARAMETERS carrying IRI strings (substitute_params pre-lowering — no variable seeding, unlike SPARQL's Pattern::Values); unbound identity → null param. Lowering has NO ledger @vocab (executor lacks a context handle) — conditions must use backtick-quoted full IRIs on @vocab ledgers. Hook: lang_support::CypherSupport registered from api cypher_lang.rs. JSON-LD ask form also landed (ed8d0e623): {\"ask\": X} normalizes to {\"where\": X}; both keys fails closed." ;
+    mem:tag "ask" ;
+    mem:tag "conditions" ;
+    mem:tag "cypher" ;
+    mem:tag "f-cypher-datatype" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_lang.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_policy_cypher_conditions.rs" ;
+    mem:artifactRef "fluree-db-query/src/lang_support.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:54:23.322509+00:00"^^xsd:dateTime ;
+    mem:rationale "The vocab caveat is the sharpest future gotcha; the params-vs-values seeding difference matters for the upcoming $value/state-graphs work." .
+
 mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
     mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
     mem:tag "crate-boundary" ;

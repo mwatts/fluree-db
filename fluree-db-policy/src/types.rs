@@ -46,6 +46,23 @@ impl PolicyQueryLanguage {
     }
 }
 
+/// Which transaction state a policy condition evaluates against
+/// (`f:queryState` on the policy node).
+///
+/// On the write path, `Pre` is committed state before the transaction and
+/// `Post` is committed state plus the staged flakes. On the read path there
+/// is no transaction in flight, so the two coincide (a `Post` condition
+/// evaluates against current state) — policies governing both actions stay
+/// portable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConditionState {
+    /// Pre-transaction state (`f:preState`, the default)
+    #[default]
+    Pre,
+    /// Post-transaction state (`f:postState`): committed + staged flakes
+    Post,
+}
+
 /// Policy query for conditional evaluation
 ///
 /// Represents a query that determines if a policy allows access.
@@ -61,6 +78,8 @@ pub struct PolicyQuery {
     pub source: String,
     /// Language the source is written in
     pub language: PolicyQueryLanguage,
+    /// Which transaction state the condition evaluates against
+    pub state: ConditionState,
 }
 
 /// Target mode for a policy restriction
@@ -154,6 +173,11 @@ impl WriteVerbs {
 pub struct WriteFlakeInfo<'a> {
     /// Lifecycle of the flake's subject within this transaction.
     pub lifecycle: WriteVerb,
+    /// The flake's operation: `true` = assert, `false` = retract. Bound
+    /// into conditions as `?$op` (`"assert"` / `"retract"`) so a value
+    /// constraint can exempt retractions (a value change retracts the old
+    /// value, whose `?$value` would otherwise fail the constraint).
+    pub op: bool,
     /// Subject's classes in pre-state. Governs class targeting for legacy
     /// bare-`f:modify` policies (`verbs: None`).
     pub pre_classes: &'a [Sid],
@@ -610,6 +634,20 @@ impl PolicyWrapper {
             .restrictions
             .iter()
             .any(|r| r.verbs.is_some())
+    }
+
+    /// Check if the modify set contains any `f:queryState f:postState`
+    /// conditions.
+    ///
+    /// Used by the transaction staging layer to decide whether a staged
+    /// (post-state) view must be constructed for condition execution.
+    pub fn has_post_state_conditions(&self) -> bool {
+        self.inner.modify.restrictions.iter().any(|r| {
+            matches!(
+                &r.value,
+                PolicyValue::Query(q) if q.state == ConditionState::Post
+            )
+        })
     }
 }
 

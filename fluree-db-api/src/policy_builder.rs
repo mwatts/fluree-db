@@ -20,8 +20,8 @@ use fluree_db_core::{FlakeValue, GraphDbRef, IndexType, LedgerSnapshot, Sid};
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest};
 use fluree_db_novelty::{Novelty, StatsAssemblyError, StatsLookup};
 use fluree_db_policy::{
-    build_policy_set, PolicyAction, PolicyContext, PolicyQuery, PolicyQueryLanguage,
-    PolicyRestriction, PolicyValue, PolicyWrapper, TargetMode, WriteVerbs,
+    build_policy_set, ConditionState, PolicyAction, PolicyContext, PolicyQuery,
+    PolicyQueryLanguage, PolicyRestriction, PolicyValue, PolicyWrapper, TargetMode, WriteVerbs,
 };
 use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
@@ -1037,6 +1037,22 @@ pub(crate) async fn load_policy_restriction(
         }
     }
 
+    // f:queryState — which transaction state the f:query condition
+    // evaluates against (f:preState default / f:postState).
+    let query_state: ConditionState = {
+        let qs_sid = resolve_system_iri_to_sid(snapshot, policy_iris::QUERY_STATE, "f:queryState")?;
+        let post_sid = resolve_system_iri_to_sid(snapshot, policy_iris::POST_STATE, "f:postState")?;
+        let bindings =
+            query_predicate(snapshot, overlay, to_t, policy_sid, &qs_sid, policy_graphs).await?;
+        let mut state = ConditionState::Pre;
+        for binding in bindings {
+            if binding.as_sid() == Some(&post_sid) {
+                state = ConditionState::Post;
+            }
+        }
+        state
+    };
+
     // Determine target mode and targets
     let (target_mode, targets, for_classes) = if !on_property.is_empty() {
         (TargetMode::OnProperty, on_property, HashSet::new())
@@ -1066,7 +1082,7 @@ pub(crate) async fn load_policy_restriction(
                 // by the query engine. We still validate the source parses to
                 // preserve the "deny on parse error" behavior without
                 // duplicating query lowering logic.
-                make_policy_query_value(&policy_id, source, language)
+                make_policy_query_value(&policy_id, source, language, query_state)
             } else {
                 // No f:allow and no f:query - this is likely a misconfigured policy
                 tracing::warn!(
@@ -1245,6 +1261,24 @@ fn parse_inline_policy(
                 _ => None,
             });
 
+        // f:queryState — which transaction state the f:query condition
+        // evaluates against (f:preState default / f:postState).
+        let query_state = obj
+            .get("f:queryState")
+            .or_else(|| obj.get(&format!("{}queryState", fluree::DB)))
+            .map(|v| {
+                let iris = extract_iris(v);
+                if iris
+                    .iter()
+                    .any(|i| i == "f:postState" || i == policy_iris::POST_STATE)
+                {
+                    ConditionState::Post
+                } else {
+                    ConditionState::Pre
+                }
+            })
+            .unwrap_or_default();
+
         // Extract f:action - can be string, object with @id, or array of these
         let action_value = obj
             .get("f:action")
@@ -1388,7 +1422,7 @@ fn parse_inline_policy(
             Some(false) => PolicyValue::Deny,
             None => {
                 if let Some((source, language)) = policy_query_source {
-                    make_policy_query_value(&id, source, language)
+                    make_policy_query_value(&id, source, language, query_state)
                 } else {
                     PolicyValue::Deny
                 }
@@ -1444,6 +1478,7 @@ fn make_policy_query_value(
     policy_id: &str,
     source: String,
     language: PolicyQueryLanguage,
+    state: ConditionState,
 ) -> PolicyValue {
     let validation = match language {
         PolicyQueryLanguage::JsonLd => serde_json::from_str::<JsonValue>(&source)
@@ -1463,7 +1498,11 @@ fn make_policy_query_value(
         )),
     };
     match validation {
-        Ok(()) => PolicyValue::Query(PolicyQuery { source, language }),
+        Ok(()) => PolicyValue::Query(PolicyQuery {
+            source,
+            language,
+            state,
+        }),
         Err(e) => {
             tracing::warn!(
                 "Policy '{}': invalid {} f:query, defaulting to deny: {}",

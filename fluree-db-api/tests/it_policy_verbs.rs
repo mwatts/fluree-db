@@ -15,6 +15,7 @@ use fluree_db_api::{
     TrackedTransactionInput, TxnOpts, TxnType,
 };
 use serde_json::{json, Value as JsonValue};
+use std::collections::HashMap;
 
 fn index_config() -> IndexConfig {
     IndexConfig {
@@ -529,5 +530,202 @@ async fn stored_verb_policy_via_policy_class() {
     assert!(
         result.is_err(),
         "stored create grant must not permit editing an existing Lead"
+    );
+}
+
+/// `?$value` / `?$op` condition bindings: a required value gate on a
+/// property constrains what may be ASSERTED while exempting retractions —
+/// a value change retracts the old value, whose `?$value` would otherwise
+/// fail the constraint.
+#[tokio::test]
+async fn value_op_gate_constrains_asserted_values_sparql() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "verbs_value_gate").await;
+
+    let policies = json!([
+        view_all(),
+        {
+            "@id": "ex:stageGate",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/ns/stage"}],
+            "f:action": "f:modify",
+            "f:exMessage": "stage may only be set to 'qualified'",
+            "f:query": {
+                "@type": "f:sparql",
+                "@value": "ASK { FILTER($op = \"retract\" || $value = \"qualified\") }"
+            }
+        }
+    ]);
+    let ctx = policy_ctx(&ledger, policies).await;
+
+    let good = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "ex:lead1", "ex:stage": "?s"},
+        "delete": {"@id": "ex:lead1", "ex:stage": "?s"},
+        "insert": {"@id": "ex:lead1", "ex:stage": "qualified"}
+    });
+    let result = try_txn(&fluree, ledger.clone(), TxnType::Update, &good, &ctx).await;
+    assert!(
+        result.is_ok(),
+        "setting stage to the allowed value must pass: {result:?}"
+    );
+
+    let bad = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "ex:lead1", "ex:stage": "?s"},
+        "delete": {"@id": "ex:lead1", "ex:stage": "?s"},
+        "insert": {"@id": "ex:lead1", "ex:stage": "junk"}
+    });
+    let result = try_txn(&fluree, ledger, TxnType::Update, &bad, &ctx).await;
+    assert!(
+        result.is_err(),
+        "setting stage to a disallowed value must be denied"
+    );
+}
+
+/// The same value gate in the JSON-LD `ask` form: `?$value` / `?$op` bind
+/// in every condition language.
+#[tokio::test]
+async fn value_op_gate_constrains_asserted_values_jsonld() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "verbs_value_gate_jsonld").await;
+
+    let policies = json!([
+        view_all(),
+        {
+            "@id": "ex:stageGate",
+            "f:required": true,
+            "f:onProperty": [{"@id": "http://example.org/ns/stage"}],
+            "f:action": "f:modify",
+            "f:query": serde_json::to_string(&json!({
+                "ask": [["filter", "(or (= ?$op \"retract\") (= ?$value \"qualified\"))"]]
+            }))
+            .unwrap()
+        }
+    ]);
+    let ctx = policy_ctx(&ledger, policies).await;
+
+    let good = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "ex:lead1", "ex:stage": "?s"},
+        "delete": {"@id": "ex:lead1", "ex:stage": "?s"},
+        "insert": {"@id": "ex:lead1", "ex:stage": "qualified"}
+    });
+    let result = try_txn(&fluree, ledger.clone(), TxnType::Update, &good, &ctx).await;
+    assert!(result.is_ok(), "allowed value must pass: {result:?}");
+
+    let bad = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "ex:lead1", "ex:stage": "?s"},
+        "delete": {"@id": "ex:lead1", "ex:stage": "?s"},
+        "insert": {"@id": "ex:lead1", "ex:stage": "junk"}
+    });
+    let result = try_txn(&fluree, ledger, TxnType::Update, &bad, &ctx).await;
+    assert!(result.is_err(), "disallowed value must be denied");
+}
+
+/// `f:queryState f:postState`: "may create Leads owned by self" — the
+/// condition must see the ex:owner property being asserted in the same
+/// transaction, which pre-state (the default) cannot.
+#[tokio::test]
+async fn post_state_condition_sees_staged_flakes() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "verbs_post_state").await;
+
+    let create_own = |query_state: Option<&str>| {
+        let mut policy = json!({
+            "@id": "ex:leadCreatorsOwnOnly",
+            "f:onClass": [{"@id": "http://example.org/ns/Lead"}],
+            "f:action": "f:create",
+            "f:query": {
+                "@type": "f:sparql",
+                "@value": "ASK { $this <http://example.org/ns/owner> $identity }"
+            }
+        });
+        if let Some(state) = query_state {
+            policy["f:queryState"] = json!({"@id": state});
+        }
+        json!([view_all(), policy])
+    };
+
+    let opts_for = |policies: serde_json::Value| GovernanceOptions {
+        policy: Some(policies),
+        policy_values: Some(HashMap::from([(
+            "?$identity".to_string(),
+            json!({"@id": "http://example.org/ns/apiUser"}),
+        )])),
+        default_allow: false,
+        ..Default::default()
+    };
+
+    // The identity must resolve to a subject for $identity to bind.
+    let seed_identity = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:apiUser",
+        "ex:kind": "service"
+    });
+    let ledger = fluree
+        .insert(ledger, &seed_identity)
+        .await
+        .expect("seed identity")
+        .ledger;
+
+    let owned = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead7",
+        "@type": "ex:Lead",
+        "ex:name": "Mine",
+        "ex:owner": {"@id": "ex:apiUser"}
+    });
+
+    // Post-state condition sees the staged ex:owner assert → allowed.
+    let post_opts = opts_for(create_own(Some("f:postState")));
+    let ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &post_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+    let result = try_txn(&fluree, ledger.clone(), TxnType::Insert, &owned, &ctx).await;
+    assert!(
+        result.is_ok(),
+        "post-state create-with-owner condition must pass: {result:?}"
+    );
+
+    // Without an owner the condition never holds.
+    let unowned = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead8",
+        "@type": "ex:Lead",
+        "ex:name": "Nobody's"
+    });
+    let result = try_txn(&fluree, ledger.clone(), TxnType::Insert, &unowned, &ctx).await;
+    assert!(result.is_err(), "ownerless create must be denied");
+
+    // Control: the same policy WITHOUT f:queryState evaluates against
+    // pre-state, where the new Lead's owner does not exist yet → denied.
+    // This pins that the selector is what switches the state.
+    let pre_opts = opts_for(create_own(None));
+    let pre_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &pre_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+    let result = try_txn(&fluree, ledger, TxnType::Insert, &owned, &pre_ctx).await;
+    assert!(
+        result.is_err(),
+        "pre-state (default) condition must not see staged flakes"
     );
 }

@@ -16,8 +16,8 @@
 use crate::error::Result;
 use crate::index::build_policy_set;
 use crate::types::{
-    PolicyAction, PolicyQuery, PolicyQueryLanguage, PolicyRestriction, PolicySet, PolicyValue,
-    TargetMode, WriteVerbs,
+    ConditionState, PolicyAction, PolicyQuery, PolicyQueryLanguage, PolicyRestriction, PolicySet,
+    PolicyValue, TargetMode, WriteVerbs,
 };
 use fluree_db_core::{IndexStats, Sid};
 use std::collections::HashSet;
@@ -104,6 +104,7 @@ pub enum WirePolicyValue {
     Query {
         source: String,
         language: PolicyQueryLanguage,
+        state: ConditionState,
     },
 }
 
@@ -201,9 +202,14 @@ where
         let value = match &w.value {
             WirePolicyValue::Allow => PolicyValue::Allow,
             WirePolicyValue::Deny => PolicyValue::Deny,
-            WirePolicyValue::Query { source, language } => PolicyValue::Query(PolicyQuery {
+            WirePolicyValue::Query {
+                source,
+                language,
+                state,
+            } => PolicyValue::Query(PolicyQuery {
                 source: source.clone(),
                 language: *language,
+                state: *state,
             }),
         };
         out.push(PolicyRestriction {
@@ -569,6 +575,7 @@ mod tests {
                 value: WirePolicyValue::Query {
                     source: json_payload.into(),
                     language: PolicyQueryLanguage::JsonLd,
+                    state: ConditionState::Pre,
                 },
                 required: false,
                 message: None,
