@@ -637,8 +637,8 @@ impl Fluree {
         // identical to the native `db()` path (this also fixes the rarer
         // `{ds}:main#...` NotFound).
         let (base_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
-        let gs_id = fluree_db_core::normalize_ledger_id(base_id)
-            .unwrap_or_else(|_| base_id.to_string());
+        let gs_id =
+            fluree_db_core::normalize_ledger_id(base_id).unwrap_or_else(|_| base_id.to_string());
 
         if self
             .nameservice()
