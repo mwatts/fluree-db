@@ -249,11 +249,12 @@ pub enum ShortestPathMode {
     Single,
     /// `allShortestPaths(...)` — every path of the minimal length.
     All,
-    /// Path *enumeration* — every node-distinct path whose hop count is in
-    /// `[min_hops, max_hops]` (Cypher `p = (a)-[:T*]->(b)`, `-[r:T*]->`).
-    /// Unlike the shortest modes, the **end may be unbound**: the operator
-    /// binds it per discovered path (a bound end filters instead). Only the
-    /// start anchors the search.
+    /// Path *enumeration* — every relationship-unique (trail) path whose hop
+    /// count is in `[min_hops, max_hops]` (Cypher `p = (a)-[:T*]->(b)`,
+    /// `-[r:T*]->`): no edge is traversed twice, but a node may be revisited via
+    /// a different edge (matches Neo4j). Unlike the shortest modes, the **end may
+    /// be unbound**: the operator binds it per discovered path (a bound end
+    /// filters instead). Only the start anchors the search.
     Enumerate,
 }
 

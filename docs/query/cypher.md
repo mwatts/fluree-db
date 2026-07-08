@@ -120,13 +120,14 @@ ORDER BY / SKIP / LIMIT
   - Everything else — **unbounded** (`-[r:T*]->`, `p = (a)-[:T*]->(b)`),
     **untyped/wildcard**, **undirected**, zero lower bounds (`*0..`), and
     lower bounds above 1 — runs the **path-enumeration** search: a DFS from
-    the (anchored) start emitting one row per **node-distinct** path whose
-    hop count is in range. The end node binds per path when free, or filters
-    the enumeration when already bound. Node-distinctness stands in for
-    Cypher's relationship-uniqueness (a walk that revisits a node is not
-    enumerated), and the search is guarded by visited/path caps that **error**
-    rather than silently truncate — narrow dense patterns with hop bounds, a
-    bound end, or a type.
+    the (anchored) start emitting one row per path whose hop count is in range.
+    The end node binds per path when free, or filters the enumeration when
+    already bound. The search enforces Cypher **relationship-uniqueness** (trail
+    semantics — no edge is traversed twice, but a node may be revisited via a
+    different edge; e.g. the triangle closure `a→b→c→a` is a valid 3-hop path),
+    matching Neo4j. It is guarded by visited/path caps that **error** rather than
+    silently truncate — narrow dense patterns with hop bounds, a bound end, or a
+    type.
 
   A **fixed** single hop also takes a path variable
   (`MATCH p = (a)-[:T]->(b)` is a `*1..1` path), as does a **multi-hop chain**

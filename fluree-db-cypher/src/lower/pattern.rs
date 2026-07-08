@@ -768,16 +768,17 @@ fn lower_var_length_rel<E: IriEncoder>(
 }
 
 /// Lower a variable-length relationship that binds a relationship or path
-/// variable into an `Enumerate`-mode path search: one row per node-distinct
-/// path whose hop count is in the pattern's bounds, with the path variable
-/// bound to the path value and a relationship variable bound to
-/// `relationships(path)`. The end node is produced per path when unbound,
-/// or filters the enumeration when an earlier pattern bound it.
+/// variable into an `Enumerate`-mode path search: one row per path whose hop
+/// count is in the pattern's bounds, with the path variable bound to the path
+/// value and a relationship variable bound to `relationships(path)`. The end
+/// node is produced per path when unbound, or filters the enumeration when an
+/// earlier pattern bound it.
 ///
 /// Handles the shapes the cheaper operators can't: unbounded with binding,
 /// untyped (wildcard) with binding, undirected, lower bounds above 1, and
-/// zero-length (`*0..`). Node-distinctness stands in for Cypher's
-/// relationship-uniqueness (walks that revisit a node are not enumerated).
+/// zero-length (`*0..`). The search enforces Cypher relationship-uniqueness
+/// (trail semantics — no edge reused, but a node may be revisited via a
+/// different edge).
 fn lower_enumerate_path<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     left: &NodePattern,

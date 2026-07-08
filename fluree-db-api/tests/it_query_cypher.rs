@@ -332,8 +332,8 @@ async fn cypher_bare_node_pattern_rejected_at_lower() {
 #[tokio::test]
 async fn cypher_var_length_unbounded_bound_relationship_variable_enumerates() {
     // Binding a variable to an UNBOUNDED variable-length relationship
-    // enumerates node-distinct paths (Enumerate mode). On an empty ledger the
-    // pattern simply matches nothing — the point is that it no longer rejects.
+    // enumerates paths under relationship-uniqueness (Enumerate mode). On an
+    // empty ledger the pattern matches nothing — the point is it no longer rejects.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-bound");
     let db = graphdb_from_ledger(&ledger0);
@@ -4941,6 +4941,59 @@ async fn cypher_var_length_relationship_uniqueness_no_self_rows() {
 }
 
 #[tokio::test]
+async fn cypher_enumerate_path_relationship_uniqueness_traverses_cycle() {
+    // Triangle 0→1→2→0 over :R. Cypher trail semantics (relationship-
+    // uniqueness) enumerate the closure 0→1→2→0 — three distinct edges, node 0
+    // revisited — which node-distinctness would wrongly drop. An unbounded typed
+    // path binding (`p = (a)-[:R*]->(x)`) routes through Enumerate mode.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:enum-relunique");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "n0", "@type": "N", "id": 0, "R": {"@id": "n1"}},
+                    {"@id": "n1", "@type": "N", "id": 1, "R": {"@id": "n2"}},
+                    {"@id": "n2", "@type": "N", "id": 2, "R": {"@id": "n0"}},
+                ]
+            }),
+        )
+        .await
+        .expect("seed triangle")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Enumerate from n0 to any node. Relationship-uniqueness yields three trails:
+    // n0→n1 (len 1), n0→n1→n2 (len 2), n0→n1→n2→n0 (len 3, the closure). The
+    // next hop would reuse edge n0→n1, so the walk stops there. Node-distinctness
+    // would have dropped the closure, returning only the first two.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {id: 0})-[:R*]->(x) RETURN x.id AS dst, length(p) AS len"#,
+        )
+        .await
+        .expect("enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let mut got: Vec<(i64, i64)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| (r[0].as_i64().expect("dst"), r[1].as_i64().expect("len")))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![(0, 3), (1, 1), (2, 2)],
+        "relationship-uniqueness enumerates the triangle closure n0→n1→n2→n0: {rows}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_var_length_exact_hops() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:varlen-exact").await;
@@ -5414,7 +5467,7 @@ async fn cypher_var_length_rel_and_path_binding() {
     assert_eq!(data[0]["row"], json!(["Bob", 1, 1]), "{path}");
     assert_eq!(data[1]["row"], json!(["Carol", 2, 2]), "{path}");
 
-    // Unbounded rel binding enumerates: one row per node-distinct path.
+    // Unbounded rel binding enumerates: one row per trail (relationship-unique).
     let unbounded = fluree
         .query_cypher(
             &db,
@@ -5587,7 +5640,7 @@ async fn cypher_shortest_path_no_path_drops_row() {
 
 #[tokio::test]
 async fn cypher_path_enumeration_unbounded_free_end() {
-    // `p = (a)-[:T*]->(b)` with b unbound: one row per node-distinct path.
+    // `p = (a)-[:T*]->(b)` with b unbound: one row per trail (relationship-unique).
     // Chain Alice→Bob→Carol→Dave gives paths of length 1, 2, 3 from Alice.
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:enum-free").await;
@@ -5751,20 +5804,26 @@ async fn cypher_path_enumeration_zero_length_and_cycles() {
         "zero-length path binds end to start"
     );
 
-    // Unbounded enumeration on a cyclic graph terminates (node-distinct):
-    // from A the only path is A→B (A→B→A revisits A).
+    // Unbounded enumeration on a cyclic graph terminates under relationship-
+    // uniqueness (no edge reused): from A the trails are A→B and the closure
+    // A→B→A (both edges distinct); A→B→A→B would reuse A→B, so the walk stops.
+    // Matches Neo4j — a node may be revisited via a different edge.
     let out = fluree
         .query_cypher(
             &db,
             r#"MATCH p = (a:N {name: "A"})-[:E*]->(b)
-               RETURN b.name AS dst, length(p) AS len"#,
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
         )
         .await
         .expect("cycle safe")
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(out, json!([["B", 1]]), "cycles do not loop or duplicate");
+    assert_eq!(
+        out,
+        json!([["B", 1], ["A", 2]]),
+        "relationship-uniqueness enumerates the 2-cycle closure A→B→A"
+    );
 }
 
 #[tokio::test]

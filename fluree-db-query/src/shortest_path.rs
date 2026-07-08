@@ -769,13 +769,15 @@ impl ShortestPathOperator {
         Ok(results)
     }
 
-    /// Every node-distinct path from `start` whose hop count lies in
-    /// `[min_hops, max_hops]` (Cypher path enumeration, `Enumerate` mode).
-    /// A `Some(end)` filter keeps only paths ending there; `None` emits one
-    /// row per qualifying path to *any* node. An unbounded `max_hops` has no
-    /// depth cap — node-distinctness makes the search finite, and the
-    /// `max_visited` / `max_paths` guards fail loudly (never truncate
-    /// silently) when a graph is too dense to enumerate.
+    /// Every path from `start` whose hop count lies in `[min_hops, max_hops]`
+    /// under Cypher **relationship-uniqueness** (trail semantics — no edge is
+    /// traversed twice, but a node MAY be revisited via a different edge; this
+    /// matches Neo4j, e.g. the triangle closure `a→b→c→a` is a valid 3-hop
+    /// path). A `Some(end)` filter keeps only paths ending there; `None` emits
+    /// one row per qualifying path to *any* node. An unbounded `max_hops` has no
+    /// depth cap — relationship-uniqueness still makes the search finite (each
+    /// edge is used at most once), and the `max_visited` / `max_paths` guards
+    /// fail loudly (never truncate silently) when a graph is too dense.
     async fn enumerate_all_paths(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -806,9 +808,27 @@ impl ShortestPathOperator {
             if max_hops.is_some_and(|m| depth >= m) {
                 continue;
             }
+            // Cypher relationship-uniqueness (trail): a node may be revisited,
+            // but no edge twice. The only edge this step can add is `last`→`nb`,
+            // so reject exactly that edge if the path already traversed it —
+            // gather the nodes already reached across an edge at `last` (directed:
+            // as the edge's source; undirected: either orientation).
+            let undirected = matches!(self.pattern.direction, PathDirection::Either);
+            let reached_via_last: Vec<Sid> = path
+                .windows(2)
+                .filter_map(|w| {
+                    if w[0] == *last {
+                        Some(w[1].clone())
+                    } else if undirected && w[1] == *last {
+                        Some(w[0].clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             for nb in self.neighbors(ctx, last, true).await? {
-                if path.contains(&nb) {
-                    continue; // node-distinct
+                if reached_via_last.contains(&nb) {
+                    continue; // relationship-uniqueness: edge last↔nb already used
                 }
                 states += 1;
                 if states >= self.max_visited {
