@@ -238,23 +238,17 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         // handled here — any other shape returns `None` and falls through to the
         // normal path unchanged.
         #[cfg(feature = "iceberg")]
-        if let (Some((provider, table_provider)), Some(json)) = (r2rml.as_ref(), input.as_jsonld())
+        if let Some(expanded) = crate::graph_source::crawl::maybe_expand_crawl(
+            self.graph.fluree,
+            &view,
+            input.as_jsonld(),
+            r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+            execution.clone(),
+            &format_config,
+        )
+        .await?
         {
-            if view.graph_source_id.is_some() {
-                if let Some(expanded) = crate::graph_source::crawl::expand_wildcard_crawl(
-                    self.graph.fluree,
-                    &view,
-                    json,
-                    provider.as_ref(),
-                    table_provider.as_ref(),
-                    execution.clone(),
-                    &format_config,
-                )
-                .await?
-                {
-                    return Ok(expanded);
-                }
-            }
+            return Ok(expanded);
         }
 
         let result = match r2rml.as_ref() {

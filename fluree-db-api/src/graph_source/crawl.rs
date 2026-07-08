@@ -21,6 +21,7 @@
 //! behavior of any query it does not fully handle.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -176,6 +177,71 @@ pub(crate) async fn expand_wildcard_crawl(
     }
 
     Ok(Some(JsonValue::Array(docs)))
+}
+
+/// Master kill-switch for expanding a subgraph crawl over a graph source through
+/// the R2RML operator. Default **on**. Set `FLUREE_R2RML_CRAWL_EXPAND=0` (or
+/// `false`/`off`) to restore native binary-index hydration — which returns `[]`
+/// for a virtual dataset (the pre-fix behavior), so this is a safety escape
+/// hatch, not a normal setting.
+fn crawl_expand_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FLUREE_R2RML_CRAWL_EXPAND")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Interception entry point used by **every** formatting terminal (the
+/// graph-source alias path *and* the ledger-scoped / dataset / connection paths).
+///
+/// If `json` is a subgraph "crawl" projection over a graph-source-backed `view`,
+/// expand it through the R2RML operator and return the per-subject JSON-LD
+/// documents. Returns `Ok(None)` — so the caller falls back to its normal
+/// (native) formatting — when: the kill-switch is off, there is no R2RML
+/// provider, the input is not JSON-LD, the view is not graph-source-backed
+/// (`graph_source_id` is `None`, i.e. a genuinely native ledger), or the crawl
+/// shape is not one this module handles. This is what makes the Solo virtual
+/// dataset "View Instances" screen return data instead of `[]`.
+pub(crate) async fn maybe_expand_crawl(
+    fluree: &Fluree,
+    view: &GraphDb,
+    json: Option<&JsonValue>,
+    r2rml: Option<(
+        &dyn fluree_db_query::r2rml::R2rmlProvider,
+        &dyn fluree_db_query::r2rml::R2rmlTableProvider,
+    )>,
+    execution: QueryExecutionOptions,
+    format_config: &FormatterConfig,
+) -> Result<Option<JsonValue>> {
+    if !crawl_expand_enabled() {
+        return Ok(None);
+    }
+    // Native ledgers (no graph source) hydrate against their binary index as
+    // before — this gate is the load-bearing guard that keeps native crawls,
+    // and any non-graph-source view, on their existing path.
+    if view.graph_source_id.is_none() {
+        return Ok(None);
+    }
+    let (Some((provider, table_provider)), Some(json)) = (r2rml, json) else {
+        return Ok(None);
+    };
+    expand_wildcard_crawl(
+        fluree,
+        view,
+        json,
+        provider,
+        table_provider,
+        execution,
+        format_config,
+    )
+    .await
 }
 
 /// Recognize a single-column wildcard crawl `{"select": {"?s": ["*"]}, ...}`.
