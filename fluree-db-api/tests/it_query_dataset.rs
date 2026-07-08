@@ -2367,3 +2367,201 @@ async fn dataset_staged_transaction_with_novel_namespace() {
         normalize_rows(&json!([["Alice", "Acme Corp"]]))
     );
 }
+
+// =============================================================================
+// PR-G2: within-ledger SPARQL FROM / FROM NAMED (D-3, Option A)
+//
+// A `FROM` / `FROM NAMED` clause on a single `GraphDb` names graphs *within
+// this ledger*; the engine builds a within-ledger `DataSetDb` over the one
+// snapshot and runs it through the shared dataset path. These mirror the W3C
+// data-r2/dataset semantics on a real Fluree ledger (rather than the harness).
+// =============================================================================
+
+/// Seed ONE ledger whose default graph and two named graphs each carry a
+/// distinct `schema:name`: default = Alice, `<urn:g1>` = Bob, `<urn:g2>` =
+/// Carol. All three live in the same ledger/snapshot.
+async fn seed_within_ledger_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <urn:g1> { ex:bob schema:name "Bob" . }
+        GRAPH <urn:g2> { ex:carol schema:name "Carol" . }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// `FROM <graph>` re-scopes the default graph to that within-ledger named
+/// graph (the query sees the FROM graph, not the ledger's real default graph),
+/// and multiple `FROM` union. W3C dawg-dataset-01/-05/-12b analog on one
+/// ledger, driven through the plain `fluree.query(&db, sparql)` path.
+#[tokio::test]
+async fn sparql_within_ledger_from_scopes_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    // Single FROM: default graph = <urn:g1> = Bob (NOT Alice from the ledger
+    // default graph, NOT Carol from <urn:g2>).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:g1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("within-ledger FROM should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+
+    // Two FROM graphs union into the default graph = Bob + Carol.
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:g1> FROM <urn:g2> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("within-ledger FROM union should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Bob"], ["Carol"]]))
+    );
+}
+
+/// `FROM NAMED` exposes a within-ledger graph as a SPARQL named graph without
+/// contributing to the default graph, and plain `FROM` does not create a named
+/// graph. W3C dawg-dataset-02/-03/-04 analog on one ledger.
+#[tokio::test]
+async fn sparql_within_ledger_from_named_semantics() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    // FROM NAMED only → the default graph is empty (dataset-02).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM NAMED <urn:g1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    assert!(
+        result.is_empty(),
+        "FROM NAMED only ⇒ the default graph is empty"
+    );
+
+    // The FROM NAMED graph is addressable via GRAPH <iri> (dataset-03).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM NAMED <urn:g1> { GRAPH <urn:g1> { ?s schema:name ?name } }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+
+    // Plain FROM does NOT create a named graph: with no FROM NAMED, GRAPH ?g
+    // ranges over an empty named set → no rows (dataset-04).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:g1> { GRAPH ?g { ?s schema:name ?name } }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    assert!(
+        result.is_empty(),
+        "plain FROM creates no named graph ⇒ GRAPH ?g is empty"
+    );
+}
+
+/// Query-surface parity (D-3, Option A): the within-ledger SPARQL `FROM` /
+/// `FROM NAMED` dataset the buffered `query` path now builds is the same
+/// engine/view-level `DataSetDb` / `DatasetOperator` construction the JSON-LD
+/// `from` / `fromNamed` surface reaches through `@graph` graph selectors. This
+/// exercises the JSON-LD side over ONE ledger (the W3C submodule only guards
+/// the SPARQL surface, so parity is asserted here).
+#[tokio::test]
+async fn fql_within_ledger_from_named_dataset_parity() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    // `from` scopes the default graph to <urn:g1>; `fromNamed` exposes <urn:g2>
+    // as a dataset named graph (alias "g2") — both within the one ledger.
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "from": {"@id": "wl:main", "graph": "urn:g1"},
+        "fromNamed": {"g2": {"@id": "wl:main", "@graph": "urn:g2"}},
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let spec = DatasetSpec::from_json(&query).expect("parse dataset spec");
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build within-ledger dataset");
+
+    // Single-ledger dataset: every graph shares the one ledger, so no
+    // cross-ledger provenance engages (Option A's single-snapshot property).
+    let ledgers: std::collections::HashSet<String> = dataset
+        .default
+        .iter()
+        .chain(dataset.named.values())
+        .map(|g| g.ledger_id.to_string())
+        .collect();
+    assert_eq!(
+        ledgers.len(),
+        1,
+        "within-ledger dataset must span exactly one ledger, got {ledgers:?}"
+    );
+
+    // Default-graph query sees <urn:g1> (Bob): the `from` @graph selector
+    // scoped the default graph to the within-ledger named graph — the JSON-LD
+    // mirror of SPARQL `FROM <urn:g1>`.
+    let result = fluree
+        .query_dataset(&dataset, &query)
+        .await
+        .expect("dataset query should succeed");
+    let primary = dataset.primary().unwrap();
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_flat_results(&jsonld),
+        normalize_flat_results(&json!(["Bob"]))
+    );
+
+    // The `fromNamed` graph <urn:g2> is reachable as a named graph (alias
+    // "g2") and stays OUT of the default graph — Carol, absent from the Bob
+    // result above.
+    let named_query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "from": {"@id": "wl:main", "graph": "urn:g1"},
+        "fromNamed": {"g2": {"@id": "wl:main", "@graph": "urn:g2"}},
+        "select": "?name",
+        "where": [["graph", "g2", {"@id": "?s", "schema:name": "?name"}]]
+    });
+    let result = fluree
+        .query_dataset(&dataset, &named_query)
+        .await
+        .expect("named-graph dataset query should succeed");
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_flat_results(&jsonld),
+        normalize_flat_results(&json!(["Carol"]))
+    );
+}

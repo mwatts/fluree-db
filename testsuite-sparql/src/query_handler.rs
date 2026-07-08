@@ -324,6 +324,43 @@ async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<
 // Query evaluation (inner, runs inside the subprocess)
 // ---------------------------------------------------------------------------
 
+/// Files referenced by a query's `FROM` / `FROM NAMED` dataset clause, each as
+/// a `(graph-name, data-url)` pair keyed by the clause IRI.
+///
+/// The dataset tests define their graphs through the query's dataset clause
+/// (not qt:data / qt:graphData), so the harness must pre-load those files.
+/// Resolving the clause here (against the query's prologue BASE) yields the
+/// exact absolute IRIs the engine's `resolve_dataset_clause` produces, so a
+/// graph loaded under this name resolves against the ledger's graph registry
+/// during within-ledger dataset construction. Both `graph-name` and `data-url`
+/// are the clause IRI: the file is read from it and its relative IRIs resolve
+/// against it as base (matching `setup_graph_store`'s named-graph loading).
+///
+/// Returns empty for queries with no dataset clause, or that fail to parse
+/// (the real parse error surfaces later at query execution).
+fn dataset_clause_graphs(sparql: &str) -> Vec<(String, String)> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    if parsed.has_errors() {
+        return Vec::new();
+    }
+    let Some(ast) = parsed.ast.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(Some(clause)) = fluree_db_sparql::resolve_dataset_clause(ast) else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut graphs = Vec::new();
+    for iri in clause.default_graphs.iter().chain(clause.named_graphs.iter()) {
+        let iri = iri.to_string();
+        if seen.insert(iri.clone()) {
+            graphs.push((iri.clone(), iri));
+        }
+    }
+    graphs
+}
+
 /// Inner async function that does the actual test work.
 ///
 /// Public for use by the `run-w3c-test` subprocess binary.
@@ -334,11 +371,10 @@ pub async fn run_eval_test(
     result_url: &str,
     graph_data: &[(String, String)],
 ) -> Result<()> {
-    // 1. Create in-memory Fluree + ledger, load default + named graph data
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = setup_graph_store(&fluree, data_url, graph_data).await?;
 
-    // 2. Read + execute the SPARQL query.
+    // 1. Read the SPARQL query (before loading the store — a dataset clause
+    //    below decides which files to pre-load).
     //
     // W3C engines resolve relative IRIs in a query against the query
     // document's URL (RFC 3986 §5.1.3 "URI used to retrieve the entity").
@@ -350,16 +386,34 @@ pub async fn run_eval_test(
         .with_context(|| format!("Reading query file: {query_url}"))?;
     let sparql = format!("BASE <{query_url}>\n{sparql}");
 
+    // The data-r2/dataset tests (and constructwhere04) define their dataset
+    // entirely through the query's FROM / FROM NAMED clause — they carry no
+    // qt:data / qt:graphData. Pre-load each clause-referenced file as a named
+    // graph under the same BASE-resolved IRI the engine resolves the clause to,
+    // so within-ledger dataset construction (`build_within_ledger_dataset`) can
+    // resolve it against the ledger's graph registry. No-op for the vast
+    // majority of tests, which carry no dataset clause.
+    let mut graph_data = graph_data.to_vec();
+    for (name, url) in dataset_clause_graphs(&sparql) {
+        if !graph_data.iter().any(|(existing, _)| existing == &name) {
+            graph_data.push((name, url));
+        }
+    }
+
+    // 2. Create the ledger + load default and named graph data.
+    let ledger = setup_graph_store(&fluree, data_url, &graph_data).await?;
+
+    // 3. Execute the SPARQL query.
     let db = GraphDb::from_ledger_state(&ledger);
     let query_result = fluree
         .query(&db, &sparql)
         .await
         .with_context(|| format!("Executing SPARQL query for test {test_id}"))?;
 
-    // 3. Parse expected results
+    // 4. Parse expected results
     let expected = parse_expected_results(result_url)?;
 
-    // 4. Detect CONSTRUCT vs SELECT/ASK from the parsed query's select mode.
+    // 5. Detect CONSTRUCT vs SELECT/ASK from the parsed query's select mode.
     //    Previous heuristic checked file extension (.ttl/.rdf), but many SPARQL
     //    1.0 SELECT tests use .ttl result files encoded in the DAWG Result Set
     //    vocabulary — not CONSTRUCT graphs. See issue #44.
@@ -391,7 +445,7 @@ pub async fn run_eval_test(
         actual
     };
 
-    // 5. Compare
+    // 6. Compare
     if !are_results_isomorphic(&expected, &actual) {
         let diff = format_results_diff(&expected, &actual);
         bail!(
