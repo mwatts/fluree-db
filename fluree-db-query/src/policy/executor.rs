@@ -131,6 +131,19 @@ impl QueryPolicyExecutor<'_> {
             }
         })?;
 
+        // Accept the query language's `ask` form as the preferred spelling
+        // of a condition — its value IS a where-pattern, so it normalizes
+        // onto the same existence-check path as the legacy `{"where": ...}`
+        // form. Both keys together is ambiguous and fails closed (deny).
+        if let Some(ask) = obj.remove("ask") {
+            if obj.contains_key("where") {
+                return Err(fluree_db_policy::PolicyError::QueryExecution {
+                    message: "Policy query cannot carry both 'ask' and 'where'".to_string(),
+                });
+            }
+            obj.insert("where".to_string(), ask);
+        }
+
         // Force select + limit for policy queries
         obj.insert(
             "select".to_string(),

@@ -65,7 +65,15 @@ three while keeping exact semantics.
 
 ## `f:query` syntax
 
-`f:query` is a string containing a JSON-encoded JSON-LD query. The engine parses the string and runs the query as a subquery for each candidate flake, with two pre-bound variables:
+A policy condition is an **existence check** — an ASK — in every language: the policy permits when the condition query has at least one solution.
+
+For the JSON-LD form, `f:query` is a string containing a JSON-encoded query whose pattern is given under the `ask` key (preferred) or the legacy `where` key — the two are equivalent:
+
+```json
+"f:query": "{\"ask\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"hr\"}}"
+```
+
+A condition carrying both `ask` and `where` is ambiguous and fails closed (deny). The engine runs the pattern as a subquery for each candidate flake, with two pre-bound variables:
 
 | Variable | Binding |
 |----------|---------|

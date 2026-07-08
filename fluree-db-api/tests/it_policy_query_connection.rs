@@ -526,3 +526,114 @@ async fn inline_policy_merges_with_policy_class_only() {
         "class-selected (name) and inline (ssn) policies must both apply"
     );
 }
+
+/// The JSON-LD `ask` form is the preferred spelling of a policy condition —
+/// identical semantics to the legacy `{"where": ...}` form (both are
+/// existence checks).
+#[tokio::test]
+async fn jsonld_ask_condition_form() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/ask-form:main";
+    let ledger = seed_people_with_ssn(&fluree, ledger_id).await;
+
+    let identity = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:aliceIdentity",
+        "ex:user": {"@id": "ex:alice"}
+    });
+    fluree
+        .insert(ledger, &identity)
+        .await
+        .expect("insert identity");
+
+    let policy = json!([
+        {
+            "@id": "ex:nameVisible",
+            "f:onProperty": [{"@id": "http://schema.org/name"}],
+            "f:action": "f:view",
+            "f:allow": true
+        },
+        {
+            "@id": "ex:ownSsnOnly",
+            "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+            "f:action": "f:view",
+            "f:query": serde_json::to_string(&json!({
+                "ask": {
+                    "@id": "?$identity",
+                    "http://example.org/ns/user": {"@id": "?$this"}
+                }
+            }))
+            .unwrap()
+        }
+    ]);
+
+    let ssns = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {
+            "policy": policy,
+            "identity": "http://example.org/ns/aliceIdentity",
+            "default-allow": false
+        },
+        "select": ["?s", "?ssn"],
+        "where": {"@id": "?s", "schema:ssn": "?ssn"}
+    });
+    let result = fluree.query_connection(&ssns).await.expect("ssn query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rendered = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld")
+        .to_string();
+    assert!(
+        rendered.contains("111-11-1111"),
+        "own SSN must be visible via ask-form condition: {rendered}"
+    );
+    assert!(
+        !rendered.contains("888-88-8888"),
+        "other user's SSN must stay hidden: {rendered}"
+    );
+}
+
+/// A condition carrying BOTH `ask` and `where` is ambiguous and must fail
+/// closed — the protected data never leaks.
+#[tokio::test]
+async fn jsonld_ask_and_where_together_fails_closed() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/ask-ambiguous:main";
+    let _ = seed_people_with_ssn(&fluree, ledger_id).await;
+
+    let policy = json!([{
+        "@id": "ex:ambiguous",
+        "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+        "f:action": "f:view",
+        "f:query": serde_json::to_string(&json!({
+            "ask": {"@id": "?$identity"},
+            "where": {"@id": "?$identity"}
+        }))
+        .unwrap()
+    }]);
+
+    let ssns = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {"policy": policy, "default-allow": false},
+        "select": ["?s", "?ssn"],
+        "where": {"@id": "?s", "schema:ssn": "?ssn"}
+    });
+    match fluree.query_connection(&ssns).await {
+        Err(_) => {} // condition error surfacing as a query error is fail-closed
+        Ok(result) => {
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+            let rendered = result
+                .to_jsonld(&ledger.snapshot)
+                .expect("to_jsonld")
+                .to_string();
+            assert!(
+                !rendered.contains("111-11-1111") && !rendered.contains("888-88-8888"),
+                "ambiguous ask+where condition must not leak protected data: {rendered}"
+            );
+        }
+    }
+}

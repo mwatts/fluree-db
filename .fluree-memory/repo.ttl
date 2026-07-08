@@ -1720,6 +1720,36 @@ mem:fact-01kwsmdy5pms38yy81d0bdxprb a mem:Fact ;
     mem:branch "feature/merge-preview-changes" ;
     mem:createdAt "2026-07-05T17:15:17.046896+00:00"^^xsd:dateTime .
 
+mem:decision-01kx0v325fhgme9a3yfn7cjqtq a mem:Decision ;
+    mem:content "Policy condition unification (user-decided 2026-07): state graph IRIs are f:preState/f:postState (NOT f:pre/f:post); every f:query condition is an ASK contract regardless of language — JSON-LD gains the existing `{\"ask\": ...}` query form as preferred spelling (parse/mod.rs already parses ask; policy parser must accept it), SPARQL ASK/SELECT as-is, Cypher reserved via f:cypher datatype (read-only MATCH, ≥1 row = allow, $this/$identity/$value as native Cypher parameters). Per-policy f:queryState selector = whole-condition state switch for graph-less languages; SPARQL GRAPH f:postState for in-query mixing. Design doc: docs/design/policy-condition-languages.md." ;
+    mem:tag "ask" ;
+    mem:tag "conditions" ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "policy" ;
+    mem:tag "prestate-poststate" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/policy-condition-languages.md" ;
+    mem:artifactRef "fluree-db-query/src/parse/mod.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:26:21.743914+00:00"^^xsd:dateTime ;
+    mem:rationale "Naming settled before deployment (annoying to change after policies ship). Cypher $param syntax coinciding with SHACL-SPARQL $this convention is the unification hinge." .
+
+mem:fact-01kx0tafnf825th2w2q4z46a66 a mem:Fact ;
+    mem:content "Write verbs LANDED on feature/policy-write-intents (1792293ed): f:action accepts f:create/f:update/f:delete; PolicyRestriction.verbs: Option<WriteVerbs> (None = legacy bare f:modify, pre-state class matching); WriteFlakeInfo carries lifecycle + pre/union classes + type_object_class; stage.rs classify_subject_lifecycle probes pre-state only when has_write_verb_policies(). rdf:type flakes match class policies by OBJECT class under verbs. Branch also has: by_class modify index (d0b6d8868), inline-policy merge fix (135fca8ef), SPARQL f:query (0a6c5e5e4). Remaining roadmap: schema-flake write bypass, $value/$op bindings, f:pre/f:post state graphs, f:onShape." ;
+    mem:tag "create-intent" ;
+    mem:tag "lifecycle" ;
+    mem:tag "policy" ;
+    mem:tag "write-verbs" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_policy_verbs.rs" ;
+    mem:artifactRef "fluree-db-policy/src/evaluate.rs" ;
+    mem:artifactRef "fluree-db-policy/src/types.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:12:56.367344+00:00"^^xsd:dateTime .
+
 mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
     mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
     mem:tag "crate-boundary" ;
