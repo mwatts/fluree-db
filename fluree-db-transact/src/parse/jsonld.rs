@@ -1125,6 +1125,11 @@ fn parse_values_cell(
                 let (expanded, _) =
                     fluree_graph_json_ld::details_with_policy(id_str, context, strict)?;
                 if expanded.starts_with("_:") {
+                    // Stable Fluree blank-node ids address the existing node;
+                    // other labels keep fresh-mint skolemization semantics.
+                    if let Some(sid) = crate::namespace::stable_blank_node_sid(&expanded) {
+                        return Ok(TemplateTerm::Sid(sid));
+                    }
                     return Ok(TemplateTerm::BlankNode(expanded.to_string()));
                 }
                 return Ok(TemplateTerm::Sid(ns_registry.sid_for_iri(&expanded)));
@@ -1348,7 +1353,11 @@ fn parse_expanded_id_with_ctx(
                 let var_id = ctx.vars.get_or_insert(s);
                 Ok(TemplateTerm::Var(var_id))
             } else if s.starts_with("_:") {
-                // Blank node
+                // Stable Fluree blank-node ids resolve to the existing node;
+                // other labels stay BlankNode for fresh-mint skolemization.
+                if let Some(sid) = crate::namespace::stable_blank_node_sid(s) {
+                    return Ok(TemplateTerm::Sid(sid));
+                }
                 Ok(TemplateTerm::BlankNode(s.clone()))
             } else {
                 // Expanded IRI - encode as SID

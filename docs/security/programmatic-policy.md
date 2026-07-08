@@ -274,7 +274,29 @@ When multiple policies match a flake, they are combined using **Deny Overrides**
 
 ## Transactions with Policy
 
-Policies can also be applied to transactions using the builder API:
+Policies can also be applied to transactions using the builder API. The
+recommended entry point is `build_transact_policy_context`, which honors
+the ledger's `#config` graph the same way the server transact path does:
+it merges config policy defaults (`f:policyClass`, `f:defaultAllow`) into
+the supplied options and resolves `f:policySource` — same-ledger named
+graphs and cross-ledger model references — before building the context.
+It returns `None` when neither the request nor the config supplies any
+policy input (run as root):
+
+```rust
+let policy_ctx = fluree_db_api::build_transact_policy_context(
+    &fluree,
+    &ledger.snapshot,
+    ledger.novelty.as_ref(),
+    Some(ledger.novelty.as_ref()),
+    ledger.t(),
+    &qc_opts,
+).await?; // -> Option<PolicyContext>
+```
+
+The lower-level `build_policy_context_from_opts` remains available when
+you want to control the policy graphs yourself (it does no config
+resolution and no defaults merge):
 
 ```rust
 use fluree_db_api::policy_builder;

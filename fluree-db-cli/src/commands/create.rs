@@ -1180,10 +1180,17 @@ pub async fn run_memory_import(
         .map_err(|e| CliError::Config(format!("failed to create ledger: {e}")))?;
 
     let schema = fluree_db_memory::schema::memory_schema_jsonld();
-    fluree
-        .graph(ledger)
-        .transact()
-        .insert(&schema)
+    // Backdate the schema transaction to the first git commit's timestamp:
+    // commit event time is monotonically non-decreasing along the chain, so
+    // stamping the schema with "now" would reject every replayed commit.
+    let graph = fluree.graph(ledger);
+    let mut schema_txn = graph.transact().insert(&schema);
+    if let Some(first) = commits.first() {
+        schema_txn = schema_txn.commit_opts(
+            fluree_db_api::CommitOpts::default().with_timestamp(first.timestamp.clone()),
+        );
+    }
+    schema_txn
         .commit()
         .await
         .map_err(|e| CliError::Config(format!("failed to transact schema: {e}")))?;
@@ -1218,6 +1225,10 @@ pub async fn run_memory_import(
     }
 
     let mut last_t = 1u64; // t=1 is the schema transaction
+                           // Git author dates are not guaranteed monotonic (rebases, merges, clock
+                           // skew), but commit event time must be non-decreasing along the chain.
+                           // Clamp: any date earlier than the previous one is bumped to it.
+    let mut last_event_time: Option<chrono::DateTime<chrono::FixedOffset>> = None;
     for (i, commit) in commits.iter().enumerate() {
         // Extract TTL content at this commit
         let repo_ttl = git_show(&repo_root, &commit.sha, ".fluree-memory/repo.ttl")?;
@@ -1256,8 +1267,23 @@ pub async fn run_memory_import(
         // Build commit metadata from the git commit. f:message is a user
         // claim — supply it via the txn-meta sidecar (works for update-shape
         // transactions which have no @graph envelope).
-        let commit_opts =
-            fluree_db_api::CommitOpts::default().with_timestamp(commit.timestamp.clone());
+        let event_time = match chrono::DateTime::parse_from_rfc3339(&commit.timestamp) {
+            Ok(dt) => {
+                let clamped = match last_event_time {
+                    Some(prev) if dt < prev => prev,
+                    _ => dt,
+                };
+                last_event_time = Some(clamped);
+                clamped.to_rfc3339()
+            }
+            // Unparseable git date: reuse the previous event time (keeps the
+            // chain monotonic) or fall back to the raw string for the first
+            // commit and let the commit guard produce the precise error.
+            Err(_) => last_event_time
+                .map(|prev| prev.to_rfc3339())
+                .unwrap_or_else(|| commit.timestamp.clone()),
+        };
+        let commit_opts = fluree_db_api::CommitOpts::default().with_timestamp(event_time);
 
         // Single transaction: retract all existing memory triples + insert new state.
         // The WHERE pivots on mem:content to target only memory instances (not schema).

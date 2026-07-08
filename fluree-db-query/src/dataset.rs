@@ -219,6 +219,47 @@ impl<'a> DataSet<'a> {
         self.named_graphs.contains_key(iri)
     }
 
+    /// Copy of this dataset where every graph matching the primary
+    /// execution view — same ledger, graph id, and `to_t` — reads through
+    /// `overlay` instead of its original overlay reference.
+    ///
+    /// Used by the executor to splice the reasoning derived-facts overlay
+    /// into dataset execution: dataset scans go through per-graph
+    /// [`GraphRef`]s, not the top-level context overlay, so without this
+    /// datalog / OWL2-RL derived facts (computed against the primary view)
+    /// are invisible to dataset queries.
+    pub fn with_overlay_for_graph<'b>(
+        &self,
+        ledger_id: &str,
+        g_id: GraphId,
+        to_t: i64,
+        overlay: &'b dyn OverlayProvider,
+    ) -> DataSet<'b>
+    where
+        'a: 'b,
+    {
+        let patch = |graph: &GraphRef<'a>| -> GraphRef<'b> {
+            let matches =
+                graph.ledger_id.as_ref() == ledger_id && graph.g_id == g_id && graph.to_t == to_t;
+            GraphRef {
+                snapshot: graph.snapshot,
+                g_id: graph.g_id,
+                overlay: if matches { overlay } else { graph.overlay },
+                to_t: graph.to_t,
+                ledger_id: Arc::clone(&graph.ledger_id),
+                policy_enforcer: graph.policy_enforcer.clone(),
+            }
+        };
+        DataSet {
+            default_graphs: self.default_graphs.iter().map(&patch).collect(),
+            named_graphs: self
+                .named_graphs
+                .iter()
+                .map(|(iri, g)| (Arc::clone(iri), patch(g)))
+                .collect(),
+        }
+    }
+
     /// True when any constituent graph (default or named) enforces a non-root
     /// view policy.
     ///

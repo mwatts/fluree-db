@@ -13,10 +13,14 @@ pub const DEFAULT_BRANCH: &str = "main";
 pub enum LedgerIdTimeSpec {
     /// @t:<transaction>
     AtT(i64),
-    /// @iso:<timestamp>
+    /// @iso:<timestamp> — resolves against commit *event time* (`db:time`)
     AtIso(String),
     /// @commit:<cid>
     AtCommit(String),
+    /// @recorded:<timestamp> — resolves against the wall-clock time commits
+    /// were recorded (`db:receivedAt`, audit axis). Identical to `@iso:` on
+    /// ledgers that never used caller-supplied event times.
+    AtRecorded(String),
 }
 
 /// Parsed ledger ID parts with optional time-travel spec.
@@ -81,7 +85,7 @@ pub fn format_ledger_id(name: &str, branch: &str) -> String {
     format!("{name}:{branch}")
 }
 
-/// Parse a ledger ID with optional `@t:`, `@iso:`, or `@commit:` time-travel suffix.
+/// Parse a ledger ID with optional `@t:`, `@iso:`, `@recorded:`, or `@commit:` time-travel suffix.
 pub fn parse_ledger_id_with_time(ledger_id: &str) -> Result<ParsedLedgerId, LedgerIdParseError> {
     let (base, time) = split_time_travel_suffix(ledger_id)?;
 
@@ -92,7 +96,7 @@ pub fn parse_ledger_id_with_time(ledger_id: &str) -> Result<ParsedLedgerId, Ledg
 
 /// Split a ledger ID string into its base and optional time-travel suffix.
 ///
-/// This does not interpret `:`; it only handles `@t:`, `@iso:`, and `@commit:`.
+/// This does not interpret `:`; it only handles `@t:`, `@iso:`, `@recorded:`, and `@commit:`.
 pub fn split_time_travel_suffix(
     ledger_id: &str,
 ) -> Result<(String, Option<LedgerIdTimeSpec>), LedgerIdParseError> {
@@ -129,9 +133,14 @@ pub fn split_time_travel_suffix(
                 ));
             }
             Some(LedgerIdTimeSpec::AtCommit(val.to_string()))
+        } else if let Some(val) = time_str.strip_prefix("recorded:") {
+            if val.is_empty() {
+                return Err(LedgerIdParseError::new("Missing value after '@recorded:'"));
+            }
+            Some(LedgerIdTimeSpec::AtRecorded(val.to_string()))
         } else {
             return Err(LedgerIdParseError::new(format!(
-                "Invalid time travel format: '{time_str}'. Expected @t:, @iso:, or @commit: prefix"
+                "Invalid time travel format: '{time_str}'. Expected @t:, @iso:, @recorded:, or @commit: prefix"
             )));
         };
 

@@ -920,7 +920,7 @@ mod tests {
                     Sid::new(3, "JSON"),
                 ),
                 Binding::lit(
-                    FlakeValue::Vector(vec![1.0, 2.5, -3.0]),
+                    FlakeValue::Vector(vec![1.0, 2.5, -3.0].into()),
                     Sid::new(2, "double"),
                 ),
             ]],

@@ -51,10 +51,35 @@ pub fn build_policy_set(
     restrictions: Vec<PolicyRestriction>,
     stats: Option<&IndexStats>,
     action_filter: PolicyAction,
+    hierarchy: Option<&fluree_db_core::SchemaHierarchy>,
 ) -> PolicySet {
     let mut set = PolicySet::new();
 
-    for restriction in restrictions {
+    for mut restriction in restrictions {
+        // RDFS entailment (always on for enforcement): a class policy also
+        // governs instances of subclasses, and a property policy also
+        // governs subproperties. Expanding here — before indexing — means
+        // the class→property union, class_check_needed computation, and the
+        // four evaluation-time `for_classes` checks all see the closure.
+        if let Some(h) = hierarchy {
+            if !restriction.for_classes.is_empty() {
+                let expanded: Vec<Sid> = restriction
+                    .for_classes
+                    .iter()
+                    .flat_map(|c| h.subclasses_of(c).iter().cloned())
+                    .collect();
+                restriction.for_classes.extend(expanded);
+            }
+            if restriction.target_mode == TargetMode::OnProperty {
+                let expanded: Vec<Sid> = restriction
+                    .targets
+                    .iter()
+                    .flat_map(|p| h.subproperties_of(p).iter().cloned())
+                    .collect();
+                restriction.targets.extend(expanded);
+            }
+        }
+
         // Filter by action
         match (&restriction.action, &action_filter) {
             (PolicyAction::Both, _) => {}                      // Matches any filter
@@ -293,7 +318,7 @@ mod tests {
             make_prop_restriction("p2", make_sid(100, "age")),
         ];
 
-        let set = build_policy_set(restrictions, None, PolicyAction::View);
+        let set = build_policy_set(restrictions, None, PolicyAction::View, None);
 
         assert_eq!(set.restrictions.len(), 2);
         assert_eq!(
@@ -316,7 +341,7 @@ mod tests {
 
         let restrictions = vec![make_class_restriction("c1", person_class)];
 
-        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View);
+        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View, None);
 
         assert_eq!(set.restrictions.len(), 1);
 
@@ -334,7 +359,7 @@ mod tests {
             make_default_restriction("d1"),
         ];
 
-        let set = build_policy_set(restrictions, None, PolicyAction::View);
+        let set = build_policy_set(restrictions, None, PolicyAction::View, None);
 
         assert_eq!(set.restrictions.len(), 2);
         assert_eq!(set.defaults.len(), 1);
@@ -352,12 +377,12 @@ mod tests {
         let restrictions = vec![view_restriction, modify_restriction];
 
         // Filter for View only
-        let view_set = build_policy_set(restrictions.clone(), None, PolicyAction::View);
+        let view_set = build_policy_set(restrictions.clone(), None, PolicyAction::View, None);
         assert_eq!(view_set.restrictions.len(), 1);
         assert_eq!(view_set.restrictions[0].id, "v1");
 
         // Filter for Modify only
-        let modify_set = build_policy_set(restrictions, None, PolicyAction::Modify);
+        let modify_set = build_policy_set(restrictions, None, PolicyAction::Modify, None);
         assert_eq!(modify_set.restrictions.len(), 1);
         assert_eq!(modify_set.restrictions[0].id, "m1");
     }

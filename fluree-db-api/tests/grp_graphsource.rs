@@ -29,3 +29,5 @@ mod it_ontology_inline;
 mod it_shapes_cross_ledger;
 #[path = "it_shapes_inline.rs"]
 mod it_shapes_inline;
+#[path = "it_validate_report.rs"]
+mod it_validate_report;

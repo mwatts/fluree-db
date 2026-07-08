@@ -81,6 +81,20 @@ pub trait OverlayProvider: Send + Sync {
         false
     }
 
+    /// Globally-unique version stamp of this overlay's current content, for
+    /// keying caches of data derived from a full overlay walk (e.g. V3
+    /// overlay-op translations shared across `range_with_overlay` calls).
+    ///
+    /// Unlike [`Self::epoch`] — which is only unique within one overlay
+    /// instance's lineage — implementations must guarantee that **no two
+    /// overlays whose `for_each_overlay_flake` output differs ever report
+    /// the same version**, across instances, clones, and overlay types.
+    /// Return `None` (the default) when no such guarantee exists; callers
+    /// must then skip caching and derive from a fresh walk.
+    fn content_version(&self) -> Option<u64> {
+        None
+    }
+
     /// Push overlay flakes for a leaf's range to the callback
     ///
     /// # Arguments

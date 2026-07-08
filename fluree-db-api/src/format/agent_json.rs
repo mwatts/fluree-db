@@ -758,7 +758,10 @@ mod tests {
                     FlakeValue::Json(r#"{"k":[1,2]}"#.to_string()),
                     Sid::new(3, "JSON"),
                 ),
-                Binding::lit(FlakeValue::Vector(vec![1.0, -2.5]), Sid::new(2, "double")),
+                Binding::lit(
+                    FlakeValue::Vector(vec![1.0, -2.5].into()),
+                    Sid::new(2, "double"),
+                ),
             ]],
         );
         assert_parity(&r, &super::super::config::FormatterConfig::agent_json());

@@ -56,8 +56,12 @@ impl std::fmt::Debug for RestCatalogClient {
 
 impl RestCatalogClient {
     /// Create a new REST catalog client.
+    ///
+    /// The HTTP client is SSRF-hardened (see [`crate::net::hardened_client_builder`]):
+    /// it follows no redirects and resolves through the guard resolver, so a
+    /// catalog request cannot be redirected or rebound to an internal address.
     pub fn new(config: RestCatalogConfig, auth: Arc<dyn SendCatalogAuth>) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::net::hardened_client_builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
@@ -251,10 +255,28 @@ impl CatalogClient for RestCatalogClient {
         // Parse vended credentials if present
         let credentials = VendedCredentials::from_config_map(&config)?;
 
+        // Retain the inline `metadata` object the REST loadTable response carries
+        // (Snowflake Horizon / Polaris include it). This lets metadata preview
+        // read the full schema/snapshot with no extra S3 fetch. A present-but-
+        // unparseable metadata object is logged and dropped, never fatal — the
+        // metadata_location fetch path still works.
+        let metadata = response.get("metadata").and_then(|m| {
+            match serde_json::from_value::<crate::metadata::TableMetadata>(m.clone()) {
+                Ok(md) => Some(md),
+                Err(e) => {
+                    tracing::debug!(
+                        "REST loadTable inline metadata present but failed to parse: {e}"
+                    );
+                    None
+                }
+            }
+        });
+
         Ok(LoadTableResponse {
             metadata_location,
             config,
             credentials,
+            metadata,
         })
     }
 }
@@ -348,10 +370,23 @@ impl super::SendCatalogClient for RestCatalogClient {
 
         let credentials = VendedCredentials::from_config_map(&config)?;
 
+        let metadata = response.get("metadata").and_then(|m| {
+            match serde_json::from_value::<crate::metadata::TableMetadata>(m.clone()) {
+                Ok(md) => Some(md),
+                Err(e) => {
+                    tracing::debug!(
+                        "REST loadTable inline metadata present but failed to parse: {e}"
+                    );
+                    None
+                }
+            }
+        });
+
         Ok(LoadTableResponse {
             metadata_location,
             config,
             credentials,
+            metadata,
         })
     }
 }

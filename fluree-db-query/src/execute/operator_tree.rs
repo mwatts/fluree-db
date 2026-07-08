@@ -2662,6 +2662,20 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Fast-path: flat-rank vector scoring (`bind ?score dotProduct(?vec, C)`
+    // over a single vector predicate, optional threshold/order/limit), served
+    // by a direct scan of the packed f32 vector arena instead of driving
+    // every row through scan → bind → filter → sort.
+    if enable_fused_fast_paths {
+        if let Some(spec) = crate::fast_vector_topk::detect_vector_topk(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(crate::fast_vector_topk::vector_topk_operator(
+                spec,
+                Some(fallback),
+            ));
+        }
+    }
+
     // Fast-path: label scan + regex filter + rdf:type membership check.
     if enable_fused_fast_paths {
         if let Some(spec) = detect_label_regex_type(query) {

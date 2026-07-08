@@ -602,7 +602,7 @@ impl Worker {
             .await
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &governance)
+        let policy_ctx = build_policy_context(&self.staging.fluree, &ledger_handle, &governance)
             .await
             .map_err(submission_to_stage)?;
 

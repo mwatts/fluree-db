@@ -4389,8 +4389,9 @@ where
                 let result = if chunk_source.is_trig(i) || chunk_source.is_nquads(i) {
                     // TriG (and N-Quads, converted to TriG) use the dedicated
                     // commit function for named-graph handling. It allocates
-                    // codes in state.ns_registry; sync them to shared_alloc
-                    // afterward for subsequent chunks' spool writes.
+                    // codes through spool_config.ns_alloc (spool prefix
+                    // lookups happen mid-parse); the sync below is a
+                    // belt-and-braces consistency check.
                     let nq_converted;
                     let trig_content: &str = if chunk_source.is_nquads(i) {
                         nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)

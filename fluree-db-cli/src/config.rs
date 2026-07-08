@@ -438,14 +438,32 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for a tracked (remote-only) ledger.
 ///
-/// Tracked ledgers have no local data — all operations are proxied to the
-/// remote server via HTTP. This is distinct from upstreams, which track
-/// a local ledger's relationship to a remote for ref-level sync.
+/// Tracked ledgers have no local data stored in `.fluree/storage` — this is
+/// distinct from upstreams, which track a local ledger's relationship to a
+/// remote for ref-level sync. The [`TrackMode`] selects how queries execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedLedgerConfig {
     pub local_alias: String,
     pub remote: String,
     pub remote_alias: String,
+    /// How queries against this tracked ledger execute (default: proxy).
+    #[serde(default)]
+    pub mode: TrackMode,
+}
+
+/// Query execution mode for a tracked ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackMode {
+    /// Query-shipping: every query is an HTTP round-trip executed by the
+    /// remote server (its compute, row-level policy applied).
+    #[default]
+    Proxy,
+    /// Peer: queries execute locally against index blocks fetched on demand
+    /// from the remote's raw storage tier and cached by CID. Requires a
+    /// token with `fluree.storage.*` scope for the ledger. Writes still
+    /// forward to the remote over HTTP.
+    Peer,
 }
 
 /// TOML structure for sync configuration in config.toml
@@ -709,6 +727,10 @@ impl TomlSyncConfigStore {
                 "remote_alias",
                 Value::from(tracked.remote_alias.as_str()).into(),
             );
+            // Only write non-default modes to keep configs tidy.
+            if tracked.mode == TrackMode::Peer {
+                table.insert("mode", Value::from("peer").into());
+            }
             tracked_aot.push(table);
         }
 

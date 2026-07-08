@@ -25,9 +25,11 @@ use crate::raw_txn_upload::PendingRawTxnUpload;
 use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
-use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
+use fluree_db_ledger::{HeadTemporal, IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
-use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes};
+use fluree_db_novelty::{
+    generate_commit_flakes, iso_to_epoch_ms_opt, stamp_graph_on_commit_flakes,
+};
 use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
 use serde::{Deserialize, Serialize};
@@ -160,9 +162,23 @@ pub struct CommitOpts {
     pub merge_parents: Vec<ContentId>,
     /// ISO 8601 timestamp for the commit.
     ///
-    /// When `None`, defaults to `Utc::now().to_rfc3339()`. Provide a fixed
-    /// value for deterministic commit hashes (testing, replay).
+    /// When `None`, defaults to `Utc::now().to_rfc3339()` (clamped to the
+    /// head commit's event time so the chain stays monotonic under clock
+    /// skew). Provide a fixed value for deterministic commit hashes
+    /// (testing, replay). This is the commit's *event time* — the axis
+    /// `@iso:` time travel resolves against. Supplied values are validated:
+    /// monotonically non-decreasing along the chain, and at most a small
+    /// skew into the future.
     pub timestamp: Option<String>,
+    /// ISO 8601 wall-clock time the commit was recorded (audit axis).
+    ///
+    /// Setting this (or committing onto a ledger whose head already carries
+    /// `db:receivedAt`) puts the ledger in sticky dual-stamp mode: this and
+    /// every subsequent commit records a system-controlled `db:receivedAt`
+    /// txn-meta entry, and `@recorded:` time travel resolves against it.
+    /// When `None` on a dual-stamp ledger, defaults to wall clock (clamped
+    /// monotonic). Normal ledgers (no event-time use) never emit it.
+    pub received_at: Option<String>,
 }
 
 impl std::fmt::Debug for CommitOpts {
@@ -187,6 +203,8 @@ impl std::fmt::Debug for CommitOpts {
             )
             .field("skip_backpressure", &self.skip_backpressure)
             .field("merge_parents", &self.merge_parents.len())
+            .field("timestamp", &self.timestamp)
+            .field("received_at", &self.received_at)
             .finish()
     }
 }
@@ -209,6 +227,7 @@ impl Clone for CommitOpts {
             skip_backpressure: self.skip_backpressure,
             merge_parents: self.merge_parents.clone(),
             timestamp: self.timestamp.clone(),
+            received_at: self.received_at.clone(),
         }
     }
 }
@@ -300,6 +319,17 @@ impl CommitOpts {
         self.timestamp = Some(ts.into());
         self
     }
+
+    /// Set the recorded-at wall-clock timestamp (ISO 8601, audit axis).
+    ///
+    /// Flips the ledger into sticky dual-stamp mode. Normally left unset:
+    /// the build path stamps wall clock automatically on dual-stamp
+    /// ledgers. Provide a fixed value only for deterministic commit hashes
+    /// (testing, replay).
+    pub fn with_received_at(mut self, ts: impl Into<String>) -> Self {
+        self.received_at = Some(ts.into());
+        self
+    }
 }
 
 /// Serializable subset of [`CommitOpts`] carrying only the fields a
@@ -327,6 +357,9 @@ pub struct CommitOptsRequest {
     pub txn_signature: Option<TxnSignature>,
     pub txn_meta: Vec<TxnMetaEntry>,
     pub timestamp: Option<String>,
+    /// Recorded-at wall-clock timestamp (audit axis, dual-stamp mode).
+    #[serde(default)]
+    pub received_at: Option<String>,
     /// Pre-resolved raw-txn CID. Set when the upstream caller's
     /// [`CommitOpts::raw_txn_upload`] was awaited before projection
     /// (e.g. by the Raft leader so the worker can reference the same
@@ -357,6 +390,7 @@ impl CommitOptsRequest {
             skip_backpressure: false,
             merge_parents: Vec::new(),
             timestamp: self.timestamp,
+            received_at: self.received_at,
         }
     }
 }
@@ -379,9 +413,110 @@ impl From<&CommitOpts> for CommitOptsRequest {
             txn_signature: opts.txn_signature.clone(),
             txn_meta: opts.txn_meta.clone(),
             timestamp: opts.timestamp.clone(),
+            received_at: opts.received_at.clone(),
             raw_txn_id: opts.raw_txn_id.clone(),
         }
     }
+}
+
+/// Maximum allowed forward skew for a caller-supplied event time.
+///
+/// Commits are immutable and event time is monotonically non-decreasing, so
+/// a single future-dated event time would permanently pin the ledger's
+/// timeline ahead of reality. Small allowance for client/server clock drift.
+const MAX_EVENT_TIME_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
+
+fn epoch_ms_to_rfc3339(ms: i64) -> Result<String> {
+    chrono::DateTime::<Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339())
+        .ok_or_else(|| {
+            TransactError::InvalidEventTime(format!("epoch milliseconds {ms} out of range"))
+        })
+}
+
+/// Resolve the commit's event time (`Commit.time`) and optional audit-axis
+/// receivedAt stamp (epoch ms) from caller opts + head temporal metadata.
+///
+/// Event time: caller-supplied values must be valid RFC 3339, at most
+/// [`MAX_EVENT_TIME_FUTURE_SKEW_MS`] in the future, and not earlier than the
+/// head commit's event time. Defaults to wall clock, clamped to the head's
+/// event time so the chain stays monotonic under clock skew — `@iso:`
+/// resolution silently mis-resolves on a non-monotonic chain.
+///
+/// receivedAt: `Some` when the caller supplied one or the ledger is already
+/// in dual-stamp mode (sticky — every post-flip commit must carry it for
+/// `@recorded:` resolution to stay exact). Clamped monotonic likewise.
+fn resolve_commit_times(
+    event: Option<String>,
+    received: Option<String>,
+    head: Option<HeadTemporal>,
+) -> Result<(String, Option<i64>)> {
+    let now = Utc::now();
+    let now_ms = now.timestamp_millis();
+    let head_event_ms = head.map(|h| h.event_time_ms);
+
+    let timestamp = match event {
+        Some(ts) => {
+            let ms = iso_to_epoch_ms_opt(&ts).ok_or_else(|| {
+                TransactError::InvalidEventTime(format!("'{ts}' is not a valid RFC 3339 timestamp"))
+            })?;
+            if ms > now_ms + MAX_EVENT_TIME_FUTURE_SKEW_MS {
+                return Err(TransactError::InvalidEventTime(format!(
+                    "event time '{ts}' is in the future; commits are immutable and event \
+                     time is monotonic, so a future event time would permanently pin the \
+                     ledger's timeline ahead of reality"
+                )));
+            }
+            if let Some(head_ms) = head_event_ms {
+                if ms < head_ms {
+                    return Err(TransactError::InvalidEventTime(format!(
+                        "event time '{ts}' is earlier than the head commit's event time \
+                         ({}); event time must be monotonically non-decreasing",
+                        epoch_ms_to_rfc3339(head_ms)?
+                    )));
+                }
+            }
+            ts
+        }
+        None => match head_event_ms {
+            // Clock went backwards (or the head is event-timed at/after our
+            // present): reuse the head's event time so the chain stays
+            // monotonic and `@iso:` resolution stays correct.
+            Some(head_ms) if now_ms < head_ms => epoch_ms_to_rfc3339(head_ms)?,
+            _ => now.to_rfc3339(),
+        },
+    };
+
+    let dual_stamp = received.is_some() || head.is_some_and(|h| h.dual_stamp());
+    let received_at_ms = if dual_stamp {
+        let ms = match received {
+            Some(ts) => iso_to_epoch_ms_opt(&ts).ok_or_else(|| {
+                TransactError::InvalidEventTime(format!(
+                    "receivedAt '{ts}' is not a valid RFC 3339 timestamp"
+                ))
+            })?,
+            None => now_ms,
+        };
+        // Symmetric with the event axis: a caller-supplied receivedAt (reachable
+        // from the Rust API / CLI — the HTTP route always passes `now`) must not
+        // be in the future. The audit axis is immutable and monotonic, so a
+        // future stamp would permanently pin the ledger's timeline ahead of
+        // reality.
+        if ms > now_ms + MAX_EVENT_TIME_FUTURE_SKEW_MS {
+            return Err(TransactError::InvalidEventTime(format!(
+                "receivedAt '{}' is in the future; the audit axis is immutable and \
+                 monotonic, so a future receivedAt would permanently pin the ledger's \
+                 timeline ahead of reality",
+                epoch_ms_to_rfc3339(ms)?
+            )));
+        }
+        let prev = head.and_then(|h| h.received_time_ms);
+        Some(prev.map_or(ms, |p| ms.max(p)))
+    } else {
+        None
+    };
+
+    Ok((timestamp, received_at_ms))
 }
 
 /// Commit a staged transaction
@@ -430,6 +565,7 @@ pub async fn build_commit(
         skip_backpressure,
         merge_parents,
         timestamp: opt_timestamp,
+        received_at: opt_received_at,
         ..
     } = opts;
 
@@ -454,6 +590,14 @@ pub async fn build_commit(
             TxnMetaValue::String(identity_val.clone()),
         ));
     }
+
+    // db:receivedAt is system-controlled like f:identity: strip any
+    // caller-supplied txn-meta claim unconditionally; the resolved value
+    // (if the ledger dual-stamps) is injected below.
+    txn_meta.retain(|entry| {
+        !(entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+            && entry.predicate_name == fluree_vocab::db::RECEIVED_AT)
+    });
 
     // No wrapper span: the caller's ambient span (e.g. `txn_commit`
     // from `commit()`, or whatever the Raft path opens) carries the
@@ -512,8 +656,18 @@ pub async fn build_commit(
         graph_delta.values().map(std::string::String::as_str),
     )?;
 
-    // Use caller-provided timestamp or default to wall clock.
-    let timestamp = opt_timestamp.unwrap_or_else(|| Utc::now().to_rfc3339());
+    // Resolve the commit's event time (`Commit.time`, the `@iso:` axis) and
+    // the optional audit-axis receivedAt stamp. Validates monotonicity and
+    // future bounds against the in-memory head temporal metadata.
+    let (timestamp, received_at_ms) =
+        resolve_commit_times(opt_timestamp, opt_received_at, base.head_temporal)?;
+    if let Some(recv_ms) = received_at_ms {
+        txn_meta.push(TxnMetaEntry::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::db::RECEIVED_AT,
+            TxnMetaValue::Long(recv_ms),
+        ));
+    }
 
     // The caller is responsible for uploading the raw-txn JSON
     // (if any) before invoking this function — the result is
@@ -751,6 +905,11 @@ fn finalize_state_with_base(
     flake_count: usize,
     base: LedgerState,
 ) -> Result<(CommitReceipt, LedgerState)> {
+    // Capture before `commit_record.flakes` is taken below; keeps the head
+    // temporal metadata current so the next commit's event-time guard and
+    // dual-stamp decision stay in-memory integer checks.
+    let head_temporal = HeadTemporal::from_commit(&commit_record).or(base.head_temporal);
+
     // 10. Generate commit metadata flakes
     let commit_metadata_flakes = {
         let span = tracing::debug_span!("commit_generate_metadata_flakes");
@@ -874,12 +1033,17 @@ fn finalize_state_with_base(
         snapshot,
         novelty: new_novelty,
         dict_novelty,
+        // Carry the hierarchy cache across commits — the schema epoch check
+        // invalidates it only when a commit touched subClassOf/subPropertyOf.
+        schema_hierarchy_cache: base.schema_hierarchy_cache,
+        shacl_compile_cache: base.shacl_compile_cache,
         runtime_small_dicts,
         head_commit_id: Some(commit_cid.clone()),
         head_index_id: base.head_index_id,
         ns_record: base.ns_record,
         binary_store: base.binary_store,
         spatial_indexes: base.spatial_indexes,
+        head_temporal,
     };
 
     let receipt = CommitReceipt {
@@ -1572,5 +1736,110 @@ mod tests {
             cs.get(&expected_cid).await.is_err(),
             "raw_txn blob must be released after EmptyTransaction error"
         );
+    }
+
+    // =========================================================================
+    // resolve_commit_times: event-time validation + dual-stamp resolution
+    // =========================================================================
+
+    fn head(event_ms: i64, received_ms: Option<i64>) -> Option<HeadTemporal> {
+        Some(HeadTemporal {
+            event_time_ms: event_ms,
+            received_time_ms: received_ms,
+        })
+    }
+
+    #[test]
+    fn resolve_times_default_is_wall_clock_no_dual_stamp() {
+        let (ts, recv) = resolve_commit_times(None, None, None).unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&ts).is_ok());
+        assert!(recv.is_none(), "plain commit must not dual-stamp");
+    }
+
+    #[test]
+    fn resolve_times_clamps_clock_backwards_to_head() {
+        // Head event time is one hour in the future (clock skew / backdated
+        // present): the default stamp must reuse it, not go backwards.
+        let future_ms = Utc::now().timestamp_millis() + 3_600_000;
+        let (ts, _) = resolve_commit_times(None, None, head(future_ms, None)).unwrap();
+        let ms = iso_to_epoch_ms_opt(&ts).unwrap();
+        assert_eq!(ms, future_ms, "default stamp must clamp to head event time");
+    }
+
+    #[test]
+    fn resolve_times_rejects_event_time_before_head() {
+        let now_ms = Utc::now().timestamp_millis();
+        let err = resolve_commit_times(
+            Some("2020-01-01T00:00:00Z".into()),
+            None,
+            head(now_ms, None),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("monotonically non-decreasing"));
+    }
+
+    #[test]
+    fn resolve_times_rejects_future_event_time() {
+        let tomorrow = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let err = resolve_commit_times(Some(tomorrow), None, None).unwrap_err();
+        assert!(err.to_string().contains("future"));
+    }
+
+    #[test]
+    fn resolve_times_rejects_unparseable_event_time() {
+        let err = resolve_commit_times(Some("garbage".into()), None, None).unwrap_err();
+        assert!(err.to_string().contains("RFC 3339"));
+    }
+
+    #[test]
+    fn resolve_times_supplied_past_event_time_ok_on_fresh_ledger() {
+        let (ts, recv) =
+            resolve_commit_times(Some("1969-07-20T20:17:00Z".into()), None, None).unwrap();
+        // Pre-1970 (negative epoch ms) is fine — historical modeling.
+        assert_eq!(ts, "1969-07-20T20:17:00Z");
+        assert!(recv.is_none(), "timestamp alone must not flip dual-stamp");
+    }
+
+    #[test]
+    fn resolve_times_explicit_received_flips_dual_stamp() {
+        let (_, recv) = resolve_commit_times(
+            Some("2020-01-01T00:00:00Z".into()),
+            Some("2026-01-01T00:00:00Z".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(recv, iso_to_epoch_ms_opt("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn resolve_times_sticky_dual_stamp_continues_without_opts() {
+        let now_ms = Utc::now().timestamp_millis();
+        let (_, recv) =
+            resolve_commit_times(None, None, head(now_ms - 1000, Some(now_ms - 1000))).unwrap();
+        let recv = recv.expect("dual-stamp ledger must keep stamping receivedAt");
+        assert!(
+            recv >= now_ms - 1000,
+            "receivedAt must be clamped monotonic"
+        );
+    }
+
+    #[test]
+    fn resolve_times_rejects_future_received_at() {
+        // Symmetric with the event axis: a caller-supplied receivedAt in the
+        // future is rejected so the immutable audit axis can't be pinned ahead.
+        let tomorrow = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let err = resolve_commit_times(Some("2020-01-01T00:00:00Z".into()), Some(tomorrow), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("future"));
+    }
+
+    #[test]
+    fn resolve_times_received_clamped_to_head_received() {
+        // Head recorded one hour ahead (clock skew): the new receivedAt must
+        // not go backwards, or @recorded: resolution breaks.
+        let future_ms = Utc::now().timestamp_millis() + 3_600_000;
+        let (_, recv) =
+            resolve_commit_times(None, None, head(future_ms - 1, Some(future_ms))).unwrap();
+        assert_eq!(recv, Some(future_ms));
     }
 }

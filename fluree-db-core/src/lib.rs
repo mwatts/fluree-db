@@ -158,7 +158,9 @@ pub use range::{
 };
 pub use range_provider::{RangeProvider, RangeQuery};
 pub use runtime_small_dicts::RuntimeSmallDicts;
-pub use schema_hierarchy::SchemaHierarchy;
+pub use schema_hierarchy::{
+    compute_schema_hierarchy_with_overlay, SchemaHierarchy, SchemaHierarchyCache,
+};
 pub use sid::{Sid, SidInterner};
 pub use stats_view::{PropertyStatData, StatsView};
 pub use storage::{
