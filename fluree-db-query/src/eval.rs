@@ -49,6 +49,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FlakeValue};
 use fluree_db_core::DatatypeConstraint;
+use num_traits::Zero;
 use crate::var_registry::VarId;
 use helpers::eval_cached_bool_predicate;
 use std::sync::Arc;
@@ -60,7 +61,7 @@ impl Expression {
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<bool> {
         match self {
-            Expression::Var(var) => Ok(row.get(*var).is_some_and(Into::into)),
+            Expression::Var(var) => binding_effective_bool(row.get(*var), ctx),
 
             Expression::Const(val) => {
                 // Constant as boolean
@@ -453,6 +454,98 @@ fn is_xsd_float(dtc: &DatatypeConstraint) -> bool {
             if sid.namespace_code == fluree_vocab::namespaces::XSD
                 && sid.name.as_ref() == fluree_vocab::xsd_names::FLOAT
     )
+}
+
+/// Whether a datatype constraint is exactly xsd:string.
+fn is_xsd_string(dtc: &DatatypeConstraint) -> bool {
+    matches!(
+        dtc,
+        DatatypeConstraint::Explicit(sid)
+            if sid.namespace_code == fluree_vocab::namespaces::XSD
+                && sid.name.as_ref() == fluree_vocab::xsd_names::STRING
+    )
+}
+
+/// SPARQL Effective Boolean Value of a bound term (§17.2.2), as a fallible
+/// result: a value with no EBV — a language-tagged or foreign-datatype literal,
+/// an IRI/blank node, an ill-typed literal, or unbound — is a type error, not
+/// silently truthy. The error is a demotable Comparison error, so a FILTER
+/// excludes the row and a BIND/Extend leaves the variable unbound
+/// (dawg-bev-1..6, not-not). Cypher structural truthiness (lists/maps/paths/
+/// relationships) is preserved; the lenient `From<&Binding>`/`From<Comparable
+/// Value>` EBVs stay in place for the non-SPARQL surfaces that use them.
+fn binding_effective_bool(
+    binding: Option<&Binding>,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<bool> {
+    match binding {
+        Some(Binding::Lit { val, dtc, .. }) => lit_effective_bool(val, dtc),
+        Some(Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        }) => {
+            let decoded =
+                ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
+            match decoded {
+                Some(Ok(val)) => match ComparableValue::try_from(&val) {
+                    Ok(cv) => comparable_effective_bool(&cv),
+                    Err(_) => Err(ebv_type_error()),
+                },
+                _ => Err(ebv_type_error()),
+            }
+        }
+        // Cypher structural truthiness (non-SPARQL surface).
+        Some(Binding::List(items)) => Ok(!items.is_empty()),
+        Some(Binding::Map(entries)) => Ok(!entries.is_empty()),
+        Some(Binding::Path { .. } | Binding::Rel(_)) => Ok(true),
+        // IRI/blank node/ref and unbound/poisoned have no effective boolean value.
+        _ => Err(ebv_type_error()),
+    }
+}
+
+/// EBV of a literal value + its datatype constraint (the common, non-encoded
+/// path). Numeric → non-zero and non-NaN; xsd:string/plain → non-empty; a
+/// language-tagged or foreign-datatype literal has no EBV.
+fn lit_effective_bool(val: &FlakeValue, dtc: &DatatypeConstraint) -> Result<bool> {
+    match val {
+        FlakeValue::Boolean(b) => Ok(*b),
+        FlakeValue::Long(n) => Ok(*n != 0),
+        FlakeValue::Double(d) => Ok(!d.is_nan() && *d != 0.0),
+        FlakeValue::BigInt(n) => Ok(!n.is_zero()),
+        FlakeValue::Decimal(d) => Ok(!d.is_zero()),
+        FlakeValue::String(s) if is_xsd_string(dtc) => Ok(!s.is_empty()),
+        _ => Err(ebv_type_error()),
+    }
+}
+
+/// EBV of an already-materialized comparable value (the late-materialized
+/// encoded path). It cannot observe a language tag, so an encoded lang-string
+/// reads as a string here — an untested corner no register test exercises.
+fn comparable_effective_bool(cv: &ComparableValue) -> Result<bool> {
+    match cv {
+        ComparableValue::Bool(b) => Ok(*b),
+        ComparableValue::Long(n) => Ok(*n != 0),
+        ComparableValue::Double(d) => Ok(!d.is_nan() && *d != 0.0),
+        ComparableValue::Float(f) => Ok(!f.is_nan() && *f != 0.0),
+        ComparableValue::BigInt(n) => Ok(!n.is_zero()),
+        ComparableValue::Decimal(d) => Ok(!d.is_zero()),
+        ComparableValue::String(s) => Ok(!s.is_empty()),
+        _ => Err(ebv_type_error()),
+    }
+}
+
+/// A value with no effective boolean value is a (demotable) type error.
+fn ebv_type_error() -> QueryError {
+    ComparisonError::TypeMismatch {
+        operator: "EBV",
+        left_type: "term",
+        right_type: "xsd:boolean",
+    }
+    .into()
 }
 
 fn decode_lookup_error(

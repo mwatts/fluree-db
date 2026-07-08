@@ -140,12 +140,9 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // W-2 serialization cluster: string-escape serialization (2)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
+    // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
+    // (numeric-zero/empty-string falsy; ill-typed/lang/IRI/unbound → type error
+    // excluding the row) — D-EBV, PR-X2
     // W-2 serialization cluster: reification output in CONSTRUCT (2)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
@@ -498,7 +495,12 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
 ];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[
-    // result mismatch (1)
+    // not-not: the D-EBV fix makes !!?v unbind for the language-tagged,
+    // xsd:dateTime and IRI VALUES rows, but the `"z"^^xsd:boolean` row is stored
+    // coerced to Boolean(false) — an ill-typed literal is canonicalized, losing
+    // both its lexical form and its ill-typedness — so its EBV is (wrongly)
+    // false, not a type error. Blocked on ill-typed-literal preservation (D6 /
+    // PR-X3, decision D-11), not on the EBV logic.
     "https://w3c.github.io/rdf-tests/sparql/sparql12/expression/manifest#not-not",
 ];
 
