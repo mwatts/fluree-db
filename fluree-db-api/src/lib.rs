@@ -5037,9 +5037,9 @@ mod tests {
             .unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "ipfs")]
-    fn test_build_ipfs_constructs_fluree() {
+    async fn test_build_ipfs_constructs_fluree() {
         // No real Kubo node needed — this only verifies the type plumbing.
         let fluree = FlureeBuilder::memory().build_ipfs("http://127.0.0.1:5001");
         // Backend should be Permanent (IPFS), not Managed.
