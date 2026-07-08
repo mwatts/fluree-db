@@ -270,9 +270,9 @@ fn select_subject_key(
         return select_override_subject_key(table, pk_cols, diagnostics);
     }
 
-    // -- Iceberg identifier_field_ids (strict under both strategies). --
+    // -- Iceberg identifier_field_ids (nullable identifier handled per strategy). --
     if !table.identifier_field_ids.is_empty() {
-        return select_identifier_subject_key(table, diagnostics);
+        return select_identifier_subject_key(table, strategy, diagnostics);
     }
 
     // -- Name fallback: a `<STEM>_KEY` / `<STEM>_ID` column. --
@@ -411,13 +411,31 @@ fn select_override_subject_key(
     }
 }
 
-/// Iceberg `identifier_field_ids` subject-key handling (strict; the pre-change
-/// behavior, unchanged by [`SubjectStrategy`]).
+/// Iceberg `identifier_field_ids` subject-key handling.
+///
+/// Iceberg requires identifier fields to be `required`, but a non-conforming
+/// writer (e.g. Snowflake-managed Iceberg) can populate `identifier_field_ids`
+/// without marking the column `required`. A nullable declared identifier is
+/// resolved per [`SubjectStrategy`], mirroring the name-fallback path:
+/// - [`SubjectStrategy::Auto`]: ADOPT it as the subject (downgrade
+///   `NoSafeSubjectKey` → `SubjectKeyUnverified`) so the table stays browsable,
+///   but do NOT index it as an FK parent — a nullable parent key would silently
+///   drop child rows at join time, and rows with a NULL key are unaddressable.
+/// - [`SubjectStrategy::Identifier`] (strict): emit `NoSafeSubjectKey`, no
+///   subject.
+///
+/// A declared identifier proven non-null is always adopted (uniqueness alone is
+/// unverifiable metadata-only, so it earns `SubjectKeyUnverified`). Malformed
+/// metadata (a field id with no matching column) is always `NoSafeSubjectKey`.
 fn select_identifier_subject_key(
     table: &EmitTableSchema,
+    strategy: SubjectStrategy,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SubjectKey {
     let mut columns = Vec::new();
+    // Every declared identifier column proven non-null? Only then may a
+    // single-column key be indexed as an FK parent.
+    let mut all_non_null = true;
     for &fid in &table.identifier_field_ids {
         let col = match table.column_by_field_id(fid) {
             Some(col) => col,
@@ -432,33 +450,59 @@ fn select_identifier_subject_key(
                 return SubjectKey::none();
             }
         };
-        // Non-null gate. Iceberg requires identifier fields to be `required`,
-        // but a non-conforming writer (e.g. Snowflake-managed Iceberg) can
-        // populate `identifier_field_ids` without marking the column required.
-        // A nullable identifier yields an unsafe subject template (silent row
-        // loss at query time) and, in the single-column case, would be indexed
-        // as a valid FK parent — so gate it, emitting no subject when it cannot
-        // be confirmed non-null. This stays STRICT under both strategies.
-        if !col.is_non_null() {
-            diagnostics.push(Diagnostic::new(
-                Severity::Error,
-                DiagCode::NoSafeSubjectKey,
-                table.qualified_name(),
-                Some(col.name.clone()),
-                format!(
-                    "identifier_field_ids column '{}' is nullable (fails required / \
-                     null_fraction==0); no safe subject key",
-                    col.name
-                ),
-            ));
-            return SubjectKey::none();
+        if col.is_non_null() {
+            // Uniqueness is still unverifiable metadata-only (NDV deferred).
+            push_subject_key_unverified(
+                table,
+                col,
+                "from Iceberg identifier_field_ids",
+                diagnostics,
+            );
+        } else {
+            match strategy {
+                SubjectStrategy::Auto => {
+                    // Adopt for browsability, but not as an FK parent: a nullable
+                    // declared identifier is the Snowflake-managed-Iceberg case
+                    // that previously produced an empty subject template and then
+                    // 500'd at scan time ("Subject map must have rr:template,
+                    // rr:column, or rr:constant").
+                    all_non_null = false;
+                    diagnostics.push(Diagnostic::new(
+                        Severity::Warning,
+                        DiagCode::SubjectKeyUnverified,
+                        table.qualified_name(),
+                        Some(col.name.clone()),
+                        format!(
+                            "subject key '{}' from Iceberg identifier_field_ids is NOT provably \
+                             non-null (a non-conforming writer set identifier_field_ids without \
+                             marking the column `required`); adopted so the table stays browsable, \
+                             but NOT indexed as an FK parent — rows with a NULL key are \
+                             unaddressable",
+                            col.name
+                        ),
+                    ));
+                }
+                SubjectStrategy::Identifier => {
+                    diagnostics.push(Diagnostic::new(
+                        Severity::Error,
+                        DiagCode::NoSafeSubjectKey,
+                        table.qualified_name(),
+                        Some(col.name.clone()),
+                        format!(
+                            "identifier_field_ids column '{}' is nullable (fails required / \
+                             null_fraction==0); no safe subject key",
+                            col.name
+                        ),
+                    ));
+                    return SubjectKey::none();
+                }
+            }
         }
-        // Even a declared identifier's uniqueness is unverifiable metadata-only
-        // (NDV deferred), so flag it. One diagnostic per key column.
-        push_subject_key_unverified(table, col, "from Iceberg identifier_field_ids", diagnostics);
         columns.push(col.name.clone());
     }
-    let index_as_pk = columns.len() == 1;
+    // A nullable-adopted (Auto) key is never an FK parent; a composite (len > 1)
+    // is never a unique key.
+    let index_as_pk = columns.len() == 1 && all_non_null;
     SubjectKey {
         columns,
         index_as_pk,

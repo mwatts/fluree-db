@@ -219,11 +219,15 @@ fn subject_key_fallback_rejects_nullable_key_under_strict_strategy() {
 }
 
 #[test]
-fn identifier_field_ids_nullable_column_yields_no_safe_subject_key() {
+fn identifier_field_ids_nullable_column_adopted_under_auto_not_indexed() {
     // identifier_field_ids points at a NULLABLE column (not required, no proven
-    // null_fraction==0). Unlike a clean identifier hint, this must fail the
-    // non-null gate: no subject, a NoSafeSubjectKey diagnostic, and — crucially —
-    // it must NOT be indexed as an FK parent.
+    // null_fraction==0) — the Snowflake-managed-Iceberg case. Under the default
+    // `Auto` strategy the emitter ADOPTS it as the subject (downgrade
+    // NoSafeSubjectKey → SubjectKeyUnverified) so the table stays browsable
+    // instead of emitting an empty subject that later 500s at scan time ("Subject
+    // map must have rr:template, rr:column, or rr:constant"). But it is NOT
+    // indexed as an FK parent: a nullable parent key would silently drop child
+    // rows at join time.
     let parent = tbl(
         "DIM_WIDGET",
         vec![1],
@@ -246,19 +250,44 @@ fn identifier_field_ids_nullable_column_yields_no_safe_subject_key() {
 
     let widget = out.structured.table_mapping("DW.DIM_WIDGET").unwrap();
     assert!(
-        widget.subject_template.is_empty(),
-        "a nullable identifier must emit no subject"
+        widget.subject_template.ends_with("/{WIDGET_KEY}"),
+        "a nullable identifier must still be adopted as a subject under Auto: {}",
+        widget.subject_template
     );
-    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+    // Downgraded to SubjectKeyUnverified — NOT NoSafeSubjectKey.
+    assert!(diag_cols(&out, DiagCode::SubjectKeyUnverified)
+        .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
+    assert!(!diag_cols(&out, DiagCode::NoSafeSubjectKey)
         .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
 
-    // Never indexed as a PK → the child's WIDGET_KEY resolves to no parent.
+    // Adopted for browsability but NOT indexed as a PK → the child's WIDGET_KEY
+    // resolves to no parent.
     assert!(
         !resolved_fks(&out)
             .iter()
             .any(|(ct, cc, _, _)| ct == "DW.FACT_USE" && cc == "WIDGET_KEY"),
         "a nullable identifier must not be a valid FK parent"
     );
+}
+
+#[test]
+fn identifier_field_ids_nullable_column_rejected_under_strict() {
+    // Under the strict `Identifier` strategy the pre-change behavior holds: a
+    // nullable declared identifier fails the non-null gate → NoSafeSubjectKey, no
+    // subject. (Under `Auto` it is adopted-but-not-indexed; see
+    // `identifier_field_ids_nullable_column_adopted_under_auto_not_indexed`.)
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, false), // nullable identifier
+            sc(2, "NAME", FieldType::String),
+        ],
+    );
+    let out = emit_r2rml(&[t], &strict_opts());
+    assert!(out.structured.table_mappings[0].subject_template.is_empty());
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+        .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
 }
 
 #[test]
@@ -284,10 +313,15 @@ fn identifier_with_unknown_null_fraction_from_partial_stats_is_not_safe() {
         },
     };
 
-    // Unknown coverage → no subject.
+    // Unknown coverage → not a safe subject. Observed under the strict
+    // `Identifier` strategy, where the failed non-null gate still yields no
+    // subject + NoSafeSubjectKey. (Under `Auto` the same is_non_null==false
+    // column is instead adopted-but-not-indexed — see
+    // `identifier_field_ids_nullable_column_adopted_under_auto_not_indexed`. Both
+    // observe the same gate: is_non_null must be false for unknown null_fraction.)
     let out = emit_r2rml(
         &[tbl("DIM_WIDGET", vec![1], vec![key(None)])],
-        &EmitOptions::default(),
+        &strict_opts(),
     );
     assert!(out.structured.table_mappings[0].subject_template.is_empty());
     assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
