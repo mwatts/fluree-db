@@ -20,8 +20,8 @@ use fluree_db_core::{FlakeValue, GraphDbRef, IndexType, LedgerSnapshot, Sid};
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest};
 use fluree_db_novelty::{Novelty, StatsAssemblyError, StatsLookup};
 use fluree_db_policy::{
-    build_policy_set, PolicyAction, PolicyContext, PolicyQuery, PolicyRestriction, PolicyValue,
-    PolicyWrapper, TargetMode,
+    build_policy_set, PolicyAction, PolicyContext, PolicyQuery, PolicyQueryLanguage,
+    PolicyRestriction, PolicyValue, PolicyWrapper, TargetMode,
 };
 use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
@@ -792,7 +792,7 @@ pub(crate) async fn load_policy_restriction(
     let mut on_class: HashSet<Sid> = HashSet::new();
     let mut required = false;
     let mut message: Option<String> = None;
-    let mut policy_query_json: Option<String> = None;
+    let mut policy_query_source: Option<(String, PolicyQueryLanguage)> = None;
 
     // Resolve predicate SIDs we need to query (system IRIs must resolve strictly).
     let view_sid = resolve_system_iri_to_sid(snapshot, policy_iris::VIEW, "f:view")?;
@@ -978,14 +978,23 @@ pub(crate) async fn load_policy_restriction(
                     val: FlakeValue::Json(s),
                     ..
                 } => {
-                    policy_query_json = Some(s.clone());
+                    policy_query_source = Some((s.clone(), PolicyQueryLanguage::JsonLd));
                     break;
                 }
+                // Plain-string literals: the datatype selects the language.
+                // `f:sparql` → SPARQL; anything else (bare xsd:string) keeps
+                // the legacy JSON-LD interpretation.
                 Binding::Lit {
                     val: FlakeValue::String(s),
+                    dtc,
                     ..
                 } => {
-                    policy_query_json = Some(s.clone());
+                    let language = if is_sparql_datatype(&dtc) {
+                        PolicyQueryLanguage::Sparql
+                    } else {
+                        PolicyQueryLanguage::JsonLd
+                    };
+                    policy_query_source = Some((s.clone(), language));
                     break;
                 }
                 _ => {}
@@ -1017,21 +1026,12 @@ pub(crate) async fn load_policy_restriction(
         Some(false) => PolicyValue::Deny,
         None => {
             // No explicit allow/deny - check for f:query
-            if let Some(query_json) = policy_query_json {
-                // Store raw policy query JSON. Parsing/lowering is handled by the query engine.
-                // We still validate that it's valid JSON to preserve previous "deny on parse error"
-                // behavior without duplicating query parsing logic.
-                match serde_json::from_str::<JsonValue>(&query_json) {
-                    Ok(_) => PolicyValue::Query(PolicyQuery { json: query_json }),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Policy '{}': failed to parse f:query JSON, defaulting to deny: {}",
-                            policy_id,
-                            e
-                        );
-                        PolicyValue::Deny // Fall back to deny on parse error
-                    }
-                }
+            if let Some((source, language)) = policy_query_source {
+                // Store the raw policy query source. Parsing/lowering is handled
+                // by the query engine. We still validate the source parses to
+                // preserve the "deny on parse error" behavior without
+                // duplicating query lowering logic.
+                make_policy_query_value(&policy_id, source, language)
             } else {
                 // No f:allow and no f:query - this is likely a misconfigured policy
                 tracing::warn!(
@@ -1167,23 +1167,33 @@ fn parse_inline_policy(
         // Extract f:query (optional). For inline policies we accept:
         // - String: JSON query string
         // - Object: {"@type":"@json","@value":{...}} where @value is serialized to JSON string
+        // - Object: {"@type":"f:sparql","@value":"ASK ..."} for SPARQL policies
         //
         // `@json` values can use object `@value` (not just string).
-        let policy_query_json: Option<String> = obj
+        let policy_query_source: Option<(String, PolicyQueryLanguage)> = obj
             .get("f:query")
             .or_else(|| obj.get(&format!("{}query", fluree::DB)))
             .and_then(|v| match v {
-                JsonValue::String(s) => Some(s.clone()),
+                JsonValue::String(s) => Some((s.clone(), PolicyQueryLanguage::JsonLd)),
                 JsonValue::Object(o) => {
-                    // Handle @json typed values
                     let inner = o.get("@value")?;
+                    // SPARQL typed value: {"@type": "f:sparql", "@value": "ASK ..."}
+                    if o.get("@type")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|t| t == "f:sparql" || t == fluree_vocab::fluree::SPARQL)
+                    {
+                        return inner
+                            .as_str()
+                            .map(|s| (s.to_string(), PolicyQueryLanguage::Sparql));
+                    }
+                    // @json typed values
                     match inner {
                         // @value is a string (already serialized JSON)
-                        JsonValue::String(s) => Some(s.clone()),
+                        JsonValue::String(s) => Some((s.clone(), PolicyQueryLanguage::JsonLd)),
                         // @value is an object (needs serialization)
-                        JsonValue::Object(_) | JsonValue::Array(_) => {
-                            serde_json::to_string(inner).ok()
-                        }
+                        JsonValue::Object(_) | JsonValue::Array(_) => serde_json::to_string(inner)
+                            .ok()
+                            .map(|s| (s, PolicyQueryLanguage::JsonLd)),
                         _ => None,
                     }
                 }
@@ -1332,14 +1342,8 @@ fn parse_inline_policy(
             Some(true) => PolicyValue::Allow,
             Some(false) => PolicyValue::Deny,
             None => {
-                if let Some(query_json) = policy_query_json {
-                    match serde_json::from_str::<JsonValue>(&query_json) {
-                        Ok(_) => PolicyValue::Query(PolicyQuery { json: query_json }),
-                        Err(e) => {
-                            tracing::warn!("Failed to parse inline policy query JSON: {}", e);
-                            PolicyValue::Deny
-                        }
-                    }
+                if let Some((source, language)) = policy_query_source {
+                    make_policy_query_value(&id, source, language)
                 } else {
                     PolicyValue::Deny
                 }
@@ -1370,6 +1374,55 @@ fn parse_inline_policy(
 // NOTE: Policy query parsing is intentionally delegated to the query engine
 // (`fluree-db-query`) to avoid duplicating query parsing/lowering and to ensure
 // full feature support (e.g., FILTER patterns) in f:query policies.
+
+/// True when a literal's datatype is `f:sparql`.
+fn is_sparql_datatype(dtc: &fluree_db_core::DatatypeConstraint) -> bool {
+    matches!(
+        dtc,
+        fluree_db_core::DatatypeConstraint::Explicit(sid)
+            if *sid == Sid::new(fluree_vocab::namespaces::FLUREE_DB, fluree_vocab::db::SPARQL)
+    )
+}
+
+/// Build the `PolicyValue` for an `f:query` source, validating per language.
+///
+/// Validation preserves the historical "deny on parse error" behavior: a
+/// source that fails to parse (or, for SPARQL, is not an ASK/SELECT query)
+/// yields `PolicyValue::Deny` with a warning rather than an error.
+///
+/// For SPARQL sources this also registers the SPARQL lowering hooks so the
+/// policy executor can evaluate the query later.
+fn make_policy_query_value(
+    policy_id: &str,
+    source: String,
+    language: PolicyQueryLanguage,
+) -> PolicyValue {
+    let validation = match language {
+        PolicyQueryLanguage::JsonLd => serde_json::from_str::<JsonValue>(&source)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        PolicyQueryLanguage::Sparql => {
+            crate::sparql_lang::ensure_sparql_support_registered();
+            crate::sparql_lang::validate_sparql_policy_source(&source)
+        }
+        other => Err(format!(
+            "unsupported policy query language {}",
+            other.as_str()
+        )),
+    };
+    match validation {
+        Ok(()) => PolicyValue::Query(PolicyQuery { source, language }),
+        Err(e) => {
+            tracing::warn!(
+                "Policy '{}': invalid {} f:query, defaulting to deny: {}",
+                policy_id,
+                language.as_str(),
+                e
+            );
+            PolicyValue::Deny
+        }
+    }
+}
 
 /// Resolve an IRI string to a SID using the snapshot's namespace table.
 ///

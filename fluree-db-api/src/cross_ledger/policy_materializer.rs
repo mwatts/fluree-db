@@ -323,7 +323,10 @@ fn restriction_to_wire(
     let value = match &r.value {
         PolicyValue::Allow => WirePolicyValue::Allow,
         PolicyValue::Deny => WirePolicyValue::Deny,
-        PolicyValue::Query(q) => WirePolicyValue::Query(q.json.clone()),
+        PolicyValue::Query(q) => WirePolicyValue::Query {
+            source: q.source.clone(),
+            language: q.language,
+        },
     };
 
     Ok(WireRestriction {

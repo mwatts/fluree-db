@@ -1546,6 +1546,19 @@ pub mod fluree {
     /// db:rule IRI - datalog rule definition predicate
     pub const RULE: &str = "https://ns.flur.ee/db#rule";
 
+    /// db:sparql datatype IRI — marks a string literal as SPARQL source text.
+    ///
+    /// Used on `f:query` (policy condition, ASK/SELECT form) and `f:rule`
+    /// (datalog rule, CONSTRUCT...WHERE form) literals to select the SPARQL
+    /// parser instead of the default JSON-LD query interpretation
+    /// (`@json` / `rdf:JSON` literals).
+    pub const SPARQL: &str = "https://ns.flur.ee/db#sparql";
+
+    /// db:cypher datatype IRI — reserved for openCypher-language policy /
+    /// rule literals. Not yet accepted by the policy or rule extractors;
+    /// registered so the IRI is stable when support lands.
+    pub const CYPHER: &str = "https://ns.flur.ee/db#cypher";
+
     /// Fluree commit subject identifier scheme (not a predicate vocabulary)
     pub const COMMIT: &str = "fluree:commit:sha256:";
 
@@ -1773,6 +1786,12 @@ pub mod db {
 
     /// db:rule - datalog rule definition
     pub const RULE: &str = "rule";
+
+    /// db:sparql - datatype local name for SPARQL source literals
+    pub const SPARQL: &str = "sparql";
+
+    /// db:cypher - datatype local name reserved for openCypher source literals
+    pub const CYPHER: &str = "cypher";
 
     /// db:op - operation type in RDF-Star annotations (assert/retract)
     pub const OP: &str = "op";

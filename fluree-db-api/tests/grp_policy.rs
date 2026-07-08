@@ -21,6 +21,8 @@ mod it_policy_named_graphs;
 mod it_policy_optional_hashjoin;
 #[path = "it_policy_query_connection.rs"]
 mod it_policy_query_connection;
+#[path = "it_policy_sparql.rs"]
+mod it_policy_sparql;
 #[path = "it_policy_time_travel.rs"]
 mod it_policy_time_travel;
 #[path = "it_policy_tracking.rs"]

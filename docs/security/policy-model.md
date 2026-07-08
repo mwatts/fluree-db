@@ -27,7 +27,7 @@ Every policy is a JSON-LD node. Required `@type`: `f:AccessPolicy` (the IRI is `
 |-----------|------|-----------|-------------|
 | `f:action` | array of IRIs (or single IRI string) | yes | Which operations the policy governs. Values: `f:view` (queries), `f:modify` (transactions). |
 | `f:allow` | boolean | one of `f:allow` / `f:query` | Static decision. `true` permits, `false` denies. Takes precedence over `f:query` if both are present. |
-| `f:query` | string (JSON-encoded JSON-LD WHERE) | one of `f:allow` / `f:query` | Dynamic decision. The targeted flake is permitted when the query returns at least one row. `?$this` and `?$identity` are pre-bound. |
+| `f:query` | string (JSON-encoded JSON-LD WHERE, or SPARQL with the `f:sparql` datatype) | one of `f:allow` / `f:query` | Dynamic decision. The targeted flake is permitted when the query returns at least one row. `?$this` and `?$identity` are pre-bound (`$this` / `$identity` in SPARQL). |
 | `f:onProperty` | array of `@id` references | no | Restrict the policy to flakes whose predicate is one of these IRIs. |
 | `f:onClass` | array of `@id` references | no | Restrict the policy to flakes whose subject has one of these `rdf:type`s. |
 | `f:onSubject` | array of `@id` references | no | Restrict the policy to flakes whose subject IRI is one of these. |
@@ -81,6 +81,39 @@ Example (typed-literal form, suitable for inline policies):
 ```
 
 > **Inline policies must use full IRIs.** Compact IRIs (`schema:ssn`) inside an inline policy passed through `opts.policy` are not expanded against the request `@context`. Use full IRIs (`http://schema.org/ssn`).
+
+## SPARQL policy queries
+
+`f:query` can alternatively be written in SPARQL. The language of the stored
+literal is selected by its RDF datatype: `@json` (or a bare string) means
+JSON-LD query; the `f:sparql` datatype (`https://ns.flur.ee/db#sparql`) means
+SPARQL source text.
+
+```json
+"f:query": {
+  "@type": "https://ns.flur.ee/db#sparql",
+  "@value": "ASK { $identity <http://example.org/role> \"hr\" }"
+}
+```
+
+The same typed-value form works for inline policies via `opts.policy` (the
+compact `"@type": "f:sparql"` is also accepted there).
+
+Rules for SPARQL policy queries:
+
+- The query must be **ASK or SELECT** (both are evaluated as existence
+  checks — the policy permits when at least one solution exists).
+  CONSTRUCT/DESCRIBE/updates are rejected at policy build time and the
+  policy falls back to **deny** (same fail-closed behavior as unparseable
+  JSON).
+- Special variables follow the SHACL-SPARQL convention: **`$this`** is the
+  subject being read or written, **`$identity`** is the requesting identity.
+  (`?this` / `?identity` are equivalent spellings; SPARQL variable names
+  cannot contain `$`, so the JSON-LD names `?$this` / `?$identity` map to
+  `$this` / `$identity`.)
+- Include `PREFIX` declarations in the query text or use full IRIs — the
+  request `@context` is not applied to policy sources.
+- GROUP BY / aggregates are not supported in policy queries.
 
 ## RDFS entailment
 

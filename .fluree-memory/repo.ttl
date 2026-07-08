@@ -2045,6 +2045,50 @@ mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
     mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
     mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
 
+mem:fact-01kwzz0ynexdgwfrw9vvsd7xfe a mem:Fact ;
+    mem:content "f:query / f:rule are language-discriminated by RDF datatype: @json or bare string → JSON-LD (legacy); `f:sparql` (https://ns.flur.ee/db#sparql; f:cypher reserved) → SPARQL. PolicyQuery = { source, language: PolicyQueryLanguage (non_exhaustive) }; WirePolicyValue::Query { source, language }. SPARQL policies must be ASK/SELECT (no grouping), evaluated as existence checks; SPARQL rules must be CONSTRUCT...WHERE with BGP + comparison FILTERs only (OPTIONAL/UNION/paths → rule skipped with warning). Build-time parse validation preserves fail-closed deny. Tests: it_policy_sparql.rs (grp_policy), it_datalog_rules_sparql.rs (grp_reasoning)." ;
+    mem:tag "datalog" ;
+    mem:tag "f-sparql-datatype" ;
+    mem:tag "policy" ;
+    mem:tag "policy-query-language" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/datalog-rules.md" ;
+    mem:artifactRef "docs/security/policy-model.md" ;
+    mem:artifactRef "fluree-db-api/src/policy_builder.rs" ;
+    mem:artifactRef "fluree-db-policy/src/types.rs" ;
+    mem:artifactRef "fluree-db-query/src/datalog_rules.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T04:15:52.494354+00:00"^^xsd:dateTime .
+
+mem:fact-01kwzz1e0t51fjfgr6bmbqpmnb a mem:Fact ;
+    mem:content "SPARQL support for policies/rules uses a OnceLock hook registry because fluree-db-sparql depends on fluree-db-query (the query crate cannot call the parser). lang_support.rs defines SparqlSupport { lower_policy_query, lower_rule }; api's sparql_lang.rs implements+registers via ensure_sparql_support_registered(), called from FlureeBuilder::finalize_with_backend (all build terminals), make_policy_query_value, and policy_view wire translation. QueryPolicyExecutor::evaluate_sparql fails CLOSED if unregistered. Binding keys \"?$this\"/\"?$identity\" map to SPARQL names \"?this\"/\"?identity\" (strip \"?$\"→\"?\"); seeded via directly-built Pattern::Values, unbound identity → Binding::Unbound (mirrors JSON null VALUES cell)." ;
+    mem:tag "crate-layering" ;
+    mem:tag "executor" ;
+    mem:tag "lang-support-registry" ;
+    mem:tag "policy" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/sparql_lang.rs" ;
+    mem:artifactRef "fluree-db-query/src/lang_support.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T04:16:08.218859+00:00"^^xsd:dateTime .
+
+mem:fact-01kx0h97eybzh5g0bkaw3dr0f3 a mem:Fact ;
+    mem:content "Test-harness trap: `normalize_rows` (fluree-db-api/tests/support/mod.rs) only sorts rows — it does NOT flatten. With `\"select\": [\"?x\"]` (array select) each row is a one-element ARRAY, so `normalize_rows(..).contains(&json!(\"ex:thing\"))` is always false; use scalar select `\"select\": \"?x\"` (flat string rows) for contains-style assertions. This trap produced a false \"bound literal objects don't match the reasoning-derived overlay\" diagnosis — DISPROVEN: bound bool/long/string objects match derived-overlay facts correctly in all combinations (base-present or derived-only predicate, JSON-LD or SPARQL rules)." ;
+    mem:tag "derived-overlay" ;
+    mem:tag "gotcha" ;
+    mem:tag "normalize-rows" ;
+    mem:tag "reasoning" ;
+    mem:tag "select-shape" ;
+    mem:tag "tests" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_datalog_rules_sparql.rs" ;
+    mem:artifactRef "fluree-db-api/tests/support/mod.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T09:34:58.014473+00:00"^^xsd:dateTime .
+
 mem:fact-01kqfy6r0w86fcsd9km0707xzg a mem:Fact ;
     mem:content "v3 commit envelope reader at `legacy_v3.rs:305-309` deliberately stubs `graph_delta = HashMap::new()` since v3 never encoded the field. Envelope-only walkers (`first_t_where_graph_registered`) therefore return `None` on any chain that includes v3 commits, regardless of whether the named graph was actually registered. Callers that rely on the result for short-circuiting must either fall through to a full load on `None`, detect v3 envelopes and signal \"inconclusive\", or accept silent correctness regressions on legacy chains." ;
     mem:tag "commit-envelope" ;

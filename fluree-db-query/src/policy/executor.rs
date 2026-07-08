@@ -2,12 +2,14 @@
 //!
 //! Implements `PolicyQueryExecutor` using the query engine asynchronously.
 
+use crate::binding::Binding;
 use crate::context::ExecutionContext;
 use crate::execute::build_where_operators_seeded;
+use crate::ir::Pattern;
 use crate::var_registry::VarRegistry;
 use fluree_db_core::{GraphId, LedgerSnapshot, OverlayProvider, Sid};
 use fluree_db_policy::{
-    PolicyQuery, PolicyQueryExecutor, PolicyQueryFut, Result as PolicyResult,
+    PolicyQuery, PolicyQueryExecutor, PolicyQueryFut, PolicyQueryLanguage, Result as PolicyResult,
     UNBOUND_IDENTITY_PREFIX,
 };
 use std::collections::HashMap;
@@ -71,11 +73,41 @@ impl PolicyQueryExecutor for QueryPolicyExecutor<'_> {
     }
 }
 
+/// Map a JSON-LD special-variable name to its SPARQL registry name.
+///
+/// JSON-LD policy bindings use `?$this` / `?$identity`; SPARQL has no `$`
+/// in variable names — the SHACL-SPARQL-style `$this` lexes as sigil `$` +
+/// name `this` and registers as `?this`. So `?$this` maps to `?this`;
+/// names without the `$` marker pass through unchanged.
+fn sparql_var_name(json_ld_name: &str) -> String {
+    match json_ld_name.strip_prefix("?$") {
+        Some(rest) => format!("?{rest}"),
+        None => json_ld_name.to_string(),
+    }
+}
+
 impl QueryPolicyExecutor<'_> {
     /// Async implementation of policy query evaluation
     async fn evaluate_async(
         &self,
         query: &PolicyQuery,
+        bindings: &HashMap<String, Sid>,
+    ) -> PolicyResult<bool> {
+        match query.language {
+            PolicyQueryLanguage::JsonLd => self.evaluate_jsonld(&query.source, bindings).await,
+            PolicyQueryLanguage::Sparql => self.evaluate_sparql(&query.source, bindings).await,
+            // `PolicyQueryLanguage` is non_exhaustive; an unknown language
+            // fails closed (error → deny), never open.
+            other => Err(fluree_db_policy::PolicyError::QueryExecution {
+                message: format!("Unsupported policy query language: {}", other.as_str()),
+            }),
+        }
+    }
+
+    /// Evaluate a JSON-LD policy query (the historical default).
+    async fn evaluate_jsonld(
+        &self,
+        source: &str,
         bindings: &HashMap<String, Sid>,
     ) -> PolicyResult<bool> {
         // Parse and lower the policy's f:query using the main query parser/IR.
@@ -87,7 +119,7 @@ impl QueryPolicyExecutor<'_> {
         // - select forced to ["?$this"]
         // - limit forced to 1
         // - VALUES injected into WHERE for special variables (?$this, ?$identity, etc.)
-        let mut query_json: serde_json::Value = serde_json::from_str(&query.json).map_err(|e| {
+        let mut query_json: serde_json::Value = serde_json::from_str(source).map_err(|e| {
             fluree_db_policy::PolicyError::QueryExecution {
                 message: format!("Invalid policy query JSON: {e}"),
             }
@@ -172,26 +204,100 @@ impl QueryPolicyExecutor<'_> {
                 message: format!("Failed to parse policy query: {e}"),
             })?;
 
-        let patterns = parsed.patterns;
+        self.run_existence_check(&vars, &parsed.patterns).await
+    }
 
+    /// Evaluate a SPARQL policy query (`f:query` stored with the `f:sparql`
+    /// datatype).
+    ///
+    /// SPARQL support is provided by a higher layer via
+    /// [`crate::lang_support::register_sparql_support`]; if it is absent this
+    /// fails closed (error → deny), never open.
+    async fn evaluate_sparql(
+        &self,
+        source: &str,
+        bindings: &HashMap<String, Sid>,
+    ) -> PolicyResult<bool> {
+        let support = crate::lang_support::sparql_support().ok_or_else(|| {
+            fluree_db_policy::PolicyError::QueryExecution {
+                message: "SPARQL policy support is not registered in this process; \
+                          cannot evaluate f:sparql policy query"
+                    .to_string(),
+            }
+        })?;
+
+        let mut vars = VarRegistry::new();
+        let mut patterns =
+            (support.lower_policy_query)(source, self.snapshot, &mut vars).map_err(|e| {
+                fluree_db_policy::PolicyError::QueryExecution {
+                    message: format!("Failed to parse SPARQL policy query: {e}"),
+                }
+            })?;
+
+        // Seed special variables with a VALUES pattern, mirroring the JSON-LD
+        // path's injected VALUES clause. Binding keys arrive in JSON-LD form
+        // (`?$this`); the SPARQL query references them as `$this`/`?this`,
+        // registered as `?this`.
+        let mut var_names: Vec<String> = bindings.keys().cloned().collect();
+        var_names.sort();
+
+        let mut var_ids = Vec::with_capacity(var_names.len());
+        let mut row = Vec::with_capacity(var_names.len());
+        for name in &var_names {
+            let var_id = vars.get_or_insert(&sparql_var_name(name));
+            if var_ids.contains(&var_id) {
+                continue;
+            }
+            let sid = bindings.get(name).expect("binding value exists");
+            var_ids.push(var_id);
+            // Unbound identity uses UNDEF (Binding::Unbound), same as the
+            // JSON-LD path's null VALUES cell.
+            if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX) {
+                row.push(Binding::Unbound);
+            } else {
+                row.push(Binding::Sid {
+                    sid: sid.clone(),
+                    t: None,
+                    op: None,
+                });
+            }
+        }
+        patterns.insert(
+            0,
+            Pattern::Values {
+                vars: var_ids,
+                rows: vec![row],
+            },
+        );
+
+        self.run_existence_check(&vars, &patterns).await
+    }
+
+    /// Execute WHERE patterns with a root (policy-free) context and report
+    /// whether any solution exists.
+    async fn run_existence_check(
+        &self,
+        vars: &VarRegistry,
+        patterns: &[Pattern],
+    ) -> PolicyResult<bool> {
         // Create the execution context WITHOUT policy (root context)
         // This is critical - policy queries must not be filtered by policy
         let ctx = if let Some(overlay) = self.overlay {
-            ExecutionContext::with_time_and_overlay(self.snapshot, &vars, self.to_t, None, overlay)
+            ExecutionContext::with_time_and_overlay(self.snapshot, vars, self.to_t, None, overlay)
                 .with_graph_id(self.g_id)
         } else {
-            ExecutionContext::with_time(self.snapshot, &vars, self.to_t, None)
+            ExecutionContext::with_time(self.snapshot, vars, self.to_t, None)
                 .with_graph_id(self.g_id)
         };
 
-        // Build the where clause operators (VALUES is now part of parsed patterns).
+        // Build the where clause operators (VALUES is now part of the patterns).
         //
         // Root: policy queries always evaluate at `self.to_t` for current state —
         // they're access-control predicates, not history-range queries. Always
         // plan as `Current`.
         let mut operator = build_where_operators_seeded(
             None,
-            &patterns,
+            patterns,
             None,
             None,
             &crate::temporal_mode::PlanningContext::current(),
@@ -200,7 +306,7 @@ impl QueryPolicyExecutor<'_> {
             message: e.to_string(),
         })?;
 
-        // Execute with limit 1 (we only need to know if there are any results)
+        // Execute and check if there's at least one result (existence check)
         operator
             .open(&ctx)
             .await
@@ -208,7 +314,6 @@ impl QueryPolicyExecutor<'_> {
                 message: e.to_string(),
             })?;
 
-        // Check if there's at least one result
         let has_results = match operator.next_batch(&ctx).await {
             Ok(Some(batch)) => !batch.is_empty(),
             Ok(None) => false,

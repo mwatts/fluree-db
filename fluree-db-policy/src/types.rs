@@ -10,18 +10,50 @@ use fluree_db_core::Sid;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Query language of a policy's `f:query` condition
+///
+/// Discriminated by the RDF datatype of the stored literal:
+/// - `@json` / `rdf:JSON` (and legacy bare `xsd:string`) → [`JsonLd`](Self::JsonLd)
+/// - `f:sparql` → [`Sparql`](Self::Sparql)
+///
+/// Marked `#[non_exhaustive]` so future languages (e.g. `f:cypher`) can be
+/// added without breaking downstream matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum PolicyQueryLanguage {
+    /// Fluree JSON-LD query (the historical default)
+    #[default]
+    JsonLd,
+    /// SPARQL ASK/SELECT source text (SHACL-SPARQL-style `$this` / `$identity`
+    /// special variables)
+    Sparql,
+}
+
+impl PolicyQueryLanguage {
+    /// Human-readable name for diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyQueryLanguage::JsonLd => "json-ld",
+            PolicyQueryLanguage::Sparql => "sparql",
+        }
+    }
+}
+
 /// Policy query for conditional evaluation
 ///
 /// Represents a query that determines if a policy allows access.
 /// If the query returns any results, access is granted.
 ///
-/// IMPORTANT: This stores the raw JSON query (typically as a string stored in the ledger
-/// as an `@json` value). Parsing/lowering is delegated to the query engine to avoid
-/// duplicating query parsing logic inside the policy system (and to support FILTER, etc.).
+/// IMPORTANT: This stores the raw query source (for JSON-LD, a string
+/// containing a JSON object; for SPARQL, the query text). Parsing/lowering is
+/// delegated to the query engine to avoid duplicating query parsing logic
+/// inside the policy system (and to support FILTER, etc.).
 #[derive(Debug, Clone)]
 pub struct PolicyQuery {
-    /// JSON query payload (string containing a JSON object)
-    pub json: String,
+    /// Raw query source text (interpretation depends on `language`)
+    pub source: String,
+    /// Language the source is written in
+    pub language: PolicyQueryLanguage,
 }
 
 /// Target mode for a policy restriction

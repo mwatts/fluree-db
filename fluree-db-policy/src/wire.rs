@@ -16,7 +16,8 @@
 use crate::error::Result;
 use crate::index::build_policy_set;
 use crate::types::{
-    PolicyAction, PolicyQuery, PolicyRestriction, PolicySet, PolicyValue, TargetMode,
+    PolicyAction, PolicyQuery, PolicyQueryLanguage, PolicyRestriction, PolicySet, PolicyValue,
+    TargetMode,
 };
 use fluree_db_core::{IndexStats, Sid};
 use std::collections::HashSet;
@@ -90,14 +91,17 @@ pub struct WireRestriction {
 
 /// IRI-form mirror of [`PolicyValue`].
 ///
-/// `Query` stores its JSON payload verbatim — it is already
-/// term-neutral; the policy query executor re-interns IRIs at
+/// `Query` stores its source text verbatim (plus the language tag) — it
+/// is already term-neutral; the policy query executor re-interns IRIs at
 /// execution time against the data ledger's term space.
 #[derive(Debug, Clone)]
 pub enum WirePolicyValue {
     Allow,
     Deny,
-    Query(String),
+    Query {
+        source: String,
+        language: PolicyQueryLanguage,
+    },
 }
 
 /// Translate a wire artifact into a list of Sid-form
@@ -194,7 +198,10 @@ where
         let value = match &w.value {
             WirePolicyValue::Allow => PolicyValue::Allow,
             WirePolicyValue::Deny => PolicyValue::Deny,
-            WirePolicyValue::Query(json) => PolicyValue::Query(PolicyQuery { json: json.clone() }),
+            WirePolicyValue::Query { source, language } => PolicyValue::Query(PolicyQuery {
+                source: source.clone(),
+                language: *language,
+            }),
         };
         out.push(PolicyRestriction {
             id: w.id.clone(),
@@ -547,7 +554,10 @@ mod tests {
                 target_mode: TargetMode::Default,
                 targets: vec![],
                 action: PolicyAction::View,
-                value: WirePolicyValue::Query(json_payload.into()),
+                value: WirePolicyValue::Query {
+                    source: json_payload.into(),
+                    language: PolicyQueryLanguage::JsonLd,
+                },
                 required: false,
                 message: None,
                 class_policy: false,
@@ -559,7 +569,10 @@ mod tests {
 
         assert_eq!(set.restrictions.len(), 1);
         match &set.restrictions[0].value {
-            PolicyValue::Query(q) => assert_eq!(q.json, json_payload),
+            PolicyValue::Query(q) => {
+                assert_eq!(q.source, json_payload);
+                assert_eq!(q.language, PolicyQueryLanguage::JsonLd);
+            }
             other => panic!("expected Query, got {other:?}"),
         }
     }
