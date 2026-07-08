@@ -612,6 +612,20 @@ impl PropertyPathOperator {
     /// Runs one policy-filtered full scan of the active graph. Only reached
     /// for both-variable unbounded `*`/`?` paths — already a full-closure
     /// enumeration — never for the bound-endpoint traversals.
+    ///
+    /// The output is inherently O(graph): §18.4 mandates every graph term as a
+    /// zero-length self-pair, so the size cannot be reduced without dropping
+    /// correct answers (that was the pp16 bug — the universe deliberately
+    /// spans terms touched only by non-path predicates, and literals). Because
+    /// this runs *before* the guarded BFS it cannot borrow that guard, so it
+    /// polls cancellation itself, like every other loop here: a runaway
+    /// `?s :p* ?o` is bounded by the query's timeout/cancellation — the right
+    /// axis for an inherently full-graph enumeration. A hard term cap is
+    /// deliberately NOT applied: `max_visited` is a traversal-depth bound
+    /// (always `DEFAULT_MAX_VISITED`) and capping the universe by it would
+    /// reject spec-valid queries on modestly large graphs. (The
+    /// `range_with_overlay` read still materializes the scan, as the wildcard
+    /// closure does; bounding the *input* is a separate, broader change.)
     async fn zero_length_universe(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Binding>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
         let flakes = range_with_overlay(
@@ -632,6 +646,11 @@ impl PropertyPathOperator {
         let mut seen_lits: HashSet<(FlakeValue, DatatypeConstraint)> = HashSet::new();
         let mut out: Vec<Binding> = Vec::new();
         for flake in flakes {
+            // Interruptible like every other traverse/closure loop in this
+            // file. This pre-BFS full-graph scan can't inherit the BFS's
+            // cancellation poll, so it polls here — a large `?s :p* ?o` stays
+            // killable by the query timeout instead of running to completion.
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             if fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
                 continue;
             }

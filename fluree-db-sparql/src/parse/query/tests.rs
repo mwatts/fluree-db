@@ -2178,6 +2178,62 @@ fn test_order_by_bare_builtin_call() {
 }
 
 #[test]
+fn test_order_by_bare_expression_not_absorbed_as_key() {
+    // `OrderCondition`'s bare form is `Constraint | Var`, never an arbitrary
+    // expression. A trailing operator after a var key must NOT become a second
+    // (spurious) key: pre-fix `ORDER BY ?x - 1` silently parsed as two keys
+    // `[?x, -1]`, corrupting the sort. The `- 1` is not a Constraint, so it is
+    // no longer absorbed — the ORDER BY keeps the single key `?x` (the stray
+    // tail is left for the parser, which currently ignores trailing tokens; a
+    // bare BuiltInCall like `ORDER BY str(?o)` stays valid, see
+    // test_order_by_bare_builtin_call). Regression guard for fluree/db#1452.
+    for q in [
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x - 1",
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x + ?y",
+    ] {
+        let ast = assert_parses(q);
+        let QueryBody::Select(sel) = &ast.body else {
+            panic!("expected SELECT query for {q}");
+        };
+        let ob = sel.modifiers.order_by.as_ref().expect("ORDER BY clause");
+        assert_eq!(ob.conditions.len(), 1, "{q}: arithmetic must not add a key");
+        assert!(
+            matches!(ob.conditions[0].expr, OrderExpr::Var(_)),
+            "{q}: the sole key must be the bare var, got {:?}",
+            ob.conditions[0].expr
+        );
+    }
+    // A *leading* bare arithmetic is not a Constraint at all, so no condition
+    // parses and ORDER BY is empty — a hard error.
+    assert!(
+        parse("SELECT * WHERE { ?s ?p ?o } ORDER BY str(?x) - 1").has_errors(),
+        "a bare arithmetic must be rejected as an order condition"
+    );
+}
+
+#[test]
+fn test_group_by_bare_expression_not_absorbed_as_key() {
+    // `GroupCondition`'s bare form is `BuiltInCall | FunctionCall` (or a
+    // parenthesized `( … )`, or a Var) — never a bare arithmetic. Kept
+    // consistent with ORDER BY (fluree/db#1452): a trailing `- 1` after a var
+    // is not absorbed as a second group key, and a leading bare arithmetic is
+    // rejected. The parenthesized `GROUP BY (?x + 1 AS ?y)` form stays valid
+    // (see test_group_by_with_expression).
+    let ast = assert_parses("SELECT ?x WHERE { ?s :p ?x } GROUP BY ?x - 1");
+    let QueryBody::Select(sel) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let gb = sel.modifiers.group_by.as_ref().expect("GROUP BY clause");
+    assert_eq!(gb.conditions.len(), 1, "`- 1` must not add a group key");
+    assert!(matches!(gb.conditions[0], GroupCondition::Var(_)));
+
+    assert!(
+        parse("SELECT ?x WHERE { ?s :p ?x } GROUP BY str(?x) - 1").has_errors(),
+        "a bare arithmetic must be rejected as a group condition"
+    );
+}
+
+#[test]
 fn test_empty_iriref() {
     // `<>` is a valid (empty, relative) IRI reference (W3C syntax-qname-05).
     assert_parses("PREFIX : <> SELECT * WHERE { : : : . }");
