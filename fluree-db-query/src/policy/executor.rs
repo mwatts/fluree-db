@@ -96,12 +96,60 @@ impl QueryPolicyExecutor<'_> {
         match query.language {
             PolicyQueryLanguage::JsonLd => self.evaluate_jsonld(&query.source, bindings).await,
             PolicyQueryLanguage::Sparql => self.evaluate_sparql(&query.source, bindings).await,
+            PolicyQueryLanguage::Cypher => self.evaluate_cypher(&query.source, bindings).await,
             // `PolicyQueryLanguage` is non_exhaustive; an unknown language
             // fails closed (error → deny), never open.
             other => Err(fluree_db_policy::PolicyError::QueryExecution {
                 message: format!("Unsupported policy query language: {}", other.as_str()),
             }),
         }
+    }
+
+    /// Evaluate a Cypher policy query via the registered lowering hook.
+    ///
+    /// Bindings become Cypher **parameters** (`?$this` → `$this`) carrying
+    /// IRI strings, substituted into the AST before lowering — no variable
+    /// seeding. An unbound identity substitutes as `null`, which never
+    /// compares equal, so identity-referencing conditions cannot hold.
+    /// Fails closed when no Cypher support is registered.
+    async fn evaluate_cypher(
+        &self,
+        source: &str,
+        bindings: &HashMap<String, Sid>,
+    ) -> PolicyResult<bool> {
+        let Some(support) = crate::lang_support::cypher_support() else {
+            return Err(fluree_db_policy::PolicyError::QueryExecution {
+                message: "Cypher policy support is not registered in this process".to_string(),
+            });
+        };
+
+        let mut params = serde_json::Map::new();
+        for (name, sid) in bindings {
+            // "?$this" → parameter name "this"; custom "?myVar" → "myVar".
+            let key = name
+                .strip_prefix("?$")
+                .or_else(|| name.strip_prefix('?'))
+                .unwrap_or(name)
+                .to_string();
+            let value = if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX) {
+                serde_json::Value::Null
+            } else {
+                let iri = self
+                    .snapshot
+                    .decode_sid(sid)
+                    .unwrap_or_else(|| sid.name.to_string());
+                serde_json::Value::String(iri)
+            };
+            params.insert(key, value);
+        }
+
+        let mut vars = VarRegistry::new();
+        let patterns = (support.lower_policy_query)(source, self.snapshot, &mut vars, &params)
+            .map_err(|e| fluree_db_policy::PolicyError::QueryExecution {
+                message: format!("Failed to lower Cypher policy query: {e}"),
+            })?;
+
+        self.run_existence_check(&vars, &patterns).await
     }
 
     /// Evaluate a JSON-LD policy query (the historical default).

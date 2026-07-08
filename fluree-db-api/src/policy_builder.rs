@@ -1015,15 +1015,17 @@ pub(crate) async fn load_policy_restriction(
                     break;
                 }
                 // Plain-string literals: the datatype selects the language.
-                // `f:sparql` → SPARQL; anything else (bare xsd:string) keeps
-                // the legacy JSON-LD interpretation.
+                // `f:sparql` → SPARQL; `f:cypher` → Cypher; anything else
+                // (bare xsd:string) keeps the legacy JSON-LD interpretation.
                 Binding::Lit {
                     val: FlakeValue::String(s),
                     dtc,
                     ..
                 } => {
-                    let language = if is_sparql_datatype(&dtc) {
+                    let language = if is_language_datatype(&dtc, fluree_vocab::db::SPARQL) {
                         PolicyQueryLanguage::Sparql
+                    } else if is_language_datatype(&dtc, fluree_vocab::db::CYPHER) {
+                        PolicyQueryLanguage::Cypher
                     } else {
                         PolicyQueryLanguage::JsonLd
                     };
@@ -1202,6 +1204,7 @@ fn parse_inline_policy(
         // - String: JSON query string
         // - Object: {"@type":"@json","@value":{...}} where @value is serialized to JSON string
         // - Object: {"@type":"f:sparql","@value":"ASK ..."} for SPARQL policies
+        // - Object: {"@type":"f:cypher","@value":"MATCH ..."} for Cypher policies
         //
         // `@json` values can use object `@value` (not just string).
         let policy_query_source: Option<(String, PolicyQueryLanguage)> = obj
@@ -1211,14 +1214,22 @@ fn parse_inline_policy(
                 JsonValue::String(s) => Some((s.clone(), PolicyQueryLanguage::JsonLd)),
                 JsonValue::Object(o) => {
                     let inner = o.get("@value")?;
+                    let type_str = o.get("@type").and_then(JsonValue::as_str);
                     // SPARQL typed value: {"@type": "f:sparql", "@value": "ASK ..."}
-                    if o.get("@type")
-                        .and_then(JsonValue::as_str)
+                    if type_str
                         .is_some_and(|t| t == "f:sparql" || t == fluree_vocab::fluree::SPARQL)
                     {
                         return inner
                             .as_str()
                             .map(|s| (s.to_string(), PolicyQueryLanguage::Sparql));
+                    }
+                    // Cypher typed value: {"@type": "f:cypher", "@value": "MATCH ..."}
+                    if type_str
+                        .is_some_and(|t| t == "f:cypher" || t == fluree_vocab::fluree::CYPHER)
+                    {
+                        return inner
+                            .as_str()
+                            .map(|s| (s.to_string(), PolicyQueryLanguage::Cypher));
                     }
                     // @json typed values
                     match inner {
@@ -1410,23 +1421,25 @@ fn parse_inline_policy(
 // (`fluree-db-query`) to avoid duplicating query parsing/lowering and to ensure
 // full feature support (e.g., FILTER patterns) in f:query policies.
 
-/// True when a literal's datatype is `f:sparql`.
-fn is_sparql_datatype(dtc: &fluree_db_core::DatatypeConstraint) -> bool {
+/// True when a literal's datatype is the given `f:` language datatype
+/// (local name under the fluree-db namespace, e.g. `f:sparql` / `f:cypher`).
+fn is_language_datatype(dtc: &fluree_db_core::DatatypeConstraint, local_name: &str) -> bool {
     matches!(
         dtc,
         fluree_db_core::DatatypeConstraint::Explicit(sid)
-            if *sid == Sid::new(fluree_vocab::namespaces::FLUREE_DB, fluree_vocab::db::SPARQL)
+            if *sid == Sid::new(fluree_vocab::namespaces::FLUREE_DB, local_name)
     )
 }
 
 /// Build the `PolicyValue` for an `f:query` source, validating per language.
 ///
 /// Validation preserves the historical "deny on parse error" behavior: a
-/// source that fails to parse (or, for SPARQL, is not an ASK/SELECT query)
-/// yields `PolicyValue::Deny` with a warning rather than an error.
+/// source that fails to parse (or is not the language's condition form —
+/// ASK/SELECT for SPARQL, a read-only query for Cypher) yields
+/// `PolicyValue::Deny` with a warning rather than an error.
 ///
-/// For SPARQL sources this also registers the SPARQL lowering hooks so the
-/// policy executor can evaluate the query later.
+/// For SPARQL / Cypher sources this also registers the corresponding
+/// lowering hooks so the policy executor can evaluate the query later.
 fn make_policy_query_value(
     policy_id: &str,
     source: String,
@@ -1439,6 +1452,10 @@ fn make_policy_query_value(
         PolicyQueryLanguage::Sparql => {
             crate::sparql_lang::ensure_sparql_support_registered();
             crate::sparql_lang::validate_sparql_policy_source(&source)
+        }
+        PolicyQueryLanguage::Cypher => {
+            crate::cypher_lang::ensure_cypher_support_registered();
+            crate::cypher_lang::validate_cypher_policy_source(&source)
         }
         other => Err(format!(
             "unsupported policy query language {}",

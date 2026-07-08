@@ -7,6 +7,8 @@ mod it_policy_allow;
 mod it_policy_class;
 #[path = "it_policy_cross_ledger.rs"]
 mod it_policy_cross_ledger;
+#[path = "it_policy_cypher_conditions.rs"]
+mod it_policy_cypher_conditions;
 #[path = "it_policy_federation.rs"]
 mod it_policy_federation;
 #[path = "it_policy_fquery.rs"]

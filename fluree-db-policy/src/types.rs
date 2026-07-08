@@ -15,9 +15,10 @@ use std::sync::Arc;
 /// Discriminated by the RDF datatype of the stored literal:
 /// - `@json` / `rdf:JSON` (and legacy bare `xsd:string`) → [`JsonLd`](Self::JsonLd)
 /// - `f:sparql` → [`Sparql`](Self::Sparql)
+/// - `f:cypher` → [`Cypher`](Self::Cypher)
 ///
-/// Marked `#[non_exhaustive]` so future languages (e.g. `f:cypher`) can be
-/// added without breaking downstream matches.
+/// Marked `#[non_exhaustive]` so future languages can be added without
+/// breaking downstream matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum PolicyQueryLanguage {
@@ -27,6 +28,11 @@ pub enum PolicyQueryLanguage {
     /// SPARQL ASK/SELECT source text (SHACL-SPARQL-style `$this` / `$identity`
     /// special variables)
     Sparql,
+    /// openCypher read query. `$this` / `$identity` are supplied as Cypher
+    /// parameters carrying the subject / identity IRI strings (compare with
+    /// `id(n)` / `elementId(n)`); at least one result row = the condition
+    /// holds.
+    Cypher,
 }
 
 impl PolicyQueryLanguage {
@@ -35,6 +41,7 @@ impl PolicyQueryLanguage {
         match self {
             PolicyQueryLanguage::JsonLd => "json-ld",
             PolicyQueryLanguage::Sparql => "sparql",
+            PolicyQueryLanguage::Cypher => "cypher",
         }
     }
 }

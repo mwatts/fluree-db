@@ -136,6 +136,39 @@ Rules for SPARQL policy queries:
   request `@context` is not applied to policy sources.
 - GROUP BY / aggregates are not supported in policy queries.
 
+## Cypher policy queries
+
+`f:query` can also be written in openCypher, selected by the `f:cypher`
+datatype (`https://ns.flur.ee/db#cypher`):
+
+```json
+"f:query": {
+  "@type": "https://ns.flur.ee/db#cypher",
+  "@value": "MATCH (i)-[:`http://example.org/ns/user`]->(t) WHERE id(i) = $identity AND id(t) = $this RETURN i"
+}
+```
+
+Rules for Cypher policy queries:
+
+- The query must be **read-only** (MATCH...RETURN). Writes
+  (CREATE/MERGE/SET/DELETE), schema commands, and procedure calls are
+  rejected at policy build time and the policy falls back to **deny**.
+- The condition holds when the query has **at least one result row** —
+  the same existence semantics as every other condition language.
+- **`$this`** and **`$identity`** are supplied as Cypher **parameters**
+  carrying the subject / identity IRI strings — compare them with
+  `id(n)` / `elementId(n)` or use them as property values. A request with
+  no identity substitutes `$identity` as `null`, which never compares
+  equal, so identity-referencing conditions cannot hold.
+- Conditions lower without a ledger `@vocab`: write labels, relationship
+  types, and property names as backtick-quoted full IRIs (as in the example
+  above) unless the data itself was written without `@vocab`.
+- Aggregates are not supported in policy queries.
+
+The condition's language is independent of the request's protocol: a Cypher
+condition governs JSON-LD and SPARQL reads and writes identically, because
+enforcement operates on flakes.
+
 ## RDFS entailment
 
 Policy targeting applies RDFS inference **always**: a policy with

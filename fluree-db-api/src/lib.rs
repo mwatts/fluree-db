@@ -44,6 +44,7 @@ pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
 pub mod cypher_import;
+pub(crate) mod cypher_lang;
 mod cypher_procedures;
 pub mod cypher_txn;
 pub mod cypher_write;
@@ -2621,6 +2622,7 @@ impl FlureeBuilder {
         // Register SPARQL lowering hooks for f:sparql policy queries and
         // datalog rules (idempotent; must precede any policy/rule evaluation).
         sparql_lang::ensure_sparql_support_registered();
+        cypher_lang::ensure_cypher_support_registered();
 
         let ledger_manager = ledger_cache_config.map(|mut lm_config| {
             if lm_config.leaflet_cache.is_none() {
