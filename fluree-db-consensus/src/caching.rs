@@ -264,17 +264,46 @@ pub struct CachingCommitter<C: Committer = LocalCommitter> {
     executor: C,
     cache: Cache<IdempotencyCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
-    per_ledger_admission: DashMap<String, Arc<Semaphore>>,
+    // `Arc` so an [`AdmissionPermits`] guard can hold a handle and
+    // evict its ledger's semaphore once idle — otherwise this map
+    // grows one never-removed entry per distinct ledger string ever
+    // submitted, which a flood of client-chosen names could exploit
+    // (admission runs before any ledger-existence check).
+    per_ledger_admission: Arc<DashMap<String, Arc<Semaphore>>>,
     per_ledger_limit: usize,
 }
 
-/// RAII guard holding both an admission permits — the per-ledger slot
-/// (acquired first) and the global slot. Dropping it releases both.
-/// Fields are private with `_` prefixes because callers only care about
-/// the lifetime effect, not direct permit access.
+/// RAII guard holding a submission's two admission permits — the
+/// per-ledger slot (acquired first) and the global slot. Dropping it
+/// releases both and, when the ledger's semaphore goes idle, evicts
+/// that semaphore from [`CachingCommitter::per_ledger_admission`] so
+/// the map stays bounded by the count of ledgers with in-flight
+/// submissions (itself bounded by the global permit pool).
 struct AdmissionPermits {
     _global: OwnedSemaphorePermit,
-    _per_ledger: OwnedSemaphorePermit,
+    /// `Option` so [`Drop`] can release this permit *before* testing
+    /// whether the semaphore is idle.
+    per_ledger: Option<OwnedSemaphorePermit>,
+    admission_map: Arc<DashMap<String, Arc<Semaphore>>>,
+    ledger_id: String,
+    per_ledger_limit: usize,
+}
+
+impl Drop for AdmissionPermits {
+    fn drop(&mut self) {
+        // Release this submission's per-ledger permit, then drop the
+        // semaphore entry iff no other submission for the same ledger
+        // still holds one. The idle test runs under DashMap's bucket
+        // lock, so a concurrent acquirer is either observed (a permit
+        // is out → entry kept) or races ahead onto its own clone of
+        // the `Arc`, which stays valid regardless — a bounded,
+        // transient relaxation of the soft per-ledger cap, never a
+        // leaked map entry.
+        drop(self.per_ledger.take());
+        self.admission_map.remove_if(&self.ledger_id, |_, semaphore| {
+            semaphore.available_permits() == self.per_ledger_limit
+        });
+    }
 }
 
 impl CachingCommitter<LocalCommitter> {
@@ -312,7 +341,7 @@ impl<C: Committer> CachingCommitter<C> {
             executor,
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         }
     }
@@ -404,7 +433,10 @@ impl<C: Committer> CachingCommitter<C> {
             .map_err(|_| SubmissionError::Overloaded)?;
         Ok(AdmissionPermits {
             _global: global,
-            _per_ledger: per_ledger,
+            per_ledger: Some(per_ledger),
+            admission_map: Arc::clone(&self.per_ledger_admission),
+            ledger_id: ledger_id.to_string(),
+            per_ledger_limit: self.per_ledger_limit,
         })
     }
 
@@ -1195,7 +1227,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1253,7 +1285,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1289,7 +1321,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1640,6 +1672,51 @@ mod tests {
             committer.try_admit("tenant-d:main"),
             Err(SubmissionError::Overloaded)
         ));
+    }
+
+    #[tokio::test]
+    async fn idle_per_ledger_semaphores_are_evicted_not_accumulated() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(100)
+            .with_per_ledger_pending_limit(2);
+
+        // A flood of distinct client-chosen ledger strings, each
+        // admitted and released in turn, must leave no residue — this
+        // is the unbounded-growth DoS the eviction closes (admission
+        // runs before any ledger-existence check).
+        for i in 0..1000 {
+            let permit = committer
+                .try_admit(&format!("flood-{i}:main"))
+                .expect("admit");
+            drop(permit);
+        }
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            0,
+            "idle per-ledger semaphores must be evicted, not accumulated"
+        );
+
+        // An in-flight submission keeps its entry; dropping it removes it.
+        let held = committer.try_admit("held:main").expect("admit held");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+        drop(held);
+        assert_eq!(committer.per_ledger_admission.len(), 0);
+
+        // Two concurrent submissions on one ledger: the entry survives
+        // the first drop (the second still holds a permit) and is
+        // removed only once the last permit is released.
+        let s1 = committer.try_admit("shared:main").expect("s1");
+        let s2 = committer.try_admit("shared:main").expect("s2");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+        drop(s1);
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            1,
+            "entry must survive while another submission holds a permit"
+        );
+        drop(s2);
+        assert_eq!(committer.per_ledger_admission.len(), 0);
     }
 
     #[test]

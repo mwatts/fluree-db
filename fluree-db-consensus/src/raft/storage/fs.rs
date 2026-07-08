@@ -78,7 +78,14 @@ async fn fsync_dir(path: &Path) -> Result<(), StorageError> {
 /// can revert on remount, silently rolling back a write whose `Ok`
 /// callers (Raft vote / log entry / snapshot pointer persistence)
 /// rely on for safety.
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+/// Durably write `bytes` to a temp file and rename it over `path`,
+/// but leave the parent-directory fsync (which makes the rename
+/// itself durable) to the caller. The file *contents* are synced
+/// before the rename, so after the caller fsyncs the directory the
+/// entry is fully durable. A batch writer (`append`) uses this to
+/// pay one directory fsync for the whole batch instead of one per
+/// entry; single writers go through [`atomic_write`].
+async fn write_and_rename(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let tmp = path.with_extension("tmp");
     {
         let mut file = fs::File::create(&tmp)
@@ -92,6 +99,14 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     fs::rename(&tmp, path)
         .await
         .map_err(|e| io_err("rename tmp", e))?;
+    Ok(())
+}
+
+/// [`write_and_rename`] plus the parent-directory fsync, so the
+/// rename is durable on return. For one-off writes (vote, committed,
+/// snapshot files); batch writers fsync the directory once at the end.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    write_and_rename(path, bytes).await?;
     if let Some(parent) = path.parent() {
         fsync_dir(parent).await?;
     }
@@ -198,9 +213,20 @@ impl FsRaftLogStore {
 #[async_trait]
 impl RaftLogStore for FsRaftLogStore {
     async fn append(&self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        // Each entry's contents are fsync'd before its rename; the
+        // renames are made durable by a single directory fsync at the
+        // end, so a batch of N pays N+1 fsyncs rather than 2N. A crash
+        // before that final fsync can leave the tail renames durable
+        // out of order (a gap), but the append hasn't been acked to
+        // openraft, and `log_state` reports only the contiguous prefix
+        // above the purge cutoff — so the gap and any orphans past it
+        // are dropped and re-appended on recovery.
         for entry in entries {
             let bytes = postcard::to_allocvec(entry).map_err(|e| ser_err("encode entry", e))?;
-            atomic_write(&self.entry_path(entry.log_id.index), &bytes).await?;
+            write_and_rename(&self.entry_path(entry.log_id.index), &bytes).await?;
+        }
+        if !entries.is_empty() {
+            fsync_dir(&self.log_dir()).await?;
         }
         Ok(())
     }
@@ -280,17 +306,31 @@ impl RaftLogStore for FsRaftLogStore {
         let last_purged = self.read_last_purged().await?;
         let purged_cutoff = last_purged.map(|p| p.index);
         let indices = self.list_entry_indices().await?;
-        // `last_log` reflects only entries strictly above
-        // `last_purged`; orphans at indices <= cutoff (left behind by
-        // a crashed `purge_through` between marker write and
-        // deletion) must not bump `last_log` or openraft sees a
-        // last_log inside the purged range.
-        let last_log = match indices
+        // `last_log` is the top of the contiguous run of entries above
+        // `last_purged`. Two orphan sources make this a contiguous
+        // scan rather than a plain max:
+        //   - indices <= cutoff (a `purge_through` that crashed between
+        //     marker write and deletion) — filtered out by the cutoff;
+        //   - a gap in the tail (an `append` batch that crashed before
+        //     its final directory fsync, leaving renames durable out of
+        //     order) — the scan stops at the gap, so openraft never
+        //     sees a `last_log` past a missing entry. Entries beyond the
+        //     gap are orphans that recovery re-appends over.
+        let last_index = indices
             .iter()
-            .rev()
-            .find(|&&idx| purged_cutoff.is_none_or(|c| idx > c))
             .copied()
-        {
+            .filter(|&idx| purged_cutoff.is_none_or(|c| idx > c))
+            .scan(None, |expected: &mut Option<u64>, idx| {
+                match *expected {
+                    Some(next) if idx != next => None, // gap — stop the run
+                    _ => {
+                        *expected = Some(idx + 1);
+                        Some(idx)
+                    }
+                }
+            })
+            .last();
+        let last_log = match last_index {
             Some(idx) => self.read_entry(idx).await?.map(|e| e.log_id),
             None => None,
         };
@@ -741,6 +781,34 @@ mod tests {
         assert!(
             state.last_log.is_none(),
             "orphans below the marker must not surface as last_log"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_state_stops_at_a_tail_gap() {
+        // Simulate an `append` batch that crashed before its final
+        // directory fsync: entries 1..3 durable, 4's rename lost, 5
+        // durable past the gap. `log_state` must report `last_log = 3`
+        // (the contiguous prefix), never 5 — otherwise openraft would
+        // see a `last_log` past the missing entry 4.
+        let (_dir, store) = fresh_log_store().await;
+        store
+            .append(&[
+                entry(1, 1),
+                entry(1, 2),
+                entry(1, 3),
+                entry(1, 4),
+                entry(1, 5),
+            ])
+            .await
+            .unwrap();
+        std::fs::remove_file(store.entry_path(4)).expect("open the gap at index 4");
+
+        let state = store.log_state().await.unwrap();
+        assert_eq!(
+            state.last_log,
+            Some(LogId::new(1, 3)),
+            "last_log must stop at the gap, ignoring the orphan at 5"
         );
     }
 
