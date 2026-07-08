@@ -5187,7 +5187,7 @@ async fn cypher_shortest_path_node_predicate_pushed_into_search() {
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(none.as_array().map(|r| r.len()), Some(0), "no path: {none}");
+    assert_eq!(none.as_array().map(Vec::len), Some(0), "no path: {none}");
 
     // Unfiltered shortestPath is unchanged: the 2-hop path through the minor.
     let two = fluree
