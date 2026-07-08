@@ -1112,6 +1112,7 @@ impl FusedR2rmlAggregateOperator {
             &self.graph_iri,
             ctx.active_snapshot,
             mapping.as_deref(),
+            ctx.reasoning_active,
         );
         if rr.unconverted_count > 0 {
             return Ok(None);

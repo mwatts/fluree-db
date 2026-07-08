@@ -779,7 +779,7 @@ async fn live_iceberg_fql_type_returns_instances() {
     );
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = genesis_ledger(&fluree, "live-iceberg-type:main");
+    let _ledger = genesis_ledger(&fluree, "live-iceberg-type:main");
 
     let alias = "fql-type-e2e";
     let mut config = R2rmlCreateConfig::new(alias, &catalog_uri, &table, mapping)
@@ -800,14 +800,23 @@ async fn live_iceberg_fql_type_returns_instances() {
     }
 
     // --- Flat FQL `@type` (bound class) must return the class's instances. ---
+    // Uses the `from`/FromQueryBuilder path with an inline WHERE (the previous
+    // `{"@graph":.., "patterns":[..]}` envelope panicked "Arrays in property
+    // values not yet supported" — it is not a valid FQL WHERE shape).
     let type_query = serde_json::json!({
         "@context": {"v": "http://example/org/ns"},
+        "from": format!("{alias}:main"),
         "select": ["?s"],
-        "where": {"@graph": format!("{alias}:main"), "patterns": [{"@id": "?s", "@type": "v:Thing"}]},
+        "where": {"@id": "?s", "@type": "v:Thing"},
     });
-    match fluree.query_graph_source(&ledger, &type_query).await {
-        Ok(result) => {
-            let rows: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    match fluree
+        .query_from()
+        .jsonld(&type_query)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let rows = json.as_array().map_or(0, Vec::len);
             eprintln!("live-iceberg flat @type returned {rows} rows");
             assert!(rows > 0, "FQL @type must return the class's instances");
         }
@@ -850,6 +859,43 @@ async fn live_iceberg_fql_type_returns_instances() {
             eprintln!("WARNING: live crawl query failed environmentally: {e}");
         }
         Err(e) => panic!("FQL @type crawl failed unexpectedly: {e}"),
+    }
+
+    // --- SAME crawl through the `from`/FromQueryBuilder path (the DEPLOYED
+    //     `POST /v1/fluree/query/<ledger>` route that returned []). Pre-fix this
+    //     native-hydrated the empty index → []; post-fix (FIX 1) it routes
+    //     through R2RML and returns the same hydrated instances as the alias
+    //     path above. ---
+    let crawl_from = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "from": format!("{alias}:main"),
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "@type": "v:Thing"},
+        "limit": 3,
+    });
+    match fluree
+        .query_from()
+        .jsonld(&crawl_from)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let docs = json.as_array().expect("crawl returns a JSON array");
+            eprintln!("live-iceberg from-crawl returned {} instances", docs.len());
+            assert!(
+                !docs.is_empty(),
+                "the from/connection-path @type crawl must return instances (deployed \
+                 View Instances regression)"
+            );
+            assert!(
+                docs.iter().all(|d| d.get("@id").is_some()),
+                "each from-crawled instance carries an @id"
+            );
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live from-crawl query failed environmentally: {e}");
+        }
+        Err(e) => panic!("FQL from-crawl failed unexpectedly: {e}"),
     }
 }
 

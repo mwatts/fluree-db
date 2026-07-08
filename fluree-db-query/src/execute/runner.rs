@@ -138,6 +138,12 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// Whether any reasoning/entailment mode was enabled for this query.
+    ///
+    /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
+    /// read by the R2RML rewriter to refuse an exact-class wildcard fusion that
+    /// could drop a subclass-entailed subject.
+    pub reasoning_active: bool,
 }
 
 /// Inputs that the preparation phase needs to know up front.
@@ -464,6 +470,7 @@ pub async fn prepare_execution_with_config(
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_active: reasoning.has_any_enabled(),
         })
     }
     .instrument(span)
@@ -801,6 +808,12 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     // bindings comparable on join keys.
     if db.eager || prepared.derived_overlay.is_some() {
         ctx = ctx.with_eager_materialization();
+    }
+    // Let the R2RML rewriter see whether entailment is active so it can refuse
+    // an exact-class wildcard fusion that a subclass-entailed subject would
+    // otherwise be dropped by.
+    if prepared.reasoning_active {
+        ctx = ctx.with_reasoning_active(true);
     }
 
     if let Some(tracker) = config.tracker {
