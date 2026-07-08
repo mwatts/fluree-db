@@ -111,9 +111,10 @@ pub(crate) fn parse_cypher_to_ir(
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
     overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     let ast = substituted_cypher_ast(cypher, params)?;
-    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay)
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay, policy)
 }
 
 /// Statements longer than this are parsed but never cached: unique bulk
@@ -207,6 +208,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the
@@ -224,6 +226,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
             overlay.map(|(o, _)| o),
             vocab.as_deref(),
             &overrides,
+            policy,
         )?;
         rewritten = fluree_db_cypher::CypherAst {
             statement: fluree_db_cypher::ast::Statement::Query(query),

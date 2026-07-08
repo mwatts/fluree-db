@@ -3861,6 +3861,7 @@ impl Fluree {
             &probe_view.snapshot,
             probe_view.default_context.as_ref(),
             Some((&*probe_view.overlay, probe_view.graph_id)),
+            probe_view.policy_enforcer().map(|e| &**e),
         )?;
 
         let target_var = vars.get(&target.name).ok_or_else(|| {
