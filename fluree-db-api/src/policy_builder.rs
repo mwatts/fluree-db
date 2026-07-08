@@ -389,9 +389,11 @@ async fn build_policy_context_from_opts_inner(
 
     // Build policy sets (view and modify)
     //
-    // Stats are critical for f:onClass policies - they need class→property relationships
-    // to know which properties to index. Without stats, OnClass policies only match
-    // @id and rdf:type properties (the implicit ones).
+    // Stats are critical for VIEW-side f:onClass policies - they need
+    // class→property relationships to know which properties to index.
+    // Without stats, view-set OnClass policies only match @id and rdf:type
+    // properties (the implicit ones). Modify sets index OnClass policies by
+    // class instead (`PolicySet::by_class`) and don't consult stats.
     //
     // Policies need the full novelty-aware class/property view so `f:onClass`
     // restrictions apply even when novelty adds properties without restating

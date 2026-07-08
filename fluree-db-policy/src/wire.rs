@@ -430,15 +430,15 @@ mod tests {
         // unrelated property.
         let unrelated = sid(100, "age");
 
-        let local_hits = local_set.restrictions_for_flake(&alice_sid, &name_sid);
-        let wire_hits = wire_set.restrictions_for_flake(&alice_sid, &name_sid);
+        let local_hits = local_set.restrictions_for_flake(&alice_sid, &name_sid, &[]);
+        let wire_hits = wire_set.restrictions_for_flake(&alice_sid, &name_sid, &[]);
         assert_eq!(local_hits.len(), wire_hits.len());
         assert_eq!(local_hits[0].id, wire_hits[0].id);
         assert!(matches!(local_hits[0].value, PolicyValue::Allow));
         assert!(matches!(wire_hits[0].value, PolicyValue::Allow));
 
-        let local_miss = local_set.restrictions_for_flake(&alice_sid, &unrelated);
-        let wire_miss = wire_set.restrictions_for_flake(&alice_sid, &unrelated);
+        let local_miss = local_set.restrictions_for_flake(&alice_sid, &unrelated, &[]);
+        let wire_miss = wire_set.restrictions_for_flake(&alice_sid, &unrelated, &[]);
         assert_eq!(local_miss.len(), 0);
         assert_eq!(wire_miss.len(), 0);
     }

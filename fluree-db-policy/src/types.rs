@@ -200,17 +200,31 @@ pub struct PropertyPolicyEntry {
 
 /// Indexed policy set
 ///
-/// Class policies are indexed INTO by_property (not a separate by_class index).
-/// This is designed for efficient lookup.
+/// View-set class policies are indexed INTO by_property (pre-expanded via
+/// class→property stats); modify-set class policies are indexed by class in
+/// `by_class`. This is designed for efficient lookup.
 #[derive(Debug, Default)]
 pub struct PolicySet {
     /// All restrictions in parse order (insertion order preserved)
     pub restrictions: Vec<PolicyRestriction>,
     /// Index: subject SID -> restriction indices
     pub by_subject: HashMap<Sid, Vec<usize>>,
-    /// Index: property SID -> property policy entries (includes class policies!)
+    /// Index: property SID -> property policy entries (includes view-set class policies!)
     /// Each entry includes whether class check is needed for that specific property
     pub by_property: HashMap<Sid, Vec<PropertyPolicyEntry>>,
+    /// Index: class SID -> restriction indices (modify sets only).
+    ///
+    /// Modify-side `f:onClass` policies are selected by the subject's
+    /// classes at evaluation time instead of being pre-expanded into
+    /// `by_property` via class→property stats. Stats describe committed
+    /// data — exactly what a write is about to change: pre-expansion
+    /// misses properties the class has never used, and the
+    /// exclusive-property shortcut (`class_check_needed = false`) would
+    /// let a class allow apply to a non-instance when the staged flake
+    /// itself contradicts the stats. View sets keep the stats expansion
+    /// (committed data matches stats there, and scan volume makes the
+    /// precomputed property index worthwhile); their `by_class` is empty.
+    pub by_class: HashMap<Sid, Vec<usize>>,
     /// Default-bucket policy indices
     pub defaults: Vec<usize>,
 }
@@ -233,28 +247,58 @@ impl PolicySet {
         Self::default()
     }
 
+    /// Collect the deduplicated class-bucket restriction indices for a
+    /// subject's classes, in insertion order. Empty unless this is a modify
+    /// set with `f:onClass` policies.
+    fn class_bucket_indices(&self, subject_classes: &[Sid]) -> Vec<usize> {
+        if self.by_class.is_empty() {
+            return Vec::new();
+        }
+        let mut idxs: Vec<usize> = subject_classes
+            .iter()
+            .filter_map(|c| self.by_class.get(c))
+            .flatten()
+            .copied()
+            .collect();
+        // A restriction targeting two of the subject's classes is still one
+        // candidate; ascending index order == insertion order.
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs
+    }
+
     /// Get candidate restrictions for a flake
     ///
-    /// Order: property-specific -> subject-specific -> defaults
+    /// Order: property-specific -> class-specific -> subject-specific -> defaults
     /// Preserves insertion order within each bucket.
-    pub fn restrictions_for_flake(&self, subject: &Sid, property: &Sid) -> Vec<&PolicyRestriction> {
+    pub fn restrictions_for_flake(
+        &self,
+        subject: &Sid,
+        property: &Sid,
+        subject_classes: &[Sid],
+    ) -> Vec<&PolicyRestriction> {
         let mut candidates = Vec::new();
 
-        // 1. Property-specific (includes class policies mapped here)
+        // 1. Property-specific (includes view-set class policies mapped here)
         if let Some(entries) = self.by_property.get(property) {
             for entry in entries {
                 candidates.push(&self.restrictions[entry.idx]);
             }
         }
 
-        // 2. Subject-specific (preserve insertion order)
+        // 2. Class-specific (modify sets)
+        for idx in self.class_bucket_indices(subject_classes) {
+            candidates.push(&self.restrictions[idx]);
+        }
+
+        // 3. Subject-specific (preserve insertion order)
         if let Some(indices) = self.by_subject.get(subject) {
             for &idx in indices {
                 candidates.push(&self.restrictions[idx]);
             }
         }
 
-        // 3. Default-bucket policies (preserve insertion order)
+        // 4. Default-bucket policies (preserve insertion order)
         for &idx in &self.defaults {
             candidates.push(&self.restrictions[idx]);
         }
@@ -264,19 +308,26 @@ impl PolicySet {
 
     /// Get candidate policy entries for a flake with per-property class_check_needed info.
     ///
-    /// Order: property-specific -> subject-specific -> defaults.
+    /// Order: property-specific -> class-specific -> subject-specific -> defaults.
     /// Preserves insertion order within each bucket.
     ///
     /// Returns `FlakePolicyEntry` which includes:
     /// - `idx`: restriction index
     /// - `class_check_needed`: whether class membership check is needed for THIS property
     ///
-    /// For non-class policies (property, subject, default), `class_check_needed` is always false
-    /// since they don't need class membership verification.
-    pub fn policy_entries_for_flake(&self, subject: &Sid, property: &Sid) -> Vec<FlakePolicyEntry> {
+    /// Class-bucket entries are selected BY the subject's classes, so their
+    /// membership check is already done (`class_check_needed: false`). For
+    /// non-class policies (property, subject, default), `class_check_needed`
+    /// is always false since they don't need class membership verification.
+    pub fn policy_entries_for_flake(
+        &self,
+        subject: &Sid,
+        property: &Sid,
+        subject_classes: &[Sid],
+    ) -> Vec<FlakePolicyEntry> {
         let mut candidates = Vec::new();
 
-        // 1. Property-specific (includes class policies mapped here)
+        // 1. Property-specific (includes view-set class policies mapped here)
         // Uses per-property class_check_needed
         if let Some(entries) = self.by_property.get(property) {
             for entry in entries {
@@ -287,7 +338,15 @@ impl PolicySet {
             }
         }
 
-        // 2. Subject-specific (never need class check)
+        // 2. Class-specific (modify sets): selection by class IS the check
+        for idx in self.class_bucket_indices(subject_classes) {
+            candidates.push(FlakePolicyEntry {
+                idx,
+                class_check_needed: false,
+            });
+        }
+
+        // 3. Subject-specific (never need class check)
         if let Some(indices) = self.by_subject.get(subject) {
             for &idx in indices {
                 candidates.push(FlakePolicyEntry {
@@ -297,7 +356,7 @@ impl PolicySet {
             }
         }
 
-        // 3. Default-bucket policies (don't need class check)
+        // 4. Default-bucket policies (don't need class check)
         for &idx in &self.defaults {
             candidates.push(FlakePolicyEntry {
                 idx,
@@ -321,9 +380,10 @@ impl PolicySet {
     /// an empty result when it is false).
     ///
     /// Soundness: this inspects the *built* index buckets that
-    /// `policy_entries_for_flake` itself reads — `by_property` (which `f:onClass`
-    /// policies are pre-expanded into at build time), plus the predicate-agnostic
-    /// `by_subject` and `defaults`. It never derives coverage from the raw
+    /// `policy_entries_for_flake` itself reads — `by_property` (which view-set
+    /// `f:onClass` policies are pre-expanded into at build time), plus the
+    /// predicate-agnostic `by_class` (modify sets), `by_subject`, and
+    /// `defaults`. It never derives coverage from the raw
     /// `restrictions`/`for_classes`, so a `false` verdict is a faithful
     /// optimization of the per-flake evaluator and can never disagree with it
     /// (even when class policies were expanded under absent stats). Schema
@@ -332,6 +392,7 @@ impl PolicySet {
     pub fn covers_predicate(&self, p: &Sid) -> bool {
         crate::schema::is_schema_predicate(p)
             || self.by_property.contains_key(p)
+            || !self.by_class.is_empty()
             || !self.by_subject.is_empty()
             || !self.defaults.is_empty()
     }
@@ -499,14 +560,14 @@ mod tests {
 
         // Query for the "name" property
         let candidates =
-            set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "name"));
+            set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "name"), &[]);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].id, "prop-1");
         assert_eq!(candidates[1].id, "default-1");
 
         // Query for a different property
         let other_candidates =
-            set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "age"));
+            set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "age"), &[]);
         assert_eq!(other_candidates.len(), 1);
         assert_eq!(other_candidates[0].id, "default-1");
     }

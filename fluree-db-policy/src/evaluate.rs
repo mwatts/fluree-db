@@ -292,7 +292,8 @@ impl PolicyContext {
         }
 
         // 1. Collect all candidate policy entries (property -> subject -> default order)
-        let candidate_entries = policy_set.policy_entries_for_flake(subject, property);
+        let candidate_entries =
+            policy_set.policy_entries_for_flake(subject, property, subject_classes);
 
         // Convert subject_classes to HashSet for efficient lookup
         let subject_class_set: HashSet<&Sid> = subject_classes.iter().collect();
@@ -404,7 +405,11 @@ impl PolicyContext {
         }
 
         // 1. Collect all candidate policy entries (property -> subject -> default order)
-        let candidate_entries = policy_set.policy_entries_for_flake(flake.subject, flake.property);
+        let candidate_entries = policy_set.policy_entries_for_flake(
+            flake.subject,
+            flake.property,
+            flake.subject_classes,
+        );
 
         // Convert subject_classes to HashSet for efficient lookup
         let subject_class_set: HashSet<&Sid> = flake.subject_classes.iter().collect();
@@ -547,7 +552,11 @@ impl PolicyContext {
         }
 
         // 1. Collect all candidate policy entries (property -> subject -> default order)
-        let candidate_entries = policy_set.policy_entries_for_flake(flake.subject, flake.property);
+        let candidate_entries = policy_set.policy_entries_for_flake(
+            flake.subject,
+            flake.property,
+            flake.subject_classes,
+        );
 
         // Convert subject_classes to HashSet for efficient lookup
         let subject_class_set: HashSet<&Sid> = flake.subject_classes.iter().collect();
@@ -712,7 +721,8 @@ impl PolicyContext {
         }
 
         let policy_set = self.wrapper.modify();
-        let candidate_entries = policy_set.policy_entries_for_flake(subject, property);
+        let candidate_entries =
+            policy_set.policy_entries_for_flake(subject, property, subject_classes);
         let subject_class_set: HashSet<&Sid> = subject_classes.iter().collect();
 
         // Filter by class applicability using per-property class_check_needed
