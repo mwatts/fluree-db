@@ -61,6 +61,15 @@ fn config_fingerprint(config: &str) -> u64 {
     h.finish()
 }
 
+/// Build the process-wide REST-client cache key for a graph source: its id plus a
+/// fingerprint of the raw config JSON. Shared by the query scan path and the
+/// `/info` row-count fetch so both reuse the SAME cached client (one OAuth token
+/// and one HTTPS connection pool), warmed by whichever path runs first. Keeping
+/// this in one place guarantees the two keys never drift.
+pub(crate) fn rest_client_cache_key(graph_source_id: &str, config: &str) -> String {
+    format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
+}
+
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
 /// file pruning. Filters on unknown columns are skipped; an empty result is
 /// `None`. Conservative — pruning never drops matching rows because the
@@ -720,10 +729,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 // ~hour instead of one per query. The fingerprint hashes the full
                 // source config, so a rotated PAT (or any config change) builds a
                 // fresh client.
-                let client_fp = format!(
-                    "{graph_source_id}\u{1f}{:016x}",
-                    config_fingerprint(&record.config)
-                );
+                let client_fp = rest_client_cache_key(graph_source_id, &record.config);
                 let catalog = match cache.rest_client(&client_fp) {
                     Some(c) => c,
                     None => {

@@ -1141,6 +1141,12 @@ fn object_map_datatype(object_map: &ObjectMap) -> String {
 struct PropertyAgg {
     count: Option<i64>,
     datatypes: BTreeMap<String, Option<i64>>,
+    /// FK relationship targets (`ref-classes`): for a ref (RefObjectMap)
+    /// predicate, the parent triples-map's class IRI(s) → accumulated child row
+    /// count. Empty for literal-column properties. Only the per-class
+    /// aggregation populates this; the flat `stats.properties` view has no
+    /// `ref-classes` field and leaves it empty.
+    ref_classes: BTreeMap<String, Option<i64>>,
 }
 
 /// Build the native-shaped [`LedgerInfo`] for a virtual (query-in-place)
@@ -1192,6 +1198,29 @@ pub fn build_virtual_ledger_info(
                 })
                 .collect();
 
+            // FK relationship targets (`ref-classes`): for each predicate whose
+            // object map is a RefObjectMap (`rr:parentTriplesMap`), the object is
+            // the parent map's subject IRI, so the predicate's target class(es)
+            // are that parent map's class(es). Resolved from the compiled mapping
+            // alone (metadata only) — the same `parentTriplesMap` → parent-map
+            // resolution the emitter's round-trip verifier does
+            // (`fluree-db-r2rml/src/emit/mod.rs`), keyed here to the parent's
+            // `classes()` rather than its `table_name()`. The ref predicate's
+            // `@id` datatype already flows through `poms` above; this adds the
+            // per-target-class counts the native `/info` carries.
+            let ref_targets: Vec<(String, Vec<String>)> = tm
+                .predicate_object_maps
+                .iter()
+                .filter_map(|pom| {
+                    let ObjectMap::RefObjectMap(rom) = &pom.object_map else {
+                        return None;
+                    };
+                    let pred = pom.predicate_map.as_constant()?;
+                    let parent = mapping.get(&rom.parent_triples_map)?;
+                    Some((pred.to_string(), parent.classes().to_vec()))
+                })
+                .collect();
+
             for class in tm.classes() {
                 let cls = classes.entry(class.clone()).or_default();
                 cls.count = add_row_counts(cls.count, rows);
@@ -1201,6 +1230,17 @@ pub fn build_virtual_ledger_info(
                     agg.count = add_row_counts(agg.count, rows);
                     let dt_entry = agg.datatypes.entry(datatype.clone()).or_insert(None);
                     *dt_entry = add_row_counts(*dt_entry, rows);
+                }
+                // Per-class FK relationship targets: accumulate the child row count
+                // onto each ref predicate's target class(es). The predicate entry
+                // already exists from the `poms` loop (its `@id` datatype); this
+                // fills the `ref-classes` map the native path carries.
+                for (pred, targets) in &ref_targets {
+                    let agg = cls.properties.entry(pred.clone()).or_default();
+                    for target_class in targets {
+                        let rc_entry = agg.ref_classes.entry(target_class.clone()).or_insert(None);
+                        *rc_entry = add_row_counts(*rc_entry, rows);
+                    }
                 }
             }
 
@@ -1225,14 +1265,21 @@ pub fn build_virtual_ledger_info(
                 .into_iter()
                 .map(|(piri, pagg)| {
                     // `langs` is empty (a Phase-1 R2RML mapping carries no
-                    // language tags); FK `ref-classes` (relationship targets) are
-                    // a follow-up enhancement.
+                    // language tags). `ref-classes` carries the FK relationship
+                    // targets derived from the mapping's RefObjectMaps. The count
+                    // is the child row count; when unknown it degrades to 0 so the
+                    // target class (the structural signal) still renders even when
+                    // the catalog is offline / row counts time out.
                     (
                         piri,
                         PropertyInfo {
                             types: pagg.datatypes,
                             langs: BTreeMap::new(),
-                            ref_classes: BTreeMap::new(),
+                            ref_classes: pagg
+                                .ref_classes
+                                .into_iter()
+                                .map(|(target_class, count)| (target_class, count.unwrap_or(0)))
+                                .collect(),
                         },
                     )
                 })
@@ -1406,37 +1453,155 @@ pub async fn build_graph_source_info(
     }
 }
 
-/// Reconstruct a (metadata-preview) Iceberg connection from a stored config.
-/// Carries the catalog auth so the preview can authenticate, but the auth is
-/// used only to read metadata and is never serialized into the response.
+/// Max in-flight per-table `loadTable` fetches for the virtual `/info` row-count
+/// pass. Each is one REST round trip; sharing a single client, 8 clears a
+/// 16-table dataset in two waves. Mirrors the generate path's fan-out width.
 #[cfg(feature = "iceberg")]
-fn connection_from_stored_config(
+const INFO_COUNT_FETCH_CONCURRENCY: usize = 8;
+
+/// Default wall-clock budget (ms) for the whole virtual `/info` row-count fetch.
+/// The structure (classes/properties) is derived from the mapping and needs no
+/// counts, so if the catalog is slow the fetch is abandoned and counts degrade to
+/// empty rather than blowing the caller's (lambda / gateway) deadline. Override
+/// with `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` (`0` disables the row-count fetch
+/// entirely, returning structure-only).
+#[cfg(feature = "iceberg")]
+const DEFAULT_INFO_COUNT_BUDGET_MS: u64 = 10_000;
+
+#[cfg(feature = "iceberg")]
+fn info_count_budget_ms() -> u64 {
+    std::env::var("FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INFO_COUNT_BUDGET_MS)
+}
+
+/// Fetch best-effort per-table row counts (and the first table's snapshot id) for
+/// a virtual Iceberg dataset, sharing ONE REST catalog client across a bounded
+/// concurrent fan-out.
+///
+/// The prior path built a fresh client AND OAuth provider (empty token cache) per
+/// table inside a SERIAL loop — a redundant token exchange + `loadTable` per
+/// table, no keep-alive — which blew the `/info` deadline on a wide dataset. Here
+/// the client (and thus its cached OAuth token + HTTPS connection pool) is reused
+/// from / warmed into the same process-wide `R2rmlCache` the scan path uses
+/// (keyed by the SAME config fingerprint), and the per-table `loadTable`s run with
+/// bounded concurrency.
+///
+/// Metadata-only: `loadTable` returns the snapshot-summary row count; no
+/// manifest-list, manifest, or Parquet/data file is read. Every step is
+/// best-effort — a parse / auth / load / metadata failure drops only that table's
+/// count (logged at debug), never the whole response. A Direct-catalog source (no
+/// REST client) returns no counts.
+#[cfg(feature = "iceberg")]
+async fn fetch_virtual_table_row_counts(
+    fluree: &crate::Fluree,
+    record: &GraphSourceRecord,
     cfg: &fluree_db_iceberg::IcebergGsConfig,
-) -> Option<crate::graph_source::IcebergConnectionConfig> {
-    use crate::graph_source::{CatalogMode, IcebergConnectionConfig, RestCatalogMode};
-    use fluree_db_iceberg::config::CatalogConfig;
-    let connection = match &cfg.catalog {
-        CatalogConfig::Rest {
-            uri,
-            warehouse,
-            auth,
-            ..
-        } => IcebergConnectionConfig {
-            catalog_mode: CatalogMode::Rest(Box::new(RestCatalogMode {
-                catalog_uri: uri.clone(),
-                warehouse: warehouse.clone(),
-                auth: auth.clone(),
-            })),
-            io: cfg.io.clone(),
-        },
-        CatalogConfig::Direct { table_location } => IcebergConnectionConfig {
-            catalog_mode: CatalogMode::Direct {
-                table_location: table_location.clone(),
-            },
-            io: cfg.io.clone(),
-        },
+    tables: &[String],
+) -> (HashMap<String, i64>, Option<i64>) {
+    use fluree_db_iceberg::catalog::{
+        parse_table_identifier, RestCatalogClient, RestCatalogConfig, SendCatalogClient,
     };
-    Some(connection)
+    use fluree_db_iceberg::config::CatalogConfig;
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    // Only a REST catalog has a client (and token) worth sharing; a Direct
+    // (table-location) source has no catalog to query for counts.
+    let CatalogConfig::Rest {
+        uri,
+        warehouse,
+        auth,
+        ..
+    } = &cfg.catalog
+    else {
+        return (HashMap::new(), None);
+    };
+
+    // Reuse (or warm) the process-wide REST client under the SAME cache key the
+    // scan path uses, so `/info` and query execution share one OAuth token +
+    // connection pool (see graph_source::r2rml::rest_client_cache_key).
+    let cache = fluree.r2rml_cache();
+    let client_fp =
+        crate::graph_source::rest_client_cache_key(&record.graph_source_id, &record.config);
+    let catalog: Arc<RestCatalogClient> = match cache.rest_client(&client_fp) {
+        Some(c) => c,
+        None => {
+            let auth_provider = match auth.create_provider_arc() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
+                    return (HashMap::new(), None);
+                }
+            };
+            let catalog_config = RestCatalogConfig {
+                uri: uri.clone(),
+                warehouse: warehouse.clone(),
+                ..Default::default()
+            };
+            match RestCatalogClient::new(catalog_config, auth_provider) {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    cache.put_rest_client(client_fp, Arc::clone(&client));
+                    client
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
+                    return (HashMap::new(), None);
+                }
+            }
+        }
+    };
+
+    let vended = cfg.io.vended_credentials;
+
+    // Fan out `loadTable` across tables with bounded concurrency, sharing the one
+    // client. `.buffered` (not `buffer_unordered`) preserves request order, so the
+    // snapshot pin (first successful table) is deterministic for the sorted
+    // `tables`.
+    let per_table: Vec<Option<(String, Option<i64>, i64)>> =
+        futures::stream::iter(tables.iter().cloned())
+            .map(|table| {
+                let catalog = Arc::clone(&catalog);
+                async move {
+                    let id = parse_table_identifier(&table).ok()?;
+                    let api_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
+                    let catalog_table_id = api_id.to_catalog();
+                    let load = match SendCatalogClient::load_table(
+                        &*catalog,
+                        &catalog_table_id,
+                        vended,
+                    )
+                    .await
+                    {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::debug!(table = %table, error = %e, "virtual ledger-info: loadTable failed; count omitted");
+                            return None;
+                        }
+                    };
+                    let metadata = load.metadata.as_ref()?;
+                    let schema =
+                        crate::graph_source::table_schema_from_metadata(&api_id, metadata).ok()?;
+                    Some((table, schema.row_count, schema.snapshot.id))
+                }
+            })
+            .buffered(INFO_COUNT_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+    let mut counts = HashMap::new();
+    let mut snapshot_id = None;
+    for (table, row_count, snap) in per_table.into_iter().flatten() {
+        if let Some(rc) = row_count {
+            counts.insert(table, rc);
+        }
+        if snapshot_id.is_none() {
+            snapshot_id = Some(snap);
+        }
+    }
+    (counts, snapshot_id)
 }
 
 /// Async orchestration for the Iceberg/R2RML virtual-info path: resolve the
@@ -1498,41 +1663,35 @@ async fn build_iceberg_virtual_info(
     meta.tables = tables.clone();
 
     // Best-effort per-table row counts + snapshot id via Iceberg metadata only
-    // (loadTable snapshot summary — reads no manifest/Parquet data). Any failure
-    // (catalog offline, missing creds) degrades counts to null while the schema
-    // (classes/properties) still renders from the mapping.
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    if let Some(conn) = cfg.as_ref().and_then(connection_from_stored_config) {
-        for table in &tables {
-            let Ok(id) = fluree_db_iceberg::catalog::parse_table_identifier(table) else {
-                continue;
-            };
-            let table_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
-            match fluree
-                .preview_iceberg_table(
-                    conn.clone(),
-                    table_id,
-                    crate::graph_source::StatsTier::Schema,
-                )
-                .await
+    // (loadTable snapshot summary — reads no manifest/Parquet data). A single
+    // shared catalog client + bounded concurrency replaces the old serial,
+    // client-per-table loop; the whole fetch is time-boxed so a slow / offline
+    // catalog degrades counts to empty (and snapshot to `None`) while the schema
+    // (classes/properties, derived from the mapping) still renders on time.
+    let budget_ms = info_count_budget_ms();
+    let (counts, fetched_snapshot): (HashMap<String, i64>, Option<i64>) = match cfg.as_ref() {
+        Some(cfg) if budget_ms > 0 => {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(budget_ms),
+                fetch_virtual_table_row_counts(fluree, record, cfg, &tables),
+            )
+            .await
             {
-                Ok(preview) => {
-                    if let Some(row_count) = preview.schema.row_count {
-                        counts.insert(table.clone(), row_count);
-                    }
-                    if meta.snapshot_id.is_none() {
-                        meta.snapshot_id = Some(preview.schema.snapshot.id);
-                    }
-                }
-                Err(e) => {
+                Ok(res) => res,
+                Err(_) => {
                     tracing::debug!(
-                        table = %table,
-                        error = %e,
-                        "virtual ledger-info: row-count preview failed; counts omitted"
+                        graph_source = %record.graph_source_id,
+                        budget_ms,
+                        "virtual ledger-info: row-count fetch exceeded budget; counts omitted"
                     );
+                    (HashMap::new(), None)
                 }
             }
         }
+        _ => (HashMap::new(), None),
+    };
+    if meta.snapshot_id.is_none() {
+        meta.snapshot_id = fetched_snapshot;
     }
 
     Ok(build_virtual_ledger_info(record, mapping.as_deref(), &meta, &counts).into_json())
@@ -2252,7 +2411,7 @@ mod tests {
     }
 
     fn two_table_mapping() -> CompiledR2rmlMapping {
-        use fluree_db_r2rml::{PredicateMap, PredicateObjectMap, TriplesMap};
+        use fluree_db_r2rml::{PredicateMap, PredicateObjectMap, RefObjectMap, TriplesMap};
         let airline = TriplesMap::new("#Airline", "openflights.airlines")
             .with_subject_template("http://ex.org/airline/{id}")
             .with_class("http://ex.org/Airline")
@@ -2273,6 +2432,17 @@ mod tests {
             .with_predicate_object(PredicateObjectMap {
                 predicate_map: PredicateMap::constant("http://ex.org/distance"),
                 object_map: ObjectMap::column("distance"),
+            })
+            // FK reference: each route points at an airline (parent map `#Airline`),
+            // so `ex:airline`'s object is an Airline subject IRI. Drives the
+            // per-class `ref-classes` derivation.
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex.org/airline"),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                    "#Airline",
+                    "airline_id",
+                    "id",
+                )),
             });
         CompiledR2rmlMapping::new(vec![airline, route])
     }
@@ -2350,6 +2520,30 @@ mod tests {
                 .is_none(),
             "founded leaked onto Route: {}",
             info["stats"]["classes"]["http://ex.org/Route"]
+        );
+
+        // FK relationship targets: Route's `airline` ref property carries a
+        // populated `ref-classes` mapping to the parent Airline class, with the
+        // child (Route) row count. Derived from the RefObjectMap's
+        // `parentTriplesMap` — the relationship the native `/info` exposes.
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Route"]["properties"]["http://ex.org/airline"]
+                ["ref-classes"]["http://ex.org/Airline"],
+            50
+        );
+        // The ref property still carries its `@id` datatype in `types` (the count
+        // and the ref-classes count agree: one airline reference per route row).
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Route"]["properties"]["http://ex.org/airline"]
+                ["types"]["@id"],
+            50
+        );
+        // A literal property has NO ref-classes (empty), so the relationship
+        // signal is unambiguous.
+        assert_eq!(
+            info["stats"]["classes"]["http://ex.org/Route"]["properties"]["http://ex.org/distance"]
+                ["ref-classes"],
+            json!({})
         );
 
         // Totals + Iceberg snapshot as the version `t`.
@@ -2471,9 +2665,9 @@ mod tests {
         );
     }
 
-    const GOLDEN_VIRTUAL_FULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":150,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":150,"size":0}]},"graph":"urn:default","stats":{"flakes":150,"size":0,"properties":{"http://ex.org/distance":{"count":50,"datatypes":{"xsd:string":50}},"http://ex.org/founded":{"count":100,"datatypes":{"xsd:integer":100}},"http://ex.org/name":{"count":100,"datatypes":{"xsd:string":100}}},"classes":{"http://ex.org/Airline":{"count":100,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":100},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":100},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":50,"properties":{"http://ex.org/distance":{"types":{"xsd:string":50},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{\"catalog\":{\"type\":\"rest\",\"uri\":\"https://polaris.example.com\",\"auth\":{\"type\":\"oauth2_client_credentials\",\"token_url\":\"https://polaris.example.com/tokens\",\"client_id\":\"svc-client\",\"client_secret\":\"[redacted]\"}},\"table\":\"openflights.airlines\"}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{"openflights.airlines":100,"openflights.routes":50}}}"#;
+    const GOLDEN_VIRTUAL_FULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":150,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":150,"size":0}]},"graph":"urn:default","stats":{"flakes":150,"size":0,"properties":{"http://ex.org/airline":{"count":50,"datatypes":{"@id":50}},"http://ex.org/distance":{"count":50,"datatypes":{"xsd:string":50}},"http://ex.org/founded":{"count":100,"datatypes":{"xsd:integer":100}},"http://ex.org/name":{"count":100,"datatypes":{"xsd:string":100}}},"classes":{"http://ex.org/Airline":{"count":100,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":100},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":100},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":50,"properties":{"http://ex.org/airline":{"types":{"@id":50},"langs":{},"ref-classes":{"http://ex.org/Airline":50}},"http://ex.org/distance":{"types":{"xsd:string":50},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{\"catalog\":{\"type\":\"rest\",\"uri\":\"https://polaris.example.com\",\"auth\":{\"type\":\"oauth2_client_credentials\",\"token_url\":\"https://polaris.example.com/tokens\",\"client_id\":\"svc-client\",\"client_secret\":\"[redacted]\"}},\"table\":\"openflights.airlines\"}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{"openflights.airlines":100,"openflights.routes":50}}}"#;
 
-    const GOLDEN_VIRTUAL_NULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":null,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":null,"size":0}]},"graph":"urn:default","stats":{"flakes":null,"size":0,"properties":{"http://ex.org/distance":{"count":null,"datatypes":{"xsd:string":null}},"http://ex.org/founded":{"count":null,"datatypes":{"xsd:integer":null}},"http://ex.org/name":{"count":null,"datatypes":{"xsd:string":null}}},"classes":{"http://ex.org/Airline":{"count":null,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":null},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":null,"properties":{"http://ex.org/distance":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{}}}"#;
+    const GOLDEN_VIRTUAL_NULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":null,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":null,"size":0}]},"graph":"urn:default","stats":{"flakes":null,"size":0,"properties":{"http://ex.org/airline":{"count":null,"datatypes":{"@id":null}},"http://ex.org/distance":{"count":null,"datatypes":{"xsd:string":null}},"http://ex.org/founded":{"count":null,"datatypes":{"xsd:integer":null}},"http://ex.org/name":{"count":null,"datatypes":{"xsd:string":null}}},"classes":{"http://ex.org/Airline":{"count":null,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":null},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":null,"properties":{"http://ex.org/airline":{"types":{"@id":null},"langs":{},"ref-classes":{"http://ex.org/Airline":0}},"http://ex.org/distance":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{}}}"#;
 
     #[test]
     fn test_redact_graph_source_config_masks_oauth_secret() {
