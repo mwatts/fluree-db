@@ -324,3 +324,205 @@ async fn policy_onclass_denies_hydration_only_subject() {
         control_result.result
     );
 }
+
+/// Regression: inline `opts.policy` must merge when `opts.identity` is also
+/// present. Identity-mode selection previously replaced — rather than
+/// combined with — an explicitly supplied inline policy, which under
+/// default-deny meant deny-all with no signal.
+///
+/// The identity node here has NO `f:policyClass`, so identity-mode selection
+/// loads zero stored policies: every flake visible below is proof the inline
+/// policy merged. The `f:query` rule additionally proves `?$identity` still
+/// binds from the identity alongside inline policies.
+#[tokio::test]
+async fn inline_policy_merges_with_identity_only() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/inline-identity:main";
+    let ledger = seed_people_with_ssn(&fluree, ledger_id).await;
+
+    let identity = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:aliceIdentity",
+        "ex:user": {"@id": "ex:alice"}
+    });
+    fluree
+        .insert(ledger, &identity)
+        .await
+        .expect("insert identity");
+
+    let policy = json!([
+        {
+            "@id": "ex:nameVisible",
+            "f:onProperty": [{"@id": "http://schema.org/name"}],
+            "f:action": "f:view",
+            "f:allow": true
+        },
+        {
+            "@id": "ex:ownSsnOnly",
+            "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+            "f:action": "f:view",
+            "f:query": serde_json::to_string(&json!({
+                "where": {
+                    "@id": "?$identity",
+                    "http://example.org/ns/user": {"@id": "?$this"}
+                }
+            }))
+            .unwrap()
+        }
+    ]);
+
+    // Names: allowed for everyone via the inline static allow.
+    let names = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {
+            "policy": policy.clone(),
+            "identity": "http://example.org/ns/aliceIdentity",
+            "default-allow": false
+        },
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+    let result = fluree.query_connection(&names).await.expect("names query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Alice", "John"])),
+        "inline policy dropped: identity + inline opts.policy must merge"
+    );
+
+    // SSNs: the inline f:query rule allows only the identity's own user, so
+    // ?$identity must be bound AND the inline policy must be in the set.
+    let ssns = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {
+            "policy": policy,
+            "identity": "http://example.org/ns/aliceIdentity",
+            "default-allow": false
+        },
+        "select": ["?s", "?ssn"],
+        "where": {"@id": "?s", "schema:ssn": "?ssn"}
+    });
+    let result = fluree.query_connection(&ssns).await.expect("ssn query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rendered = jsonld.to_string();
+    assert!(
+        rendered.contains("111-11-1111"),
+        "own SSN must be visible via inline f:query rule: {rendered}"
+    );
+    assert!(
+        !rendered.contains("888-88-8888"),
+        "other user's SSN must stay hidden under default-deny: {rendered}"
+    );
+}
+
+/// Inline `opts.policy` merges ON TOP of the stored policies selected by the
+/// identity's `f:policyClass` — selection modes choose which stored policies
+/// load, they never gate inline ones.
+#[tokio::test]
+async fn inline_policy_merges_with_identity_stored_policies() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/inline-identity-stored:main";
+    let ledger = seed_people_with_ssn(&fluree, ledger_id).await;
+
+    // Stored policy (selected via the identity's f:policyClass): names only.
+    let setup = json!({
+        "@context": {"ex": "http://example.org/ns/", "f": "https://ns.flur.ee/db#"},
+        "@graph": [
+            {
+                "@id": "ex:namePolicy",
+                "@type": ["f:AccessPolicy", "ex:AppPolicy"],
+                "f:onProperty": [{"@id": "http://schema.org/name"}],
+                "f:action": {"@id": "f:view"},
+                "f:allow": true
+            },
+            {
+                "@id": "ex:bobIdentity",
+                "f:policyClass": [{"@id": "ex:AppPolicy"}]
+            }
+        ]
+    });
+    fluree.insert(ledger, &setup).await.expect("insert setup");
+
+    // Inline policy adds SSN visibility on top of the stored set.
+    let inline = json!([{
+        "@id": "ex:ssnVisible",
+        "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+        "f:action": "f:view",
+        "f:allow": true
+    }]);
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {
+            "policy": inline,
+            "identity": "http://example.org/ns/bobIdentity",
+            "default-allow": false
+        },
+        "select": ["?name", "?ssn"],
+        "where": {"@id": "?s", "schema:name": "?name", "schema:ssn": "?ssn"}
+    });
+    let result = fluree.query_connection(&query).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice", "111-11-1111"], ["John", "888-88-8888"]])),
+        "stored (name) and inline (ssn) policies must both apply"
+    );
+}
+
+/// Inline `opts.policy` merges when `policy-class` selects stored policies
+/// (no identity). The class-only arm previously loaded stored policies XOR
+/// parsed the inline policy.
+#[tokio::test]
+async fn inline_policy_merges_with_policy_class_only() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/inline-class:main";
+    let ledger = seed_people_with_ssn(&fluree, ledger_id).await;
+
+    let setup = json!({
+        "@context": {"ex": "http://example.org/ns/", "f": "https://ns.flur.ee/db#"},
+        "@graph": [{
+            "@id": "ex:namePolicy",
+            "@type": ["f:AccessPolicy", "ex:AppPolicy"],
+            "f:onProperty": [{"@id": "http://schema.org/name"}],
+            "f:action": {"@id": "f:view"},
+            "f:allow": true
+        }]
+    });
+    fluree.insert(ledger, &setup).await.expect("insert setup");
+
+    let inline = json!([{
+        "@id": "ex:ssnVisible",
+        "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+        "f:action": "f:view",
+        "f:allow": true
+    }]);
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {
+            "policy": inline,
+            "policy-class": "http://example.org/ns/AppPolicy",
+            "default-allow": false
+        },
+        "select": ["?name", "?ssn"],
+        "where": {"@id": "?s", "schema:name": "?name", "schema:ssn": "?ssn"}
+    });
+    let result = fluree.query_connection(&query).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Alice", "111-11-1111"], ["John", "888-88-8888"]])),
+        "class-selected (name) and inline (ssn) policies must both apply"
+    );
+}

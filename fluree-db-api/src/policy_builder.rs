@@ -257,9 +257,11 @@ async fn build_policy_context_from_opts_inner(
     // when we have a concrete SID), not for gating access — `opts.default_allow`
     // governs in all three cases.
     //
-    // Priority: cross-ledger restrictions > identity > policy_class > policy >
-    // policy_values["?$identity"]
-    let (identity_sid, restrictions) = if let Some(mut merged) = cross_ledger_restrictions {
+    // Stored-policy selection priority: cross-ledger restrictions >
+    // identity + policy_class > identity > policy_class. Inline `opts.policy`
+    // is not part of the chain — it merges additively after selection.
+    // `?$identity` binding priority: identity > policy_values["?$identity"].
+    let (identity_sid, mut restrictions) = if let Some(merged) = cross_ledger_restrictions {
         // Cross-ledger short-circuit: the resolver already materialized
         // restrictions from the model ledger, filtered by the policy-class
         // chain. Rule selection is complete before this function runs.
@@ -274,10 +276,11 @@ async fn build_policy_context_from_opts_inner(
         // `?$identity` (f:query rules referencing it won't match), same as
         // identity-mode's NotFound.
         //
-        // opts.policy (inline JSON-LD) still applies and gets merged below.
-        // Moving — not cloning — the owned input keeps model-ledger policy
-        // sets (which can be large: each `PolicyRestriction` carries
-        // strings + hash sets) from paying a per-request copy.
+        // opts.policy (inline JSON-LD) still applies — it merges after the
+        // selection chain. Moving — not cloning — the owned input keeps
+        // model-ledger policy sets (which can be large: each
+        // `PolicyRestriction` carries strings + hash sets) from paying a
+        // per-request copy.
         let identity_sid = if let Some(identity_iri) = &opts.identity {
             let resolved =
                 resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
@@ -299,9 +302,6 @@ async fn build_policy_context_from_opts_inner(
             None
         };
 
-        if let Some(policy_json) = &opts.policy {
-            merged.extend(parse_inline_policy(snapshot, policy_json)?);
-        }
         (identity_sid, merged)
     } else if let (Some(identity_iri), Some(classes)) = (
         &opts.identity,
@@ -328,11 +328,8 @@ async fn build_policy_context_from_opts_inner(
         if let Some(sid) = &identity_sid {
             policy_values.insert("?$identity".to_string(), sid.clone());
         }
-        let mut restrictions =
+        let restrictions =
             load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?;
-        if let Some(policy_json) = &opts.policy {
-            restrictions.extend(parse_inline_policy(snapshot, policy_json)?);
-        }
         (identity_sid, restrictions)
     } else if let Some(identity_iri) = &opts.identity {
         match load_policies_by_identity(snapshot, overlay, to_t, identity_iri, policy_graphs)
@@ -373,14 +370,22 @@ async fn build_policy_context_from_opts_inner(
 
         let restrictions = if let Some(classes) = &opts.policy_class {
             load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?
-        } else if let Some(policy_json) = &opts.policy {
-            parse_inline_policy(snapshot, policy_json)?
         } else {
             vec![]
         };
 
         (identity_sid, restrictions)
     };
+
+    // Inline `opts.policy` merges additively in every selection mode: the
+    // modes above choose which STORED policies load; they never gate an
+    // explicitly supplied inline policy. Merging once here keeps the arms
+    // consistent — selection-specific merging silently dropped inline
+    // policies on the identity-only and class-only paths, which under
+    // default-deny meant deny-all with no signal.
+    if let Some(policy_json) = &opts.policy {
+        restrictions.extend(parse_inline_policy(snapshot, policy_json)?);
+    }
 
     // Build policy sets (view and modify)
     //

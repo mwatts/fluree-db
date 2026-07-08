@@ -209,7 +209,7 @@ Pass policies in `opts.policy` (an array of policy nodes) for ad-hoc requests:
 }
 ```
 
-Useful for tests, admin scripts, and migration tooling. Inline policies and stored policies can coexist in a single request.
+Useful for tests, admin scripts, and migration tooling. Inline policies and stored policies can coexist in a single request: inline policies always merge **on top of** whatever stored policies the request selects — via `identity`, `policy-class`, or a cross-ledger `f:policySource` — never instead of them.
 
 ## Request-time options
 
