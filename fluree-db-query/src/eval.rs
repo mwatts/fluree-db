@@ -146,7 +146,7 @@ impl Expression {
     ) -> Result<Option<ComparableValue>> {
         match self {
             Expression::Var(var) => match row.get(*var) {
-                Some(Binding::Lit { val, dtc, .. }) => Ok(lit_to_comparable(val, dtc)),
+                Some(Binding::Lit { val, dtc, .. }) => Ok(lit_to_comparable(val, dtc, ctx)),
                 Some(Binding::EncodedLit {
                     o_kind,
                     o_key,
@@ -431,17 +431,47 @@ pub fn passes_filters(
     Ok(true)
 }
 
-/// Convert a literal binding's value to a `ComparableValue`, recovering the
-/// xsd:float type (stored as an f64, tagged only by its datatype) so numeric
-/// promotion keeps a float result float. The Long/String fast paths are
-/// byte-identical to `TryFrom<&FlakeValue>`; only the xsd:double path pays the
-/// single, cheap datatype check that distinguishes float from double.
-fn lit_to_comparable(val: &FlakeValue, dtc: &DatatypeConstraint) -> Option<ComparableValue> {
+/// Convert a literal binding's value to a `ComparableValue`, carrying the
+/// datatype for the datatype-sensitive cases:
+/// - xsd:float (stored as an f64, tagged only by its datatype) becomes `Float`
+///   so numeric promotion keeps a float result float;
+/// - a string literal with a NON-xsd:string datatype or a language tag becomes
+///   a `TypedLiteral` so `=`/`!=` can be datatype-aware (D5/D7).
+///
+/// The Long, xsd:double and xsd:string/plain-string fast paths are
+/// byte-identical to `TryFrom<&FlakeValue>`; only the xsd:double path pays one
+/// cheap datatype check (float vs double) and the string path one (xsd:string
+/// vs foreign/lang). Foreign string literals are rare (BSBM has none).
+fn lit_to_comparable(
+    val: &FlakeValue,
+    dtc: &DatatypeConstraint,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<ComparableValue> {
     match val {
         FlakeValue::Long(n) => Some(ComparableValue::Long(*n)),
         FlakeValue::Double(d) if is_xsd_float(dtc) => Some(ComparableValue::Float(*d as f32)),
         FlakeValue::Double(d) => Some(ComparableValue::Double(*d)),
-        FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+        FlakeValue::String(s) if is_xsd_string(dtc) => {
+            Some(ComparableValue::String(Arc::from(s.as_str())))
+        }
+        // A string literal with a foreign *datatype* becomes a `TypedLiteral` so
+        // `=`/`!=` can distinguish it (D5). A language-tagged literal stays a
+        // plain String: no greenable equality test needs language-aware `=`, and
+        // carrying the tag would break the string builtins (CONTAINS/REPLACE/…)
+        // that operate on a String. Resolving the datatype Sid to an IRI needs
+        // the snapshot; without it, degrade to a bare string.
+        FlakeValue::String(s) => match dtc {
+            DatatypeConstraint::LangTag(_) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+            DatatypeConstraint::Explicit(_) => {
+                match ctx.and_then(|c| dtc.to_unresolved(c.active_snapshot)) {
+                    Some(u) => Some(ComparableValue::TypedLiteral {
+                        val: FlakeValue::String(s.clone()),
+                        dtc: Some(u),
+                    }),
+                    None => Some(ComparableValue::String(Arc::from(s.as_str()))),
+                }
+            }
+        },
         _ => ComparableValue::try_from(val).ok(),
     }
 }

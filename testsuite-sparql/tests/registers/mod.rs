@@ -161,8 +161,10 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-eq",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-not-eq",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-simple",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-2-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-2-2",
+    // D5 datatype-aware `=`/`!=` (rdf_term_equal) greened eq-2-1/eq-2-2 (numeric
+    // promotion + foreign-datatype distinctness) and open-eq-04. eq-4 remains: a
+    // foreign-datatype binding still value-matches a plain-string constant on the
+    // eval path (foreign-datatype Sid→IRI decode gap on the filter side).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
     // joint PR-G1 (GRAPH-variable semantics) + PR-X2 (D5 value equality);
@@ -176,7 +178,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-04",
+    // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need typed-
+    // literal *constants* to carry their datatype (lower_typed_literal drops it);
+    // open-eq-07/08/10/11/12 now select the correct 12/42/52/52/10-row set but
+    // stay non-isomorphic on blank-node OUTPUT identity (the same object bnode is
+    // re-minted per binding) — orthogonal to the equality lattice.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-05",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-06",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-07",
