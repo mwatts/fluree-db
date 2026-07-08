@@ -151,9 +151,10 @@ ORDER BY / SKIP / LIMIT
   - **Math:** `abs`, `round`, `floor`, `ceil`/`ceiling`, `rand`, `sqrt`,
     `sign`, `log` (natural logarithm), and the `^` exponent operator
     (right-associative).
-  - **Identity:** `id(n)` / `elementId(n)` return the node/relationship's **IRI
-    string** — Fluree has no integer element id, so this is its stable string
-    identity (differs from Neo4j's integer `id`).
+  - **Identity:** `id(n)` / `elementId(n)` return the node/relationship's
+    stable **identity string** (the stored name — a full IRI in `@vocab`
+    mode; see [names](#names-and-opting-into-iris)). Fluree has no integer
+    element id (differs from Neo4j's integer `id`).
 - `WHERE` expressions: comparison, AND/OR/XOR/NOT, arithmetic `+ - * / %`, `^`,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
@@ -421,22 +422,42 @@ MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r.since, o
 MATCH (a:Person)-[:WORKS_FOR]->(o:Organization) RETURN a, o
 ```
 
-### IRI mapping for bare identifiers
+### Names, and opting into IRIs
 
-Cypher uses bare names like `Person`, `WORKS_FOR`, `name`. Fluree
-resolves them via:
+Cypher uses bare names like `Person`, `WORKS_FOR`, `name`. **By
+default they are just names** — no IRI prefix is invented for them.
+Internally they live under namespace code 0 (the empty prefix), so a
+label written as `Person` reads back as `Person` on every surface:
+`labels(n)`, Bolt, and even JSON-LD/SPARQL queries against the same
+ledger see the same bare (relative) name. A pure-Cypher user never
+sees or configures a namespace.
 
-1. **The ledger's default `@context`** (the same context that applies
-   to JSON-LD queries against the same ledger).
-   - `@vocab` supplies the fallback namespace.
-   - Full-term mappings (e.g. `"Person": "http://example.org/Person"`)
-     act as overrides.
-2. **Fallback default:** `http://example.org/` when no context is
-   configured. Useful in tests; not appropriate for production data.
+To interoperate with RDF-style data (full IRIs), configure the
+ledger's default `@context` — the same context that applies to JSON-LD
+queries against that ledger:
+
+- `@vocab` supplies the namespace prefix: `Person` then resolves to
+  `<vocab>Person`, matching data whose IRIs live under that vocab.
+- Full-term mappings (e.g. `"Person": "http://schema.org/Person"`) act
+  as per-name overrides (they work with or without `@vocab`).
 
 The mapping is **case-preserving**: `WORKS_FOR` becomes
 `<vocab>WORKS_FOR`, not `<vocab>worksFor`. Put any case-normalizing
 aliases in the context.
+
+The placement rule for a name (without `@vocab`) is: **no colon →
+the whole name, verbatim**. Backticked names containing `/`, `#`,
+spaces, or `@` (`` `a/b` ``, `` `my prop` ``, `` `user@host` ``) are
+never split into namespaces — they round-trip intact. A backticked
+name that *does* contain a colon is treated as an RDF identifier
+(prefixed name or full IRI): `` `ex:code` `` or
+`` `http://schema.org/name` `` registers its namespace and
+interoperates with SPARQL/JSON-LD views of the same data.
+
+Note the two modes address different data: bare names and
+vocab-resolved IRIs are different identifiers. Adding `@vocab` to a
+ledger whose data was written bare (or vice versa) changes what Cypher
+statements match.
 
 ## See also
 

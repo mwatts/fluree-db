@@ -44,9 +44,28 @@ use fluree_db_core::{
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-/// Default maximum number of nodes to visit during traversal
-/// This prevents runaway closure enumeration for both-variable patterns
-pub const DEFAULT_MAX_VISITED: usize = 10_000;
+/// Default maximum number of nodes a path traversal may visit —
+/// a runaway-closure backstop, not a tuning knob. Overridable with
+/// `FLUREE_PATH_MAX_VISITED` (read once per process) for graphs whose
+/// legitimate traversals exceed it; see [`path_max_visited`].
+pub const DEFAULT_MAX_VISITED: usize = 1_000_000;
+
+/// The effective visited-node cap for path traversals (property paths and
+/// shortest path): `FLUREE_PATH_MAX_VISITED` when set, else
+/// [`DEFAULT_MAX_VISITED`]. Visited sets currently hold `Sid`s
+/// (~60-100 bytes each with the string heap), so the cap also bounds
+/// per-query memory: the 1M default admits ~100 MB worst case for a
+/// pathological closure. Raise deliberately.
+pub fn path_max_visited() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FLUREE_PATH_MAX_VISITED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_VISITED)
+    })
+}
 
 /// Predicates a wildcard (untyped) path must never traverse: `rdf:type` (its
 /// object is a class, not a node) and the `f:reifies*` reifier bundle (the
@@ -139,7 +158,7 @@ impl PropertyPathOperator {
 
     /// Create with default max_visited
     pub fn with_defaults(child: Option<BoxedOperator>, pattern: PropertyPathPattern) -> Self {
-        Self::new(child, pattern, DEFAULT_MAX_VISITED)
+        Self::new(child, pattern, path_max_visited())
     }
 
     /// Trim output to only the specified downstream variables.

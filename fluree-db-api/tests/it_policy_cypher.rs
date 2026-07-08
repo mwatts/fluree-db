@@ -18,14 +18,12 @@ use serde_json::{json, Value as JsonValue};
 use support::{genesis_ledger, graphdb_from_ledger};
 
 fn ctx() -> JsonValue {
-    json!({
-        "ex": "http://example.org/"
-    })
+    json!({})
 }
 
 /// Two Person nodes, each with a visible `name` and a sensitive `secret`.
-/// All properties live under the `ex:` (`http://example.org/`) vocab so they
-/// match Cypher's default-`@vocab` resolution of `n.name` / `n.secret`.
+/// Everything is bare namespace-0 names, matching Cypher's default
+/// resolution of `n.name` / `n.secret`.
 async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api::LedgerState {
     let ledger0 = genesis_ledger(fluree, ledger_id);
     fluree
@@ -34,10 +32,10 @@ async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api:
             &json!({
                 "@context": ctx(),
                 "@graph": [
-                    {"@id": "ex:alice", "@type": "ex:Person",
-                     "ex:name": "Alice", "ex:secret": "ALICE-SECRET"},
-                    {"@id": "ex:bob", "@type": "ex:Person",
-                     "ex:name": "Bob", "ex:secret": "BOB-SECRET"},
+                    {"@id": "alice", "@type": "Person",
+                     "name": "Alice", "secret": "ALICE-SECRET"},
+                    {"@id": "bob", "@type": "Person",
+                     "name": "Bob", "secret": "BOB-SECRET"},
                 ]
             }),
         )
@@ -50,14 +48,14 @@ async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api:
 fn deny_secret_policy() -> JsonValue {
     json!([
         {
-            "@id": "ex:denySecret",
+            "@id": "denySecret",
             "@type": "f:AccessPolicy",
             "f:action": "f:view",
-            "f:onProperty": [{"@id": "http://example.org/secret"}],
+            "f:onProperty": [{"@id": "secret"}],
             "f:allow": false
         },
         {
-            "@id": "ex:allowAll",
+            "@id": "allowAll",
             "@type": "f:AccessPolicy",
             "f:action": "f:view",
             "f:allow": true
@@ -231,6 +229,120 @@ async fn cypher_where_metadata_filter_under_policy_sees_filtered_flakes() {
         rooted.as_array().map_or(0, Vec::len),
         2,
         "without policy both keys visible → both nodes pass size>1: {rooted}"
+    );
+}
+
+/// Every string inside a typed cell tree (node labels, property keys and
+/// values, nested lists/maps), for leak assertions on the Bolt-facing
+/// typed-table formatter.
+fn typed_cell_strings(
+    cell: &fluree_db_api::format::cypher_typed::CypherCell,
+    out: &mut Vec<String>,
+) {
+    use fluree_db_api::format::cypher_typed::CypherCell;
+    match cell {
+        CypherCell::Value(v) => flatten_strings(v, out),
+        CypherCell::Decimal(s) | CypherCell::BigInt(s) => out.push(s.clone()),
+        CypherCell::Temporal(_) => {}
+        CypherCell::List(cells) => cells.iter().for_each(|c| typed_cell_strings(c, out)),
+        CypherCell::Map(entries) => entries.iter().for_each(|(k, c)| {
+            out.push(k.clone());
+            typed_cell_strings(c, out);
+        }),
+        CypherCell::Node(n) => {
+            out.push(n.iri.to_string());
+            out.extend(n.labels.iter().map(ToString::to_string));
+            for (k, c) in &n.properties {
+                out.push(k.to_string());
+                typed_cell_strings(c, out);
+            }
+        }
+        CypherCell::Relationship(r) => {
+            out.push(r.type_name.to_string());
+            for (k, c) in &r.properties {
+                out.push(k.to_string());
+                typed_cell_strings(c, out);
+            }
+        }
+        CypherCell::Path(p) => {
+            for n in &p.nodes {
+                typed_cell_strings(&CypherCell::Node(Box::new(n.clone())), out);
+            }
+            for r in &p.rels {
+                typed_cell_strings(&CypherCell::Relationship(Box::new(r.clone())), out);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cypher_typed_table_under_policy_filters_node_hydration() {
+    // The typed-table formatter (Bolt's node/relationship transport) hydrates
+    // node properties from raw SPOT state at format time — a read that
+    // bypasses the scan operators. Under a view policy that hydration must
+    // filter per flake (it used to fail closed instead).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-cypher:typed-table";
+    let l = seed(&fluree, ledger_id).await;
+
+    let qc_opts = GovernanceOptions {
+        policy: Some(deny_secret_policy()),
+        default_allow: true,
+        ..Default::default()
+    };
+    let db_policy = fluree
+        .db_with_policy(ledger_id, &qc_opts)
+        .await
+        .expect("db_with_policy");
+
+    let q = "MATCH (n:Person) RETURN n ORDER BY n.name";
+    let (_, rows) = fluree
+        .query_cypher(&db_policy, q)
+        .await
+        .expect("cypher typed under policy")
+        .to_cypher_typed_table(&db_policy)
+        .await
+        .expect("typed table must work under a view policy (filtered, not refused)");
+
+    let mut strings = Vec::new();
+    for row in &rows {
+        for cell in row {
+            typed_cell_strings(cell, &mut strings);
+        }
+    }
+    assert!(
+        !strings
+            .iter()
+            .any(|s| s.contains("SECRET") || s == "secret"),
+        "hydrated node must not carry the policy-hidden property: {strings:?}"
+    );
+    assert!(
+        strings.iter().any(|s| s == "Alice"),
+        "hydrated node must keep visible properties: {strings:?}"
+    );
+    assert!(
+        strings.iter().any(|s| s == "Person"),
+        "hydrated node must keep its labels: {strings:?}"
+    );
+
+    // Positive control: the same typed table without policy carries the secret.
+    let db_root = graphdb_from_ledger(&l);
+    let (_, rows) = fluree
+        .query_cypher(&db_root, q)
+        .await
+        .expect("cypher typed root")
+        .to_cypher_typed_table(&db_root)
+        .await
+        .expect("typed table");
+    let mut strings = Vec::new();
+    for row in &rows {
+        for cell in row {
+            typed_cell_strings(cell, &mut strings);
+        }
+    }
+    assert!(
+        strings.iter().any(|s| s.contains("SECRET")),
+        "without policy the secret property is present: {strings:?}"
     );
 }
 

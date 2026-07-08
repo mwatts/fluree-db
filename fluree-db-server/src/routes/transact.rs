@@ -309,7 +309,7 @@ async fn transact_via_consensus(
 /// the tracking tally on the current span. Shared by the commit-receipt
 /// response path ([`transact_via_consensus`]) and the Cypher write-RETURN
 /// path, which shapes its own response body from the receipt.
-async fn submit_via_consensus(
+pub(crate) async fn submit_via_consensus(
     state: &AppState,
     request: TransactionRequest,
     headers: &HeaderMap,
@@ -1921,7 +1921,7 @@ async fn execute_cypher_transact(
 /// Wait (briefly) until the cached ledger state includes commit `t`. Local
 /// consensus updates the cache before the receipt returns, so this passes
 /// immediately; a Raft follower may lag until the commit event applies.
-async fn wait_for_committed_state(
+pub(crate) async fn wait_for_committed_state(
     state: &AppState,
     ledger_id: &str,
     commit_t: i64,

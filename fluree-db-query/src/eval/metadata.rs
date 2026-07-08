@@ -93,7 +93,11 @@ fn binding_subject_s_id(
 }
 
 /// Extract the Cypher-local name from a full IRI (inverse of `@vocab` concat).
-fn cypher_name_from_iri(iri: &str) -> String {
+/// The Cypher-visible name for an IRI: the fragment after the last `#` or
+/// `/`, falling back to the whole IRI. Shared naming rule for labels,
+/// property keys, and relationship types across `labels()`/`keys()`/
+/// `properties()`/`type()` and the result formatters.
+pub fn cypher_name_from_iri(iri: &str) -> String {
     if let Some((_, local)) = iri.rsplit_once('#') {
         if !local.is_empty() {
             return local.to_string();

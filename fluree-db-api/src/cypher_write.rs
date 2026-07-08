@@ -559,6 +559,89 @@ pub async fn write_return_rows(
     skolem_txn_id: &str,
     ledger: &LedgerState,
 ) -> Result<serde_json::Value, crate::error::ApiError> {
+    let solutions = count_write_return_solutions(plan, skolem_txn_id, ledger).await?;
+
+    let columns: Vec<&str> = plan.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut data = Vec::with_capacity(solutions as usize);
+    for s in 0..solutions {
+        let row: Vec<serde_json::Value> = plan
+            .columns
+            .iter()
+            .map(|c| {
+                serde_json::Value::String(format!(
+                    "{}{}-{skolem_txn_id}-{s}-{}",
+                    fluree_db_transact::BLANK_NODE_PREFIX,
+                    fluree_db_transact::BLANK_NODE_ID_PREFIX,
+                    c.label
+                ))
+            })
+            .collect();
+        let meta: Vec<serde_json::Value> = plan
+            .columns
+            .iter()
+            .map(|_| serde_json::Value::Null)
+            .collect();
+        data.push(serde_json::json!({"row": row, "meta": meta}));
+    }
+    Ok(serde_json::json!({
+        "results": [{"columns": columns, "data": data}]
+    }))
+}
+
+/// The typed counterpart of [`write_return_rows`]: created entities come
+/// back as hydrated [`crate::format::cypher_typed::CypherNode`] cells
+/// (labels + properties from `ledger`), matching what reads return for
+/// `RETURN n`. Value-typed transports (Bolt) use this.
+pub async fn write_return_typed_rows(
+    plan: &CypherWriteReturnPlan,
+    skolem_txn_id: &str,
+    ledger: &LedgerState,
+) -> Result<
+    (
+        Vec<String>,
+        Vec<Vec<crate::format::cypher_typed::CypherCell>>,
+    ),
+    crate::error::ApiError,
+> {
+    use crate::format::cypher_typed::{hydrate_nodes, CypherCell};
+
+    let solutions = count_write_return_solutions(plan, skolem_txn_id, ledger).await?;
+    let columns: Vec<String> = plan.columns.iter().map(|c| c.name.clone()).collect();
+
+    let mut sids = Vec::with_capacity(solutions as usize * plan.columns.len());
+    for s in 0..solutions {
+        for c in &plan.columns {
+            sids.push(skolem_sid(skolem_txn_id, s, &c.label));
+        }
+    }
+    let view = crate::view::GraphDb::from_ledger_state(ledger);
+    let compactor = crate::format::IriCompactor::new(
+        view.snapshot.shared_namespaces(),
+        &fluree_graph_json_ld::ParsedContext::default(),
+    );
+    let nodes = hydrate_nodes(&view, &compactor, &sids)
+        .await
+        .map_err(|e| crate::error::ApiError::internal(format!("write RETURN hydration: {e}")))?;
+
+    let mut nodes = nodes.into_iter();
+    let rows: Vec<Vec<CypherCell>> = (0..solutions)
+        .map(|_| {
+            plan.columns
+                .iter()
+                .map(|_| CypherCell::Node(Box::new(nodes.next().expect("one node per cell"))))
+                .collect()
+        })
+        .collect();
+    Ok((columns, rows))
+}
+
+/// One row per WHERE solution: probe the skolemized ids of the first
+/// RETURN column until one is absent from the post-commit state.
+async fn count_write_return_solutions(
+    plan: &CypherWriteReturnPlan,
+    skolem_txn_id: &str,
+    ledger: &LedgerState,
+) -> Result<u64, crate::error::ApiError> {
     use fluree_db_core::{IndexType, RangeMatch, RangeOptions, RangeTest};
 
     let solutions: u64 = if plan.has_read_clauses {
@@ -605,32 +688,7 @@ pub async fn write_return_rows(
         // No WHERE: templates fire once against the single empty solution.
         1
     };
-
-    let columns: Vec<&str> = plan.columns.iter().map(|c| c.name.as_str()).collect();
-    let mut data = Vec::with_capacity(solutions as usize);
-    for s in 0..solutions {
-        let row: Vec<serde_json::Value> = plan
-            .columns
-            .iter()
-            .map(|c| {
-                serde_json::Value::String(format!(
-                    "{}{}-{skolem_txn_id}-{s}-{}",
-                    fluree_db_transact::BLANK_NODE_PREFIX,
-                    fluree_db_transact::BLANK_NODE_ID_PREFIX,
-                    c.label
-                ))
-            })
-            .collect();
-        let meta: Vec<serde_json::Value> = plan
-            .columns
-            .iter()
-            .map(|_| serde_json::Value::Null)
-            .collect();
-        data.push(serde_json::json!({"row": row, "meta": meta}));
-    }
-    Ok(serde_json::json!({
-        "results": [{"columns": columns, "data": data}]
-    }))
+    Ok(solutions)
 }
 
 /// Parse + param-substitute Cypher source and plan its write-statement
@@ -641,17 +699,9 @@ pub fn plan_write_return_source(
     cypher: &str,
     params: Option<&fluree_db_cypher::ParamMap>,
 ) -> Result<Option<CypherWriteReturnPlan>, crate::error::ApiError> {
-    let out = fluree_db_cypher::parse_cypher(cypher);
-    if out.has_errors() {
-        return Ok(None);
-    }
-    let Some(mut ast) = out.ast else {
+    let Ok(ast) = crate::query::helpers::substituted_cypher_ast(cypher, params) else {
         return Ok(None);
     };
-    let empty = fluree_db_cypher::ParamMap::new();
-    if fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty)).is_err() {
-        return Ok(None);
-    }
     plan_write_return(&ast).map_err(|e| crate::error::ApiError::cypher(e, Vec::new()))
 }
 
@@ -659,4 +709,16 @@ pub fn plan_write_return_source(
 /// (`fluree_db_transact::ir::TxnOpts`).
 pub fn fresh_skolem_txn_id() -> String {
     fluree_db_transact::generate_txn_id()
+}
+
+/// Whether a Cypher statement is a write (contains updating clauses).
+/// Transports that carry reads and writes on one verb — Bolt `RUN` —
+/// dispatch on this. Parses through the process-wide AST cache; parse
+/// errors surface with full diagnostics.
+pub fn cypher_statement_is_write(cypher: &str) -> crate::Result<bool> {
+    let ast = crate::query::helpers::parse_cypher_ast_cached(cypher)?;
+    Ok(matches!(
+        ast.statement,
+        fluree_db_cypher::ast::Statement::Update(_)
+    ))
 }

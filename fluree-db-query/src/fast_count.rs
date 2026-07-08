@@ -1088,15 +1088,15 @@ pub fn count_distinct_position_operator(
                     "COUNT(DISTINCT) subjects",
                 ),
                 DistinctPosition::Predicates => (
-                    // Always the PSOT `p_const` directory scan — exact from
-                    // leaflet metadata. A per-graph-stats shortcut used to
-                    // answer this in-memory, but the incremental index build
-                    // persists delta-only per-graph property stats (base
-                    // entries lost, net-zero deltas kept at count 0), which
-                    // made the shortcut return wrong counts after any
-                    // incremental index. Reinstate only after the incremental
-                    // stats merge is fixed AND covered by a regression test.
-                    count_distinct_predicates_psot(store, ctx.binary_g_id)?,
+                    // Prefer the O(#predicates) in-memory stats count; fall back
+                    // to the PSOT `p_const` directory scan when stats are absent
+                    // (older index). Both are gated above to HEAD/no-overlay with
+                    // no scan-hidden predicates, so the stats count equals the
+                    // scan exactly.
+                    match distinct_predicates_from_graph_stats(ctx) {
+                        Some(c) => c,
+                        None => count_distinct_predicates_psot(store, ctx.binary_g_id)?,
+                    },
                     "COUNT(DISTINCT) predicates",
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
@@ -1112,6 +1112,24 @@ pub fn count_distinct_position_operator(
         fallback,
         label,
     )
+}
+
+/// Current-state distinct-predicate count from the per-graph index stats:
+/// properties with a positive current flake count. O(#predicates), no leaf
+/// opens — the in-memory equivalent of `count_distinct_predicates_psot`.
+///
+/// `GraphPropertyStatEntry.count` is post-dedup and retraction-decremented, so
+/// `count > 0` ⇔ the predicate has a live PSOT leaflet, matching the scan
+/// exactly. Safe only at HEAD with no overlay and no scan-hidden predicates —
+/// both are caller-gated (`fast_path_store`, `graph_has_scan_hidden_predicates`).
+/// Current-state-exact after an incremental index only because the build now
+/// carries base per-graph property stats forward (they were previously dropped,
+/// net-zero churn pinned at 0). Returns `None` when stats are absent (older
+/// index) so the caller falls back to the PSOT scan.
+fn distinct_predicates_from_graph_stats(ctx: &crate::context::ExecutionContext<'_>) -> Option<u64> {
+    let graphs = ctx.active_snapshot.stats.as_ref()?.graphs.as_ref()?;
+    let g = graphs.iter().find(|g| g.g_id == ctx.binary_g_id)?;
+    Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
 /// Per-chunk partial for the distinct-lead count: groups counted within the

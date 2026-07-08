@@ -106,8 +106,8 @@ async fn cypher_http_read_write_round_trip() {
         &state,
         "cypherhttp",
         json!({
-            "@context": {"ex": "http://example.org/"},
-            "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 30
+            "@context": {},
+            "@id": "alice", "@type": "Person", "name": "Alice", "age": 30
         }),
     )
     .await;
@@ -226,10 +226,10 @@ async fn cypher_http_json_envelope_with_params() {
         &state,
         "cypherparams",
         json!({
-            "@context": {"ex": "http://example.org/"},
+            "@context": {},
             "@graph": [
-                {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
-                {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+                {"@id": "alice", "@type": "Person", "name": "Alice"},
+                {"@id": "bob",   "@type": "Person", "name": "Bob"},
             ]
         }),
     )
@@ -364,8 +364,7 @@ async fn connection_scoped_cypher_is_rejected() {
 }
 
 /// A trailing RETURN on a write answers with the created entities as a
-/// Cypher-JSON envelope (benchgraph `arango__single_vertex_write` /
-/// `arango__single_edge_write` round trips).
+/// Cypher-JSON envelope (single vertex / single edge write round trips).
 #[tokio::test]
 async fn cypher_http_write_with_return() {
     let (_tmp, state) = server_state().await;

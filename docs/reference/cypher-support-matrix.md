@@ -23,13 +23,15 @@ meet Fluree's RDF model.
 
 These shape everything below; read them first.
 
-- **Nodes are IRIs.** A node is an RDF subject (an IRI/blank node), not an opaque
-  LPG node. `labels(n)` are `rdf:type` assertions; node identity is the IRI.
+- **Nodes are durable subjects.** A node is an RDF subject, not an opaque LPG
+  node. `labels(n)` are `rdf:type` assertions; node identity is the subject's
+  stored name — a plain name by default, a full IRI in `@vocab` (RDF-compat)
+  mode (see [names and IRIs](../query/cypher.md#names-and-opting-into-iris)).
 - **Relationships are edge annotations.** A relationship is the base triple
   `(s, p, o)`; binding `-[r:T]->` reifies it into an `f:reifies*` annotation node
   (the LPG edge identity). Fluree does **not** implement RDF-star triple terms —
   see [Edge annotations](../concepts/edge-annotations.md).
-- **`id(n)` / `elementId(n)`** return the node/relationship **IRI string** — there
+- **`id(n)` / `elementId(n)`** return the node/relationship **identity string** — there
   is no integer element id.
 - **No implicit per-statement transaction id** semantics; immutability/time-travel
   replace it (`f:t`, history queries).
@@ -112,7 +114,7 @@ These shape everything below; read them first.
 | Aggregates: `count` `sum` `avg` `min` `max` `collect` (+ `DISTINCT`) | ✅ | Implicit grouping by non-aggregate projections; HAVING via `WITH`. |
 | List: `size` `head` `last` `tail` `reverse` `range` | ✅ | |
 | Path/metadata: `length` `nodes` `relationships` `pathPairs` `labels` `type` `startNode` `endNode` `keys` `properties` | ✅ | |
-| `id` / `elementId` | ⟂ | Returns the IRI string. |
+| `id` / `elementId` | ⟂ | Returns the identity string (name, or IRI in `@vocab` mode). |
 | Temporal accessors `<date>.year/.month/.day/.hour/.minute/.second` | ✅ | |
 | Temporal constructors `date()` `datetime()` `duration()` | ⏳ | Use XSD-typed literals. |
 | Spatial `point()` / `distance()` | ⏳ | |
@@ -127,6 +129,25 @@ These shape everything below; read them first.
 | Mixed-representation equality (encoded vs decoded) | ✅ | Normalized at DISTINCT/GROUP BY/join/MINUS/VALUES. |
 | `xsd:float` string-backed numeric coercion | ✅ | In SUM/AVG, comparisons, math. |
 | List / map ordering in `ORDER BY` | ⏳ | `ORDER BY <list/map>` rejected (defensive total order internally). |
+
+## Bolt protocol (Neo4j drivers)
+
+The server accepts official Neo4j drivers (`bolt://` scheme) against
+the openCypher surface — versions 4.4 and 5.0–5.4, autocommit and
+explicit transactions. See the [Bolt guide](../guides/bolt.md) and
+[Bolt reference](../api/bolt.md). Transport-specific semantics:
+
+| Aspect | Status | Notes |
+|--------|:------:|-------|
+| Autocommit `RUN` (read + write), params, reactive `PULL`/`DISCARD` | ✅ | Same execution paths as the HTTP routes. |
+| Explicit transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) | ✅ | Optimistic: `BEGIN` pins the head; statements stage privately (read-your-writes; statement errors surface at `RUN`, poisoning the transaction until `RESET`); `COMMIT` publishes atomically only if the head is still the pinned base, else fails `Neo.TransientError.*` — managed transaction functions (`execute_write` etc.) retry automatically. Isolation is serializable-against-base, stronger than Neo4j's read-committed. Single-node (local commit) deployments only; Raft/peer reject `BEGIN` clearly. |
+| `db` selection | ✅ | Driver `database=` (HELLO defaults or per-RUN) → ledger id; fallback `--bolt-default-db`. |
+| `xsd:decimal` values | ⟂ | Bolt/PackStream has no decimal type: rendered as **Float** (Neo4j parity, precision loss). The JSON transport keeps exact lexical strings. Integer `/` produces decimals, so this shows on ordinary division. |
+| Temporal values (`xsd:date` / `dateTime` / `time`) | ✅ | Bolt `Date` / `DateTime` / `Time` structures (4.4 gets the legacy local-seconds `DateTime`; lexical forms without a timezone map to the Local variants). |
+| Node values (`RETURN n`) | ✅ | Bolt `Node` structures: `element_id` = the durable identity string (name, or full IRI in `@vocab` mode), numeric `id` = stable hash of the IRI (opaque handle), labels via the `labels()` rule (`db:Node` marker hidden), properties fetched per node at format time — **literal-valued predicates only** (multi-valued become lists); ref-valued predicates are relationships and never inline into the node map (Neo4j parity). Under a view policy the hydration filters per flake through the same enforcer as the scan path. |
+| Relationship / path values | ✅ | Bolt `Relationship` (endpoints + type + annotation properties when reified; synthesized stable `id` otherwise) and `Path` structures (unique node/rel lists + walk indices). |
+| Auth | ✅ | `bearer` (data-plane JWT/JWS, same tokens/issuers as HTTP), `basic` as a token carrier (password = token), `none` when auth isn't required. Ledger scopes + token expiry re-checked per statement; identity drives in-ledger policy. See the [Bolt reference](../api/bolt.md#authentication). |
+| `ROUTE` / cluster routing | ⏳ | Use the `bolt://` (direct) scheme; `neo4j://` routing answers a failure unless an advertised address is configured. |
 
 ## Maintaining this matrix
 

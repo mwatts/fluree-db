@@ -31,14 +31,17 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
+    range_with_overlay, FlakeValue, IndexType, OverlayProvider, RangeMatch, RangeOptions,
+    RangeTest, Sid,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Safety bound: maximum nodes visited across both BFS frontiers per search.
-pub const DEFAULT_MAX_VISITED: usize = 100_000;
+pub const DEFAULT_MAX_VISITED: usize = crate::property_path::DEFAULT_MAX_VISITED;
 
 /// Safety bound: maximum number of paths returned by `allShortestPaths`.
 pub const DEFAULT_MAX_PATHS: usize = 1_000;
@@ -100,7 +103,7 @@ impl ShortestPathOperator {
 
     /// Create with default safety bounds.
     pub fn with_defaults(child: BoxedOperator, pattern: ShortestPathPattern) -> Self {
-        Self::new(child, pattern, DEFAULT_MAX_VISITED)
+        Self::new(child, pattern, crate::property_path::path_max_visited())
     }
 
     /// Trim output to only the specified downstream variables.
@@ -305,7 +308,48 @@ impl ShortestPathOperator {
 
     /// Bidirectional BFS for a single shortest path. Returns the node sequence
     /// (start..end inclusive) or `None` if no path exists within the bounds.
+    ///
+    /// Tries the raw-id lane first (batched frontier expansion over base
+    /// index rows, u64-keyed state — no per-node Sid materialization); the
+    /// Sid-keyed per-node search remains the fallback for views the lane
+    /// can't serve (no binary store, active policy, unsummarizable overlay).
     async fn bidirectional(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        start: &Sid,
+        end: &Sid,
+    ) -> Result<Option<Vec<Sid>>> {
+        // Endpoints are part of `nodes(p)`: if either fails a pushed node
+        // predicate, no qualifying path exists.
+        if self.pattern.node_filter.is_some()
+            && !(self.node_qualifies(ctx, start)? && self.node_qualifies(ctx, end)?)
+        {
+            return Ok(None);
+        }
+        if let Some(result) = self.bidirectional_ids(ctx, start, end).await? {
+            return Ok(result);
+        }
+        self.bidirectional_sids(ctx, start, end).await
+    }
+
+    /// Whether `node` satisfies the pushed-in per-node predicate (an
+    /// `all(x IN nodes(p) WHERE …)` filter moved into the search). `true` when
+    /// there is no filter. Evaluated with the same member resolution as the
+    /// post-filter, so a returned path's every node passes the original `all`.
+    fn node_qualifies(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<bool> {
+        match &self.pattern.node_filter {
+            None => Ok(true),
+            Some(nf) => crate::eval::eval_single_node_predicate(
+                nf.var,
+                &nf.predicate,
+                Binding::sid(node.clone()),
+                ctx,
+            ),
+        }
+    }
+
+    /// Sid-keyed bidirectional BFS (per-node `range_with_overlay` probes).
+    async fn bidirectional_sids(
         &self,
         ctx: &ExecutionContext<'_>,
         start: &Sid,
@@ -360,6 +404,12 @@ impl ShortestPathOperator {
             for node in &frontier {
                 let nbrs = self.neighbors(ctx, node, expand_forward).await?;
                 for nb in nbrs {
+                    // Pushed node predicate: only traverse through qualifying
+                    // nodes, so BFS returns the shortest path whose nodes all
+                    // pass (endpoints checked up front in `bidirectional`).
+                    if self.pattern.node_filter.is_some() && !self.node_qualifies(ctx, &nb)? {
+                        continue;
+                    }
                     let (near, far) = if expand_forward {
                         (&mut fwd_prev, &bwd_next)
                     } else {
@@ -428,6 +478,85 @@ impl ShortestPathOperator {
             }
         }
         left
+    }
+
+    /// Raw-id bidirectional BFS: state keyed by persisted `s_id` (u64),
+    /// frontier levels expanded with ONE batched galloping index sweep per
+    /// side instead of a probe per node, and neighbors taken as raw `o_key`
+    /// ids (for `IRI_REF` rows, `o_key` IS the target's `s_id` — no
+    /// dictionary in the loop).
+    ///
+    /// Overlay correctness is per-node: a node with any overlay flake on the
+    /// side being expanded (as subject for out-edges, as ref-object for
+    /// in-edges — retracts stamp both) takes the Sid-space
+    /// `range_with_overlay` fallback, whose results merge novelty. Subjects
+    /// that exist only in novelty enter the search as `PathNode::Novel` and
+    /// always expand via the fallback.
+    ///
+    /// Returns `None` when the lane can't serve the view (no binary store,
+    /// active policy — base-row reads bypass the flake-level policy filter —
+    /// or an overlay that can't be summarized per subject).
+    async fn bidirectional_ids(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        start: &Sid,
+        end: &Sid,
+    ) -> Result<Option<Option<Vec<Sid>>>> {
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(None);
+        };
+        if !ctx.allow_unfiltered() || ctx.is_multi_ledger() {
+            return Ok(None);
+        }
+        // A pushed node predicate qualifies nodes by their properties; the
+        // raw-id lane never materializes a node's Sid. Decline to the Sid lane,
+        // which evaluates the predicate per node during expansion.
+        if self.pattern.node_filter.is_some() {
+            return Ok(None);
+        }
+        let (_db, overlay, to_t) = ctx.require_single_graph()?;
+        let Some(dirty) = overlay_dirty_ids(overlay, ctx.binary_g_id, store) else {
+            return Ok(None);
+        };
+        let store = Arc::clone(store);
+        let g_id = ctx.binary_g_id;
+
+        // Reserved edge predicates as base p_ids (absent from the base dict
+        // means absent from base rows; the Sid fallback re-checks by Sid).
+        let mut reserved_pids: FxHashSet<u32> = FxHashSet::default();
+        for sid in fluree_db_core::reifies_predicate_sids() {
+            if let Some(p_id) = store.sid_to_p_id(&sid) {
+                reserved_pids.insert(p_id);
+            }
+        }
+        let rdf_type_sid = Sid::new(
+            fluree_vocab::namespaces::RDF,
+            fluree_vocab::predicates::RDF_TYPE,
+        );
+        if let Some(p_id) = store.sid_to_p_id(&rdf_type_sid) {
+            reserved_pids.insert(p_id);
+        }
+        let typed_pid = match &self.pattern.predicate {
+            Some(pred) => match store.sid_to_p_id(pred) {
+                Some(p_id) => Some(p_id),
+                // Predicate unknown to the base index: base has no such
+                // edges; only novelty could. Let the Sid lane handle it.
+                None if !overlay.is_effectively_empty() => return Ok(None),
+                None => return Ok(Some(None)),
+            },
+            None => None,
+        };
+
+        let search = IdSearch {
+            op: self,
+            store,
+            g_id,
+            to_t,
+            dirty,
+            reserved_pids,
+            typed_pid,
+        };
+        search.run(ctx, start, end).await.map(Some)
     }
 
     /// Layered forward BFS that records all minimal-length predecessors, then
@@ -714,6 +843,390 @@ impl ShortestPathOperator {
             rows.push(row);
         }
         Ok(rows)
+    }
+}
+
+// ============================================================================
+// Raw-id bidirectional lane
+// ============================================================================
+
+/// A BFS node in the raw-id lane: a persisted subject id, or a subject that
+/// exists only in novelty (no persisted id — always expands via the Sid
+/// fallback). The two never alias: batched base rows only ever produce
+/// persisted ids, and Sid-lane neighbors resolve to `Id` whenever a
+/// persisted id exists.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PathNode {
+    Id(u64),
+    Novel(Sid),
+}
+
+/// Persisted subject ids the overlay touches, split by the side they
+/// invalidate: `subjects` (any overlay flake with the node as subject —
+/// out-edges incomplete in base) and `objects` (as ref-object — in-edges
+/// incomplete). Retract flakes stamp both, so batched base reads are only
+/// trusted where they are provably the whole truth.
+struct DirtyIds {
+    subjects: FxHashSet<u64>,
+    objects: FxHashSet<u64>,
+}
+
+/// Build (and LRU-cache, keyed on overlay content version) the overlay's
+/// dirty-id sets for one graph. `None` = the overlay can't be summarized
+/// (no content version) — the caller must decline the raw-id lane.
+fn overlay_dirty_ids(
+    overlay: &dyn OverlayProvider,
+    g_id: fluree_db_core::GraphId,
+    store: &Arc<BinaryIndexStore>,
+) -> Option<Arc<DirtyIds>> {
+    use std::sync::OnceLock;
+    type Cache = parking_lot::Mutex<lru::LruCache<(u64, u16, u64), Arc<DirtyIds>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+
+    if overlay.is_effectively_empty() {
+        static EMPTY: OnceLock<Arc<DirtyIds>> = OnceLock::new();
+        return Some(Arc::clone(EMPTY.get_or_init(|| {
+            Arc::new(DirtyIds {
+                subjects: FxHashSet::default(),
+                objects: FxHashSet::default(),
+            })
+        })));
+    }
+    let version = overlay.content_version()?;
+    // Store-instance id, not the raw pointer: a dropped store can be
+    // reallocated at the same address, so a pointer-keyed cache is subject to
+    // an ABA misread (ABA on the store, not just a coinciding version/g_id).
+    let store_key = store.store_id();
+    let cache = CACHE.get_or_init(|| {
+        parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8).expect("nonzero"),
+        ))
+    });
+    if let Some(hit) = cache.lock().get(&(version, g_id, store_key)) {
+        return Some(Arc::clone(hit));
+    }
+
+    // Collect with no to_t cap: a superset stays conservative (a node whose
+    // overlay flakes all lie beyond the view's t just takes the fallback).
+    let mut subject_sids: std::collections::HashSet<Sid> = std::collections::HashSet::new();
+    let mut object_sids: std::collections::HashSet<Sid> = std::collections::HashSet::new();
+    overlay.for_each_overlay_flake(
+        g_id,
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |f| {
+            subject_sids.insert(f.s.clone());
+            if let FlakeValue::Ref(o) = &f.o {
+                object_sids.insert(o.clone());
+            }
+        },
+    );
+    let resolve = |sids: std::collections::HashSet<Sid>| -> FxHashSet<u64> {
+        let mut out = FxHashSet::default();
+        for sid in sids {
+            if let Ok(Some(s_id)) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+                out.insert(s_id);
+            }
+            // No persisted id: the node can never appear as a PathNode::Id,
+            // so it needs no dirty marker.
+        }
+        out
+    };
+    let dirty = Arc::new(DirtyIds {
+        subjects: resolve(subject_sids),
+        objects: resolve(object_sids),
+    });
+    cache
+        .lock()
+        .put((version, g_id, store_key), Arc::clone(&dirty));
+    Some(dirty)
+}
+
+/// One anchored raw-id search over a fixed view.
+struct IdSearch<'a> {
+    op: &'a ShortestPathOperator,
+    store: Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    to_t: i64,
+    dirty: Arc<DirtyIds>,
+    /// Reserved edge predicates (`rdf:type`, `f:reifies*`) as base p_ids;
+    /// wildcard expansion drops their rows, mirroring
+    /// [`crate::property_path::is_reserved_edge_predicate`].
+    reserved_pids: FxHashSet<u32>,
+    /// The single typed predicate's base p_id (`None` = wildcard path).
+    typed_pid: Option<u32>,
+}
+
+impl IdSearch<'_> {
+    fn node_for_sid(&self, sid: &Sid) -> PathNode {
+        match self
+            .store
+            .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+        {
+            Ok(Some(s_id)) => PathNode::Id(s_id),
+            _ => PathNode::Novel(sid.clone()),
+        }
+    }
+
+    fn sid_for_node(&self, node: &PathNode) -> Result<Sid> {
+        match node {
+            PathNode::Novel(sid) => Ok(sid.clone()),
+            PathNode::Id(s_id) => {
+                let (ns_code, suffix) = self
+                    .store
+                    .resolve_subject_parts(*s_id)
+                    .map_err(|e| QueryError::Internal(format!("resolve path node {s_id}: {e}")))?;
+                Ok(Sid::new(ns_code, suffix))
+            }
+        }
+    }
+
+    /// Which edge orientations this expansion side follows (mirrors
+    /// [`ShortestPathOperator::neighbors`]'s direction table).
+    fn orientations(&self, expand_forward: bool) -> (bool, bool) {
+        match (self.op.pattern.direction, expand_forward) {
+            (PathDirection::Outgoing, true) | (PathDirection::Incoming, false) => (true, false),
+            (PathDirection::Outgoing, false) | (PathDirection::Incoming, true) => (false, true),
+            (PathDirection::Either, _) => (true, true),
+        }
+    }
+
+    /// A persisted node's base rows are the whole truth for this side iff
+    /// the overlay never touches the orientations being followed.
+    fn is_clean(&self, s_id: u64, use_out: bool, use_in: bool) -> bool {
+        (!use_out || !self.dirty.subjects.contains(&s_id))
+            && (!use_in || !self.dirty.objects.contains(&s_id))
+    }
+
+    /// Expand one frontier level: batched galloping sweeps for clean
+    /// persisted nodes, per-node Sid probes for dirty/novelty ones.
+    /// Returns `(source, neighbor)` pairs.
+    async fn expand(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        frontier: &[PathNode],
+        expand_forward: bool,
+    ) -> Result<Vec<(PathNode, PathNode)>> {
+        let (use_out, use_in) = self.orientations(expand_forward);
+        let mut batched: Vec<u64> = Vec::new();
+        let mut fallback: Vec<(PathNode, Sid)> = Vec::new();
+        for node in frontier {
+            match node {
+                PathNode::Id(s_id) if self.is_clean(*s_id, use_out, use_in) => {
+                    batched.push(*s_id);
+                }
+                PathNode::Id(_) => fallback.push((node.clone(), self.sid_for_node(node)?)),
+                PathNode::Novel(sid) => fallback.push((node.clone(), sid.clone())),
+            }
+        }
+        batched.sort_unstable();
+        batched.dedup();
+
+        let mut out: Vec<(PathNode, PathNode)> = Vec::new();
+
+        if !batched.is_empty() {
+            if use_out {
+                self.batched_out(&batched, &mut out)?;
+            }
+            if use_in {
+                self.batched_in(&batched, &mut out)?;
+            }
+        }
+        for (node, sid) in fallback {
+            let nbrs = self.op.neighbors(ctx, &sid, expand_forward).await?;
+            for nb in nbrs {
+                let nb_node = self.node_for_sid(&nb);
+                out.push((node.clone(), nb_node));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Out-edges of `subjects` from base rows. For `IRI_REF` rows `o_key`
+    /// is the target's `s_id` — neighbors come back as raw ids.
+    fn batched_out(&self, subjects: &[u64], out: &mut Vec<(PathNode, PathNode)>) -> Result<()> {
+        match self.typed_pid {
+            Some(p_id) => {
+                let refs = fluree_db_binary_index::batched_lookup_predicate_refs(
+                    &self.store,
+                    self.g_id,
+                    p_id,
+                    subjects,
+                    self.to_t,
+                )
+                .map_err(|e| QueryError::Internal(format!("batched out-edges: {e}")))?;
+                for (s_id, targets) in refs {
+                    for t in targets {
+                        out.push((PathNode::Id(s_id), PathNode::Id(t)));
+                    }
+                }
+            }
+            None => {
+                let rows = fluree_db_binary_index::batched_lookup_subject_properties(
+                    &self.store,
+                    self.g_id,
+                    subjects,
+                    self.to_t,
+                )
+                .map_err(|e| QueryError::Internal(format!("batched out-edges: {e}")))?;
+                for (s_id, props) in rows {
+                    for (p_id, o_type, o_key) in props {
+                        if self.reserved_pids.contains(&p_id) {
+                            continue;
+                        }
+                        if !fluree_db_core::o_type::OType::from_u16(o_type).is_node_ref() {
+                            continue;
+                        }
+                        out.push((PathNode::Id(s_id), PathNode::Id(o_key)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// In-edges pointing at `objects` from base rows.
+    fn batched_in(&self, objects: &[u64], out: &mut Vec<(PathNode, PathNode)>) -> Result<()> {
+        let inbound = fluree_db_binary_index::batched_lookup_inbound_refs(
+            &self.store,
+            self.g_id,
+            objects,
+            self.to_t,
+        )
+        .map_err(|e| QueryError::Internal(format!("batched in-edges: {e}")))?;
+        for (o_key, edges) in inbound {
+            for (p_id, s_id) in edges {
+                let keep = match self.typed_pid {
+                    Some(tp) => p_id == tp,
+                    None => !self.reserved_pids.contains(&p_id),
+                };
+                if keep {
+                    out.push((PathNode::Id(o_key), PathNode::Id(s_id)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The bidirectional meet-in-the-middle loop, u64-keyed. Structure is
+    /// identical to [`ShortestPathOperator::bidirectional_sids`].
+    async fn run(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        start: &Sid,
+        end: &Sid,
+    ) -> Result<Option<Vec<Sid>>> {
+        let min_hops = self.op.pattern.min_hops.unwrap_or(1);
+        let max_hops = self.op.pattern.max_hops;
+
+        let start_node = self.node_for_sid(start);
+        let end_node = self.node_for_sid(end);
+
+        if start_node == end_node && min_hops == 0 {
+            return Ok(Some(vec![start.clone()]));
+        }
+
+        let mut fwd_prev: FxHashMap<PathNode, PathNode> = FxHashMap::default();
+        let mut bwd_next: FxHashMap<PathNode, PathNode> = FxHashMap::default();
+        fwd_prev.insert(start_node.clone(), start_node.clone());
+        bwd_next.insert(end_node.clone(), end_node.clone());
+
+        let mut fwd_frontier: Vec<PathNode> = vec![start_node.clone()];
+        let mut bwd_frontier: Vec<PathNode> = vec![end_node.clone()];
+        let mut depth = 0u32;
+
+        while !fwd_frontier.is_empty() && !bwd_frontier.is_empty() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            if fwd_prev.len() + bwd_next.len() >= self.op.max_visited {
+                return Err(QueryError::ResourceLimit(format!(
+                    "shortestPath exceeded max visited nodes ({})",
+                    self.op.max_visited
+                )));
+            }
+            if let Some(max) = max_hops {
+                if depth >= max {
+                    return Ok(None);
+                }
+            }
+            depth += 1;
+
+            let expand_forward = fwd_frontier.len() <= bwd_frontier.len();
+            let frontier = if expand_forward {
+                std::mem::take(&mut fwd_frontier)
+            } else {
+                std::mem::take(&mut bwd_frontier)
+            };
+            let mut next: Vec<PathNode> = Vec::new();
+
+            let pairs = self.expand(ctx, &frontier, expand_forward).await?;
+            for (node, nb) in pairs {
+                let (near, far) = if expand_forward {
+                    (&mut fwd_prev, &bwd_next)
+                } else {
+                    (&mut bwd_next, &fwd_prev)
+                };
+                if near.contains_key(&nb) {
+                    continue;
+                }
+                near.insert(nb.clone(), node.clone());
+                if far.contains_key(&nb) {
+                    let path =
+                        self.reconstruct(&fwd_prev, &bwd_next, &nb, &start_node, &end_node)?;
+                    if path.len().saturating_sub(1) as u32 >= min_hops {
+                        return Ok(Some(path));
+                    }
+                }
+                next.push(nb);
+            }
+
+            if expand_forward {
+                fwd_frontier = next;
+            } else {
+                bwd_frontier = next;
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Stitch the predecessor chains through `meet` and materialize Sids —
+    /// the only place the raw-id lane touches the dictionary, bounded by
+    /// path length.
+    fn reconstruct(
+        &self,
+        fwd_prev: &FxHashMap<PathNode, PathNode>,
+        bwd_next: &FxHashMap<PathNode, PathNode>,
+        meet: &PathNode,
+        start: &PathNode,
+        end: &PathNode,
+    ) -> Result<Vec<Sid>> {
+        let mut left: Vec<PathNode> = vec![meet.clone()];
+        let mut cur = meet.clone();
+        while &cur != start {
+            match fwd_prev.get(&cur) {
+                Some(p) if p != &cur => {
+                    left.push(p.clone());
+                    cur = p.clone();
+                }
+                _ => break,
+            }
+        }
+        left.reverse();
+
+        let mut cur = meet.clone();
+        while &cur != end {
+            match bwd_next.get(&cur) {
+                Some(n) if n != &cur => {
+                    left.push(n.clone());
+                    cur = n.clone();
+                }
+                _ => break,
+            }
+        }
+        left.iter().map(|n| self.sid_for_node(n)).collect()
     }
 }
 

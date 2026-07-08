@@ -310,7 +310,11 @@ pub(crate) fn minmax_numeric_post(
     Ok(best.map(|(o_type, o_key)| numeric_binding_from_otype_okey(store, o_type, o_key)))
 }
 
-fn numeric_binding_from_otype_okey(store: &BinaryIndexStore, o_type: u16, o_key: u64) -> Binding {
+pub(crate) fn numeric_binding_from_otype_okey(
+    store: &BinaryIndexStore,
+    o_type: u16,
+    o_key: u64,
+) -> Binding {
     let ot = OType::from_u16(o_type);
     let dt = store
         .resolve_datatype_sid(o_type)

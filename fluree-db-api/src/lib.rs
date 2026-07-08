@@ -43,6 +43,7 @@ pub mod config_resolver;
 pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
+pub mod cypher_txn;
 pub mod cypher_write;
 pub mod dataset;
 mod error;
@@ -3451,14 +3452,14 @@ impl Fluree {
     /// `docs/concepts/cypher.md` for the surface.
     ///
     /// Context resolution: the ledger's configured `default_context`
-    /// (if any) supplies `@vocab` and bare-identifier overrides.
-    /// A CAS read or parse failure on a configured context
-    /// propagates as an error — writes never silently fall back to
-    /// the built-in vocab when a custom context was specified.
-    /// The built-in fallback (`http://example.org/`) applies only
-    /// when (a) the ledger has no nameservice record yet
-    /// (genesis / pre-commit), or (b) the record exists but no
-    /// `default_context` CID is configured.
+    /// (if any) supplies `@vocab` and bare-identifier overrides
+    /// (RDF-compat mode). A CAS read or parse failure on a configured
+    /// context propagates as an error — writes never silently fall
+    /// back to bare names when a custom context was specified. Bare
+    /// namespace-0 names (the default) apply only when (a) the ledger
+    /// has no nameservice record yet (genesis / pre-commit), or
+    /// (b) the record exists but no `default_context` CID is
+    /// configured.
     pub async fn transact_cypher(
         &self,
         ledger: LedgerState,
@@ -3505,17 +3506,11 @@ impl Fluree {
         // uses; a Some plan needs a caller-known skolem id so the created
         // Sids are reconstructible post-commit.
         let return_plan = {
-            let out = fluree_db_cypher::parse_cypher(cypher);
-            match out.ast {
-                Some(mut ast) if !out.has_errors() => {
-                    let empty = fluree_db_cypher::ParamMap::new();
-                    fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-                        .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-                    crate::cypher_write::plan_write_return(&ast)
-                        .map_err(|e| ApiError::cypher(e, Vec::new()))?
-                }
+            match crate::query::helpers::substituted_cypher_ast(cypher, params) {
+                Ok(ast) => crate::cypher_write::plan_write_return(&ast)
+                    .map_err(|e| ApiError::cypher(e, Vec::new()))?,
                 // Parse errors surface with full diagnostics below.
-                _ => None,
+                Err(_) => None,
             }
         };
         let skolem_txn_id = return_plan
@@ -3576,22 +3571,7 @@ impl Fluree {
         snapshot: &fluree_db_core::LedgerSnapshot,
         skolem_txn_id: Option<String>,
     ) -> Result<crate::cypher_write::WritePlan> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
 
         // Validate a trailing RETURN up front (lowering ignores it): the v1
         // surface is bare created-entity variables, and it never combines with
@@ -3777,6 +3757,7 @@ impl Fluree {
             &probe_ast,
             &probe_view.snapshot,
             probe_view.default_context.as_ref(),
+            Some((&*probe_view.overlay, probe_view.graph_id)),
         )?;
 
         let target_var = vars.get(&target.name).ok_or_else(|| {
@@ -3861,27 +3842,7 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<fluree_db_transact::ir::Txn> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-
-        // Substitute `$param` references before lowering. Always run (empty
-        // map when no params were supplied) so an unfilled `$param` reports a
-        // clear missing-parameter error.
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
         self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await
     }
@@ -3900,8 +3861,9 @@ impl Fluree {
         // write Cypher resolves bare identifiers the same way `query_cypher`
         // does. `Ok(None)` (no default_context configured) and
         // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
-        // context"; every other error propagates so writes never silently land
-        // under the built-in vocab when a custom context couldn't be loaded.
+        // context" (bare namespace-0 names); every other error propagates so
+        // writes never silently land under bare names when a custom context
+        // couldn't be loaded.
         let default_context = match self.get_default_context(ledger_id).await {
             Ok(ctx) => ctx,
             Err(ApiError::NotFound(_)) => None,
@@ -3909,10 +3871,8 @@ impl Fluree {
         };
         let (vocab, overrides) =
             crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
-        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
-            vocab: Some(vocab),
-            overrides,
-        };
+        let cypher_opts =
+            fluree_db_transact::lower_cypher_update::CypherLowerOpts { vocab, overrides };
 
         let mut ns = NamespaceRegistry::from_db(snapshot);
         Ok(

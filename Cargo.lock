@@ -2486,6 +2486,7 @@ dependencies = [
  "hex",
  "indexmap 2.13.0",
  "itoa",
+ "lru 0.12.5",
  "mimalloc",
  "moka",
  "num-bigint",
@@ -2540,6 +2541,13 @@ dependencies = [
  "tracing",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "fluree-db-bolt"
+version = "4.1.1"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
@@ -3001,6 +3009,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "once_cell",
+ "parking_lot",
  "percent-encoding",
  "postcard",
  "rand 0.8.5",
@@ -3073,6 +3082,7 @@ dependencies = [
  "ed25519-dalek",
  "fluree-db-api",
  "fluree-db-binary-index",
+ "fluree-db-bolt",
  "fluree-db-connection",
  "fluree-db-consensus",
  "fluree-db-core",
