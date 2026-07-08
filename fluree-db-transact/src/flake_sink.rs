@@ -202,7 +202,10 @@ impl GraphSink for FlakeSink<'_> {
                 if let Some(&id) = self.blank_labels.get(l) {
                     return id;
                 }
-                let sid = self.skolemize(l);
+                // Stable Fluree blank-node ids (`fdb-...`) address the
+                // existing stored node; other labels skolemize fresh.
+                let sid = crate::namespace::stable_blank_node_sid_from_label(l)
+                    .unwrap_or_else(|| self.skolemize(l));
                 let id = self.add_term(ResolvedTerm::Sid(sid));
                 self.blank_labels.insert(l.to_string(), id);
                 id

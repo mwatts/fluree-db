@@ -60,7 +60,9 @@ pub mod error;
 pub mod io;
 pub mod manifest;
 pub mod metadata;
+pub mod net;
 pub mod scan;
+pub mod stats;
 
 // Re-export commonly used types
 pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
@@ -72,6 +74,10 @@ pub use io::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType, IcebergStor
 pub use manifest::{DataFile, ManifestContent, ManifestEntry, ManifestListEntry, TypedValue};
 pub use scan::{
     ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan, ScanPlanner,
+};
+pub use stats::{
+    aggregate_column_stats, read_snapshot_data_files, typed_value_to_json, AggregatedColumnStats,
+    TableStatsAggregation,
 };
 
 // AWS/Send-safe types

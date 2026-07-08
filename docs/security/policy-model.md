@@ -82,6 +82,15 @@ Example (typed-literal form, suitable for inline policies):
 
 > **Inline policies must use full IRIs.** Compact IRIs (`schema:ssn`) inside an inline policy passed through `opts.policy` are not expanded against the request `@context`. Use full IRIs (`http://schema.org/ssn`).
 
+## RDFS entailment
+
+Policy targeting applies RDFS inference **always**: a policy with
+`f:onClass ex:Employee` governs instances of every `rdfs:subClassOf*
+ex:Employee` class, and a policy with `f:onProperty ex:phone` governs every
+`rdfs:subPropertyOf* ex:phone` property. The hierarchy reflects committed
+state (kept current automatically; no reindex needed). Cross-ledger policy
+wires are not expanded (no hierarchy handle in that path yet).
+
 ## Combining algorithm
 
 When more than one policy targets the same flake, the engine combines them as follows:

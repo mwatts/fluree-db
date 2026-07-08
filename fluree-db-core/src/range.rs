@@ -203,6 +203,15 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
     fn epoch(&self) -> u64 {
         self.0.epoch()
     }
+
+    fn is_effectively_empty(&self) -> bool {
+        self.0.is_effectively_empty()
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        self.0.content_version()
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

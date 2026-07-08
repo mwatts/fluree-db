@@ -1102,24 +1102,34 @@ async fn hydrate_list_index_meta_for_retractions(
     retractions: &mut [Flake],
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> Result<()> {
-    for flake in retractions.iter_mut() {
+    use std::collections::BTreeMap;
+
+    // Group candidates by (graph, subject, predicate): one range lookup per
+    // group, not one per retraction. Every `range_with_overlay` call pays a
+    // full overlay translation of the graph's novelty (walk + translate +
+    // sort), so per-flake lookups make filtered-DELETE staging
+    // O(matched_triples × novelty log novelty) — observed as a >900s livelock
+    // for ~21k matched triples on a novelty-heavy ledger. Grouped, the cost
+    // scales with distinct (subject, predicate) pairs instead.
+    let mut groups: HashMap<(GraphId, Sid, Sid), Vec<usize>> = HashMap::new();
+    for (idx, flake) in retractions.iter().enumerate() {
         // Only retractions with no metadata are candidates.
-        if flake.op {
+        if flake.op || flake.m.is_some() {
             continue;
         }
-        if flake.m.is_some() {
-            continue;
-        }
-
-        // Resolve the correct graph for this retraction flake.
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
+        groups
+            .entry((g_id, flake.s.clone(), flake.p.clone()))
+            .or_default()
+            .push(idx);
+    }
 
-        // Find currently asserted matching flakes (db + novelty overlay) and copy list index meta if present.
+    for ((g_id, s, p), members) in groups {
+        // Find currently asserted flakes for this (subject, predicate)
+        // (db + novelty overlay) and copy list index meta where present.
         let rm = fluree_db_core::RangeMatch::new()
-            .with_subject(flake.s.clone())
-            .with_predicate(flake.p.clone())
-            .with_object(flake.o.clone())
-            .with_datatype(flake.dt.clone());
+            .with_subject(s)
+            .with_predicate(p);
 
         let found = fluree_db_core::range_with_overlay(
             &ledger.snapshot,
@@ -1132,11 +1142,36 @@ async fn hydrate_list_index_meta_for_retractions(
         )
         .await?;
 
-        if let Some(existing) = found
-            .into_iter()
-            .find(|f| f.op && f.m.as_ref().and_then(|m| m.i).is_some())
-        {
-            flake.m = existing.m;
+        // Index asserted list-carrying metas per object value, in index
+        // order. Every matching retraction copies the FIRST dt-compatible
+        // meta — mirroring the per-flake lookup's `.find()` this replaces:
+        // identical duplicates then collapse in the accumulator, so a value
+        // asserted at N list positions loses exactly one entry per distinct
+        // WHERE binding (pinned by the `object-probe-list-retract` case in
+        // `it_join_batched_overlay.rs`).
+        let mut metas: BTreeMap<FlakeValue, Vec<(Sid, fluree_db_core::FlakeMeta)>> =
+            BTreeMap::new();
+        for f in found {
+            if f.op {
+                if let Some(m) = f.m.filter(|m| m.i.is_some()) {
+                    metas.entry(f.o).or_default().push((f.dt, m));
+                }
+            }
+        }
+        if metas.is_empty() {
+            continue;
+        }
+
+        for idx in members {
+            let flake = &mut retractions[idx];
+            if let Some(candidates) = metas.get(&flake.o) {
+                if let Some((_, m)) = candidates
+                    .iter()
+                    .find(|(dt, _)| fluree_db_core::dt_compatible(&flake.dt, dt))
+                {
+                    flake.m = Some(m.clone());
+                }
+            }
         }
     }
 
@@ -2158,15 +2193,31 @@ pub async fn stage_with_shacl(
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
         .collect();
 
-    // Create SHACL engine from cache
-    let engine = ShaclEngine::new(shacl_cache.clone());
+    // Create SHACL engine from cache, with the current (novelty-aware) RDFS
+    // hierarchy so subproperty/subclass entailment applies on this legacy
+    // path too.
+    let base = view.base();
+    let hierarchy = base
+        .schema_hierarchy_cache
+        .current(
+            &base.snapshot,
+            base.novelty.as_ref(),
+            base.t(),
+            base.novelty.schema_epoch,
+        )
+        .await?;
+    let engine =
+        ShaclEngine::from_shared_cache(std::sync::Arc::new(shacl_cache.clone()), hierarchy);
 
     // Validate staged flakes against shapes (per graph). `None` for
     // `enabled_graphs` means "validate every graph with staged flakes" —
     // this legacy path doesn't consult per-graph config.
-    let report = validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None).await?;
+    let report =
+        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
 
-    if !report.conforms {
+    // Reject on violations only — spec-level `conforms` is also false for
+    // warnings/infos, which must not block a commit.
+    if report.violation_count() > 0 {
         return Err(TransactError::ShaclViolation(format_shacl_report(&report)));
     }
 
@@ -2221,23 +2272,41 @@ impl ShaclValidationOutcome {
 /// Returns a [`ShaclValidationOutcome`] split into reject / warn buckets.
 /// The caller decides whether to propagate an error, log warnings, or both.
 #[cfg(feature = "shacl")]
+#[allow(clippy::too_many_arguments)]
 pub async fn validate_view_with_shacl(
     view: &StagedLedger,
-    shacl_cache: &ShaclCache,
+    shacl_cache: std::sync::Arc<ShaclCache>,
+    hierarchy: Option<fluree_db_core::SchemaHierarchy>,
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
+    membership_g_ids: &[GraphId],
+    cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
 ) -> Result<ShaclValidationOutcome> {
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     if shacl_cache.is_empty() {
         return Ok(ShaclValidationOutcome::default());
     }
 
-    let engine = ShaclEngine::new(shacl_cache.clone());
+    // `membership_g_ids` (the `f:shapesSource` graph[s]) are unioned into
+    // `sh:class` value-membership resolution so a shared value-set vocabulary
+    // can live alongside the shapes rather than in each data graph.
+    // `cross_ledger_db` is a live handle into a model ledger holding the
+    // controlled vocabulary (cross-ledger `f:shapesSource`), consulted on
+    // demand for `sh:class` membership.
+    let engine = ShaclEngine::from_shared_cache(shacl_cache, hierarchy)
+        .with_membership_graphs(membership_g_ids.to_vec());
     let enabled_graphs: Option<HashSet<GraphId>> =
         per_graph_policy.map(|m| m.keys().copied().collect());
-    let report =
-        validate_staged_nodes(view, &engine, graph_sids, tracker, enabled_graphs.as_ref()).await?;
+    let report = validate_staged_nodes(
+        view,
+        &engine,
+        graph_sids,
+        tracker,
+        enabled_graphs.as_ref(),
+        cross_ledger,
+    )
+    .await?;
 
     // Split violations by the graph's configured mode. `graph_id` on each
     // result was tagged during the per-graph loop in validate_staged_nodes.
@@ -2269,8 +2338,11 @@ pub async fn validate_view_with_shacl(
 /// Validate staged nodes against SHACL shapes, per graph.
 ///
 /// Groups staged subjects by their graph and validates each group with a
-/// `GraphDbRef` targeting the correct `g_id`. Shape compilation stays at
-/// g_id=0 (shapes are schema-level definitions in the default graph).
+/// `GraphDbRef` targeting the correct `g_id`. Shape *compilation* graph is
+/// chosen upstream by `f:shapesSource` (see `apply_shacl_policy_to_staged_view`)
+/// — this loop only drives per-graph *validation*. `sh:class` value membership
+/// additionally consults the engine's `membership_g_ids` (the `f:shapesSource`
+/// vocabulary graph[s]) unioned with each focus node's own data graph.
 ///
 /// When `graph_sids` is `None` (e.g., commit-transfer path where the txn
 /// context is unavailable), falls back to validating all subjects against
@@ -2282,6 +2354,7 @@ async fn validate_staged_nodes(
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
+    cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
 ) -> Result<ValidationReport> {
     use fluree_vocab::namespaces::RDF;
     use fluree_vocab::rdf_names;
@@ -2389,7 +2462,9 @@ async fn validate_staged_nodes(
             // inside `validate_node` via post-state range queries — see the
             // SubjectsOf/ObjectsOf handling there for why hints can't be
             // reliably built from staged flakes alone.
-            let report = engine.validate_node(db, subject, &node_types).await?;
+            let report = engine
+                .validate_node(db, subject, &node_types, cross_ledger)
+                .await?;
             // Tag each result with the graph it was validated under so the
             // caller can route warn vs reject per-graph (see
             // `ShaclValidationOutcome`).
@@ -2400,10 +2475,11 @@ async fn validate_staged_nodes(
         }
     }
 
-    // Check conformance
-    let conforms = all_results
-        .iter()
-        .all(|r| r.severity != fluree_db_shacl::Severity::Violation);
+    // Spec semantics: `sh:conforms` is true iff there are NO results, matching
+    // `ShaclEngine::validate_staged` so `ValidationReport.conforms` means the
+    // same thing across crates. Enforcement gates here key off
+    // `violation_count()` (warnings/info don't reject), not `conforms`.
+    let conforms = all_results.is_empty();
 
     Ok(ValidationReport {
         conforms,
@@ -2431,12 +2507,7 @@ fn format_shacl_report(report: &ValidationReport) -> String {
         .enumerate()
     {
         writeln!(&mut output, "  {}. {}", i + 1, result.message).ok();
-        writeln!(
-            &mut output,
-            "     Focus node: {}{}",
-            result.focus_node.namespace_code, result.focus_node.name
-        )
-        .ok();
+        writeln!(&mut output, "     Focus node: {}", result.focus_node).ok();
         if let Some(path) = &result.result_path {
             writeln!(
                 &mut output,

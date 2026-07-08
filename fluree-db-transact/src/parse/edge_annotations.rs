@@ -1060,17 +1060,16 @@ fn build_annotation_delete(
         .map(String::from);
 
     let template_id: String = if let Some(ann_id) = explicit_id {
-        // Reject blank-node @ids: a user can't legitimately pin a
-        // specific anonymous annotation by its blank-node id (those
-        // are minted server-side at insert time). If they really
-        // want to retract an anonymous annotation, they should use
-        // the selector form (no @id) and let the WHERE clause
-        // resolve it.
-        if ann_id.starts_with("_:") {
+        // Reject client-authored blank-node @ids: those are skolemized
+        // fresh at insert time, so they can't pin an existing annotation.
+        // Stable Fluree ids (`_:fdb-...`, obtained from a query) DO denote
+        // the stored node and pass through to the delete template.
+        if ann_id.starts_with("_:") && crate::namespace::stable_blank_node_sid(&ann_id).is_none() {
             return Err(TransactError::UnsupportedFeature(
-                "delete by anonymous annotation @id is not supported — anonymous SIDs \
-                 are minted at insert time and not user-addressable. Use a selector \
-                 form (no @id, body properties only) or attach an explicit @id at insert."
+                "delete by anonymous annotation @id is not supported — client blank-node \
+                 labels are minted fresh at insert time and not user-addressable. Use the \
+                 stable `_:fdb-...` id returned by a query, a selector form (no @id, body \
+                 properties only), or attach an explicit @id at insert."
                     .to_string(),
             ));
         }

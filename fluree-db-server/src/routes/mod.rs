@@ -8,6 +8,7 @@ mod events;
 mod export;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+mod iceberg_ssrf;
 mod import;
 mod ledger;
 mod log;
@@ -16,12 +17,15 @@ mod pack;
 mod policy_auth;
 mod push;
 pub(crate) mod query;
+pub(crate) mod serving;
 mod show;
 mod storage_proxy;
 mod stream_query;
 mod stubs;
 mod submissions;
 mod transact;
+#[cfg(feature = "shacl")]
+mod validate;
 
 use crate::state::AppState;
 use axum::{
@@ -124,6 +128,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Status of a negotiated upload — reads this node's
         // `state.import_jobs` map (each node owns the jobs it minted).
         .route("/import-upload/:import_id", get(import::import_status));
+
+    // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
+    // connection carries a secret in the body) but they mutate nothing and
+    // create no graph source, so they sit in the reads block (no leader-forward).
+    #[cfg(feature = "iceberg")]
+    let v1_admin_protected_reads = v1_admin_protected_reads
+        .route(
+            "/iceberg/catalog/browse",
+            post(iceberg::iceberg_catalog_browse),
+        )
+        .route(
+            "/iceberg/catalog/preview",
+            post(iceberg::iceberg_catalog_preview),
+        )
+        .route(
+            "/iceberg/r2rml/generate",
+            post(iceberg::iceberg_r2rml_generate),
+        )
+        .route(
+            "/iceberg/r2rml/validate",
+            post(iceberg::iceberg_r2rml_validate),
+        );
 
     let v1_admin_protected_reads = v1_admin_protected_reads
         .layer(middleware::from_fn_with_state(
@@ -260,6 +286,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Stub endpoints (not yet implemented)
         .route("/subscribe", get(stubs::subscribe))
         .route("/remote/:path", get(stubs::remote).post(stubs::remote));
+
+    // Vended S3 credentials (absent without the aws feature → 404)
+    #[cfg(feature = "aws")]
+    let v1 = v1.route(
+        "/storage/credentials",
+        get(storage_proxy::get_vended_credentials),
+    );
+
+    // SHACL validation report (read endpoint; see routes/validate.rs)
+    #[cfg(feature = "shacl")]
+    let v1 = v1.route(
+        "/validate/*ledger",
+        get(validate::validate_ledger_tail).post(validate::validate_ledger_tail),
+    );
 
     let mut router = Router::new()
         // Health check

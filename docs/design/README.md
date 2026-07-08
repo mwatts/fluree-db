@@ -20,6 +20,10 @@ Design of the nameservice schema: ledger records, graph source records, configur
 
 How ContentId (CIDv1) values decouple the commit chain from storage backends, enabling replication across filesystem, S3, and IPFS. Includes the pack protocol wire format for efficient bulk transfer.
 
+### [Remote mounts and serving tiers](remote-mounts.md)
+
+How a Fluree server exposes ledgers to other instances (query tier vs raw-block tier, per-ledger `f:servingDefaults` posture, token scoping) and how a consumer mounts a remote's ledgers read-only under an alias prefix: `CompositeNameService`, `StorageBackend::Routed`, `ProxyStorage` raw/filtered modes, and the CID-verified cache-forever integrity model.
+
 ### [ContentId and ContentStore](content-id-and-contentstore.md)
 
 The content-addressed identity layer: `ContentId` type, `ContentStore` trait, multicodec content kinds, and the bridge between CID-based identity and storage-backend addressing.

@@ -90,16 +90,32 @@ impl ExecutableQuery {
         Self { query, reasoning }
     }
 
-    /// True if any pattern in this query calls `fulltext(...)`.
+    /// True if any expression in this query calls `fulltext(...)`.
     ///
     /// The query-context setup code checks this before allocating the
     /// per-graph fulltext arena map and resolving the English `lang_id`,
     /// skipping that work for queries that don't use full-text scoring.
+    ///
+    /// Covers WHERE patterns plus the expression positions outside them:
+    /// ORDER BY expression binds, post-aggregation binds, and HAVING.
+    /// (Aggregate inputs are variables only — expression arguments lower
+    /// to synthetic binds inside `patterns` first.)
     pub fn uses_fulltext(&self) -> bool {
+        let target = crate::ir::Function::Fulltext;
         self.query
             .patterns
             .iter()
-            .any(|p| p.contains_function(&crate::ir::Function::Fulltext))
+            .any(|p| p.contains_function(&target))
+            || self
+                .query
+                .order_binds
+                .iter()
+                .any(|(_, expr)| expr.contains_function(&target))
+            || self.query.grouping.as_ref().is_some_and(|g| {
+                g.aggregation()
+                    .is_some_and(|a| a.binds.iter().any(|(_, e)| e.contains_function(&target)))
+                    || g.having().is_some_and(|h| h.contains_function(&target))
+            })
     }
 }
 
@@ -740,6 +756,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         .map(|o| o as &dyn fluree_db_core::OverlayProvider)
         .unwrap_or(db.overlay);
 
+    // Dataset execution scans through per-graph `GraphRef`s, not the
+    // top-level context overlay — splice the derived-facts overlay into
+    // every ref matching the primary execution view, or datalog / OWL2-RL
+    // derived facts are invisible to dataset queries.
+    let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
+        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
+            db.snapshot.ledger_id.as_str(),
+            db.g_id,
+            db.t,
+            effective_overlay,
+        )),
+        _ => None,
+    };
+
     let mut ctx = ExecutionContext::with_time_and_overlay(
         db.snapshot,
         vars,
@@ -782,7 +812,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);
     }
-    if let Some(dataset) = config.dataset {
+    if let Some(dataset) = patched_dataset.as_ref().or(config.dataset) {
         ctx = ctx.with_dataset(dataset);
     }
     if let Some((r2rml_provider, r2rml_table_provider)) = config.r2rml {

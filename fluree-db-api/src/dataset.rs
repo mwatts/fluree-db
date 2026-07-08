@@ -435,8 +435,14 @@ pub enum TimeSpec {
     AtT(i64),
     /// At a specific commit hash
     AtCommit(String),
-    /// At a specific ISO 8601 timestamp
+    /// At a specific ISO 8601 timestamp, resolved against commit *event
+    /// time* (`db:time` — user-suppliable for backdated historical loads)
     AtTime(String),
+    /// At a specific ISO 8601 timestamp, resolved against the wall-clock
+    /// time commits were *recorded* (`db:receivedAt`, audit axis).
+    /// Identical to `AtTime` on ledgers that never used caller-supplied
+    /// event times.
+    AtRecorded(String),
     /// "latest" keyword - resolves to current ledger t
     Latest,
 }
@@ -455,6 +461,11 @@ impl TimeSpec {
     /// Create at-time specification
     pub fn at_time(time: impl Into<String>) -> Self {
         Self::AtTime(time.into())
+    }
+
+    /// Create at-recorded specification (audit axis)
+    pub fn at_recorded(time: impl Into<String>) -> Self {
+        Self::AtRecorded(time.into())
     }
 
     /// Create latest specification
@@ -905,6 +916,7 @@ fn parse_ledger_id_time_travel(
         LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
         LedgerIdTimeSpec::AtIso(value) => TimeSpec::AtTime(value),
         LedgerIdTimeSpec::AtCommit(value) => TimeSpec::AtCommit(value),
+        LedgerIdTimeSpec::AtRecorded(value) => TimeSpec::AtRecorded(value),
     });
 
     Ok((format!("{identifier}{fragment_suffix}"), time_spec))
@@ -994,6 +1006,8 @@ fn parse_named_graph_object(
             if let Some(at_str) = at_val.as_str() {
                 if let Some(commit_hash) = at_str.strip_prefix("commit:") {
                     source.time_spec = Some(TimeSpec::AtCommit(commit_hash.to_string()));
+                } else if let Some(recorded) = at_str.strip_prefix("recorded:") {
+                    source.time_spec = Some(TimeSpec::AtRecorded(recorded.to_string()));
                 } else {
                     source.time_spec = Some(TimeSpec::AtTime(at_str.to_string()));
                 }
@@ -1072,9 +1086,12 @@ fn parse_single_graph_source(
                 }
             } else if let Some(at_val) = obj.get("at") {
                 if let Some(at_str) = at_val.as_str() {
-                    // Determine if it's a commit hash or timestamp
+                    // Determine if it's a commit hash, recorded-axis
+                    // timestamp, or event-time timestamp
                     if let Some(commit_hash) = at_str.strip_prefix("commit:") {
                         source.time_spec = Some(TimeSpec::AtCommit(commit_hash.to_string()));
+                    } else if let Some(recorded) = at_str.strip_prefix("recorded:") {
+                        source.time_spec = Some(TimeSpec::AtRecorded(recorded.to_string()));
                     } else {
                         // Assume ISO timestamp
                         source.time_spec = Some(TimeSpec::AtTime(at_str.to_string()));

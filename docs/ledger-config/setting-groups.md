@@ -38,6 +38,8 @@ Controls default policy enforcement behavior.
 
 When `f:policySource` is set, the policy loader scans the specified graph for policy rules instead of the default graph. This keeps policy rules separate from end-user data. If `f:policySource` is not set, policies are loaded from the default graph (backward compatible).
 
+`f:policySource` and the policy defaults are honored on **both reads and writes**: queries load view rules from the configured graph, and transactions load `f:modify` rules from the same graph before staging. Config-declared `f:policyClass` / `f:defaultAllow` defaults apply to transactions even when the request itself carries no policy inputs — an operator who relocates policy into a named graph (or a model ledger) gets the same enforcement on writes as on reads.
+
 **Cross-ledger references are supported on `f:policySource`.** The graph source can name another ledger via `f:ledger`, so a single model ledger can hold policy rules that govern many data ledgers. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the configuration pattern and the contract on `f:policyClass` filtering, baseline `f:AccessPolicy` semantics, and the failure modes.
 
 **Not yet honored on `f:policySource`** (parsed by the config layer but rejected at request time with a clear error): `f:atT` temporal pinning, `f:trustPolicy` verification, `f:rollbackGuard` freshness constraints. Cross-ledger references are also supported on `f:constraintsSource`, `f:schemaSource` (single graph only — transitive `owl:imports` recursion across ledgers is not yet supported), `f:shapesSource`, and `f:rulesSource`. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the end-to-end configuration patterns and failure modes shared by all five subsystems.
@@ -125,7 +127,7 @@ Controls OWL/RDFS reasoning applied at query time.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `f:reasoningModes` | IRI or list | (none) | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog` |
+| `f:reasoningModes` | IRI, string, or list | (none) | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog`. Accepts repeated IRI objects (`f:reasoningModes f:rdfs, f:datalog`), string literals (`"rdfs"`), or an RDF collection of either (`( "rdfs" "datalog" )`); mode names are case-insensitive |
 | `f:schemaSource` | `f:GraphRef` | (none) | Graph containing schema triples (`rdfs:subClassOf`, etc.) |
 | `f:reasoningMaxFacts` | integer | 1,000,000 | OWL2-RL materialization budget: max derived facts before the closure is capped |
 | `f:reasoningMaxSeconds` | integer | 30 | OWL2-RL materialization budget: max wall-clock seconds before the closure is capped |
@@ -360,6 +362,29 @@ and how configured properties interact with `@fulltext`-datatype values.
 Some settings are structurally tied to the ledger as a whole and are **not meaningful per-graph**. They live exclusively on `f:LedgerConfig` and are ignored if present on `f:GraphConfig`.
 
 Override control does not apply to ledger-scoped settings — they are changed only by writing to the config graph.
+
+### `f:servingDefaults` — serving posture
+
+Declares which serving tiers the ledger's **origin server** offers to callers. Fields (all optional; absent means allowed):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `f:serveQuery` | boolean | Origin executes queries for this ledger (`false` → query endpoints return 403 with a stable message) |
+| `f:serveBlocks` | boolean | Origin serves raw replication content — storage-proxy blocks/objects, commit blobs, pack streams (`false` → those endpoints return 404) |
+| `f:publicVisibility` | boolean | Ledger is discoverable/readable without a token (default `false`; reserved for the anonymous access tier) |
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main>    a f:LedgerConfig ;
+                      f:servingDefaults <urn:cfg:serving> .
+    <urn:cfg:serving> f:serveQuery  false ;
+                      f:serveBlocks true .
+}
+```
+
+The example above is the "bring your own compute" posture: consumers fetch index blocks and execute queries client-side (peer mode); the origin refuses to spend query compute.
+
+Serving gates bind **only the origin's serving surface** (transaction-role servers). A read-only peer or a consumer that mounts the ledger's blocks always queries its own copy freely — the posture travels with the config graph but is deliberately not enforced on replicas, since restricting what a holder of the full blocks does locally is not enforceable anyway. Peers negotiate the mode via the `serving` field on nameservice record responses (see [Query peers](../operations/query-peers.md)).
 
 > **Note:** `f:authzSource` (an identity/relationship graph used by policy evaluation) is planned as a ledger-scoped setting but is not yet implemented. When available, it will let the config graph specify which graph contains identity data (e.g., DID→role mappings) for policy resolution.
 

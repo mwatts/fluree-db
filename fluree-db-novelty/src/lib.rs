@@ -49,8 +49,10 @@ pub use commit::{
     CommitEnvelope, CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES,
     MAX_TXN_META_ENTRIES,
 };
-pub use commit_flakes::{generate_commit_flakes, stamp_graph_on_commit_flakes};
-pub use delta::compute_delta_keys;
+pub use commit_flakes::{
+    generate_commit_flakes, iso_to_epoch_ms_opt, stamp_graph_on_commit_flakes,
+};
+pub use delta::{compute_delta_keys, compute_delta_keys_and_changes, NetChangeAccumulator};
 pub use error::{NoveltyError, Result};
 pub use fluree_db_core::commit::codec::envelope::{MAX_GRAPH_DELTA_ENTRIES, MAX_GRAPH_IRI_LENGTH};
 pub use fluree_db_core::commit::codec::format::{CommitSignature, ALGO_ED25519};
@@ -63,7 +65,7 @@ pub use runtime_stats::{
 pub use stats::current_stats;
 
 use fact_state::NoveltyFactState;
-use fluree_db_core::{Flake, GraphId, IndexType, Sid};
+use fluree_db_core::{Flake, GraphId, IndexType, Sid, CONFIG_GRAPH_ID};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -475,6 +477,34 @@ pub struct Novelty {
 
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
+    /// Globally-unique content-version stamp (see
+    /// [`OverlayProvider::content_version`]): refreshed from a process-wide
+    /// counter on every content mutation, so no two novelty states with
+    /// different flake content ever share a version — across instances,
+    /// clones, and ledgers. Clones share the version until one mutates,
+    /// which is exactly right: identical content, identical key. `0` means
+    /// "empty since construction" (all empty overlays are equivalent).
+    content_version: u64,
+    /// Epoch for the RDFS schema-hierarchy cache — bumped only when a commit
+    /// asserts or retracts `rdfs:subClassOf` / `rdfs:subPropertyOf`, so the
+    /// shared hierarchy cache stays current without any work on the (vastly
+    /// more common) commits that don't touch the schema.
+    pub schema_epoch: u64,
+    /// Epoch for the compiled-SHACL cache — bumped only when a commit
+    /// asserts or retracts SHACL vocabulary (any `sh:*` predicate, or an
+    /// `rdf:type` edge to a SHACL / class type). Lets transaction
+    /// enforcement reuse the previously compiled shapes when nothing
+    /// shape-affecting changed.
+    pub shacl_epoch: u64,
+
+    /// Highest `commit_t` at which the ledger config graph (`CONFIG_GRAPH_ID`)
+    /// received a write. Monotonic within a novelty window; resets to 0 when
+    /// novelty is rebuilt (e.g. reindex) — a downward reset only forces a
+    /// re-resolve, never a stale read. Used as the fail-safe invalidation key
+    /// for the resolved-config cache on `LedgerHandle`: config content at head
+    /// is fully determined by this marker, so a matching marker guarantees the
+    /// cached config is current. Stays 0 for ledgers that never write config.
+    pub config_write_t: i64,
 
     /// Edge-annotation attachment overlay (M1 — derived from the
     /// `f:reifies*` system flakes flowing through the same pipeline).
@@ -488,6 +518,10 @@ pub struct Novelty {
     fact_state: NoveltyFactState,
 }
 
+/// Process-wide counter backing [`Novelty::content_version`]. Starts at 1 so
+/// `0` uniquely means "empty since construction".
+static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
@@ -497,6 +531,10 @@ impl Novelty {
             flake_count: 0,
             t,
             epoch: 0,
+            content_version: 0,
+            schema_epoch: 0,
+            shacl_epoch: 0,
+            config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
@@ -513,6 +551,15 @@ impl Novelty {
                 NoveltyError::InvalidGraph(format!("flake references unknown graph Sid: {g_sid}"))
             }),
         }
+    }
+
+    /// Stamp a fresh globally-unique content version. Pair with every
+    /// `epoch += 1`: `epoch` drives lineage-local cache invalidation, while
+    /// the content version keys cross-instance caches (see
+    /// [`OverlayProvider::content_version`]).
+    fn refresh_content_version(&mut self) {
+        self.content_version =
+            NEXT_CONTENT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.
@@ -644,6 +691,7 @@ impl Novelty {
         if merges > 0 {
             self.recompute_totals();
             self.epoch += 1;
+            self.refresh_content_version();
         }
         merges
     }
@@ -800,6 +848,13 @@ impl Novelty {
         // From here on every step is infallible.
         self.t = self.t.max(commit_t);
         self.epoch += 1; // Bump epoch once per commit
+        self.refresh_content_version();
+
+        // Advance the config-graph write marker so the resolved-config cache
+        // (see `LedgerHandle`) invalidates iff this commit touched config.
+        if checked.contains(&CONFIG_GRAPH_ID) {
+            self.config_write_t = self.config_write_t.max(commit_t);
+        }
 
         // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m) is
         // already **currently asserted** in this graph's novelty window. This
@@ -814,6 +869,8 @@ impl Novelty {
         // reserved-predicate test is a single SID compare — negligible even on
         // ledgers that never use annotations.
         let mut accepted_reifies: Vec<Flake> = Vec::new();
+        let mut schema_touched = false;
+        let mut shacl_touched = false;
         for (flake, g_id) in routed {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
@@ -822,7 +879,18 @@ impl Novelty {
             if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
                 accepted_reifies.push(flake.clone());
             }
+            // Asserting OR retracting a hierarchy edge changes the RDFS
+            // schema — invalidate the shared hierarchy cache. Likewise any
+            // SHACL-vocabulary flake invalidates the compiled-shapes cache.
+            schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
+            shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
             per_graph.entry(g_id).or_default().push(flake);
+        }
+        if schema_touched {
+            self.schema_epoch += 1;
+        }
+        if shacl_touched {
+            self.shacl_epoch += 1;
         }
 
         // Record every kept flake (assert + retract) into the current-state
@@ -910,6 +978,12 @@ impl Novelty {
             total_flakes += flakes.len();
             for flake in flakes {
                 let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+                if fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p) {
+                    self.schema_epoch += 1;
+                }
+                if fluree_db_core::namespaces::is_shacl_affecting_flake(&flake) {
+                    self.shacl_epoch += 1;
+                }
                 per_graph.entry(g_id).or_default().push(flake);
             }
         }
@@ -917,6 +991,7 @@ impl Novelty {
         if per_graph.is_empty() {
             self.t = max_t;
             self.epoch += 1;
+            self.refresh_content_version();
             return Ok(());
         }
 
@@ -1006,6 +1081,13 @@ impl Novelty {
             // somehow exceeds the local-index width).
             self.set_graph_segments(g_id, kept, true);
 
+            // Keep the config-graph write marker current on the bulk path too
+            // (mirrors `apply_commit`), so the resolved-config cache invalidates
+            // after a bulk import that writes config.
+            if g_id == CONFIG_GRAPH_ID {
+                self.config_write_t = self.config_write_t.max(max_t);
+            }
+
             // Update attachment overlay after the per-graph batch is committed.
             // Malformed bundles are skipped + warned + counted on
             // `attachments.observed_malformed_bundle_count` (see
@@ -1018,6 +1100,7 @@ impl Novelty {
 
         self.t = max_t;
         self.epoch += 1;
+        self.refresh_content_version();
         self.recompute_totals();
 
         tracing::debug!(
@@ -1092,6 +1175,7 @@ impl Novelty {
         self.fact_state = fs;
 
         self.epoch += 1;
+        self.refresh_content_version();
     }
 
     /// Comparator-ordered k-way merge over one graph's segments for `index` and
@@ -1345,6 +1429,10 @@ impl OverlayProvider for Novelty {
         // compaction rebuild from survivors), so "no live bytes" (`size == 0`)
         // and "no flakes" coincide — just defer to `is_empty()`.
         self.is_empty()
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        Some(self.content_version)
     }
 
     fn for_each_overlay_flake(
@@ -1612,6 +1700,44 @@ mod tests {
         assert_eq!(novelty.t, 1);
         assert_eq!(novelty.epoch, 1); // Epoch bumped once
         assert!(novelty.size > 0);
+    }
+
+    #[test]
+    fn content_version_is_globally_unique_across_divergent_clones() {
+        let mut a = Novelty::new(0);
+        assert_eq!(
+            OverlayProvider::content_version(&a),
+            Some(0),
+            "empty-since-construction novelty reports version 0"
+        );
+
+        let rg = no_graphs();
+        a.apply_commit(vec![make_flake(1, 1, 100, 1, true)], 1, &rg)
+            .unwrap();
+        let v_a1 = OverlayProvider::content_version(&a).unwrap();
+        assert_ne!(v_a1, 0, "mutation stamps a fresh version");
+
+        // A clone shares the version while content is identical.
+        let mut b = a.clone();
+        assert_eq!(OverlayProvider::content_version(&b), Some(v_a1));
+
+        // Divergent mutations from the same base must never share a version
+        // (per-instance `epoch` DOES collide here: both go 1 → 2).
+        a.apply_commit(vec![make_flake(2, 1, 200, 2, true)], 2, &rg)
+            .unwrap();
+        b.apply_commit(vec![make_flake(3, 1, 300, 2, true)], 2, &rg)
+            .unwrap();
+        assert_eq!(a.epoch, b.epoch, "epochs collide across divergent clones");
+        let v_a2 = OverlayProvider::content_version(&a).unwrap();
+        let v_b2 = OverlayProvider::content_version(&b).unwrap();
+        assert_ne!(v_a2, v_b2, "content versions must not collide");
+        assert_ne!(v_a2, v_a1);
+        assert_ne!(v_b2, v_a1);
+
+        // clear_up_to changes content, so it must also refresh the version.
+        let before_clear = OverlayProvider::content_version(&a).unwrap();
+        a.clear_up_to(1);
+        assert_ne!(OverlayProvider::content_version(&a).unwrap(), before_clear);
     }
 
     #[test]
@@ -2164,6 +2290,61 @@ mod tests {
             before,
             "re-assert after compaction must still dedup"
         );
+    }
+
+    // ===== Config-graph write marker (resolved-config cache invalidation) =====
+
+    /// `config_write_t` must advance to `commit_t` exactly when a commit touches
+    /// `CONFIG_GRAPH_ID`, stay put on data-only commits, and never regress. This
+    /// is the fail-safe invalidation key for the resolved-config cache: a
+    /// matching marker proves config is unchanged, and a data-only write can
+    /// never spuriously invalidate (churn) nor a config write fail to (stale).
+    #[test]
+    fn config_write_marker_tracks_only_config_graph() {
+        let cfg_g = Sid::new(9, "config-graph");
+        let mut rg = HashMap::new();
+        rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
+
+        let mut n = Novelty::new(0);
+        assert_eq!(n.config_write_t, 0, "marker starts at 0");
+
+        // Data-only commit (default graph, g = None) must not move the marker.
+        n.apply_commit(vec![make_flake(1, 1, 1, 5, true)], 5, &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 0, "default-graph write leaves marker");
+
+        // A commit touching the config graph advances the marker to commit_t.
+        n.apply_commit(vec![make_graph_flake(2, 1, 1, 7, cfg_g.clone())], 7, &rg)
+            .unwrap();
+        assert_eq!(
+            n.config_write_t, 7,
+            "config write advances marker to commit_t"
+        );
+
+        // A later data-only commit must neither bump nor regress the marker.
+        n.apply_commit(vec![make_flake(3, 1, 1, 9, true)], 9, &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 7, "later data-only write leaves marker");
+    }
+
+    /// The bulk (cold-load) path maintains the same marker as `apply_commit`.
+    #[test]
+    fn config_write_marker_tracks_config_graph_on_bulk() {
+        let cfg_g = Sid::new(9, "config-graph");
+        let mut rg = HashMap::new();
+        rg.insert(cfg_g.clone(), CONFIG_GRAPH_ID);
+
+        let mut n = Novelty::new(0);
+        n.bulk_apply_commits(vec![(vec![make_flake(1, 1, 1, 3, true)], 3)], &rg)
+            .unwrap();
+        assert_eq!(n.config_write_t, 0, "bulk data-only load leaves marker");
+
+        n.bulk_apply_commits(
+            vec![(vec![make_graph_flake(2, 1, 1, 8, cfg_g.clone())], 8)],
+            &rg,
+        )
+        .unwrap();
+        assert_eq!(n.config_write_t, 8, "bulk config load advances marker");
     }
 
     /// A same-`t` assert+retract of one identity must resolve to ABSENT in

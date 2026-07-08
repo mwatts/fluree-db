@@ -257,7 +257,11 @@ pub async fn build_policy_ctx(
     }
     let ledger = fluree.ledger(alias).await?;
     let opts = policy.to_options().map_err(CliError::Usage)?;
-    let ctx = fluree_db_api::build_policy_context(
+    // Config-aware: honors f:policySource (same-ledger named graphs and
+    // cross-ledger model references) and merges config policy defaults,
+    // matching server-side transact enforcement.
+    let ctx = fluree_db_api::build_transact_policy_context(
+        fluree,
         &ledger.snapshot,
         ledger.novelty.as_ref(),
         Some(ledger.novelty.as_ref()),
@@ -265,7 +269,7 @@ pub async fn build_policy_ctx(
         &opts,
     )
     .await?;
-    Ok(Some(ctx))
+    Ok(ctx)
 }
 
 /// Print transaction result from remote server JSON response.

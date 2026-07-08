@@ -274,7 +274,7 @@ impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
             RawObject::GeoPoint { lat, lng } => GeoPointBits::new(lat, lng)
                 .map(FlakeValue::GeoPoint)
                 .ok_or_else(|| parse_err!("geo point", format!("({lat}, {lng})"))),
-            RawObject::Vector(vec) => Ok(FlakeValue::Vector(vec)),
+            RawObject::Vector(vec) => Ok(FlakeValue::Vector(vec.into())),
         }
     }
 }

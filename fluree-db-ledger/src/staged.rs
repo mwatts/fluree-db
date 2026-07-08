@@ -207,6 +207,14 @@ impl StagedLedger {
         &self.base
     }
 
+    /// Get the base ledger state mutably.
+    ///
+    /// Used by the commit path to lazily resolve head temporal metadata
+    /// (`LedgerState::ensure_head_temporal`) before building a commit.
+    pub fn base_mut(&mut self) -> &mut LedgerState {
+        &mut self.base
+    }
+
     /// Consume the view and return the owned base ledger state
     ///
     /// Use this when the staged changes should be discarded (e.g., no-op updates).

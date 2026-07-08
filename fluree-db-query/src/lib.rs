@@ -52,6 +52,7 @@ pub(crate) mod fast_string_fold;
 pub(crate) mod fast_string_prefix_count_all;
 pub(crate) mod fast_sum_strlen_group_concat;
 pub(crate) mod fast_union_star_count_all;
+pub(crate) mod fast_vector_topk;
 pub mod filter;
 pub(crate) mod filter_fold;
 pub mod geo_rewrite;

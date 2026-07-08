@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_event_time.rs"]
+mod it_event_time;
 #[path = "it_query_history_combinations.rs"]
 mod it_query_history_combinations;
 #[path = "it_query_history_range.rs"]

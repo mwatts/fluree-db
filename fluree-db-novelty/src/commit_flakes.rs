@@ -41,13 +41,18 @@ pub fn stamp_graph_on_commit_flakes(flakes: &mut [Flake], graph_sid: &Sid) {
     }
 }
 
+/// Parse ISO-8601 timestamp to epoch milliseconds.
+pub fn iso_to_epoch_ms_opt(iso: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// Parse ISO-8601 timestamp to epoch milliseconds
 ///
 /// Falls back to 0 if parsing fails.
 fn iso_to_epoch_ms(iso: &str) -> i64 {
-    DateTime::parse_from_rfc3339(iso)
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0)
+    iso_to_epoch_ms_opt(iso).unwrap_or(0)
 }
 
 /// Generate commit metadata flakes for a commit.

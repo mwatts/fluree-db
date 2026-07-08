@@ -321,6 +321,16 @@ async fn resolve_history_endpoint_t(
             )
             .await
         }
+        dataset::TimeSpec::AtRecorded(iso) => {
+            let target_epoch_ms = time_resolve::iso_to_target_epoch_ms(iso)?;
+            time_resolve::recorded_to_t(
+                &ledger.snapshot,
+                Some(ledger.novelty.as_ref()),
+                target_epoch_ms,
+                latest_t,
+            )
+            .await
+        }
         dataset::TimeSpec::AtCommit(commit_prefix) => {
             time_resolve::commit_to_t(
                 &ledger.snapshot,
@@ -338,6 +348,7 @@ fn convert_time_spec(ts: &dataset::TimeSpec) -> Result<crate::TimeSpec> {
     match ts {
         dataset::TimeSpec::AtT(t) => Ok(crate::TimeSpec::AtT(*t)),
         dataset::TimeSpec::AtTime(iso) => Ok(crate::TimeSpec::AtTime(iso.clone())),
+        dataset::TimeSpec::AtRecorded(iso) => Ok(crate::TimeSpec::AtRecorded(iso.clone())),
         dataset::TimeSpec::AtCommit(sha) => Ok(crate::TimeSpec::AtCommit(sha.clone())),
         dataset::TimeSpec::Latest => Ok(crate::TimeSpec::Latest),
     }

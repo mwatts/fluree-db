@@ -24,6 +24,7 @@ mod event_bus;
 pub mod file;
 pub mod ledger_config;
 pub mod memory;
+pub mod mount;
 mod notifying;
 pub(crate) mod ns_format;
 pub mod storage_ns;

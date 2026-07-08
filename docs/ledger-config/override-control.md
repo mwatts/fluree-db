@@ -110,12 +110,12 @@ For each setting group independently:
 
 | Ledger-wide | Per-graph | Query (identity) | Effective | Why |
 |-------------|-----------|-------------------|-----------|-----|
-| `modes: [rdfs]`, OverrideNone | (none) | `reasoning: [owl2-rl]` (any) | **rdfs** | No overrides |
-| `modes: [rdfs]`, OverrideAll | (none) | `reasoning: [owl2-rl]` (any) | **owl2-rl** | Override allowed |
-| `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2-rl]` (alice) | **owl2-rl** | Alice authorized |
-| `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2-rl]` (bob) | **rdfs** | Bob not authorized |
-| `modes: [rdfs]`, OverrideAll | `modes: [owl2-rl]` | (none) | **owl2-rl** | Per-graph overrides |
-| `modes: [rdfs]`, OverrideNone | `modes: [owl2-rl]` | (none) | **rdfs** | OverrideNone blocks per-graph |
+| `modes: [rdfs]`, OverrideNone | (none) | `reasoning: [owl2rl]` (any) | **rdfs** | No overrides |
+| `modes: [rdfs]`, OverrideAll | (none) | `reasoning: [owl2rl]` (any) | **owl2rl** | Override allowed |
+| `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2rl]` (alice) | **owl2rl** | Alice authorized |
+| `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2rl]` (bob) | **rdfs** | Bob not authorized |
+| `modes: [rdfs]`, OverrideAll | `modes: [owl2rl]` | (none) | **owl2rl** | Per-graph overrides |
+| `modes: [rdfs]`, OverrideNone | `modes: [owl2rl]` | (none) | **rdfs** | OverrideNone blocks per-graph |
 
 ### SHACL (`f:shaclDefaults`)
 

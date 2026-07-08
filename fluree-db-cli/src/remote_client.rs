@@ -2132,7 +2132,7 @@ impl RemoteLedgerClient {
 
     /// Read-only merge preview between two branches on the remote server.
     ///
-    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=`.
+    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=&include_changes=&max_changes=&changes_after_subject=`.
     /// The ledger path segment is URL-encoded (via [`op_url`](Self::op_url))
     /// so names containing spaces, `?`, `#`, `%`, etc. produce well-formed URLs.
     #[allow(clippy::too_many_arguments)]
@@ -2146,6 +2146,9 @@ impl RemoteLedgerClient {
         include_conflicts: Option<bool>,
         include_conflict_details: Option<bool>,
         strategy: Option<&str>,
+        include_changes: Option<bool>,
+        max_changes: Option<usize>,
+        changes_after_subject: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("merge-preview", ledger);
         let mut sep = '?';
@@ -2193,6 +2196,20 @@ impl RemoteLedgerClient {
                 &mut sep,
                 "strategy",
                 urlencoding::encode(s).into_owned(),
+            );
+        }
+        if let Some(b) = include_changes {
+            push(&mut url, &mut sep, "include_changes", b.to_string());
+        }
+        if let Some(n) = max_changes {
+            push(&mut url, &mut sep, "max_changes", n.to_string());
+        }
+        if let Some(c) = changes_after_subject {
+            push(
+                &mut url,
+                &mut sep,
+                "changes_after_subject",
+                urlencoding::encode(c).into_owned(),
             );
         }
 

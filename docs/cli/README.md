@@ -59,6 +59,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |
 | [`query`](query.md) | Query a ledger |
+| [`validate`](validate.md) | Validate data against SHACL shapes (report) |
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |
 | [`log`](log.md) | Show commit log |
@@ -148,7 +149,9 @@ Input is resolved in this priority order: `-e` flag > positional inline > `-f` f
 The CLI auto-detects data format based on content:
 - Lines starting with `@prefix` or `@base` → Turtle
 - Content starting with `{` or `[` → JSON-LD
+- Leading `MATCH`/`MERGE`/`CREATE (`/`DETACH`, or a `.cypher`/`.cyp`/`.cql` file → Cypher
+- SPARQL query/update keywords (`SELECT`/`INSERT`/`DELETE`/`PREFIX`) → SPARQL
 - Files with `.ttl` extension → Turtle
 - Files with `.json` or `.jsonld` extension → JSON-LD
 
-You can override with `--format turtle` or `--format jsonld`.
+You can override with `--format turtle`, `--format jsonld`, `--format sparql`, or `--format cypher` (see the per-command docs for the exact set each accepts).

@@ -125,6 +125,7 @@ pub async fn build_policy_context_from_opts(
         opts,
         policy_graphs,
         None,
+        None,
     )
     .await
 }
@@ -134,18 +135,52 @@ pub async fn build_policy_context_from_opts(
 /// `cross_ledger_restrictions` is a pre-materialized list produced
 /// against a model ledger by the cross-ledger resolver and
 /// translated into D's term space via
-/// `fluree_db_policy::wire_to_restrictions` (with D's configured
-/// `policy_class` set already applied as a filter). When supplied,
-/// the local same-ledger policy load (`load_policies_by_class` /
-/// `parse_inline_policy`) is bypassed for the class / inline-policy
-/// branch — those restrictions are used as-is. Identity loading and
-/// `?$identity` binding still run locally against D per the
-/// identity contract in the design doc.
+/// `fluree_db_policy::wire_to_restrictions` (with the policy-class
+/// filter chain already applied). When supplied, the local
+/// same-ledger policy load (`load_policies_by_identity` /
+/// `load_policies_by_class` / `parse_inline_policy`) is bypassed
+/// for rule selection — those restrictions are used as-is, plus any
+/// inline `opts.policy` merge.
 ///
-/// `policy_graphs` is still consulted for the identity-mode path
-/// (`opts.identity` set) because identity binding always resolves
+/// Identity contract: `opts.identity` is **bind-only** under
+/// cross-ledger. It resolves against D to populate `?$identity` for
+/// f:query rules; it never selects rules (same-ledger identity-mode
+/// consults the identity's D-local `f:policyClass` triples — those
+/// are intentionally ignored here because a cross-ledger
+/// `f:policySource` declares M the policy authority).
+///
+/// `policy_graphs` is still consulted for the identity binding's
+/// subject-existence check because identity binding always resolves
 /// against the data ledger; cross-ledger never contributes identity
 /// records.
+/// [`build_policy_context_from_opts`] plus a pre-resolved cross-ledger
+/// ontology bundle (`f:reasoningDefaults` / `f:schemaSource` with
+/// `f:ledger`): the model ledger's subclass/subproperty edges merge into the
+/// policy entailment hierarchy. Policies themselves remain same-ledger.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_policy_context_from_opts_with_schema(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &GovernanceOptions,
+    policy_graphs: &[fluree_db_core::GraphId],
+    cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
+) -> Result<PolicyContext> {
+    build_policy_context_from_opts_inner(
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        opts,
+        policy_graphs,
+        None,
+        cross_ledger_schema,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn build_policy_context_from_opts_with_cross_ledger(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -154,6 +189,7 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
     opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Vec<PolicyRestriction>,
+    cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
     build_policy_context_from_opts_inner(
         snapshot,
@@ -163,10 +199,12 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
         opts,
         policy_graphs,
         Some(cross_ledger_restrictions),
+        cross_ledger_schema,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_policy_context_from_opts_inner(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -175,7 +213,15 @@ async fn build_policy_context_from_opts_inner(
     opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
+    cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
+    // A cross-ledger `f:policySource` is only ever passed here when configured,
+    // so its presence — even with an empty restriction set — means policy
+    // governs this request. It must count as an explicit policy input so a
+    // policy class that selects zero model-ledger rules cannot collapse to a
+    // root (unrestricted) context; `default_allow` governs instead.
+    let has_cross_ledger_source = cross_ledger_restrictions.is_some();
+
     struct PolicyStatsLookup<'a> {
         overlay: &'a dyn fluree_db_core::OverlayProvider,
     }
@@ -204,14 +250,60 @@ async fn build_policy_context_from_opts_inner(
 
     // Load policies and resolve identity SID.
     //
-    // When opts.identity is set, load_policies_by_identity returns a three-state enum
-    // distinguishing identity-not-in-ledger, identity-exists-with-no-policies, and
-    // identity-exists-with-policies. The distinction matters for binding `?$identity`
-    // in policy_values (only possible when we have a concrete SID), not for gating
-    // access — `opts.default_allow` governs in all three cases.
+    // When opts.identity is set (same-ledger), load_policies_by_identity returns a
+    // three-state enum distinguishing identity-not-in-ledger,
+    // identity-exists-with-no-policies, and identity-exists-with-policies. The
+    // distinction matters for binding `?$identity` in policy_values (only possible
+    // when we have a concrete SID), not for gating access — `opts.default_allow`
+    // governs in all three cases.
     //
-    // Priority: identity > policy_class > policy > policy_values["?$identity"]
-    let (identity_sid, restrictions) = if let Some(identity_iri) = &opts.identity {
+    // Priority: cross-ledger restrictions > identity > policy_class > policy >
+    // policy_values["?$identity"]
+    let (identity_sid, restrictions) = if let Some(mut merged) = cross_ledger_restrictions {
+        // Cross-ledger short-circuit: the resolver already materialized
+        // restrictions from the model ledger, filtered by the policy-class
+        // chain. Rule selection is complete before this function runs.
+        //
+        // Identity contract: an identity on the request is BIND-ONLY here.
+        // It resolves against the data ledger to populate `?$identity` for
+        // f:query rules — it never selects rules the way same-ledger
+        // identity-mode does (via the identity's f:policyClass triples in
+        // D). Those D-local triples are intentionally not consulted: a
+        // cross-ledger f:policySource declares M the policy authority.
+        // An identity with no subject node in D yields an unbound
+        // `?$identity` (f:query rules referencing it won't match), same as
+        // identity-mode's NotFound.
+        //
+        // opts.policy (inline JSON-LD) still applies and gets merged below.
+        // Moving — not cloning — the owned input keeps model-ledger policy
+        // sets (which can be large: each `PolicyRestriction` carries
+        // strings + hash sets) from paying a per-request copy.
+        let identity_sid = if let Some(identity_iri) = &opts.identity {
+            let resolved =
+                resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
+                    .await?;
+            if let Some(sid) = &resolved {
+                policy_values.insert("?$identity".to_string(), sid.clone());
+            }
+            resolved
+        } else if let Some(sid) = policy_values.get("?$identity") {
+            Some(sid.clone())
+        } else if let Some(pv) = &opts.policy_values {
+            if pv.contains_key("?$identity") {
+                return Err(ApiError::query(
+                    "?$identity provided in policy-values but could not be encoded",
+                ));
+            }
+            None
+        } else {
+            None
+        };
+
+        if let Some(policy_json) = &opts.policy {
+            merged.extend(parse_inline_policy(snapshot, policy_json)?);
+        }
+        (identity_sid, merged)
+    } else if let Some(identity_iri) = &opts.identity {
         match load_policies_by_identity(snapshot, overlay, to_t, identity_iri, policy_graphs)
             .await?
         {
@@ -248,22 +340,7 @@ async fn build_policy_context_from_opts_inner(
             None
         };
 
-        let restrictions = if let Some(mut merged) = cross_ledger_restrictions {
-            // Cross-ledger short-circuit: the resolver already
-            // materialized restrictions from the model ledger and
-            // (per the identity contract) the wire artifact has been
-            // filtered by opts.policy_class. opts.policy (inline
-            // JSON-LD) still applies and gets merged below.
-            //
-            // Moving — not cloning — the owned input keeps
-            // model-ledger policy sets (which can be large: each
-            // `PolicyRestriction` carries strings + hash sets) from
-            // paying a per-request copy.
-            if let Some(policy_json) = &opts.policy {
-                merged.extend(parse_inline_policy(snapshot, policy_json)?);
-            }
-            merged
-        } else if let Some(classes) = &opts.policy_class {
+        let restrictions = if let Some(classes) = &opts.policy_class {
             load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?
         } else if let Some(policy_json) = &opts.policy {
             parse_inline_policy(snapshot, policy_json)?
@@ -297,8 +374,48 @@ async fn build_policy_context_from_opts_inner(
         snapshot.stats.clone()
     };
 
-    let view_set = build_policy_set(restrictions.clone(), stats.as_ref(), PolicyAction::View);
-    let modify_set = build_policy_set(restrictions, stats.as_ref(), PolicyAction::Modify);
+    // Current RDFS hierarchy (always-on entailment for enforcement): class
+    // policies govern subclass instances, property policies govern
+    // subproperties. Only OnClass/OnProperty restrictions consult it —
+    // identity-only, default-allow, and OnSubject policies don't. Skip the
+    // O(ontology-size) schema clone + sort + scans entirely when nothing can
+    // use it, since this builder runs uncached on every governed query.
+    let needs_hierarchy = restrictions
+        .iter()
+        .any(|r| !r.for_classes.is_empty() || matches!(r.target_mode, TargetMode::OnProperty));
+    let hierarchy = if !needs_hierarchy {
+        None
+    } else {
+        match &cross_ledger_schema {
+            // Cross-ledger ontology: compose the model ledger's schema bundle
+            // over the local overlay so its subclass/subproperty edges merge in.
+            Some(bundle) => {
+                let composed = fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                    overlay,
+                    std::sync::Arc::clone(bundle),
+                );
+                fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, &composed, to_t)
+                    .await
+            }
+            None => {
+                fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, overlay, to_t).await
+            }
+        }
+        .map_err(|e| ApiError::internal(format!("policy hierarchy computation failed: {e}")))?
+    };
+
+    let view_set = build_policy_set(
+        restrictions.clone(),
+        stats.as_ref(),
+        PolicyAction::View,
+        hierarchy.as_ref(),
+    );
+    let modify_set = build_policy_set(
+        restrictions,
+        stats.as_ref(),
+        PolicyAction::Modify,
+        hierarchy.as_ref(),
+    );
 
     // Check if this is a root policy (unrestricted access).
     //
@@ -307,7 +424,8 @@ async fn build_policy_context_from_opts_inner(
     // be false so that `default_allow` (not a blanket bypass) governs access.
     let has_explicit_policy_input = opts.identity.is_some()
         || opts.policy_class.as_ref().is_some_and(|v| !v.is_empty())
-        || opts.policy.is_some();
+        || opts.policy.is_some()
+        || has_cross_ledger_source;
     let is_root = !has_explicit_policy_input
         && view_set.restrictions.is_empty()
         && modify_set.restrictions.is_empty();
@@ -395,6 +513,67 @@ enum IdentityLookupResult {
     },
 }
 
+/// Resolve an identity IRI to a bindable SID **without loading its policies**.
+///
+/// Used under cross-ledger `f:policySource`, where rule selection is
+/// exclusively the wire's policy-class filter and the identity contributes
+/// only the `?$identity` binding. Mirrors identity-mode's three-state
+/// contract for the binding decision: `None` when the IRI is unresolvable or
+/// has no subject node in the searched graphs (identity-mode's `NotFound` —
+/// no binding), `Some(sid)` when the subject exists (with or without
+/// D-local policies, which are intentionally not consulted here).
+async fn resolve_identity_binding_sid(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    to_t: i64,
+    identity_iri: &str,
+    graphs: &[fluree_db_core::GraphId],
+) -> Result<Option<Sid>> {
+    let identity_sid = match resolve_identity_iri_to_sid(snapshot, identity_iri) {
+        Ok(sid) => sid,
+        Err(_) => return Ok(None),
+    };
+
+    if subject_exists_in_graphs(snapshot, overlay, to_t, &identity_sid, graphs).await? {
+        Ok(Some(identity_sid))
+    } else {
+        Ok(None)
+    }
+}
+
+/// True if `subject` appears as the subject of at least one flake in any of
+/// `graphs`. A `SPOT` range capped at one flake — the cheapest existence probe.
+///
+/// Shared by identity binding under cross-ledger policy
+/// ([`resolve_identity_binding_sid`]) and same-ledger identity-mode's
+/// found-no-policies check ([`load_policies_by_identity`]) so the two agree on
+/// what "the identity exists" means (same index, same graph set).
+async fn subject_exists_in_graphs(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    to_t: i64,
+    subject: &Sid,
+    graphs: &[fluree_db_core::GraphId],
+) -> Result<bool> {
+    let range_opts = RangeOptions::default().with_flake_limit(1);
+    for &g_id in graphs {
+        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
+        let exists = db
+            .range_with_opts(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject(subject.clone()),
+                range_opts.clone(),
+            )
+            .await
+            .map_err(|e| ApiError::internal(format!("identity existence check failed: {e}")))?;
+        if !exists.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Look up the policies for `identity_iri` via its `f:policyClass` property.
 ///
 /// Returns an [`IdentityLookupResult`] that distinguishes whether the identity
@@ -462,21 +641,8 @@ async fn load_policies_by_identity(
         // in any of the configured policy graphs. Both the policyClass lookup and this
         // existence check must cover the same set of graphs so that named-graph
         // policy configurations work consistently.
-        let range_opts = RangeOptions::default().with_flake_limit(1);
-        for &g_id in policy_graphs {
-            let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
-            let exists = db
-                .range_with_opts(
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::subject(identity_sid.clone()),
-                    range_opts.clone(),
-                )
-                .await
-                .map_err(|e| ApiError::internal(format!("identity existence check failed: {e}")))?;
-            if !exists.is_empty() {
-                return Ok(IdentityLookupResult::FoundNoPolicies { identity_sid });
-            }
+        if subject_exists_in_graphs(snapshot, overlay, to_t, &identity_sid, policy_graphs).await? {
+            return Ok(IdentityLookupResult::FoundNoPolicies { identity_sid });
         }
         return Ok(IdentityLookupResult::NotFound);
     }

@@ -33,6 +33,16 @@ use fluree_vocab::{db, fluree};
 /// (not imported) to avoid adding a transact → indexer layering inversion;
 /// the two sites are asserted in sync by the debug_assert in emit paths.
 const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
+
+/// System-injected txn-meta predicates that legitimately live in a reserved
+/// namespace: `build_commit` strips any user-supplied claim for these and
+/// injects the system-controlled value (`f:identity` for provenance,
+/// `db:receivedAt` for the dual-stamp audit axis). They must flow through
+/// the resolver like ordinary entries so they stay queryable post-index.
+fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
+    entry.predicate_ns == FLUREE_DB
+        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
+}
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -479,7 +489,8 @@ impl CommitResolver {
         writer: &mut W,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns),
+            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
+                || is_system_txn_meta_entry(entry),
             "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
             entry.predicate_ns
         );
@@ -1990,7 +2001,8 @@ impl SharedResolverState {
         chunk: &mut RebuildChunk,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns),
+            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
+                || is_system_txn_meta_entry(entry),
             "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
             entry.predicate_ns
         );
