@@ -294,26 +294,28 @@ fn untyped_undirected_is_rejected() {
 }
 
 #[test]
-fn bounded_var_length_rel_binding_lowers_unbounded_rejected() {
-    // A BOUNDED `-[r:T*m..n]->` binds `r` to a rel list (lowers OK); the
-    // UNBOUNDED form needs path enumeration the transitive operator lacks
-    // (rejected at lowering).
-    let lower_res = |src: &str| {
+fn var_length_rel_binding_lowers_bounded_and_unbounded() {
+    // A BOUNDED `-[r:T*m..n]->` binds `r` via the fixed-chain expansion; the
+    // UNBOUNDED form binds via Enumerate-mode path search + relationships().
+    let lower = |src: &str| {
         let out = parse_cypher(src);
         assert!(!out.has_errors(), "parse should accept it: {src}");
         let ast = out.ast.unwrap();
         let encoder = ConstEncoder;
         let mut vars = VarRegistry::new();
-        lower_cypher(&ast, &encoder, &mut vars)
+        lower_cypher(&ast, &encoder, &mut vars).unwrap_or_else(|e| panic!("{src}: {e}"))
     };
-    assert!(
-        lower_res("MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b").is_ok(),
-        "bounded var-length rel binding lowers"
-    );
-    assert!(
-        lower_res("MATCH (a:Person)-[r:KNOWS*]->(b) RETURN b").is_err(),
-        "unbounded var-length rel binding is rejected"
-    );
+    lower("MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b");
+    let q = lower("MATCH (a:Person)-[r:KNOWS*]->(b) RETURN b");
+    let sp = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::ShortestPath(sp) => Some(sp),
+            _ => None,
+        })
+        .expect("unbounded rel binding lowers to an Enumerate path search");
+    assert_eq!(sp.mode, fluree_db_query::ir::ShortestPathMode::Enumerate);
 }
 
 #[test]
@@ -371,19 +373,24 @@ impl fluree_db_query::parse::encode::IriEncoder for ConstEncoder {
 }
 
 #[test]
-fn plain_fixed_path_value_is_rejected_at_lowering() {
-    // A fixed-length `p = (a)-[:KNOWS]->(b)` now parses (the parser no longer
-    // blocks non-shortestPath path vars), but path binding is only supported for
-    // shortestPath and a single bounded variable-length relationship, so lowering
-    // rejects this shape.
-    let out = parse_cypher("MATCH p = (a)-[:KNOWS]->(b) RETURN p");
-    assert!(!out.has_errors(), "fixed path value now parses");
-    let ast = out.ast.expect("ast");
-    let encoder = NoEncoder;
-    let mut vars = VarRegistry::new();
+fn plain_fixed_path_value_lowers_as_single_hop() {
+    // A fixed-length `p = (a)-[:KNOWS]->(b)` builds a one-hop path value
+    // (treated as `*1..1`); a MULTI-hop path value is still rejected.
+    let lower_res = |src: &str| {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse should accept it: {src}");
+        let ast = out.ast.unwrap();
+        let encoder = ConstEncoder;
+        let mut vars = VarRegistry::new();
+        lower_cypher(&ast, &encoder, &mut vars)
+    };
     assert!(
-        lower_cypher(&ast, &encoder, &mut vars).is_err(),
-        "a fixed-length path binding is rejected at lowering"
+        lower_res("MATCH p = (a:Person)-[:KNOWS]->(b) RETURN p").is_ok(),
+        "single fixed hop path value lowers"
+    );
+    assert!(
+        lower_res("MATCH p = (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN p").is_ok(),
+        "multi-hop fixed path value lowers (MakePathHops)"
     );
 }
 

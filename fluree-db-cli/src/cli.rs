@@ -269,24 +269,28 @@ pub enum Commands {
         /// file, or a directory of .ttl/.nt/.nq/.trig, .jsonld, or
         /// .jsonl/.ndjson files (bulk import, bypasses novelty).
         /// Also accepts `.csv` node/relationship files (neo4j-admin header
-        /// convention) — a single file or a directory of them.
-        /// Any of these may carry a `.gz` or `.zst` suffix and is decoded
-        /// transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
+        /// convention) and `.cypher`/`.cyp`/`.cql` scripts of CREATE /
+        /// MATCH…CREATE statements — a single file or a directory of them.
+        /// Any of the RDF/JSON-LD forms may carry a `.gz` or `.zst` suffix and
+        /// is decoded transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
         /// Files in a directory are processed in lexicographic order.
         #[arg(long)]
         from: Option<PathBuf>,
 
-        /// CSV import: how properties on a relationship (edge) are stored.
-        /// `annotated` (default) keeps them as RDF 1.2 / LPG `@annotation`
-        /// (queryable from Cypher and SPARQL); `plain` drops them for pure RDF;
-        /// `nary` (an intermediate node) is not implemented yet.
+        /// CSV/Cypher import: how properties on a relationship (edge) are
+        /// stored. `annotated` (default) keeps them as RDF 1.2 / LPG
+        /// `@annotation` (queryable from Cypher and SPARQL); `plain` drops
+        /// them for pure RDF; `nary` (an intermediate node) is not
+        /// implemented yet.
         #[arg(long, value_enum, default_value_t = EdgeProperties::Annotated)]
         edge_properties: EdgeProperties,
 
-        /// CSV import: base IRI namespace for minted ids, predicates, and
-        /// classes (e.g. `--base-iri http://ldbc.example/`).
-        #[arg(long, default_value = "http://example.org/")]
-        base_iri: String,
+        /// CSV/Cypher import: base IRI namespace for minted ids, predicates,
+        /// and classes (e.g. `--base-iri http://ldbc.example/`). CSV defaults
+        /// to `http://example.org/`; Cypher defaults to bare names
+        /// (namespace 0), which zero-config Cypher queries read directly.
+        #[arg(long)]
+        base_iri: Option<String>,
 
         /// Import memory history from a git-tracked .fluree-memory/ directory.
         /// Each git commit becomes a Fluree transaction, enabling time-travel
@@ -525,6 +529,54 @@ pub enum Commands {
 
         #[command(flatten)]
         policy: PolicyArgs,
+    },
+
+    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD
+    /// template (the `LOAD CSV` analog).
+    ///
+    /// Reads the CSV locally and streams it to the ledger — local or remote —
+    /// one batch per transaction (one commit each). All cell values are
+    /// strings; cast in the template as needed. An empty cell is `null` for
+    /// `--cypher` and `""` for `--jsonld`.
+    ///
+    /// With `--cypher`, the per-row body rides in `UNWIND $batch AS row …` and
+    /// columns are read as `row.<column>`. With `--jsonld`, the batch is
+    /// injected as the update's `values` clause and columns are bound to
+    /// `?<column>` variables.
+    ///
+    /// Examples:
+    ///   fluree load people --from people.csv \
+    ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
+    ///   fluree load people --from people.csv \
+    ///     --jsonld '{"where":{"@id":"?s","ex:id":"?id"},"insert":{"@id":"?s","ex:name":"?name"}}'
+    Load {
+        /// Ledger name (defaults to the active ledger).
+        ledger: Option<String>,
+
+        /// CSV file to read.
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Per-row Cypher, using `row` (wrapped in `UNWIND $batch AS row …`).
+        #[arg(long, group = "load_template")]
+        cypher: Option<String>,
+
+        /// Per-row JSON-LD update; the batch is injected as its `values`
+        /// clause, binding one `?<column>` variable per CSV column.
+        #[arg(long, group = "load_template")]
+        jsonld: Option<String>,
+
+        /// Rows per transaction (one commit each).
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+
+        /// CSV field delimiter (a single character).
+        #[arg(long, default_value = ",")]
+        field_terminator: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin").
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Query a ledger

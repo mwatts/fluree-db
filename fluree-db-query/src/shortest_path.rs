@@ -769,6 +769,83 @@ impl ShortestPathOperator {
         Ok(results)
     }
 
+    /// Every path from `start` whose hop count lies in `[min_hops, max_hops]`
+    /// under Cypher **relationship-uniqueness** (trail semantics — no edge is
+    /// traversed twice, but a node MAY be revisited via a different edge; this
+    /// matches Neo4j, e.g. the triangle closure `a→b→c→a` is a valid 3-hop
+    /// path). A `Some(end)` filter keeps only paths ending there; `None` emits
+    /// one row per qualifying path to *any* node. An unbounded `max_hops` has no
+    /// depth cap — relationship-uniqueness still makes the search finite (each
+    /// edge is used at most once), and the `max_visited` / `max_paths` guards
+    /// fail loudly (never truncate silently) when a graph is too dense.
+    async fn enumerate_all_paths(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        start: &Sid,
+        end: Option<&Sid>,
+    ) -> Result<Vec<Vec<Sid>>> {
+        let min_hops = self.pattern.min_hops.unwrap_or(1);
+        let max_hops = self.pattern.max_hops;
+        let mut results: Vec<Vec<Sid>> = Vec::new();
+        let mut stack: Vec<Vec<Sid>> = vec![vec![start.clone()]];
+        let mut states: usize = 0;
+
+        while let Some(path) = stack.pop() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            let depth = (path.len() - 1) as u32;
+            let last = path.last().expect("path always carries the start node");
+
+            if depth >= min_hops && end.is_none_or(|e| e == last) {
+                results.push(path.clone());
+                if results.len() >= self.max_paths {
+                    return Err(QueryError::ResourceLimit(format!(
+                        "path enumeration exceeded max paths ({}); narrow the pattern \
+                         (tighter hop bounds, a bound end node, or a specific type)",
+                        self.max_paths
+                    )));
+                }
+            }
+            if max_hops.is_some_and(|m| depth >= m) {
+                continue;
+            }
+            // Cypher relationship-uniqueness (trail): a node may be revisited,
+            // but no edge twice. The only edge this step can add is `last`→`nb`,
+            // so reject exactly that edge if the path already traversed it —
+            // gather the nodes already reached across an edge at `last` (directed:
+            // as the edge's source; undirected: either orientation).
+            let undirected = matches!(self.pattern.direction, PathDirection::Either);
+            let reached_via_last: Vec<Sid> = path
+                .windows(2)
+                .filter_map(|w| {
+                    if w[0] == *last {
+                        Some(w[1].clone())
+                    } else if undirected && w[1] == *last {
+                        Some(w[0].clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for nb in self.neighbors(ctx, last, true).await? {
+                if reached_via_last.contains(&nb) {
+                    continue; // relationship-uniqueness: edge last↔nb already used
+                }
+                states += 1;
+                if states >= self.max_visited {
+                    return Err(QueryError::ResourceLimit(format!(
+                        "path enumeration exceeded max visited nodes ({}); narrow the \
+                         pattern (tighter hop bounds, a bound end node, or a specific type)",
+                        self.max_visited
+                    )));
+                }
+                let mut next = path.clone();
+                next.push(nb);
+                stack.push(next);
+            }
+        }
+        Ok(results)
+    }
+
     /// Process one child row: resolve endpoints, search, build output rows.
     async fn process_row(
         &self,
@@ -788,26 +865,41 @@ impl ShortestPathOperator {
         let start = Self::resolve_endpoint(ctx, &self.pattern.start, start_binding);
         let end = Self::resolve_endpoint(ctx, &self.pattern.end, end_binding);
 
-        // Anchored contract: both endpoints must resolve. If not, emit no row
-        // (a mandatory MATCH drops it; an OPTIONAL wrapper restores it as null).
-        let (Some(start), Some(end)) = (start, end) else {
+        // The start always anchors the search; the shortest modes also anchor
+        // the end. A missing anchor emits no row (a mandatory MATCH drops it;
+        // an OPTIONAL wrapper restores it as null). Enumerate treats a
+        // resolved end as a filter and an unresolved one as "produce it".
+        let Some(start) = start else {
             return Ok(Vec::new());
         };
+        let enumerate = matches!(self.pattern.mode, ShortestPathMode::Enumerate);
+        // The end var (if any), for binding produced ends under Enumerate.
+        let end_var = match &self.pattern.end {
+            Ref::Var(v) => Some(*v),
+            _ => None,
+        };
 
-        let want_all = matches!(self.pattern.mode, ShortestPathMode::All);
-        let paths = if self.pattern.min_hops.unwrap_or(1) > 1 {
-            // A lower hop bound > 1 can require a *longer* path than the plain
-            // shortest one, which distance-finalizing BFS cannot discover (it
-            // pins each node at its minimal distance). Use iterative-deepening
-            // node-distinct search instead.
-            self.bounded_qualifying_paths(ctx, &start, &end, want_all)
-                .await?
-        } else if want_all {
-            self.all_shortest(ctx, &start, &end).await?
+        let paths = if enumerate {
+            self.enumerate_all_paths(ctx, &start, end.as_ref()).await?
         } else {
-            match self.bidirectional(ctx, &start, &end).await? {
-                Some(p) => vec![p],
-                None => Vec::new(),
+            let Some(end) = end else {
+                return Ok(Vec::new());
+            };
+            let want_all = matches!(self.pattern.mode, ShortestPathMode::All);
+            if self.pattern.min_hops.unwrap_or(1) > 1 {
+                // A lower hop bound > 1 can require a *longer* path than the plain
+                // shortest one, which distance-finalizing BFS cannot discover (it
+                // pins each node at its minimal distance). Use iterative-deepening
+                // node-distinct search instead.
+                self.bounded_qualifying_paths(ctx, &start, &end, want_all)
+                    .await?
+            } else if want_all {
+                self.all_shortest(ctx, &start, &end).await?
+            } else {
+                match self.bidirectional(ctx, &start, &end).await? {
+                    Some(p) => vec![p],
+                    None => Vec::new(),
+                }
             }
         };
 
@@ -835,7 +927,19 @@ impl ShortestPathOperator {
                         edges: edges.clone(),
                     });
                 } else if let Some(col) = child_batch.column(*var) {
-                    row.push(col[row_idx].clone());
+                    // Enumerate with an unbound end: bind it from the path's
+                    // final node (a child column may exist but hold Unbound,
+                    // e.g. under an OPTIONAL replay).
+                    if enumerate
+                        && end_var == Some(*var)
+                        && matches!(col[row_idx], Binding::Unbound)
+                    {
+                        row.push(Binding::sid(path.last().expect("non-empty path").clone()));
+                    } else {
+                        row.push(col[row_idx].clone());
+                    }
+                } else if enumerate && end_var == Some(*var) {
+                    row.push(Binding::sid(path.last().expect("non-empty path").clone()));
                 } else {
                     row.push(Binding::Unbound);
                 }
@@ -1308,10 +1412,11 @@ impl Operator for ShortestPathOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        // Anchored: at most one row per input (Single) — All is unbounded.
+        // Anchored: at most one row per input (Single) — All and Enumerate
+        // are unbounded.
         match self.pattern.mode {
             ShortestPathMode::Single => self.child.estimated_rows(),
-            ShortestPathMode::All => None,
+            ShortestPathMode::All | ShortestPathMode::Enumerate => None,
         }
     }
 }

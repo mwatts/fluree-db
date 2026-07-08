@@ -92,6 +92,68 @@ fn lower_with_context<E: IriEncoder>(
             Ok(query)
         }
         Statement::Update(_) => Err(LowerError::WriteOnQueryPath),
+        Statement::Schema(cmd) => match cmd.kind {
+            // Fluree has no user-managed index/constraint catalog: SHOW
+            // answers zero rows (with the shared Neo4j column heads) so
+            // migration tooling iterating the result proceeds cleanly.
+            crate::ast::SchemaCommandKind::ShowSchema => {
+                let q = schema_show_query(cmd.span);
+                stmt::lower_query(ctx, &q)
+            }
+            _ => Err(LowerError::WriteOnQueryPath),
+        },
+        // Procedure shims are resolved at the API layer (they need ledger
+        // stats to answer); by the time lowering runs they have been
+        // rewritten to a constant-rows Query. Reaching here means a caller
+        // skipped that rewrite.
+        Statement::CallProcedure(call) => Err(LowerError::unsupported(format!(
+            "CALL {}() must be resolved against a ledger before lowering",
+            call.name
+        ))),
+    }
+}
+
+/// Zero-row, fixed-column read for `SHOW INDEXES` / `SHOW CONSTRAINTS`:
+/// an empty `InlineRows` over the column set the two SHOW forms share.
+fn schema_show_query(span: crate::span::SourceSpan) -> crate::ast::Query {
+    use crate::ast::{Expr, ProjectionItem, Query, ReadClause, ReturnClause, Variable};
+    let cols = [
+        "id",
+        "name",
+        "type",
+        "entityType",
+        "labelsOrTypes",
+        "properties",
+    ];
+    let vars: Vec<Variable> = cols
+        .iter()
+        .map(|c| Variable {
+            name: (*c).to_string(),
+            span,
+        })
+        .collect();
+    Query {
+        clauses: vec![ReadClause::InlineRows {
+            vars: vars.clone(),
+            rows: Vec::new(),
+        }],
+        return_clause: ReturnClause {
+            items: vars
+                .into_iter()
+                .map(|v| ProjectionItem {
+                    expr: Expr::Var(v),
+                    alias: None,
+                    span,
+                })
+                .collect(),
+            distinct: false,
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+            span,
+        },
+        union_tail: None,
+        span,
     }
 }
 

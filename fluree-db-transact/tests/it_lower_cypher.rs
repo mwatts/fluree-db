@@ -219,10 +219,10 @@ fn deferred_write_shapes_are_rejected() {
     for src in [
         // Bare DELETE n needs a relationship-existence probe.
         "MATCH (n:Person) DELETE n",
-        // MERGE ON MATCH SET needs a complementary EXISTS branch.
+        // MERGE ON MATCH SET needs a complementary EXISTS branch — on the
+        // direct single-Txn lowering it always errors (the API layer resolves
+        // the standalone form as a conditional write before reaching here).
         "MERGE (n:Person {name: \"A\"}) ON MATCH SET n.x = 1",
-        // A property-bearing MERGE relationship needs an annotation-sidecar guard.
-        "MERGE (a:Person {name: \"A\"})-[:KNOWS {since: 2020}]->(b:Person {name: \"B\"})",
         // Undirected MERGE relationship is rejected.
         "MERGE (a:Person {name: \"A\"})-[:KNOWS]-(b:Person {name: \"B\"})",
         // Multi-hop MERGE pattern is deferred.
@@ -253,6 +253,23 @@ fn deferred_write_shapes_are_rejected() {
             r.ok()
         );
     }
+}
+
+#[test]
+fn property_bearing_merge_relationship_guards_on_annotation_sidecar() {
+    // `MERGE (a)-[:T {p: v}]->(b)` matches only edges whose annotation carries
+    // those values: the NOT EXISTS guard must contain an EdgeAnnotation (with
+    // a property body), not a bare base triple.
+    let txn =
+        lower("MERGE (a:Person {name: \"A\"})-[:KNOWS {since: 2020}]->(b:Person {name: \"B\"})");
+    assert_eq!(txn.txn_type, TxnType::Update);
+    let debug = format!("{:?}", txn.where_patterns);
+    assert!(
+        debug.contains("NotExists") && debug.contains("EdgeAnnotation"),
+        "guard: {debug}"
+    );
+    // Create branch fires the endpoints + edge + reifier bundle with props.
+    assert!(!txn.insert_templates.is_empty());
 }
 
 #[test]

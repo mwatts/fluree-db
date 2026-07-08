@@ -555,7 +555,12 @@ impl Worker {
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
             TransactionBody::Cypher { .. } => {
-                staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                let resolved = cypher_txn.expect("cypher_txn is Some for a Cypher body");
+                let staged = staged.txn(resolved.primary);
+                match resolved.followup {
+                    Some(followup) => staged.txn_followup(followup),
+                    None => staged,
+                }
             }
         };
 

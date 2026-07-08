@@ -63,15 +63,35 @@ fn lower_part<E: IriEncoder>(
     // unlabeled but it must participate in a relationship.
     lower_node(ctx, &part.head, out)?;
 
-    // A plain `p = …` path variable (not shortestPath) is supported only for a
-    // single bounded variable-length relationship in v1; that segment builds the
-    // path value. Reject it on other shapes rather than silently leaving p unbound.
+    // A plain `p = …` path variable (not shortestPath) is supported for a
+    // single relationship segment — fixed or variable-length — which builds
+    // the path value. Reject multi-hop shapes rather than silently leaving
+    // p unbound.
     let single_var_length = part.tail.len() == 1 && part.tail[0].0.length.is_some();
-    if part.path_var.is_some() && !single_var_length {
-        return Err(LowerError::unsupported(
-            "a path variable (`p = …`) is supported for shortestPath and a single \
-             bounded variable-length relationship in v1",
-        ));
+    let single_fixed_hop = part.tail.len() == 1 && part.tail[0].0.length.is_none();
+    // A multi-hop chain of fixed single-typed directed hops builds its path
+    // value from the interleaved node refs and per-hop relationship values.
+    if part.path_var.is_some() && !single_var_length && !single_fixed_hop {
+        return lower_multi_hop_path(ctx, part, out);
+    }
+    // `p = (a)-[:T]->(b)`: a fixed hop is a `*1..1` path — reuse the
+    // variable-length machinery to build the path value.
+    if part.path_var.is_some() && single_fixed_hop {
+        let (rel, next) = &part.tail[0];
+        if rel.props.is_some() {
+            return Err(LowerError::unsupported(
+                "a path variable over a property-filtered relationship is deferred — \
+                 filter via WHERE on the relationship variable instead",
+            ));
+        }
+        lower_node(ctx, next, out)?;
+        let mut fixed = rel.clone();
+        fixed.length = Some(crate::ast::LengthRange {
+            min: Some(1),
+            max: Some(1),
+            span: rel.span,
+        });
+        return lower_var_length_rel(ctx, &part.head, &fixed, next, out, part.path_var.as_ref());
     }
 
     let mut prev = part.head.clone();
@@ -429,6 +449,82 @@ fn build_rel_hop<E: IriEncoder>(
     Ok(out)
 }
 
+/// Lower `p = (a)-[:R1]->(b)-[:R2]->(c)` — a multi-hop chain of FIXED
+/// single-typed directed hops — binding `p` via `MakePathHops(node0, rel1,
+/// node1, rel2, node2, …)`. Hops lower as ordinary relationship patterns
+/// first (so labels/props/rel vars behave normally); the path value is a
+/// pure expression over the bound node refs. The caller has already lowered
+/// the head node. Variable-length or undirected segments in a multi-hop
+/// path value stay deferred.
+fn lower_multi_hop_path<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    part: &PatternPart,
+    out: &mut Vec<Pattern>,
+) -> Result<()> {
+    let path_var = part
+        .path_var
+        .as_ref()
+        .expect("caller checked path_var.is_some()");
+    for (rel, _) in &part.tail {
+        if rel.length.is_some() {
+            return Err(LowerError::unsupported(
+                "a variable-length segment inside a multi-hop path value \
+                 (`p = (a)-[:T*]->(b)-[:U]->(c)`) is deferred — bind the segments separately",
+            ));
+        }
+        if rel.types.len() != 1 {
+            return Err(LowerError::unsupported(
+                "multi-hop path values need single-typed hops (`-[:T]->`) in v1",
+            ));
+        }
+        if matches!(rel.direction, Direction::Either) {
+            return Err(LowerError::unsupported(
+                "multi-hop path values need directed hops (`->` or `<-`) in v1",
+            ));
+        }
+    }
+
+    let node_expr = |ctx: &mut LoweringContext<'_, E>, node: &NodePattern| {
+        ref_to_expr(&lookup_node_ref(ctx, node)).ok_or_else(|| {
+            LowerError::unsupported(
+                "an IRI-anchored node in a multi-hop path value is deferred — bind it \
+                 to a variable first",
+            )
+        })
+    };
+
+    let mut args: Vec<Expression> = Vec::with_capacity(part.tail.len() * 2 + 1);
+    args.push(node_expr(ctx, &part.head)?);
+    let mut prev = part.head.clone();
+    for (rel, next) in &part.tail {
+        lower_node(ctx, next, out)?;
+        lower_rel(ctx, &prev, rel, next, out, None)?;
+        let s_ref = lookup_node_ref(ctx, &prev);
+        let o_ref = lookup_node_ref(ctx, next);
+        // Stored edge orientation for the hop's relationship value.
+        let (es, eo) = match rel.direction {
+            Direction::Outgoing => (&s_ref, &o_ref),
+            Direction::Incoming => (&o_ref, &s_ref),
+            Direction::Either => unreachable!("rejected above"),
+        };
+        let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
+        let Some(rel_expr) = make_rel_expr(ctx, &Ref::Iri(type_iri.as_str().into()), es, eo) else {
+            // The type never entered the dictionary — no such edges exist, so
+            // the whole path matches nothing.
+            out.push(empty_path_result(&lookup_node_ref(ctx, &part.head), &o_ref));
+            return Ok(());
+        };
+        args.push(rel_expr);
+        args.push(node_expr(ctx, next)?);
+        prev = next.clone();
+    }
+    out.push(Pattern::Bind {
+        var: ctx.intern_var(&path_var.name),
+        expr: Expression::call(Function::MakePathHops, args),
+    });
+    Ok(())
+}
+
 /// `MakeRel(start, pred, end)` for a value-only relationship variable, or
 /// `None` when a term isn't expressible as an expression (an IRI-anchored
 /// endpoint, or a typed predicate absent from the dictionary — which has no
@@ -498,18 +594,33 @@ fn lower_var_length_rel<E: IriEncoder>(
     path_var: Option<&Variable>,
 ) -> Result<()> {
     if rel.props.is_some() {
-        return Err(LowerError::unsupported(
-            "property filters on a variable-length relationship are deferred",
-        ));
-    }
-    if rel.types.is_empty() {
-        // Untyped wildcard paths can't name a single predicate to build rel/path
-        // values from, so binding is deferred there.
+        // Only the bounded single-typed directed chain expansion can filter
+        // per hop (each hop's annotation carries the property values).
+        let bounded_typed_directed = rel.types.len() == 1
+            && rel.length.as_ref().is_some_and(|l| l.max.is_some())
+            && rel.length.as_ref().map_or(1, |l| l.min.unwrap_or(1)) >= 1
+            && !matches!(rel.direction, Direction::Either);
+        if !bounded_typed_directed {
+            return Err(LowerError::unsupported(
+                "property filters on a variable-length relationship are supported only on \
+                 bounded single-typed directed ranges (`-[:T*1..3 {p: v}]->`) in v1",
+            ));
+        }
         if rel.var.is_some() || path_var.is_some() {
             return Err(LowerError::unsupported(
-                "binding a relationship/path variable on an untyped variable-length path \
-                 (`-[r*]->` / `p = (a)-[*]->(b)`) is deferred; name a relationship type",
+                "binding a relationship/path variable on a property-filtered \
+                 variable-length range is deferred — filter via WHERE on the bound \
+                 relationships instead",
             ));
+        }
+    }
+    if rel.types.is_empty() {
+        // Untyped wildcard paths with a rel/path binding enumerate (the
+        // wildcard operator resolves each found hop's stored predicate to
+        // build the values); without a binding the cheaper reachability
+        // operator answers.
+        if rel.var.is_some() || path_var.is_some() {
+            return lower_enumerate_path(ctx, left, rel, right, out, path_var);
         }
         return lower_untyped_var_length_rel(ctx, left, rel, right, out);
     }
@@ -531,14 +642,10 @@ fn lower_var_length_rel<E: IriEncoder>(
         // whose closure follows an edge of any listed type per hop (LDBC IC12's
         // `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`).
         None => {
-            // Unbounded paths use the transitive operator, which yields reachable
-            // endpoints but no enumerated hops to build a rel-list / path from.
+            // The transitive operator yields reachable endpoints but no
+            // enumerated hops; a rel/path binding enumerates instead.
             if rel.var.is_some() || path_var.is_some() {
-                return Err(LowerError::unsupported(
-                    "binding a relationship/path variable on an UNBOUNDED variable-length path \
-                     (`-[r:T*]->` / `p = (a)-[:T*]->(b)`) is deferred; use a bounded range \
-                     like `-[r:T*1..3]->`",
-                ));
+                return lower_enumerate_path(ctx, left, rel, right, out, path_var);
             }
             let modifier = match lo {
                 0 => PathModifier::ZeroOrMore,
@@ -591,6 +698,14 @@ fn lower_var_length_rel<E: IriEncoder>(
                      deferred; use an unbounded `[:A|B*]` or a single type",
                 ));
             }
+            // Bounded shapes the fixed-chain expansion can't express — an
+            // undirected hop, a zero lower bound, or a bound too deep to
+            // unroll — bind via path enumeration instead.
+            if (rel.var.is_some() || path_var.is_some())
+                && (matches!(rel.direction, Direction::Either) || lo == 0 || hi > MAX_BOUNDED_HOPS)
+            {
+                return lower_enumerate_path(ctx, left, rel, right, out, path_var);
+            }
             let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
             if lo == 0 {
                 return Err(LowerError::unsupported(
@@ -608,14 +723,6 @@ fn lower_var_length_rel<E: IriEncoder>(
                      unbounded `*` for deeper traversal",
                 ));
             }
-            if matches!(rel.direction, Direction::Either)
-                && (rel.var.is_some() || path_var.is_some())
-            {
-                return Err(LowerError::unsupported(
-                    "binding a relationship/path variable on an undirected variable-length path \
-                     is deferred (a bound relationship needs a definite orientation)",
-                ));
-            }
             // The predicate SID for constructing rel/path values per branch. If the
             // type isn't in the dictionary there are no edges, so binding is moot;
             // the chains below simply match nothing.
@@ -625,8 +732,15 @@ fn lower_var_length_rel<E: IriEncoder>(
 
             let mut chains: Vec<Vec<Pattern>> = Vec::with_capacity((hi - lo + 1) as usize);
             for k in lo..=hi {
-                let (mut chain, nodes) =
-                    build_fixed_chain(ctx, &left_ref, &right_ref, k, &type_iri, rel.direction)?;
+                let (mut chain, nodes) = build_fixed_chain(
+                    ctx,
+                    &left_ref,
+                    &right_ref,
+                    k,
+                    &type_iri,
+                    rel.direction,
+                    rel.props.as_ref(),
+                )?;
                 if let Some(pred) = &pred_sid {
                     if let Some(rv) = rel_var_id {
                         chain.push(Pattern::Bind {
@@ -651,6 +765,99 @@ fn lower_var_length_rel<E: IriEncoder>(
             Ok(())
         }
     }
+}
+
+/// Lower a variable-length relationship that binds a relationship or path
+/// variable into an `Enumerate`-mode path search: one row per path whose hop
+/// count is in the pattern's bounds, with the path variable bound to the path
+/// value and a relationship variable bound to `relationships(path)`. The end
+/// node is produced per path when unbound, or filters the enumeration when an
+/// earlier pattern bound it.
+///
+/// Handles the shapes the cheaper operators can't: unbounded with binding,
+/// untyped (wildcard) with binding, undirected, lower bounds above 1, and
+/// zero-length (`*0..`). The search enforces Cypher relationship-uniqueness
+/// (trail semantics — no edge reused, but a node may be revisited via a
+/// different edge).
+fn lower_enumerate_path<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    left: &NodePattern,
+    rel: &RelPattern,
+    right: &NodePattern,
+    out: &mut Vec<Pattern>,
+    path_var: Option<&Variable>,
+) -> Result<()> {
+    if rel.types.len() > 1 {
+        return Err(LowerError::unsupported(
+            "binding a relationship/path variable over a type alternation (`[:A|B*]`) is \
+             deferred; use a single type or the untyped form",
+        ));
+    }
+    let length = rel
+        .length
+        .as_ref()
+        .expect("caller checked length.is_some()");
+    let lo = length.min.unwrap_or(1);
+    let hi = length.max;
+    if let Some(hi) = hi {
+        if hi < lo {
+            return Err(LowerError::unsupported(
+                "variable-length path upper bound must be ≥ the lower bound",
+            ));
+        }
+    }
+
+    let start_ref = lookup_node_ref(ctx, left);
+    let end_ref = lookup_node_ref(ctx, right);
+    let direction = match rel.direction {
+        Direction::Outgoing => PathDirection::Outgoing,
+        Direction::Incoming => PathDirection::Incoming,
+        Direction::Either => PathDirection::Either,
+    };
+
+    // Typed → the named predicate; a type absent from the dictionary has no
+    // edges, so the pattern matches nothing. Untyped → wildcard edge-set.
+    let predicate = match rel.types.first() {
+        None => None,
+        Some(t) => {
+            let type_iri = ctx.resolve_predicate(&t.name)?;
+            match ctx.encoder.encode_iri(&type_iri) {
+                Some(sid) => Some(sid),
+                None => {
+                    out.push(empty_path_result(&start_ref, &end_ref));
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let path_var_id = match path_var {
+        Some(v) => ctx.intern_var(&v.name),
+        // A rel-var-only binding (`-[r:T*]->`) still enumerates through a
+        // path value; the synthetic path var carries it to the Bind below.
+        None => ctx.fresh_synth(),
+    };
+    out.push(Pattern::ShortestPath(ShortestPathPattern {
+        start: start_ref,
+        end: end_ref,
+        predicate,
+        direction,
+        mode: ShortestPathMode::Enumerate,
+        path_var: path_var_id,
+        min_hops: Some(lo),
+        max_hops: hi,
+        needs_relationships: true,
+        // Var-length enumeration carries no `all(x IN nodes(p) …)` node filter.
+        node_filter: None,
+    }));
+    if let Some(rv) = &rel.var {
+        let rel_var_id = ctx.intern_var(&rv.name);
+        out.push(Pattern::Bind {
+            var: rel_var_id,
+            expr: Expression::call(Function::Relationships, vec![Expression::Var(path_var_id)]),
+        });
+    }
+    Ok(())
 }
 
 /// Lower an **untyped** variable-length relationship `-[*m..n]->` (no relationship
@@ -753,6 +960,7 @@ fn build_fixed_chain<E: IriEncoder>(
     k: u32,
     type_iri: &str,
     direction: Direction,
+    props: Option<&MapLit>,
 ) -> Result<(Vec<Pattern>, Vec<Ref>)> {
     let mut chain = Vec::new();
     let mut nodes: Vec<Ref> = vec![s.clone()];
@@ -763,13 +971,30 @@ fn build_fixed_chain<E: IriEncoder>(
         } else {
             Ref::Var(ctx.fresh_synth())
         };
-        push_hop(
-            &prev,
-            &next,
-            ctx.iri_ref(type_iri.to_string()),
-            direction,
-            &mut chain,
-        );
+        if let Some(props) = props {
+            // A property-filtered hop matches only edges whose annotation
+            // carries the values (one row per matching annotation).
+            let (gs, go) = match direction {
+                Direction::Outgoing => (prev.clone(), next.clone()),
+                Direction::Incoming => (next.clone(), prev.clone()),
+                Direction::Either => unreachable!("rejected by the props gate"),
+            };
+            let ann = Ref::Var(ctx.fresh_synth());
+            let body = build_annotation_body(ctx, &ann, Some(props))?;
+            chain.push(Pattern::EdgeAnnotation {
+                edge: TriplePattern::new(gs, ctx.iri_ref(type_iri.to_string()), go.into()),
+                annotation: ann,
+                body,
+            });
+        } else {
+            push_hop(
+                &prev,
+                &next,
+                ctx.iri_ref(type_iri.to_string()),
+                direction,
+                &mut chain,
+            );
+        }
         nodes.push(next.clone());
         prev = next;
     }

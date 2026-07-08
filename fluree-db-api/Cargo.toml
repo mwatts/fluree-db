@@ -208,6 +208,10 @@ name = "it_csv_import"
 path = "tests/it_csv_import.rs"
 
 [[test]]
+name = "it_cypher_import"
+path = "tests/it_cypher_import.rs"
+
+[[test]]
 name = "it_query_explain"
 path = "tests/it_query_explain.rs"
 

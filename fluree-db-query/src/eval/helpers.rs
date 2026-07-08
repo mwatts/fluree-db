@@ -411,6 +411,7 @@ fn function_supported_for_bool_cache(func: &Function) -> bool {
         func,
         Function::Rand
             | Function::Now
+            | Function::Today
             | Function::Uuid
             | Function::StrUuid
             | Function::Bnode

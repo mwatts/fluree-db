@@ -111,9 +111,10 @@ pub(crate) fn parse_cypher_to_ir(
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
     overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     let ast = substituted_cypher_ast(cypher, params)?;
-    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay)
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay, policy)
 }
 
 /// Statements longer than this are parsed but never cached: unique bulk
@@ -207,12 +208,34 @@ pub(crate) fn lower_cypher_ast_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the
     // context-aware lower entry so the ledger's IRI mappings actually
     // apply to bare Cypher identifiers.
     let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
+
+    // Procedure shims (`CALL db.labels() YIELD …`) answer from ledger stats:
+    // rewrite the statement to a constant-rows query, then lower that.
+    let rewritten;
+    let ast = if let fluree_db_cypher::ast::Statement::CallProcedure(call) = &ast.statement {
+        let query = crate::cypher_procedures::procedure_call_query(
+            call,
+            snapshot,
+            overlay.map(|(o, _)| o),
+            vocab.as_deref(),
+            &overrides,
+            policy,
+        )?;
+        rewritten = fluree_db_cypher::CypherAst {
+            statement: fluree_db_cypher::ast::Statement::Query(query),
+            span: ast.span,
+        };
+        &rewritten
+    } else {
+        ast
+    };
 
     let mut vars = VarRegistry::new();
     let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)

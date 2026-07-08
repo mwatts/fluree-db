@@ -340,6 +340,53 @@ async fn cypher_http_merge_on_match_set_conditional() {
 }
 
 #[tokio::test]
+async fn cypher_http_per_row_rel_merge_on_match_set() {
+    // Per-row relationship MERGE … ON MATCH SET over the server's consensus
+    // (locked) write path: the ON MATCH and create branches stage into one
+    // commit under the write lock.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherperrow").await;
+
+    // Seed Alice, Bob, Carol + an existing Alice-KNOWS->Bob edge.
+    let (s, b) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherperrow",
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                  (c:Person {name: "Carol"})"#,
+    )
+    .await;
+    assert!(s.is_success(), "seed: {s} {b}");
+
+    let (s2, b2) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherperrow",
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person) WHERE b.name <> "Alice"
+           MERGE (a)-[:KNOWS]->(b)
+           ON CREATE SET b.tag = "created"
+           ON MATCH  SET b.tag = "matched""#,
+    )
+    .await;
+    assert!(s2.is_success(), "per-row merge: {s2} {b2}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherperrow",
+        r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+           RETURN b.name AS name, b.tag AS tag ORDER BY name"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Bob") && body.contains("matched"),
+        "ON MATCH tagged the pre-existing edge's endpoint: {body}"
+    );
+    assert!(
+        body.contains("Carol") && body.contains("created"),
+        "ON CREATE tagged the newly-created edge's endpoint: {body}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_parse_error_is_client_error() {
     let (_tmp, state) = server_state().await;
     create_ledger(&state, "cypherbad").await;

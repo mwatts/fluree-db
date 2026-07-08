@@ -694,6 +694,12 @@ impl BindPattern {
         expr: &Expression,
         bound_vars: &HashSet<VarId>,
     ) -> Option<Self> {
+        // EXISTS / pattern comprehensions are async subqueries resolved
+        // per-row by the standalone BindOperator; the fused join block's
+        // synchronous eval would silently collapse them to false/unbound.
+        if crate::filter::contains_exists(expr) {
+            return None;
+        }
         let required_vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
         required_vars.is_subset(bound_vars).then(|| Self {
             required_vars,

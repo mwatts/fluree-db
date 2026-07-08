@@ -330,21 +330,19 @@ async fn cypher_bare_node_pattern_rejected_at_lower() {
 }
 
 #[tokio::test]
-async fn cypher_var_length_unbounded_bound_relationship_variable_rejected() {
-    // Binding a variable to an UNBOUNDED variable-length relationship needs path
-    // enumeration the transitive operator doesn't provide (deferred). The bounded
-    // form is supported — see `cypher_var_length_rel_and_path_binding`.
+async fn cypher_var_length_unbounded_bound_relationship_variable_enumerates() {
+    // Binding a variable to an UNBOUNDED variable-length relationship
+    // enumerates paths under relationship-uniqueness (Enumerate mode). On an
+    // empty ledger the pattern matches nothing — the point is it no longer rejects.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-bound");
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree
         .query_cypher(&db, "MATCH (a:Person)-[r:KNOWS*]->(b) RETURN b")
-        .await;
-    assert!(
-        r.is_err(),
-        "unbounded bound var-length relationship must be rejected"
-    );
+        .await
+        .expect("unbounded rel binding is supported");
+    assert_eq!(r.row_count(), 0, "empty ledger has no paths");
 }
 
 #[tokio::test]
@@ -3943,6 +3941,216 @@ async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_trailing_set_applies_on_both_branches() {
+    // The upsert idiom: `MERGE (n {key}) SET …` — the SET runs after the
+    // MERGE on the create AND the match branch.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-trailing-set");
+
+    // First run: node absent → created, trailing SET applies.
+    let l = fluree
+        .transact_cypher(l, r#"MERGE (n:Person {name: "Carol"}) SET n.seen = 1"#)
+        .await
+        .expect("merge+set create branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {name: "Carol", seen: 1}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "trailing SET applied on the create branch"
+    );
+
+    // Second run: node present → matched, trailing SET overwrites.
+    let l = fluree
+        .transact_cypher(l, r#"MERGE (n:Person {name: "Carol"}) SET n.seen = 2"#)
+        .await
+        .expect("merge+set match branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "still exactly one node (no duplicate)"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {seen: 2}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "trailing SET applied on the match branch"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {seen: 1}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        0,
+        "old value was retracted"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_on_create_and_trailing_set_combine() {
+    // ON CREATE SET fires only on create; the trailing SET fires on both runs.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-oncreate-trailing");
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Item {sku: "a1"}) ON CREATE SET n.origin = "created" SET n.stamp = 7"#,
+        )
+        .await
+        .expect("first run")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:Item {origin: "created", stamp: 7}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "both ON CREATE SET and trailing SET applied on create"
+    );
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Item {sku: "a1"}) ON CREATE SET n.origin = "recreated" SET n.stamp = 9"#,
+        )
+        .await
+        .expect("second run")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:Item {origin: "created", stamp: 9}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "trailing SET updated stamp; ON CREATE SET did not re-fire"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_trailing_set_map_merge_with_params() {
+    // The canonical ETL statement: MERGE (n {key: $k}) SET n += $props.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-set-map");
+
+    let params = json!({ "id": 42, "props": { "name": "Eve", "age": 30 } });
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "MERGE (n:User {id: $id}) SET n += $props",
+            params.as_object(),
+        )
+        .await
+        .expect("upsert create branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:User {id: 42, name: "Eve", age: 30}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "map merged into the created node"
+    );
+
+    // Re-run with changed props: same node, values updated.
+    let params = json!({ "id": 42, "props": { "name": "Eve", "age": 31 } });
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "MERGE (n:User {id: $id}) SET n += $props",
+            params.as_object(),
+        )
+        .await
+        .expect("upsert match branch")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:User) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "no duplicate node"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:User {age: 31}) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "map merge updated the property on the match branch"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_match_set_map_merge_param() {
+    // `SET n += $map` after a plain MATCH (the same whole-map param the MERGE
+    // upsert uses, through the ordinary MATCH … SET lowering).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:match-set-map-param");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (n:User {id: 7, name: "Ann"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+
+    let params = json!({ "props": { "name": "Anne", "city": "Oslo" } });
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "MATCH (n:User {id: 7}) SET n += $props",
+            params.as_object(),
+        )
+        .await
+        .expect("set map param")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:User {id: 7, name: "Anne", city: "Oslo"}) RETURN n"#
+            )
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "whole-map param merged via MATCH … SET"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:merge-on-create");
@@ -3994,6 +4202,272 @@ async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
             .row_count(),
         1,
         "original role unchanged"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_with_properties_is_per_value() {
+    // `MERGE (a)-[:T {p: v}]->(b)` matches only an edge whose annotation
+    // carries those values; a different value creates a parallel edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-props");
+
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:City {name: "X"}), (:Country {name: "Y"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+
+    // Per-row form on bound endpoints: absent → creates the edge with props.
+    let stmt_w3 = r#"MATCH (a:City {name: "X"}), (b:Country {name: "Y"})
+                     MERGE (a)-[:IN {since: 2020}]->(b)"#;
+    let l = fluree
+        .transact_cypher(l, stmt_w3)
+        .await
+        .expect("create")
+        .ledger;
+    let t_after_create = l.t();
+
+    // Same statement again: annotation matches → no-op.
+    let l = fluree
+        .transact_cypher(l, stmt_w3)
+        .await
+        .expect("noop")
+        .ledger;
+    assert_eq!(l.t(), t_after_create, "matching property MERGE is a no-op");
+
+    // Different value → the guard misses → a parallel edge is created.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:City {name: "X"}), (b:Country {name: "Y"})
+               MERGE (a)-[:IN {since: 2021}]->(b)"#,
+        )
+        .await
+        .expect("parallel create")
+        .ledger;
+
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (:City {name: "X"})-[r:IN]->(:Country {name: "Y"})
+               RETURN r.since ORDER BY r.since"#,
+        )
+        .await
+        .expect("read back")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([[2020], [2021]]),
+        "two parallel edges by value"
+    );
+
+    // Exactly two City/Country nodes — per-row MERGE reused the endpoints.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:City) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_on_match_set_updates_annotation() {
+    // Standalone relationship MERGE with ON CREATE / ON MATCH SET resolves as
+    // a conditional write: first run creates (ON CREATE fires on the rel
+    // var), second run updates the annotation property.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-on-match");
+
+    let stmt = r#"MERGE (a:City {name: "X"})-[r:IN]->(b:Country {name: "Y"})
+                  ON CREATE SET r.checks = 1
+                  ON MATCH  SET r.checks = 2"#;
+
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("create")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let read = r#"MATCH (:City {name: "X"})-[r:IN]->(:Country {name: "Y"}) RETURN r.checks"#;
+    let jsonld = fluree
+        .query_cypher(&db, read)
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(jsonld, json!([[1]]), "ON CREATE SET fired on the rel var");
+
+    let l = fluree.transact_cypher(l, stmt).await.expect("match").ledger;
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(&db, read)
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([[2]]),
+        "ON MATCH SET updated the annotation property"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:City) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "no duplicate endpoints on the match branch"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_trailing_set_applies_on_both_branches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-trailing");
+
+    let stmt =
+        |year: i64| format!(r#"MERGE (a:U {{id: 1}})-[r:F]->(b:U {{id: 2}}) SET r.at = {year}"#);
+
+    // Create branch: trailing SET lands on the created edge.
+    let l = fluree
+        .transact_cypher(l, &stmt(2020))
+        .await
+        .expect("create branch")
+        .ledger;
+    // Match branch: same edge, trailing SET overwrites.
+    let l = fluree
+        .transact_cypher(l, &stmt(2021))
+        .await
+        .expect("match branch")
+        .ledger;
+
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(&db, "MATCH (:U {id: 1})-[r:F]->(:U {id: 2}) RETURN r.at")
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([[2021]]),
+        "trailing SET applied on both branches"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:U) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "exactly two endpoint nodes"
+    );
+}
+
+// ============================================================================
+// Multi-statement scripts (semicolon-separated, sequential autocommit)
+// ============================================================================
+
+#[tokio::test]
+async fn transact_cypher_script_executes_statements_sequentially() {
+    // cypher-shell semantics: one commit per statement, later statements see
+    // earlier ones' effects (the MATCH in statement 3 binds nodes created by
+    // statements 1–2).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:script");
+    let t0 = l.t();
+
+    let script = r#"
+        CREATE (:Person {name: "Alice; the first"}); // ; inside a string
+        CREATE (:Person {name: "Bob"});
+        MATCH (a:Person {name: "Alice; the first"}), (b:Person {name: "Bob"})
+        CREATE (a)-[:KNOWS {since: 2020}]->(b);
+    "#;
+    let l = fluree
+        .transact_cypher(l, script)
+        .await
+        .expect("script")
+        .ledger;
+    assert_eq!(l.t(), t0 + 3, "one commit per statement");
+
+    let db = graphdb_from_ledger(&l);
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, r.since, b.name"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jsonld,
+        json!([["Alice; the first", 2020, "Bob"]]),
+        "the semicolon inside the string did not split the statement"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_accepts_trailing_semicolon() {
+    // A single statement terminated with `;` (the cypher-shell habit) is one
+    // statement, not a rejected multi-statement script.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:trailing-semi");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Person {name: "Ada"});"#)
+        .await
+        .expect("trailing semicolon accepted")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_script_return_on_last_statement_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:script-return");
+
+    // RETURN on the final statement answers rows.
+    let (result, rows) = fluree
+        .transact_cypher_returning(
+            l,
+            r#"CREATE (:P {id: 1}); CREATE (n:P {id: 2}) RETURN n;"#,
+            None,
+        )
+        .await
+        .expect("script with final RETURN");
+    assert!(rows.is_some(), "final RETURN answered");
+
+    // A read anywhere before the end is rejected with the statement number.
+    let msg = fluree
+        .transact_cypher(
+            result.ledger,
+            r#"MATCH (n:P) RETURN n; CREATE (:P {id: 3});"#,
+        )
+        .await
+        .expect_err("mid-script read")
+        .to_string();
+    assert!(
+        msg.contains("statement 1") && msg.contains("read"),
+        "error names the offending statement: {msg}"
     );
 }
 
@@ -4467,6 +4941,59 @@ async fn cypher_var_length_relationship_uniqueness_no_self_rows() {
 }
 
 #[tokio::test]
+async fn cypher_enumerate_path_relationship_uniqueness_traverses_cycle() {
+    // Triangle 0→1→2→0 over :R. Cypher trail semantics (relationship-
+    // uniqueness) enumerate the closure 0→1→2→0 — three distinct edges, node 0
+    // revisited — which node-distinctness would wrongly drop. An unbounded typed
+    // path binding (`p = (a)-[:R*]->(x)`) routes through Enumerate mode.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:enum-relunique");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "n0", "@type": "N", "id": 0, "R": {"@id": "n1"}},
+                    {"@id": "n1", "@type": "N", "id": 1, "R": {"@id": "n2"}},
+                    {"@id": "n2", "@type": "N", "id": 2, "R": {"@id": "n0"}},
+                ]
+            }),
+        )
+        .await
+        .expect("seed triangle")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Enumerate from n0 to any node. Relationship-uniqueness yields three trails:
+    // n0→n1 (len 1), n0→n1→n2 (len 2), n0→n1→n2→n0 (len 3, the closure). The
+    // next hop would reuse edge n0→n1, so the walk stops there. Node-distinctness
+    // would have dropped the closure, returning only the first two.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {id: 0})-[:R*]->(x) RETURN x.id AS dst, length(p) AS len"#,
+        )
+        .await
+        .expect("enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let mut got: Vec<(i64, i64)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| (r[0].as_i64().expect("dst"), r[1].as_i64().expect("len")))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![(0, 3), (1, 1), (2, 2)],
+        "relationship-uniqueness enumerates the triangle closure n0→n1→n2→n0: {rows}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_var_length_exact_hops() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:varlen-exact").await;
@@ -4660,7 +5187,7 @@ async fn cypher_shortest_path_node_predicate_pushed_into_search() {
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(none.as_array().map(|r| r.len()), Some(0), "no path: {none}");
+    assert_eq!(none.as_array().map(Vec::len), Some(0), "no path: {none}");
 
     // Unfiltered shortestPath is unchanged: the 2-hop path through the minor.
     let two = fluree
@@ -4940,17 +5467,19 @@ async fn cypher_var_length_rel_and_path_binding() {
     assert_eq!(data[0]["row"], json!(["Bob", 1, 1]), "{path}");
     assert_eq!(data[1]["row"], json!(["Carol", 2, 2]), "{path}");
 
-    // Unbounded rel binding is deferred with a clear error.
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*]->(b:Person) RETURN size(r)"#,
-            )
-            .await
-            .is_err(),
-        "unbounded var-length rel binding is deferred"
-    );
+    // Unbounded rel binding enumerates: one row per trail (relationship-unique).
+    let unbounded = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*]->(b:Person)
+               RETURN size(r) AS hops ORDER BY hops"#,
+        )
+        .await
+        .expect("unbounded rel binding enumerates")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(unbounded, json!([[1], [2], [3]]), "one row per path length");
 }
 
 #[tokio::test]
@@ -5103,6 +5632,326 @@ async fn cypher_shortest_path_no_path_drops_row() {
         .await
         .expect("no-path shortestPath");
     assert_eq!(rows.row_count(), 0, "no directed Dave→Alice path");
+}
+
+// ============================================================================
+// Path enumeration — free path values, unbounded var-length binding
+// ============================================================================
+
+#[tokio::test]
+async fn cypher_path_enumeration_unbounded_free_end() {
+    // `p = (a)-[:T*]->(b)` with b unbound: one row per trail (relationship-unique).
+    // Chain Alice→Bob→Carol→Dave gives paths of length 1, 2, 3 from Alice.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-free").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["Bob", 1], ["Carol", 2], ["Dave", 3]]),
+        "every path from Alice, end bound per path"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_bound_end_filters() {
+    // A bound end keeps only paths ending there; a diamond yields both.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:enum-diamond");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:N {name: "A"}), (b:N {name: "B"}), (c:N {name: "C"}), (d:N {name: "D"});
+               MATCH (a:N {name: "A"}), (b:N {name: "B"}) CREATE (a)-[:E]->(b);
+               MATCH (a:N {name: "A"}), (c:N {name: "C"}) CREATE (a)-[:E]->(c);
+               MATCH (b:N {name: "B"}), (d:N {name: "D"}) CREATE (b)-[:E]->(d);
+               MATCH (c:N {name: "C"}), (d:N {name: "D"}) CREATE (c)-[:E]->(d);"#,
+        )
+        .await
+        .expect("seed diamond")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {name: "A"})-[:E*]->(d:N {name: "D"})
+               RETURN [n IN nodes(p) | n.name] AS names ORDER BY names"#,
+        )
+        .await
+        .expect("diamond paths")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[["A", "B", "D"]], [["A", "C", "D"]]]),
+        "both diamond arms enumerated"
+    );
+}
+
+#[tokio::test]
+async fn cypher_rel_var_binding_on_unbounded_path() {
+    // `-[r:T*]->` binds the relationship list per enumerated path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-relvar").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*2..]->(b)
+               RETURN b.name AS dst, size(r) AS hops, [x IN r | type(x)] AS types
+               ORDER BY hops"#,
+        )
+        .await
+        .expect("rel var enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([
+            ["Carol", 2, ["KNOWS", "KNOWS"]],
+            ["Dave", 3, ["KNOWS", "KNOWS", "KNOWS"]]
+        ]),
+        "lower bound 2 honored; rel list per path"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_untyped_and_fixed_hop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-untyped").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Untyped wildcard with a path binding.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[*1..2]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("untyped enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["Bob", 1], ["Carol", 2]]), "wildcard bounded");
+
+    // Fixed single hop `p = (a)-[:T]->(b)` — a *1..1 path value.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)
+               RETURN length(p) AS len, [n IN nodes(p) | n.name] AS names,
+                      [x IN relationships(p) | type(x)] AS types"#,
+        )
+        .await
+        .expect("fixed hop path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[1, ["Alice", "Bob"], ["KNOWS"]]]),
+        "fixed hop builds a 1-hop path value"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_zero_length_and_cycles() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:enum-zero-cycle");
+    // A→B and B→A: a 2-cycle.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:N {name: "A"})-[:E]->(b:N {name: "B"});
+               MATCH (a:N {name: "A"}), (b:N {name: "B"}) CREATE (b)-[:E]->(a);"#,
+        )
+        .await
+        .expect("seed cycle")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // `*0..` includes the zero-length path (end = start, no relationships).
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {name: "A"})-[:E*0..1]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("zero length")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["A", 0], ["B", 1]]),
+        "zero-length path binds end to start"
+    );
+
+    // Unbounded enumeration on a cyclic graph terminates under relationship-
+    // uniqueness (no edge reused): from A the trails are A→B and the closure
+    // A→B→A (both edges distinct); A→B→A→B would reuse A→B, so the walk stops.
+    // Matches Neo4j — a node may be revisited via a different edge.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:N {name: "A"})-[:E*]->(b)
+               RETURN b.name AS dst, length(p) AS len ORDER BY len"#,
+        )
+        .await
+        .expect("cycle safe")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["B", 1], ["A", 2]]),
+        "relationship-uniqueness enumerates the 2-cycle closure A→B→A"
+    );
+}
+
+#[tokio::test]
+async fn cypher_path_enumeration_undirected_binding() {
+    // Undirected var-length with a binding routes through enumeration.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:enum-undirected").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (b:Person {name: "Bob"})-[:KNOWS*1..1]-(x)
+               RETURN x.name AS other ORDER BY other"#,
+        )
+        .await
+        .expect("undirected enumerate")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["Alice"], ["Carol"]]),
+        "both undirected neighbors of Bob"
+    );
+}
+
+#[tokio::test]
+async fn cypher_multi_hop_fixed_path_value() {
+    // `p = (a)-[:T]->(b)-[:T]->(c)` — a multi-hop fixed chain builds the
+    // path value from interleaved nodes and per-hop relationship values.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:multi-hop-path").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+               RETURN length(p) AS len,
+                      [n IN nodes(p) | n.name] AS names,
+                      [r IN relationships(p) | type(r)] AS types"#,
+        )
+        .await
+        .expect("multi-hop path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[2, ["Alice", "Bob", "Carol"], ["KNOWS", "KNOWS"]]]),
+        "{out}"
+    );
+
+    // Incoming hops keep the STORED edge orientation in relationships(p).
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (c:Person {name: "Carol"})<-[:KNOWS]-(b)<-[:KNOWS]-(a)
+               RETURN [n IN nodes(p) | n.name] AS names,
+                      startNode(relationships(p)[0]) = b AS first_starts_at_b"#,
+        )
+        .await
+        .expect("incoming multi-hop path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([[["Carol", "Bob", "Alice"], true]]), "{out}");
+
+    // A variable-length segment inside a multi-hop path value stays deferred.
+    let msg = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b)-[:KNOWS]->(c) RETURN p"#,
+        )
+        .await
+        .expect_err("mixed var-length multi-hop")
+        .to_string();
+    assert!(msg.contains("variable-length segment"), "{msg}");
+}
+
+#[tokio::test]
+async fn cypher_var_length_property_filter_on_bounded_range() {
+    // `-[:T*1..2 {p: v}]->` matches per hop on the edge annotation values.
+    // A -[w:1]-> B -[w:1]-> C, plus A -[w:2]-> C directly.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:varlen-props");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:V {name: "A"}), (:V {name: "B"}), (:V {name: "C"});
+               MATCH (a:V {name: "A"}), (b:V {name: "B"}) CREATE (a)-[:E {w: 1}]->(b);
+               MATCH (b:V {name: "B"}), (c:V {name: "C"}) CREATE (b)-[:E {w: 1}]->(c);
+               MATCH (a:V {name: "A"}), (c:V {name: "C"}) CREATE (a)-[:E {w: 2}]->(c);"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Only w:1 hops qualify: A→B (1 hop) and A→B→C (2 hops); the direct
+    // A→C edge (w:2) is filtered out.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:V {name: "A"})-[:E*1..2 {w: 1}]->(x)
+               RETURN x.name AS dst ORDER BY dst"#,
+        )
+        .await
+        .expect("filtered var-length")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["B"], ["C"]]), "{out}");
+
+    // Unbounded / binding combinations stay deferred with clear errors.
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (a:V)-[:E* {w: 1}]->(x) RETURN x"#)
+        .await
+        .expect_err("unbounded with props")
+        .to_string();
+    assert!(msg.contains("bounded"), "{msg}");
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (a:V)-[r:E*1..2 {w: 1}]->(x) RETURN x"#)
+        .await
+        .expect_err("binding with props")
+        .to_string();
+    assert!(msg.contains("WHERE"), "{msg}");
 }
 
 #[tokio::test]
@@ -7525,5 +8374,1089 @@ async fn cypher_backticked_names_round_trip_without_splitting() {
         result.row_count(),
         1,
         "colon names round-trip via the split"
+    );
+}
+
+// ============================================================================
+// Temporal constructors — date() / datetime() / time() / duration()
+// ============================================================================
+
+#[tokio::test]
+async fn cypher_temporal_constructors_in_return_and_where() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-read");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Thing {name: "x"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Constant constructors fold at lowering; temporal accessors read back.
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Thing)
+               RETURN datetime('2020-05-06T10:00:00Z').year, date('2024-01-15').month"#,
+        )
+        .await
+        .expect("constructor fold")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[2020, 1]]), "{res}");
+}
+
+#[tokio::test]
+async fn cypher_temporal_constructors_write_and_compare() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-write");
+
+    // Constructors as property values in CREATE.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Event {name: "a", at: datetime("2024-03-04T05:06:07Z"),
+                               on: date("2024-03-04"), took: duration("PT2H")}),
+                      (:Event {name: "b", at: datetime("2019-01-01T00:00:00Z")})"#,
+        )
+        .await
+        .expect("create with temporal values")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Typed comparison against a constructor constant in WHERE.
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (e:Event) WHERE e.at > datetime("2024-01-01T00:00:00Z")
+               RETURN e.name, e.at.year"#,
+        )
+        .await
+        .expect("where compare")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([["a", 2024]]), "{res}");
+
+    // The duration value persisted and reads back.
+    let took = fluree
+        .query_cypher(&db, r#"MATCH (e:Event {name: "a"}) RETURN e.took"#)
+        .await
+        .expect("duration read");
+    assert_eq!(took.row_count(), 1, "duration value present");
+
+    // SET with a constructor value.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (e:Event {name: "b"}) SET e.on = date("2019-01-01")"#,
+        )
+        .await
+        .expect("set temporal")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let res = fluree
+        .query_cypher(&db, r#"MATCH (e:Event {name: "b"}) RETURN e.on.year"#)
+        .await
+        .expect("set read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[2019]]), "{res}");
+}
+
+#[tokio::test]
+async fn cypher_zero_arg_datetime_and_date_write_statement_timestamp() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-now");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Tick {n: 1, at: datetime(), on: date()})"#)
+        .await
+        .expect("create with now")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Both folded to real temporal values at write time.
+    let res = fluree
+        .query_cypher(
+            &db,
+            "MATCH (t:Tick) WHERE t.at.year >= 2026 AND t.on.year >= 2026 RETURN t.n",
+        )
+        .await
+        .expect("read back now")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[1]]), "{res}");
+
+    // Zero-arg constructors also evaluate on the read path.
+    let now_rows = fluree
+        .query_cypher(&db, "MATCH (t:Tick) WHERE t.at <= datetime() RETURN t.n")
+        .await
+        .expect("read-side now");
+    assert_eq!(now_rows.row_count(), 1, "stored instant is before now()");
+}
+
+#[tokio::test]
+async fn cypher_temporal_component_map_constructors() {
+    // Component maps fold to the same typed values the lexical forms build:
+    // in reads (accessors + comparisons) and as write property values.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-components");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Event {name: "a", at: datetime({year: 2024, month: 3, day: 4,
+                                                        hour: 5, minute: 6, second: 7}),
+                               on: date({year: 2024, month: 3, day: 4}),
+                               took: duration({hours: 2, minutes: 30})})"#,
+        )
+        .await
+        .expect("create with component maps")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Component-map constant equals the lexical constant.
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (e:Event)
+               WHERE e.at = datetime("2024-03-04T05:06:07Z")
+                 AND e.on = date("2024-03-04")
+               RETURN e.name,
+                      date({year: 2024, month: 2}).month,
+                      duration({days: 3}) = duration("P3D"),
+                      time({hour: 10, minute: 30}).hour"#,
+        )
+        .await
+        .expect("component map read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([["a", 2, true, 10]]), "{res}");
+
+    // Errors are actionable: unknown component / missing year.
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (e:Event) RETURN date({year: 2024, dayz: 3})"#)
+        .await
+        .expect_err("unknown component")
+        .to_string();
+    assert!(msg.contains("dayz"), "{msg}");
+    let msg = fluree
+        .query_cypher(&db, r#"MATCH (e:Event) RETURN date({month: 3})"#)
+        .await
+        .expect_err("missing year")
+        .to_string();
+    assert!(msg.contains("year"), "{msg}");
+}
+
+#[tokio::test]
+async fn cypher_zero_arg_localdatetime_is_now() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:localdatetime-now");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:T {name: "x"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:T)
+               RETURN localdatetime() >= datetime("2026-01-01T00:00:00Z")"#,
+        )
+        .await
+        .expect("localdatetime()")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(res, serde_json::json!([[true]]), "{res}");
+}
+
+#[tokio::test]
+async fn cypher_temporal_constructor_bad_literal_errors() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:temporal-bad");
+    let err = fluree
+        .transact_cypher(l, r#"CREATE (:E {at: datetime("not-a-date")})"#)
+        .await;
+    let msg = format!("{err:?}");
+    assert!(err.is_err(), "bad literal must error");
+    assert!(
+        msg.contains("datetime"),
+        "error names the constructor: {msg}"
+    );
+}
+
+// ============================================================================
+// Schema DDL no-ops — CREATE/DROP INDEX|CONSTRAINT, SHOW INDEXES|CONSTRAINTS
+// ============================================================================
+
+#[tokio::test]
+async fn cypher_schema_ddl_is_a_noop_write() {
+    // Framework migrations (spring-data, neo4j-migrations) run index /
+    // constraint DDL at startup. Fluree indexes everything: accept as no-ops.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:schema-ddl");
+    let t0 = l.t();
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            "CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name)",
+        )
+        .await
+        .expect("create index accepted")
+        .ledger;
+    let l = fluree
+        .transact_cypher(
+            l,
+            "CREATE CONSTRAINT person_id_unique FOR (n:Person) REQUIRE n.id IS UNIQUE",
+        )
+        .await
+        .expect("create constraint accepted")
+        .ledger;
+    let l = fluree
+        .transact_cypher(l, "DROP INDEX person_name IF EXISTS")
+        .await
+        .expect("drop index accepted")
+        .ledger;
+
+    assert_eq!(l.t(), t0, "schema DDL commits nothing");
+
+    // Data writes still work after the DDL no-ops.
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Person {name: "Ada"})"#)
+        .await
+        .expect("data write")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn cypher_show_indexes_and_constraints_answer_zero_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:show-schema");
+    let db = graphdb_from_ledger(&l);
+
+    for stmt in [
+        "SHOW INDEXES",
+        "SHOW CONSTRAINTS",
+        "SHOW INDEXES YIELD name",
+    ] {
+        let res = fluree
+            .query_cypher(&db, stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e:?}"));
+        assert_eq!(res.row_count(), 0, "{stmt} answers zero rows");
+    }
+}
+
+// ============================================================================
+// Procedure shims — CALL db.labels() / db.relationshipTypes() /
+// db.propertyKeys() / db.schema.visualization() / dbms.components()
+// ============================================================================
+
+/// Seed a small property graph: two labels, one relationship, two data
+/// properties — all bare ns-0 names, all still in novelty (no index build).
+async fn seed_procedure_graph(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+) -> support::MemoryLedger {
+    let l = genesis_ledger(fluree, ledger_id);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Ada", age: 36})-[:KNOWS]->(b:Company {name: "Acme"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger
+}
+
+/// Flatten a single-column string result into a list (result order).
+async fn string_column(
+    fluree: &support::MemoryFluree,
+    db: &fluree_db_api::GraphDb,
+    stmt: &str,
+) -> Vec<String> {
+    let jsonld = fluree
+        .query_cypher(db, stmt)
+        .await
+        .unwrap_or_else(|e| panic!("{stmt}: {e:?}"))
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[0].as_str().expect("string cell").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn cypher_call_db_labels_lists_labels_from_novelty() {
+    // Neo4j Browser's first act on connect. Data is novelty-only here —
+    // the stats merge must see labels that have never been indexed.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-labels").await;
+    let db = graphdb_from_ledger(&l);
+
+    let labels = string_column(&fluree, &db, "CALL db.labels()").await;
+    assert_eq!(labels, vec!["Company", "Person"], "sorted distinct labels");
+
+    // YIELD + WHERE + RETURN compose like any read.
+    let filtered = string_column(
+        &fluree,
+        &db,
+        r#"CALL db.labels() YIELD label WHERE label STARTS WITH "P" RETURN label"#,
+    )
+    .await;
+    assert_eq!(filtered, vec!["Person"]);
+
+    // YIELD alias renames the visible column.
+    let aliased = string_column(
+        &fluree,
+        &db,
+        "CALL db.labels() YIELD label AS l RETURN l ORDER BY l DESC",
+    )
+    .await;
+    assert_eq!(aliased, vec!["Person", "Company"]);
+}
+
+#[tokio::test]
+async fn cypher_call_relationship_types_and_property_keys_split_by_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-types-keys").await;
+    let db = graphdb_from_ledger(&l);
+
+    // KNOWS is the only ref-object predicate (rdf:type is excluded — it is
+    // the label edge, not a user relationship).
+    let types = string_column(&fluree, &db, "CALL db.relationshipTypes()").await;
+    assert_eq!(types, vec!["KNOWS"]);
+
+    // name/age are literal-object predicates.
+    let keys = string_column(&fluree, &db, "CALL db.propertyKeys()").await;
+    assert_eq!(keys, vec!["age", "name"]);
+}
+
+#[tokio::test]
+async fn cypher_call_procedures_answer_from_head_index_stats_too() {
+    // Same answers once the data is indexed and novelty is empty.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:proc-indexed";
+    seed_procedure_graph(&fluree, ledger_id).await;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let labels = string_column(&fluree, &db, "CALL db.labels()").await;
+    assert_eq!(labels, vec!["Company", "Person"]);
+    let types = string_column(&fluree, &db, "CALL db.relationshipTypes()").await;
+    assert_eq!(types, vec!["KNOWS"]);
+    let keys = string_column(&fluree, &db, "CALL db.propertyKeys()").await;
+    assert_eq!(keys, vec!["age", "name"]);
+}
+
+#[tokio::test]
+async fn cypher_call_dbms_components_reports_compat_identity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:proc-components");
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(&db, "CALL dbms.components() YIELD name, versions, edition")
+        .await
+        .expect("components")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = jsonld.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{jsonld}");
+    assert_eq!(rows[0][0].as_str(), Some("Neo4j Kernel"), "{jsonld}");
+    let versions = rows[0][1].as_array().expect("versions list");
+    assert_eq!(versions.len(), 1, "{jsonld}");
+    assert!(
+        rows[0][2].as_str().unwrap_or_default().contains("Fluree"),
+        "edition carries Fluree attribution: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_call_db_schema_visualization_returns_one_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-schema-viz").await;
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(&db, "CALL db.schema.visualization()")
+        .await
+        .expect("schema viz")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = jsonld.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{jsonld}");
+    let nodes = rows[0][0].as_array().expect("nodes list");
+    assert_eq!(nodes.len(), 2, "one entry per label: {jsonld}");
+    let rels = rows[0][1].as_array().expect("relationships list");
+    assert_eq!(rels.len(), 1, "one entry per rel type: {jsonld}");
+}
+
+#[tokio::test]
+async fn cypher_call_apoc_meta_data_attributes_schema_per_label() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-meta-data").await;
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            "CALL apoc.meta.data() YIELD label, property, count, type, other, elementType \
+             RETURN label, property, type, other ORDER BY label, property",
+        )
+        .await
+        .expect("meta.data")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = jsonld.as_array().expect("rows");
+
+    // Company: name (STRING). Person: age (INTEGER), name (STRING),
+    // KNOWS (RELATIONSHIP → Company).
+    let flat: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_str().unwrap().to_string(),
+                r[1].as_str().unwrap().to_string(),
+                r[2].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flat,
+        vec![
+            ("Company".into(), "name".into(), "STRING".into()),
+            ("Person".into(), "KNOWS".into(), "RELATIONSHIP".into()),
+            ("Person".into(), "age".into(), "INTEGER".into()),
+            ("Person".into(), "name".into(), "STRING".into()),
+        ],
+        "{jsonld}"
+    );
+    let knows_other = rows[1][3].as_array().expect("other list");
+    assert_eq!(knows_other, &[json!("Company")], "{jsonld}");
+}
+
+#[tokio::test]
+async fn cypher_call_apoc_meta_data_answers_langchain_schema_queries() {
+    // The three exact queries LangChain's Neo4jGraph issues to build its
+    // schema description — the reason this shim exists.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_procedure_graph(&fluree, "it/cypher:proc-langchain").await;
+    let db = graphdb_from_ledger(&l);
+
+    let run = |stmt: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            fluree
+                .query_cypher(db, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{stmt}: {e:?}"))
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld")
+        }
+    };
+
+    // Node properties.
+    let node_props = run("CALL apoc.meta.data() \
+         YIELD label, other, elementType, type, property \
+         WHERE NOT type = \"RELATIONSHIP\" AND elementType = \"node\" \
+         WITH label AS nodeLabels, collect({property:property, type:type}) AS properties \
+         RETURN {labels: nodeLabels, properties: properties} AS output")
+    .await;
+    let rows = node_props.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "one output per label: {node_props}");
+    let person = rows
+        .iter()
+        .map(|r| &r[0])
+        .find(|o| o["labels"] == json!("Person"))
+        .unwrap_or_else(|| panic!("Person output missing: {node_props}"));
+    let props = person["properties"].as_array().expect("properties");
+    assert!(
+        props.contains(&json!({"property": "age", "type": "INTEGER"}))
+            && props.contains(&json!({"property": "name", "type": "STRING"})),
+        "{node_props}"
+    );
+
+    // Relationship properties (edge-annotation attribution not emitted —
+    // zero rows, which LangChain tolerates).
+    let rel_props = run("CALL apoc.meta.data() \
+         YIELD label, other, elementType, type, property \
+         WHERE NOT type = \"RELATIONSHIP\" AND elementType = \"relationship\" \
+         WITH label AS nodeLabels, collect({property:property, type:type}) AS properties \
+         RETURN {type: nodeLabels, properties: properties} AS output")
+    .await;
+    assert_eq!(rel_props.as_array().expect("rows").len(), 0, "{rel_props}");
+
+    // Relationships (start)-[type]->(end).
+    let rels = run("CALL apoc.meta.data() \
+         YIELD label, other, elementType, type, property \
+         WHERE type = \"RELATIONSHIP\" AND elementType = \"node\" \
+         UNWIND other AS other_node \
+         RETURN {start: label, type: property, end: toString(other_node)} AS output")
+    .await;
+    let rows = rels.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{rels}");
+    assert_eq!(
+        rows[0][0],
+        json!({"start": "Person", "type": "KNOWS", "end": "Company"}),
+        "{rels}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_exists_in_projection_evaluates_per_row() {
+    // EXISTS { pattern } in RETURN projection (IC7/IC10 shape) must evaluate
+    // per row, not constant-false.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:exists-proj");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:P {name: "A"})-[:K]->(b:P {name: "B"}); CREATE (:P {name: "C"});"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:P) RETURN n.name AS name, EXISTS { (n)-[:K]->() } AS has ORDER BY name"#,
+        )
+        .await
+        .expect("projected exists")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["A", true], ["B", false], ["C", false]]),
+        "EXISTS evaluates per row in projection position"
+    );
+}
+
+#[tokio::test]
+async fn cypher_exists_in_projection_with_both_endpoints_bound() {
+    // Regression: an EXISTS whose inner pattern correlates on MULTIPLE bound
+    // vars used to be swallowed by the fused join block's synchronous eval,
+    // collapsing to constant false (the IC7 shape). It must resolve per row —
+    // bare, inside CASE, and in a WITH projection.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:exists-both-bound");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:P {name: "A"})-[:K]->(b:P {name: "B"}); CREATE (:P {name: "C"});"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Directed and undirected, both endpoints bound.
+    for pattern in ["(a)-[:K]->(x)", "(a)-[:K]-(x)"] {
+        let stmt = format!(
+            r#"MATCH (a:P {{name: "A"}}), (x:P) WHERE x.name <> "A"
+               RETURN x.name AS name, EXISTS {{ {pattern} }} AS knows ORDER BY name"#
+        );
+        let out = fluree
+            .query_cypher(&db, &stmt)
+            .await
+            .expect("both-bound exists")
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        assert_eq!(out, json!([["B", true], ["C", false]]), "{pattern}");
+    }
+
+    // Inside CASE in projection.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:P {name: "A"}), (x:P) WHERE x.name <> "A"
+               RETURN x.name AS name,
+                      CASE WHEN EXISTS { (a)-[:K]-(x) } THEN 1 ELSE 0 END AS knows
+               ORDER BY name"#,
+        )
+        .await
+        .expect("case exists")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["B", 1], ["C", 0]]));
+
+    // In a WITH projection.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:P) WITH n.name AS name, EXISTS { (n)-[:K]->() } AS has
+               RETURN name, has ORDER BY name"#,
+        )
+        .await
+        .expect("with exists")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([["A", true], ["B", false], ["C", false]]));
+}
+
+#[tokio::test]
+async fn cypher_foreach_unrolls_constant_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:foreach");
+
+    // Pure CREATE body: one distinct node per element.
+    let l = fluree
+        .transact_cypher(l, r#"FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))"#)
+        .await
+        .expect("foreach create")
+        .ledger;
+    // range() as the list; a MATCH-bound variable stays referenced in the body.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (n:N {v: 1}) FOREACH (i IN range(1, 2) | CREATE (n)-[:T]->(:M {i: i}))"#,
+        )
+        .await
+        .expect("foreach edges from bound node")
+        .ledger;
+    // SET body applies per element (last write wins on the same property).
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (n:N {v: 2}) FOREACH (x IN ["a", "b"] | SET n.mark = x)"#,
+        )
+        .await
+        .expect("foreach set")
+        .ledger;
+
+    let db = graphdb_from_ledger(&l);
+    let counts = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:N) WITH count(n) AS nodes
+               MATCH (:N {v: 1})-[:T]->(m:M)
+               RETURN nodes, count(m) AS edges"#,
+        )
+        .await
+        .expect("read back")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        counts,
+        json!([[3, 2]]),
+        "3 nodes; 2 edges from the bound node"
+    );
+    let mark = fluree
+        .query_cypher(&db, r#"MATCH (n:N {v: 2}) RETURN n.mark"#)
+        .await
+        .expect("mark")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(mark, json!([["b"]]), "SET per element, last wins");
+
+    // Runtime lists are deferred with a clear error.
+    let msg = fluree
+        .transact_cypher(l, r#"MATCH (n:N) FOREACH (x IN n.list | SET n.y = x)"#)
+        .await
+        .expect_err("runtime list")
+        .to_string();
+    assert!(msg.contains("FOREACH"), "{msg}");
+}
+
+#[tokio::test]
+async fn cypher_null_literal_in_expressions() {
+    // `null` is a first-class expression value: projected as JSON null,
+    // never equal to anything, detected by IS NULL, skipped by coalesce.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:null-lit");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:P {name: "A"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:P)
+               RETURN null AS nothing,
+                      coalesce(null, n.name) AS name,
+                      CASE WHEN n.name = "Z" THEN 1 ELSE null END AS via_case,
+                      null IS NULL AS yes"#,
+        )
+        .await
+        .expect("null literal expressions")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([[null, "A", null, true]]), "{out}");
+
+    // Comparison with null is never true: the row drops.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:P) WHERE n.name = null RETURN n"#)
+            .await
+            .expect("null comparison")
+            .row_count(),
+        0,
+        "= null matches nothing"
+    );
+
+    // Null inside a list literal survives as a null element.
+    let out = fluree
+        .query_cypher(&db, r#"MATCH (n:P) RETURN [1, null, 2] AS xs"#)
+        .await
+        .expect("null in list")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out, json!([[[1, null, 2]]]), "{out}");
+}
+
+#[tokio::test]
+async fn cypher_call_procedure_errors_are_actionable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:proc-errors");
+    let db = graphdb_from_ledger(&l);
+
+    // Unknown procedure names the supported set.
+    let msg = fluree
+        .query_cypher(&db, "CALL apoc.load.json()")
+        .await
+        .expect_err("unknown procedure")
+        .to_string();
+    assert!(
+        msg.contains("apoc.load.json") && msg.contains("db.labels"),
+        "unknown-procedure error lists the shims: {msg}"
+    );
+
+    // Unknown YIELD column names the real columns.
+    let msg = fluree
+        .query_cypher(&db, "CALL db.labels() YIELD nope")
+        .await
+        .expect_err("unknown yield column")
+        .to_string();
+    assert!(
+        msg.contains("nope") && msg.contains("label"),
+        "yield error names the columns: {msg}"
+    );
+
+    // Args on a no-arg shim.
+    let msg = fluree
+        .query_cypher(&db, r#"CALL db.labels("x")"#)
+        .await
+        .expect_err("args rejected")
+        .to_string();
+    assert!(msg.contains("no arguments"), "{msg}");
+
+    // Procedure calls only stand alone (first clause).
+    let msg = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) CALL db.labels() YIELD label RETURN label",
+        )
+        .await
+        .expect_err("mid-query procedure")
+        .to_string();
+    assert!(
+        msg.contains("first clause"),
+        "mid-query procedure is a clear parse error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_keyword_alias_names_output_column_and_binds_downstream() {
+    // Keyword tokens (`count`, `end`, `order`, …) are accepted as binding
+    // names — a deliberate leniency over strict openCypher. The alias must
+    // both name the output column and remain referenceable downstream.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:keyword-alias");
+    let l = fluree
+        .insert(
+            l,
+            &json!({"@context": ctx(), "@id": "alice", "@type": "Person", "name": "Alice"}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Terminal RETURN alias named with a keyword → that column name.
+    let cj = fluree
+        .query_cypher(&db, r#"MATCH (n:Person) RETURN n.name AS end"#)
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["columns"], json!(["end"]), "{cj}");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!("Alice"),
+        "{cj}"
+    );
+
+    // WITH-aliased keyword aggregate, referenced in a later WHERE and RETURN.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WITH count(*) AS count WHERE count > 0 RETURN count"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(cj["results"][0]["columns"], json!(["count"]), "{cj}");
+    assert_eq!(cj["results"][0]["data"][0]["row"][0], json!(1), "{cj}");
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_per_row_on_match_set() {
+    // Per-row relationship MERGE where the rows split across both branches:
+    // ON MATCH SET fires on the pre-existing edge, ON CREATE SET on the newly
+    // created one — atomically, in a single commit.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-per-row-onmatch");
+
+    // Seed Alice, Bob, Carol and one existing Alice-KNOWS->Bob edge.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                      (c:Person {name: "Carol"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let seed_t = l.t();
+
+    // MERGE Alice→(everyone else): Alice->Bob already exists (ON MATCH), Alice->
+    // Carol is missing (ON CREATE). One statement, one commit.
+    let result = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}), (b:Person) WHERE b.name <> "Alice"
+               MERGE (a)-[:KNOWS]->(b)
+               ON CREATE SET b.tag = "created"
+               ON MATCH SET b.tag = "matched""#,
+        )
+        .await
+        .expect("per-row merge with on-match/on-create");
+
+    assert_eq!(
+        result.ledger.t(),
+        seed_t + 1,
+        "the two branches publish as a single commit (t advances by exactly one)"
+    );
+
+    let db = graphdb_from_ledger(&result.ledger);
+
+    // Exactly two edges: the pre-existing Alice->Bob plus the created Alice->Carol.
+    let edges = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+               RETURN b.name AS name, b.tag AS tag ORDER BY name"#,
+        )
+        .await
+        .expect("edges")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        edges,
+        json!([["Bob", "matched"], ["Carol", "created"]]),
+        "ON MATCH tags the pre-existing edge's endpoint; ON CREATE tags the new one: {edges}"
+    );
+
+    // Alice was never a MERGE tail, so it carries no tag.
+    let alice_tagged = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}) WHERE a.tag IS NOT NULL RETURN a"#,
+        )
+        .await
+        .expect("alice")
+        .row_count();
+    assert_eq!(
+        alice_tagged, 0,
+        "the head endpoint is untouched by either branch"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_per_row_on_match_only_all_existing() {
+    // When every matched row already has the edge, only ON MATCH SET fires and
+    // no new edges are created — still a single commit.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-per-row-onmatch-only");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+               MERGE (a)-[:KNOWS]->(b)
+               ON CREATE SET b.tag = "created"
+               ON MATCH SET b.tag = "matched""#,
+        )
+        .await
+        .expect("per-row merge all-existing")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person) RETURN b.tag AS tag"#,
+        )
+        .await
+        .expect("rows")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(rows, json!([["matched"]]), "only ON MATCH fired: {rows}");
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_batch_node_merge_upsert() {
+    // The `LOAD CSV` shape: per-row node find-or-create keyed on a unique id,
+    // with a trailing SET applied on both branches. Two passes prove upsert:
+    // first pass creates, second pass updates without duplicating.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:unwind-node-merge");
+
+    let batch1 = json!({ "batch": [
+        {"id": "1", "name": "Alice"},
+        {"id": "2", "name": "Bob"},
+    ]});
+    let stmt = "UNWIND $batch AS row \
+                MERGE (n:Person {id: row.id}) \
+                SET n.name = row.name";
+
+    let seed_t = l.t();
+    let res = fluree
+        .transact_cypher_with_params(l, stmt, batch1.as_object())
+        .await
+        .expect("first upsert pass");
+    assert_eq!(res.ledger.t(), seed_t + 1, "one batch → one commit");
+    let db = graphdb_from_ledger(&res.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "first pass creates both nodes"
+    );
+
+    // Second pass: id 1 already exists (update name), id 3 is new (create).
+    let batch2 = json!({ "batch": [
+        {"id": "1", "name": "Alice2"},
+        {"id": "3", "name": "Carol"},
+    ]});
+    let res = fluree
+        .transact_cypher_with_params(res.ledger, stmt, batch2.as_object())
+        .await
+        .expect("second upsert pass");
+    let db = graphdb_from_ledger(&res.ledger);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) RETURN n.id AS id, n.name AS name ORDER BY id",
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        rows,
+        json!([["1", "Alice2"], ["2", "Bob"], ["3", "Carol"]]),
+        "id 1 updated in place (no duplicate), id 3 created, id 2 untouched: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_batch_node_merge_on_create_on_match() {
+    // Per-row node upsert with distinct ON CREATE vs ON MATCH branches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:unwind-node-merge-oncreate");
+    // Seed id 1 so the next pass matches it and creates id 2.
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $batch AS row MERGE (n:Person {id: row.id})",
+            json!({"batch": [{"id": "1"}]}).as_object(),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let l = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $batch AS row MERGE (n:Person {id: row.id}) \
+             ON CREATE SET n.origin = 'created' \
+             ON MATCH SET n.origin = 'matched'",
+            json!({"batch": [{"id": "1"}, {"id": "2"}]}).as_object(),
+        )
+        .await
+        .expect("upsert with on-create/on-match")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) RETURN n.id AS id, n.origin AS origin ORDER BY id",
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        rows,
+        json!([["1", "matched"], ["2", "created"]]),
+        "existing id 1 took ON MATCH; new id 2 took ON CREATE: {rows}"
     );
 }
