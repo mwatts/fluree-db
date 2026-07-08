@@ -11,7 +11,7 @@ use crate::query_eval::PolicyQueryExecutor;
 use crate::schema::is_schema_flake;
 use crate::types::{
     FlakePolicyEntry, PolicyDecision, PolicyRestriction, PolicySet, PolicyValue, PolicyWrapper,
-    TargetMode,
+    TargetMode, WriteFlakeInfo,
 };
 use crate::Result;
 use fluree_db_core::{FlakeValue, Sid, Tracker};
@@ -574,7 +574,90 @@ impl PolicyContext {
             })
             .collect();
 
-        // 3. Apply required subset filtering (AFTER class filtering)
+        self.combine_applicable_async_detailed(
+            policy_set,
+            applicable_entries,
+            flake.subject,
+            executor,
+            tracker,
+        )
+        .await
+    }
+
+    /// Check if a staged write flake is allowed, with write-verb semantics
+    /// and full f:query support.
+    ///
+    /// This is the write-path counterpart of
+    /// [`allow_modify_flake_async_detailed`](Self::allow_modify_flake_async_detailed):
+    /// candidates are selected against the superset of classes that could
+    /// make any policy applicable, then each candidate is filtered by its
+    /// own semantics — legacy bare-`f:modify` policies match the subject's
+    /// pre-state classes and govern all operations; verb policies match the
+    /// subject's lifecycle, its pre∪post classes, and (for `rdf:type`
+    /// flakes) the class being asserted or retracted. See [`WriteFlakeInfo`].
+    pub async fn allow_modify_flake_write_async_detailed<'a>(
+        &'a self,
+        subject: &Sid,
+        property: &Sid,
+        object: &FlakeValue,
+        write: WriteFlakeInfo<'_>,
+        executor: &dyn PolicyQueryExecutor,
+        tracker: &Tracker,
+    ) -> Result<PolicyDecision<'a>> {
+        // Root policy bypasses all checks
+        if self.wrapper.is_root() {
+            return Ok(PolicyDecision::Allowed { restriction: None });
+        }
+
+        // Schema flakes always allowed (needed for internal operations)
+        if is_schema_flake(property, object) {
+            return Ok(PolicyDecision::Allowed { restriction: None });
+        }
+
+        let policy_set = self.wrapper.modify();
+
+        // Select candidates against the superset of classes that could make
+        // any policy applicable (union classes already contain pre-state
+        // classes; add the rdf:type object class so policies targeting a
+        // minted class are found). write_applicable() then applies each
+        // restriction's exact semantics.
+        let mut selection_classes: Vec<Sid> = write.union_classes.to_vec();
+        if let Some(obj_class) = write.type_object_class {
+            if !selection_classes.contains(obj_class) {
+                selection_classes.push(obj_class.clone());
+            }
+        }
+        let candidate_entries =
+            policy_set.policy_entries_for_flake(subject, property, &selection_classes);
+
+        let applicable_entries: Vec<FlakePolicyEntry> = candidate_entries
+            .into_iter()
+            .filter(|entry| write_applicable(&policy_set.restrictions[entry.idx], &write))
+            .collect();
+
+        self.combine_applicable_async_detailed(
+            policy_set,
+            applicable_entries,
+            subject,
+            executor,
+            tracker,
+        )
+        .await
+    }
+
+    /// Shared tail of detailed async evaluation: required-subset filtering,
+    /// deny-overrides, then required-AND or allow-overrides combining with
+    /// f:query execution. `applicable_entries` must already be filtered for
+    /// per-restriction applicability (class / verb semantics).
+    async fn combine_applicable_async_detailed<'a>(
+        &'a self,
+        policy_set: &'a PolicySet,
+        applicable_entries: Vec<FlakePolicyEntry>,
+        subject: &Sid,
+        executor: &dyn PolicyQueryExecutor,
+        tracker: &Tracker,
+    ) -> Result<PolicyDecision<'a>> {
+        // Apply required subset filtering (AFTER applicability filtering)
         let has_required = applicable_entries
             .iter()
             .any(|entry| policy_set.restrictions[entry.idx].required);
@@ -602,7 +685,7 @@ impl PolicyContext {
             .map(|entry| &policy_set.restrictions[entry.idx])
             .collect();
 
-        // 4. Evaluate with "Deny Overrides" semantics
+        // Evaluate with "Deny Overrides" semantics
         //
         // First pass: check for explicit Deny
         for entry in &filtered_entries {
@@ -626,7 +709,7 @@ impl PolicyContext {
                 tracker.policy_executed(&restriction.id);
                 if let PolicyValue::Query(q) = &restriction.value {
                     let bindings = build_policy_values_clause(
-                        flake.subject,
+                        subject,
                         &self.identity,
                         self.wrapper.policy_values(),
                     );
@@ -664,7 +747,7 @@ impl PolicyContext {
                 PolicyValue::Query(q) => {
                     // Build bindings for special variables + wrapper's policy_values
                     let bindings = build_policy_values_clause(
-                        flake.subject,
+                        subject,
                         &self.identity,
                         self.wrapper.policy_values(),
                     );
@@ -690,7 +773,7 @@ impl PolicyContext {
             }
         }
 
-        // 5. Policies applied, but none allowed -> deny with candidates
+        // Policies applied, but none allowed -> deny with candidates
         Ok(PolicyDecision::Denied {
             candidates: candidate_restrictions,
         })
@@ -847,6 +930,49 @@ fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
     })
 }
 
+/// Per-restriction applicability of a candidate policy to a staged write
+/// flake.
+///
+/// Legacy bare-`f:modify` policies (`verbs: None`) keep pre-state semantics:
+/// class targeting matches the subject's pre-transaction classes and every
+/// operation is governed. Verb policies (`verbs: Some`) use exact lifecycle
+/// semantics: the subject's lifecycle must be one of the policy's verbs,
+/// class targeting matches the subject's pre∪post classes, and `rdf:type`
+/// flakes match by the class they assert or retract (minting or removing
+/// membership in C is an operation ON C).
+///
+/// Class-targeted candidates are ALWAYS checked precisely here — candidate
+/// selection may over-select via the superset classes, and the view-set
+/// exclusivity shortcut (`class_check_needed == false`) is unsound for
+/// writes.
+fn write_applicable(r: &PolicyRestriction, write: &WriteFlakeInfo<'_>) -> bool {
+    match r.verbs {
+        None => {
+            if r.class_policy {
+                r.for_classes.iter().any(|c| write.pre_classes.contains(c))
+            } else {
+                true
+            }
+        }
+        Some(verbs) => {
+            if !verbs.contains(write.lifecycle) {
+                return false;
+            }
+            if r.class_policy {
+                match write.type_object_class {
+                    Some(obj_class) => r.for_classes.contains(obj_class),
+                    None => r
+                        .for_classes
+                        .iter()
+                        .any(|c| write.union_classes.contains(c)),
+                }
+            } else {
+                true
+            }
+        }
+    }
+}
+
 /// Build values clause for policy query execution.
 ///
 /// ALWAYS includes ?$identity binding to ensure it's ground.
@@ -893,6 +1019,7 @@ mod tests {
             target_mode: TargetMode::OnProperty,
             targets: [property].into_iter().collect(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,

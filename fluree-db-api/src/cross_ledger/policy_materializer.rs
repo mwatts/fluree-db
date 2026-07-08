@@ -335,6 +335,7 @@ fn restriction_to_wire(
         target_mode: r.target_mode,
         targets,
         action: r.action,
+        verbs: r.verbs,
         value,
         required: r.required,
         message: r.message.clone(),

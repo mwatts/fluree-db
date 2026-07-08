@@ -21,7 +21,7 @@ use fluree_db_core::{RangeMatch, RangeOptions, RangeTest};
 use fluree_db_novelty::{Novelty, StatsAssemblyError, StatsLookup};
 use fluree_db_policy::{
     build_policy_set, PolicyAction, PolicyContext, PolicyQuery, PolicyQueryLanguage,
-    PolicyRestriction, PolicyValue, PolicyWrapper, TargetMode,
+    PolicyRestriction, PolicyValue, PolicyWrapper, TargetMode, WriteVerbs,
 };
 use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
@@ -830,9 +830,13 @@ pub(crate) async fn load_policy_restriction(
         }
     }
 
-    // f:action - collect all action values to determine View, Modify, or Both
-    let action: Option<PolicyAction> = {
+    // f:action - collect action values: f:view / f:modify plus the write
+    // verbs f:create / f:update / f:delete. Any verb implies the modify side.
+    let (action, verbs): (Option<PolicyAction>, Option<WriteVerbs>) = {
         let action_sid = resolve_system_iri_to_sid(snapshot, policy_iris::ACTION, "f:action")?;
+        let create_sid = resolve_system_iri_to_sid(snapshot, policy_iris::CREATE, "f:create")?;
+        let update_sid = resolve_system_iri_to_sid(snapshot, policy_iris::UPDATE, "f:update")?;
+        let delete_sid = resolve_system_iri_to_sid(snapshot, policy_iris::DELETE, "f:delete")?;
         let bindings = query_predicate(
             snapshot,
             overlay,
@@ -844,21 +848,43 @@ pub(crate) async fn load_policy_restriction(
         .await?;
         let mut has_view = false;
         let mut has_modify = false;
+        let mut v = WriteVerbs::default();
         for binding in bindings {
             if let Some(action_ref) = binding.as_sid() {
                 if &view_sid == action_ref {
                     has_view = true;
                 } else if &modify_sid == action_ref {
                     has_modify = true;
+                } else if &create_sid == action_ref {
+                    v.create = true;
+                } else if &update_sid == action_ref {
+                    v.update = true;
+                } else if &delete_sid == action_ref {
+                    v.delete = true;
                 }
             }
         }
-        match (has_view, has_modify) {
+        // Explicit verbs select exact lifecycle semantics. Bare f:modify
+        // alongside verbs still means "all writes", so it widens the verb
+        // set to ALL (keeping exact semantics); bare f:modify alone stays
+        // legacy (verbs: None).
+        let verbs = if v.any() {
+            if has_modify {
+                Some(WriteVerbs::ALL)
+            } else {
+                Some(v)
+            }
+        } else {
+            None
+        };
+        let has_modify_side = has_modify || v.any();
+        let action = match (has_view, has_modify_side) {
             (true, true) => Some(PolicyAction::Both),
             (true, false) => Some(PolicyAction::View),
             (false, true) => Some(PolicyAction::Modify),
             (false, false) => None,
-        }
+        };
+        (action, verbs)
     };
 
     // f:onProperty (can have multiple values)
@@ -1064,6 +1090,7 @@ pub(crate) async fn load_policy_restriction(
         target_mode,
         targets,
         action: action.unwrap_or(PolicyAction::Both),
+        verbs,
         value,
         required,
         message,
@@ -1212,7 +1239,7 @@ fn parse_inline_policy(
             .get("f:action")
             .or_else(|| obj.get(&format!("{}action", fluree::DB)));
 
-        let action = parse_action_value(action_value);
+        let (action, verbs) = parse_action_value(action_value);
 
         // Extract targets - track whether targeting was specified for validation
         let mut on_property: HashSet<Sid> = HashSet::new();
@@ -1362,6 +1389,7 @@ fn parse_inline_policy(
             target_mode,
             targets,
             action,
+            verbs,
             value,
             required,
             message,
@@ -1517,19 +1545,24 @@ fn build_policy_values(
     Ok(result)
 }
 
-/// Parse f:action value into PolicyAction.
+/// Parse f:action value into PolicyAction plus optional write verbs.
 ///
 /// Handles multiple formats:
 /// - String: "f:view", "f:modify", or full IRI
 /// - Object with @id: {"@id": "f:view"}
 /// - Array of the above: [{"@id": "f:view"}, {"@id": "f:modify"}]
 ///
-/// Returns PolicyAction::Both if both view and modify are specified or if
-/// the value cannot be parsed.
-fn parse_action_value(value: Option<&JsonValue>) -> PolicyAction {
+/// The write verbs `f:create` / `f:update` / `f:delete` imply the modify
+/// side and select exact lifecycle semantics; bare `f:modify` alone keeps
+/// legacy semantics (`verbs: None`), and `f:modify` alongside a verb widens
+/// the verb set to ALL while keeping exact semantics.
+///
+/// Returns PolicyAction::Both if both view and modify sides are specified
+/// or if the value cannot be parsed.
+fn parse_action_value(value: Option<&JsonValue>) -> (PolicyAction, Option<WriteVerbs>) {
     let value = match value {
         Some(v) => v,
-        None => return PolicyAction::Both,
+        None => return (PolicyAction::Both, None),
     };
 
     // Collect all action IRIs from the value
@@ -1537,6 +1570,7 @@ fn parse_action_value(value: Option<&JsonValue>) -> PolicyAction {
 
     let mut has_view = false;
     let mut has_modify = false;
+    let mut v = WriteVerbs::default();
 
     for s in action_strs {
         if s.contains("view") {
@@ -1545,14 +1579,35 @@ fn parse_action_value(value: Option<&JsonValue>) -> PolicyAction {
         if s.contains("modify") {
             has_modify = true;
         }
+        if s == "f:create" || s.ends_with("#create") {
+            v.create = true;
+        }
+        if s == "f:update" || s.ends_with("#update") {
+            v.update = true;
+        }
+        if s == "f:delete" || s.ends_with("#delete") {
+            v.delete = true;
+        }
     }
 
-    match (has_view, has_modify) {
+    let verbs = if v.any() {
+        if has_modify {
+            Some(WriteVerbs::ALL)
+        } else {
+            Some(v)
+        }
+    } else {
+        None
+    };
+    let has_modify_side = has_modify || v.any();
+
+    let action = match (has_view, has_modify_side) {
         (true, true) => PolicyAction::Both,
         (true, false) => PolicyAction::View,
         (false, true) => PolicyAction::Modify,
         (false, false) => PolicyAction::Both, // Default if no recognized action
-    }
+    };
+    (action, verbs)
 }
 
 /// Extract action strings from a JSON value (string, object with @id, or array).
@@ -1628,49 +1683,49 @@ mod tests {
 
     #[test]
     fn test_parse_action_none() {
-        assert_eq!(parse_action_value(None), PolicyAction::Both);
+        assert_eq!(parse_action_value(None).0, PolicyAction::Both);
     }
 
     #[test]
     fn test_parse_action_string_view() {
         let v = serde_json::json!("f:view");
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::View);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::View);
     }
 
     #[test]
     fn test_parse_action_string_modify() {
         let v = serde_json::json!("f:modify");
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Modify);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Modify);
     }
 
     #[test]
     fn test_parse_action_object_view() {
         let v = serde_json::json!({"@id": "f:view"});
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::View);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::View);
     }
 
     #[test]
     fn test_parse_action_object_modify() {
         let v = serde_json::json!({"@id": "https://ns.flur.ee/db#modify"});
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Modify);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Modify);
     }
 
     #[test]
     fn test_parse_action_array_view_only() {
         let v = serde_json::json!([{"@id": "f:view"}]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::View);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::View);
     }
 
     #[test]
     fn test_parse_action_array_modify_only() {
         let v = serde_json::json!([{"@id": "f:modify"}]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Modify);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Modify);
     }
 
     #[test]
     fn test_parse_action_array_both() {
         let v = serde_json::json!([{"@id": "f:view"}, {"@id": "f:modify"}]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Both);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Both);
     }
 
     #[test]
@@ -1679,6 +1734,6 @@ mod tests {
             {"@id": "https://ns.flur.ee/db#view"},
             {"@id": "https://ns.flur.ee/db#modify"}
         ]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Both);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Both);
     }
 }

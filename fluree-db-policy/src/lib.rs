@@ -64,6 +64,7 @@ pub use schema::{is_schema_flake, is_schema_predicate};
 pub use types::{
     FlakePolicyEntry, PolicyAction, PolicyDecision, PolicyQuery, PolicyQueryLanguage,
     PolicyRestriction, PolicySet, PolicyValue, PolicyWrapper, PropertyPolicyEntry, TargetMode,
+    WriteFlakeInfo, WriteVerb, WriteVerbs,
 };
 pub use wire::{
     build_policy_set_from_wire, wire_to_restrictions, PolicyArtifactWire, WireOrigin,

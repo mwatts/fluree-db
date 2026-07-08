@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::index::build_policy_set;
 use crate::types::{
     PolicyAction, PolicyQuery, PolicyQueryLanguage, PolicyRestriction, PolicySet, PolicyValue,
-    TargetMode,
+    TargetMode, WriteVerbs,
 };
 use fluree_db_core::{IndexStats, Sid};
 use std::collections::HashSet;
@@ -77,6 +77,9 @@ pub struct WireRestriction {
     pub targets: Vec<String>,
     /// `f:action`.
     pub action: PolicyAction,
+    /// Explicit write verbs (`f:create`/`f:update`/`f:delete`), if any.
+    /// `None` = bare `f:modify` legacy semantics.
+    pub verbs: Option<WriteVerbs>,
     /// `f:allow` / `f:query` effect.
     pub value: WirePolicyValue,
     /// `f:required` flag.
@@ -208,6 +211,7 @@ where
             target_mode: w.target_mode,
             targets,
             action: w.action,
+            verbs: w.verbs,
             value,
             required: w.required,
             message: w.message.clone(),
@@ -298,6 +302,7 @@ mod tests {
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into()],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Allow,
                 required: false,
                 message: None,
@@ -344,6 +349,7 @@ mod tests {
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into(), unknown_iri.into()],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Deny,
                 required: false,
                 message: None,
@@ -392,6 +398,7 @@ mod tests {
             target_mode: TargetMode::OnProperty,
             targets: [name_sid.clone()].into_iter().collect(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,
@@ -410,6 +417,7 @@ mod tests {
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into()],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Allow,
                 required: false,
                 message: None,
@@ -463,6 +471,7 @@ mod tests {
                     target_mode: TargetMode::Default,
                     targets: vec![],
                     action: PolicyAction::View,
+                    verbs: None,
                     value: WirePolicyValue::Allow,
                     required: false,
                     message: None,
@@ -475,6 +484,7 @@ mod tests {
                     target_mode: TargetMode::Default,
                     targets: vec![],
                     action: PolicyAction::View,
+                    verbs: None,
                     value: WirePolicyValue::Allow,
                     required: false,
                     message: None,
@@ -524,6 +534,7 @@ mod tests {
                 target_mode: TargetMode::Default,
                 targets: vec![],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Allow,
                 required: false,
                 message: None,
@@ -554,6 +565,7 @@ mod tests {
                 target_mode: TargetMode::Default,
                 targets: vec![],
                 action: PolicyAction::View,
+                verbs: None,
                 value: WirePolicyValue::Query {
                     source: json_payload.into(),
                     language: PolicyQueryLanguage::JsonLd,

@@ -45,10 +45,23 @@ If all targeting predicates are omitted, the policy is a **default policy** that
 `f:action` carries IRIs in the `f:` namespace:
 
 - `"f:view"` (or `{"@id": "f:view"}`) — queries.
-- `"f:modify"` (or `{"@id": "f:modify"}`) — transactions.
+- `"f:modify"` (or `{"@id": "f:modify"}`) — transactions (all writes).
 - Both: `[{"@id": "f:view"}, {"@id": "f:modify"}]`.
+- Write verbs — `"f:create"`, `"f:update"`, `"f:delete"` — refine the
+  transaction side by the subject's lifecycle within the transaction. See
+  [Write verbs](policy-in-transactions.md#write-verbs) for full semantics.
 
 A policy with no `f:action` defaults to applying to both view and modify.
+
+**Verbs vs bare `f:modify`.** The write verbs select *exact* lifecycle
+semantics: class targeting matches the subject's classes before **or**
+after the transaction (so "may create new instances of `ex:Lead`" is
+expressible), and `rdf:type` writes match by the class they assert or
+retract. Bare `f:modify` keeps its long-standing semantics: it governs all
+writes, with class targeting matched against the subject's pre-transaction
+classes only (so class-targeted policies never apply to brand-new
+subjects). Naming `f:modify` alongside a verb widens the verb set to all
+three while keeping exact semantics.
 
 ## `f:query` syntax
 

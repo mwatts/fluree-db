@@ -2036,6 +2036,18 @@ pub mod policy_iris {
     /// `https://ns.flur.ee/db#modify` - modify action IRI
     pub const MODIFY: &str = "https://ns.flur.ee/db#modify";
 
+    /// `https://ns.flur.ee/db#create` - create write verb (subject is new
+    /// in this transaction's post-state)
+    pub const CREATE: &str = "https://ns.flur.ee/db#create";
+
+    /// `https://ns.flur.ee/db#update` - update write verb (subject exists
+    /// before and after this transaction)
+    pub const UPDATE: &str = "https://ns.flur.ee/db#update";
+
+    /// `https://ns.flur.ee/db#delete` - delete write verb (subject is
+    /// removed by this transaction)
+    pub const DELETE: &str = "https://ns.flur.ee/db#delete";
+
     /// `https://ns.flur.ee/db#onProperty` - property-level targeting
     pub const ON_PROPERTY: &str = "https://ns.flur.ee/db#onProperty";
 

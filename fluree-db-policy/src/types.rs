@@ -81,6 +81,89 @@ pub enum PolicyAction {
     Both,
 }
 
+/// The lifecycle of a subject within one transaction, derived from its
+/// existence before and after the transaction:
+///
+/// | exists pre-state | exists post-state | lifecycle |
+/// |------------------|-------------------|-----------|
+/// | no               | yes               | Create    |
+/// | yes              | yes               | Update    |
+/// | yes              | no                | Delete    |
+///
+/// Every staged flake inherits its subject's lifecycle verb: asserts occur
+/// under Create/Update, retracts under Update/Delete. Changing a value
+/// (retract old + assert new on an existing subject) is entirely Update;
+/// clearing one value of a persisting subject is Update; Delete means the
+/// subject is removed outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteVerb {
+    /// Subject does not exist in pre-state (all its flakes are asserts)
+    Create,
+    /// Subject exists in both pre- and post-state
+    Update,
+    /// Subject exists in pre-state and is fully removed by this transaction
+    Delete,
+}
+
+/// The set of write verbs a modify policy governs (`f:create` / `f:update` /
+/// `f:delete` in `f:action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteVerbs {
+    pub create: bool,
+    pub update: bool,
+    pub delete: bool,
+}
+
+impl WriteVerbs {
+    /// All three verbs (equivalent coverage to bare `f:modify`, but with
+    /// exact lifecycle/class semantics).
+    pub const ALL: WriteVerbs = WriteVerbs {
+        create: true,
+        update: true,
+        delete: true,
+    };
+
+    /// True if this set contains the given lifecycle verb.
+    pub fn contains(&self, verb: WriteVerb) -> bool {
+        match verb {
+            WriteVerb::Create => self.create,
+            WriteVerb::Update => self.update,
+            WriteVerb::Delete => self.delete,
+        }
+    }
+
+    /// True if at least one verb is set.
+    pub fn any(&self) -> bool {
+        self.create || self.update || self.delete
+    }
+}
+
+/// Write-time evaluation context for one staged flake.
+///
+/// Carries the per-subject lifecycle and class information the write
+/// evaluator needs. Built by the transaction staging layer from the staged
+/// flake batch plus pre-state lookups.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteFlakeInfo<'a> {
+    /// Lifecycle of the flake's subject within this transaction.
+    pub lifecycle: WriteVerb,
+    /// Subject's classes in pre-state. Governs class targeting for legacy
+    /// bare-`f:modify` policies (`verbs: None`).
+    pub pre_classes: &'a [Sid],
+    /// Subject's classes in pre ∪ post state (pre-state classes plus
+    /// `rdf:type` classes asserted in this transaction). Governs class
+    /// targeting for verb policies — a deny on class C cannot be escaped by
+    /// un-typing in the same transaction, and a create sees the class being
+    /// minted.
+    pub union_classes: &'a [Sid],
+    /// For `rdf:type` flakes whose object is a class ref: that class.
+    /// Verb policies match type flakes by this OBJECT class — adding or
+    /// removing membership in C is an operation ON C — so an allow scoped
+    /// to class A can never mint class B, even on a subject that is
+    /// (post-state) an A.
+    pub type_object_class: Option<&'a Sid>,
+}
+
 /// Result of detailed policy evaluation
 ///
 /// This enum provides access to the winning restriction on allow,
@@ -165,6 +248,15 @@ pub struct PolicyRestriction {
     pub targets: HashSet<Sid>,
     /// Action (View, Modify, Both)
     pub action: PolicyAction,
+    /// Write verbs this policy governs on the modify side.
+    ///
+    /// `None` = bare `f:modify` (legacy): all operations, class targeting
+    /// evaluated against the subject's PRE-state classes only (a
+    /// class-targeted policy therefore never applies to brand-new
+    /// subjects). `Some(verbs)` = explicit `f:create` / `f:update` /
+    /// `f:delete` in `f:action`: exact lifecycle semantics — see
+    /// [`WriteVerb`] and [`WriteFlakeInfo`].
+    pub verbs: Option<WriteVerbs>,
     /// Policy value (Allow, Deny, Query)
     pub value: PolicyValue,
     /// Required flag (for subset filtering)
@@ -499,6 +591,19 @@ impl PolicyWrapper {
 
         view_has || modify_has
     }
+
+    /// Check if the modify set contains any explicit write-verb policies
+    /// (`f:create` / `f:update` / `f:delete`).
+    ///
+    /// Used by the transaction staging layer to decide whether per-subject
+    /// lifecycle classification (pre/post existence probes) is needed.
+    pub fn has_write_verb_policies(&self) -> bool {
+        self.inner
+            .modify
+            .restrictions
+            .iter()
+            .any(|r| r.verbs.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +631,7 @@ mod tests {
             target_mode: TargetMode::OnProperty,
             targets: [make_sid(100, "name")].into_iter().collect(),
             action: PolicyAction::View,
+            verbs: None,
             value: PolicyValue::Allow,
             required: false,
             message: None,
@@ -548,6 +654,7 @@ mod tests {
             target_mode: TargetMode::Default,
             targets: HashSet::new(),
             action: PolicyAction::Both,
+            verbs: None,
             value: PolicyValue::Deny,
             required: false,
             message: Some("Access denied".to_string()),

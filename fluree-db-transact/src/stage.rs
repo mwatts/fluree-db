@@ -20,7 +20,8 @@ use fluree_db_core::Tracker;
 use fluree_db_core::{Flake, FlakeValue, GraphId, Sid};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
-    is_schema_flake, populate_class_cache, PolicyContext, PolicyDecision, PolicyError,
+    is_schema_flake, lookup_subject_classes, PolicyContext, PolicyDecision, PolicyError,
+    WriteFlakeInfo, WriteVerb,
 };
 use fluree_db_query::parse::{lower_unresolved_patterns, UnresolvedPattern};
 use fluree_db_query::{
@@ -1184,14 +1185,40 @@ async fn hydrate_list_index_meta_for_retractions(
     Ok(())
 }
 
+/// Per-(graph, subject) write-time state computed once per transaction for
+/// policy enforcement: the class sets each policy flavor targets against and
+/// the subject's lifecycle verb.
+struct SubjectWriteState {
+    /// Subject's classes in pre-transaction state (legacy `f:modify` class
+    /// targeting).
+    pre_classes: Vec<Sid>,
+    /// pre_classes ∪ classes asserted via rdf:type in this transaction
+    /// (write-verb class targeting).
+    union_classes: Vec<Sid>,
+    /// Lifecycle verb: create / update / delete (see [`WriteVerb`]).
+    lifecycle: WriteVerb,
+}
+
+/// Per-(graph, subject) deltas gathered from the staged flake batch.
+#[derive(Default)]
+struct SubjectDelta {
+    has_assert: bool,
+    has_retract: bool,
+    /// Classes asserted via rdf:type in this transaction.
+    asserted_classes: Vec<Sid>,
+    /// (p, o, dt) of this subject's retractions, for full-removal detection.
+    retracts: Vec<(Sid, FlakeValue, Sid)>,
+}
+
 /// Enforce modify policies on staged flakes
 ///
 /// This function handles the complete policy enforcement flow:
-/// 1. Populates the class cache for f:onClass policy support (if needed)
+/// 1. Computes per-subject write state (classes and, when write-verb
+///    policies are present, lifecycle classification)
 /// 2. Enforces modify policies on each flake with full f:query support
 ///
-/// Returns `Ok(())` if all flakes pass policy, or an error if any flake is denied
-/// or if the class cache population fails.
+/// Returns `Ok(())` if all flakes pass policy, or an error if any flake is
+/// denied or a pre-state lookup fails.
 async fn enforce_modify_policies(
     flakes: &[Flake],
     policy: &PolicyContext,
@@ -1199,32 +1226,145 @@ async fn enforce_modify_policies(
     tracker: Option<&Tracker>,
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> Result<()> {
-    // Pre-populate class cache for f:onClass policy support, per graph.
-    if policy.wrapper().has_class_policies() {
-        // Group subjects by graph to populate class cache with correct g_id.
-        let mut subjects_by_graph: HashMap<GraphId, HashSet<Sid>> = HashMap::new();
+    let needs_classes = policy.wrapper().has_class_policies();
+    let needs_lifecycle = policy.wrapper().has_write_verb_policies();
+
+    let mut states: HashMap<(GraphId, Sid), SubjectWriteState> = HashMap::new();
+    if needs_classes || needs_lifecycle {
+        // Gather per-subject deltas from the staged batch.
+        let mut deltas: HashMap<(GraphId, Sid), SubjectDelta> = HashMap::new();
         for flake in flakes {
             let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
-            subjects_by_graph
-                .entry(g_id)
-                .or_default()
-                .insert(flake.s.clone());
+            let d = deltas.entry((g_id, flake.s.clone())).or_default();
+            if flake.op {
+                d.has_assert = true;
+                if fluree_db_core::is_rdf_type(&flake.p) {
+                    if let FlakeValue::Ref(c) = &flake.o {
+                        if !d.asserted_classes.contains(c) {
+                            d.asserted_classes.push(c.clone());
+                        }
+                    }
+                }
+            } else {
+                d.has_retract = true;
+                if needs_lifecycle {
+                    d.retracts
+                        .push((flake.p.clone(), flake.o.clone(), flake.dt.clone()));
+                }
+            }
         }
 
+        // Batched pre-state class lookup per graph.
+        let mut subjects_by_graph: HashMap<GraphId, Vec<Sid>> = HashMap::new();
+        for (g_id, s) in deltas.keys() {
+            subjects_by_graph.entry(*g_id).or_default().push(s.clone());
+        }
+        let mut pre_classes_map: HashMap<(GraphId, Sid), Vec<Sid>> = HashMap::new();
         for (g_id, subjects) in &subjects_by_graph {
-            let subject_vec: Vec<Sid> = subjects.iter().cloned().collect();
-            populate_class_cache(&subject_vec, ledger.as_graph_db_ref(*g_id), policy)
+            let map = lookup_subject_classes(subjects, ledger.as_graph_db_ref(*g_id))
                 .await
                 .map_err(|e| {
                     TransactError::Query(fluree_db_query::QueryError::Internal(format!(
-                        "Failed to populate class cache: {e}"
+                        "Failed to look up subject classes for policy: {e}"
                     )))
                 })?;
+            for (s, classes) in map {
+                pre_classes_map.insert((*g_id, s), classes);
+            }
+        }
+
+        for ((g_id, s), d) in deltas {
+            let pre_classes = pre_classes_map
+                .remove(&(g_id, s.clone()))
+                .unwrap_or_default();
+            let mut union_classes = pre_classes.clone();
+            for c in &d.asserted_classes {
+                if !union_classes.contains(c) {
+                    union_classes.push(c.clone());
+                }
+            }
+            let lifecycle = if needs_lifecycle {
+                classify_subject_lifecycle(ledger, g_id, &s, &d, &pre_classes).await?
+            } else {
+                // Without write-verb policies the lifecycle is never read.
+                WriteVerb::Update
+            };
+            states.insert(
+                (g_id, s),
+                SubjectWriteState {
+                    pre_classes,
+                    union_classes,
+                    lifecycle,
+                },
+            );
         }
     }
 
     // Enforce modify policies with full f:query support
-    enforce_modify_policy_per_flake(flakes, policy, ledger, tracker, reverse_graph).await
+    enforce_modify_policy_per_flake(flakes, policy, ledger, tracker, reverse_graph, &states).await
+}
+
+/// Classify a subject's lifecycle within this transaction:
+/// `(exists pre, exists post)` → Create `(no, yes)`, Update `(yes, yes)`,
+/// Delete `(yes, no)`.
+///
+/// Existence probes hit pre-state (snapshot + committed novelty) only when
+/// the cheap signals are inconclusive: a subject with pre-state classes
+/// exists; a subject with asserts exists post-state. The full pre-state
+/// flake scan runs only for retract-only subjects, where full removal must
+/// be distinguished from partial retraction.
+async fn classify_subject_lifecycle(
+    ledger: &LedgerState,
+    g_id: GraphId,
+    subject: &Sid,
+    delta: &SubjectDelta,
+    pre_classes: &[Sid],
+) -> Result<WriteVerb> {
+    let scan_pre_state = || async move {
+        let rm = fluree_db_core::RangeMatch::new().with_subject(subject.clone());
+        let opts = fluree_db_core::RangeOptions::new().with_to_t(ledger.t());
+        fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            fluree_db_core::IndexType::Spot,
+            fluree_db_core::RangeTest::Eq,
+            rm,
+            opts,
+        )
+        .await
+    };
+
+    if delta.has_assert {
+        // Post-state existence is guaranteed by the assert; lifecycle is
+        // decided by pre-state existence alone. Results can include
+        // retraction flakes, so existence means at least one LIVE assert.
+        let pre_exists = !pre_classes.is_empty() || scan_pre_state().await?.iter().any(|f| f.op);
+        return Ok(if pre_exists {
+            WriteVerb::Update
+        } else {
+            WriteVerb::Create
+        });
+    }
+
+    // Retract-only subject: Delete iff every live pre-state flake is
+    // retracted by this transaction; otherwise the subject persists (Update).
+    let pre_flakes = scan_pre_state().await?;
+    if !pre_flakes.iter().any(|f| f.op) {
+        // Retracting from a nonexistent subject nets to nothing; classify as
+        // Update so no create/delete grant is consumed by a no-op.
+        return Ok(WriteVerb::Update);
+    }
+    let fully_retracted = pre_flakes.iter().filter(|f| f.op).all(|pre| {
+        delta.retracts.iter().any(|(p, o, dt)| {
+            p == &pre.p && o == &pre.o && fluree_db_core::dt_compatible(dt, &pre.dt)
+        })
+    });
+    Ok(if fully_retracted {
+        WriteVerb::Delete
+    } else {
+        WriteVerb::Update
+    })
 }
 
 /// Enforce modify policies on each flake individually
@@ -1240,6 +1380,7 @@ async fn enforce_modify_policy_per_flake(
     ledger: &LedgerState,
     tracker: Option<&Tracker>,
     reverse_graph: &HashMap<Sid, GraphId>,
+    states: &HashMap<(GraphId, Sid), SubjectWriteState>,
 ) -> Result<()> {
     // Build per-graph QueryPolicyExecutors so f:query policies execute against
     // the correct graph. Cache executors to avoid rebuilding for every flake.
@@ -1249,17 +1390,13 @@ async fn enforce_modify_policy_per_flake(
     // so we only use the tracker here for async policy query calls.
     let async_tracker = tracker.cloned().unwrap_or_else(Tracker::disabled);
 
+    let empty_classes: Vec<Sid> = Vec::new();
+
     for flake in flakes {
         // Schema flakes always allowed (needed for internal operations)
         if is_schema_flake(&flake.p, &flake.o) {
             continue;
         }
-
-        // Get subject classes from cache (empty if not cached)
-        // Class cache is populated per-graph by enforce_modify_policies() above.
-        let subject_classes = policy
-            .get_cached_subject_classes(&flake.s)
-            .unwrap_or_default();
 
         // Resolve the graph for this flake and get/create a cached executor.
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
@@ -1269,13 +1406,30 @@ async fn enforce_modify_policy_per_flake(
                 .with_graph_id(g_id)
         });
 
+        // Per-subject write state (absent when no class/verb policies are
+        // loaded — the evaluator then never reads classes or lifecycle).
+        let state = states.get(&(g_id, flake.s.clone()));
+        let write = WriteFlakeInfo {
+            lifecycle: state.map_or(WriteVerb::Update, |st| st.lifecycle),
+            pre_classes: state.map_or(&empty_classes, |st| &st.pre_classes),
+            union_classes: state.map_or(&empty_classes, |st| &st.union_classes),
+            type_object_class: if fluree_db_core::is_rdf_type(&flake.p) {
+                match &flake.o {
+                    FlakeValue::Ref(c) => Some(c),
+                    _ => None,
+                }
+            } else {
+                None
+            },
+        };
+
         // Evaluate modify policies with full f:query support using detailed API
         let decision = policy
-            .allow_modify_flake_async_detailed(
+            .allow_modify_flake_write_async_detailed(
                 &flake.s,
                 &flake.p,
                 &flake.o,
-                &subject_classes,
+                write,
                 executor,
                 &async_tracker,
             )
