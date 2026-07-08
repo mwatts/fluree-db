@@ -68,16 +68,6 @@ async fn fsync_dir(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Atomic write: stage to `<path>.tmp`, fsync, rename onto `path`,
-/// fsync the parent directory.
-///
-/// On any POSIX-y filesystem the rename is atomic, so readers either
-/// see the previous good file or the new good file — never a torn
-/// write. Fsyncing the parent directory after the rename is what
-/// keeps that guarantee across a power loss: without it the rename
-/// can revert on remount, silently rolling back a write whose `Ok`
-/// callers (Raft vote / log entry / snapshot pointer persistence)
-/// rely on for safety.
 /// Durably write `bytes` to a temp file and rename it over `path`,
 /// but leave the parent-directory fsync (which makes the rename
 /// itself durable) to the caller. The file *contents* are synced
@@ -311,22 +301,25 @@ impl RaftLogStore for FsRaftLogStore {
         // scan rather than a plain max:
         //   - indices <= cutoff (a `purge_through` that crashed between
         //     marker write and deletion) — filtered out by the cutoff;
-        //   - a gap in the tail (an `append` batch that crashed before
-        //     its final directory fsync, leaving renames durable out of
-        //     order) — the scan stops at the gap, so openraft never
-        //     sees a `last_log` past a missing entry. Entries beyond the
-        //     gap are orphans that recovery re-appends over.
+        //   - a gap anywhere from `cutoff + 1` up (an `append` batch
+        //     that crashed before its final directory fsync, leaving
+        //     renames durable out of order) — the scan is anchored at
+        //     `cutoff + 1` (or index 1 with nothing purged) and stops
+        //     at the first missing index, so openraft never sees a
+        //     `last_log` past a hole. A gap at the very front (the
+        //     first expected index absent) yields `None`. Entries
+        //     beyond the gap are orphans that recovery re-appends over.
+        let first_expected = purged_cutoff.map_or(1, |c| c + 1);
         let last_index = indices
             .iter()
             .copied()
             .filter(|&idx| purged_cutoff.is_none_or(|c| idx > c))
-            .scan(None, |expected: &mut Option<u64>, idx| {
-                match *expected {
-                    Some(next) if idx != next => None, // gap — stop the run
-                    _ => {
-                        *expected = Some(idx + 1);
-                        Some(idx)
-                    }
+            .scan(first_expected, |expected, idx| {
+                if idx == *expected {
+                    *expected += 1;
+                    Some(idx)
+                } else {
+                    None // gap (at the anchor or in the tail) — stop the run
                 }
             })
             .last();
@@ -809,6 +802,49 @@ mod tests {
             state.last_log,
             Some(LogId::new(1, 3)),
             "last_log must stop at the gap, ignoring the orphan at 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_state_reports_none_on_a_front_gap() {
+        // The gap is at the very first expected index. This is the
+        // crash-mid-append case on a log that was empty above the
+        // cutoff (fresh node, or right after a snapshot install +
+        // full purge): the batch's first entry's rename is lost while
+        // later ones survive. With nothing older to anchor the run,
+        // `last_log` must be `None` — reporting the surviving orphans'
+        // top would put `last_log` above the missing anchor.
+
+        // No purge marker → the anchor is index 1; drop entry 1.
+        let (_dir, store) = fresh_log_store().await;
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        std::fs::remove_file(store.entry_path(1)).expect("open the front gap at index 1");
+        let state = store.log_state().await.unwrap();
+        assert!(
+            state.last_log.is_none(),
+            "a gap at the anchor must yield last_log=None, got {:?}",
+            state.last_log
+        );
+
+        // With a purge cutoff at 3, the anchor is index 4; drop entry 4.
+        let (_dir2, store2) = fresh_log_store().await;
+        store2
+            .append(&[entry(1, 4), entry(1, 5), entry(1, 6)])
+            .await
+            .unwrap();
+        let marker = postcard::to_allocvec(&LogId::new(1, 3)).expect("encode marker");
+        atomic_write(&store2.last_purged_path(), &marker)
+            .await
+            .expect("write marker");
+        std::fs::remove_file(store2.entry_path(4)).expect("open the front gap at index 4");
+        let state2 = store2.log_state().await.unwrap();
+        assert!(
+            state2.last_log.is_none(),
+            "a gap at cutoff+1 must yield last_log=None, got {:?}",
+            state2.last_log
         );
     }
 
