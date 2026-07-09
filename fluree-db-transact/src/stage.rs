@@ -1753,7 +1753,23 @@ async fn stream_where_into_accumulator(
     //   optionally providing dataset-local aliases for `["graph", "<alias>", ...]` patterns.
     let allowed_named_graphs: Option<Vec<(String, Option<String>)>> =
         if let Some(w) = txn.sparql_where.as_ref() {
-            if w.using_named_graph_iris.is_empty() {
+            // SPARQL UPDATE dataset scoping. A `USING` / `USING NAMED` clause
+            // defines the WHERE dataset EXACTLY (SPARQL 1.1 §3.1.3): the
+            // WHERE-visible named graphs are precisely the `USING NAMED` set,
+            // which is EMPTY when only a plain `USING <g>` is given. So an
+            // explicit `GRAPH <g>` block inside the WHERE addresses a named
+            // graph that is not in the dataset and matches nothing — "the GRAPH
+            // clause does not override the USING clause" (W3C
+            // dawg-delete-using-02a/06a; #1441). Selecting all registered named
+            // graphs here (the `None` fallback below) is what over-deleted: the
+            // `GRAPH <g2>` probe reached g2 despite `USING <g3>`.
+            //
+            // `None` is returned ONLY when there is no `USING`/`USING NAMED`
+            // clause at all, so the ambient graph-store dataset (every
+            // registered named graph) applies — the case a plain
+            // `DELETE WHERE { GRAPH <g> { .. } }` (no USING) relies on. That
+            // no-USING path stays byte-identical to before.
+            if w.using_default_graph_iris.is_empty() && w.using_named_graph_iris.is_empty() {
                 None
             } else {
                 Some(

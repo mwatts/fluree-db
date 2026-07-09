@@ -189,18 +189,17 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // time); its lexer half lands in PR-1 (1)
 ];
 
-// Remaining cluster: USING + explicit GRAPH scoping (class F). The
+// Fully green: the last cluster — USING + explicit GRAPH scoping (class F) —
+// was greened by PR-U6. A `USING`/`USING NAMED` clause now defines the WHERE
+// dataset exactly, so an explicit `GRAPH <g>` block matches nothing unless `g`
+// is in the `USING NAMED` set (dawg-delete-using-02a/06a, #1441 — the block no
+// longer over-reaches into a named graph scoped out by `USING`). The
 // graph-management grammar (LOAD/CLEAR/CREATE/DROP/COPY/MOVE/ADD + SILENT), the
 // same-bnode multi-op requests, and the double-registered syntax-update-1
-// tests were all greened by PR-U3 (building on PR-U1's DELETE-WHERE-GRAPH and
-// PR-U2's multi-operation `;` support) — audit §4.2.1, burn-down
+// tests were greened earlier by PR-U3 (building on PR-U1's DELETE-WHERE-GRAPH
+// and PR-U2's multi-operation `;` support) — audit §4.2.1, burn-down
 // update-completeness.md.
-pub const SPARQL11_UPDATE: &[&str] = &[
-    // update eval: USING + explicit GRAPH over-deletes from the default
-    // graph (class F scoping) (2) — PR-U6, sequenced after PR-G1
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-02a",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/delete/manifest#dawg-delete-using-06a",
-];
+pub const SPARQL11_UPDATE: &[&str] = &[];
 
 // Empty: jsonres01-04 went green once the Turtle lexer treated a trailing
 // '.' after a blank-node label (`_:o6.`) as the statement terminator
