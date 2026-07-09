@@ -331,12 +331,11 @@ Don't read `FLUREE_BENCH_*` env vars in your bench's hot loop —
 hand-rolled `std::env::var` call inside `b.iter` is a system call per
 iteration. Read once, reuse.
 
-### `iter_batched` setup needs a tokio reactor for file-backed Fluree
+### `iter_batched` setup needs a tokio reactor to build Fluree
 
 `criterion::iter_batched`'s `setup` closure runs **synchronously**, outside
 any `block_on`. If `setup` calls anything that requires a running tokio
-reactor — most notably `FlureeBuilder::file(...).build()` and any path
-that touches the file storage backend during construction — you'll get:
+reactor — including every `FlureeBuilder::build*` method — you'll get:
 
 ```
 thread 'main' panicked: there is no reactor running, must be called from
@@ -365,10 +364,12 @@ b.iter_batched(
 );
 ```
 
-`FlureeBuilder::memory().build_memory()` does **not** have this constraint
-— it constructs synchronously without a reactor. Use the memory builder
-when the bench's hot path doesn't actually need disk I/O; reach for the
-file builder only when you need to exercise persistence/load paths.
+`FlureeBuilder::memory().build_memory()` has the same constraint: even
+though it is synchronous, it spawns the ledger-cache event listener task
+whenever ledger caching is enabled (the default), so it too must run
+inside `rt.block_on`. Use the memory builder when the bench's hot path
+doesn't actually need disk I/O; reach for the file builder only when you
+need to exercise persistence/load paths.
 
 ### Workspace clippy lints apply to bench code
 

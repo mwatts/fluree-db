@@ -1145,6 +1145,11 @@ async fn liveness_monitor_demotes_killed_follower() {
         unreachable_after: Duration::from_millis(500),
         live_after: Duration::from_millis(200),
         refusal_backoff: Duration::from_millis(300),
+        // Tiny lag window so the frozen follower trips within a
+        // sample or two of the modest (~10-writes/s) progress loop —
+        // any real gap counts as behind. (Production uses the far
+        // larger DEFAULT_MAX_HEALTHY_LAG so normal pipelining is fine.)
+        max_healthy_lag: 1,
     };
     let mut cluster = TestCluster::spawn_with_liveness(CLUSTER_SIZE, liveness_config).await;
     cluster.bootstrap().await;
@@ -1189,18 +1194,23 @@ async fn liveness_monitor_demotes_killed_follower() {
     // than asserting an exact post-demote set.
     wait_for_voter_demoted(&cluster, leader_id, target, Duration::from_secs(5)).await;
 
-    progress_handle.abort();
-
-    // Every other live node should observe the same demotion via
-    // raft replication — the state is replicated, not leader-local.
-    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
-        let eligible = read_eligible_voters(&cluster, node.node_id).await;
-        assert!(
-            !eligible.contains(&target),
-            "node {} should observe the killed follower {target} as demoted; got {eligible:?}",
-            node.node_id
-        );
+    // Every live node observes the same demotion — the state is
+    // replicated, not leader-local. But replication + apply lag the
+    // leader's commit, so each node must be POLLED to convergence,
+    // not read once: reading a follower immediately after the leader
+    // confirmed was the flake. Keep the progress loop running so
+    // replication stays active while the followers catch up.
+    let live: Vec<NodeId> = cluster
+        .nodes
+        .iter()
+        .filter(|n| n.is_alive())
+        .map(|n| n.node_id)
+        .collect();
+    for node_id in live {
+        wait_for_voter_demoted(&cluster, node_id, target, Duration::from_secs(5)).await;
     }
+
+    progress_handle.abort();
 }
 
 /// Pick any live voter that's not the leader and not `excluded`.

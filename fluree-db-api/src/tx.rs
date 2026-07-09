@@ -476,6 +476,21 @@ async fn resolve_cross_ledger_schema_for_tx(
         })
 }
 
+/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
+/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
+/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
+/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
+/// compiled target index bakes in subclass expansion), and the same shape
+/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
+#[cfg(feature = "shacl")]
+struct CachedShaclCompile {
+    snapshot_t: i64,
+    shacl_epoch: u64,
+    schema_epoch: u64,
+    shapes_g_ids: Vec<GraphId>,
+    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
+}
+
 /// Resolve `f:shapesSource` from a loaded `LedgerConfig` into concrete graph
 /// IDs, against the current snapshot's graph registry.
 ///
@@ -489,20 +504,6 @@ async fn resolve_cross_ledger_schema_for_tx(
 /// same mechanism — schema, policy, and SHACL shapes can live in any graph
 /// the ledger knows about, including the config graph itself.
 #[cfg(feature = "shacl")]
-/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
-/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
-/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
-/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
-/// compiled target index bakes in subclass expansion), and the same shape
-/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
-struct CachedShaclCompile {
-    snapshot_t: i64,
-    shacl_epoch: u64,
-    schema_epoch: u64,
-    shapes_g_ids: Vec<GraphId>,
-    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
-}
-
 pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
