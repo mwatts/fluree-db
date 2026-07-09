@@ -288,12 +288,14 @@ impl ArithmeticOp {
                 let af = a.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
                 self.apply(ComparableValue::Float(af), ComparableValue::Float(b))
             }
-            (ComparableValue::Float(a), ComparableValue::Double(b)) => {
-                self.apply(ComparableValue::Double(a as f64), ComparableValue::Double(b))
-            }
-            (ComparableValue::Double(a), ComparableValue::Float(b)) => {
-                self.apply(ComparableValue::Double(a), ComparableValue::Double(b as f64))
-            }
+            (ComparableValue::Float(a), ComparableValue::Double(b)) => self.apply(
+                ComparableValue::Double(a as f64),
+                ComparableValue::Double(b),
+            ),
+            (ComparableValue::Double(a), ComparableValue::Float(b)) => self.apply(
+                ComparableValue::Double(a),
+                ComparableValue::Double(b as f64),
+            ),
             // Non-numeric types can't do arithmetic
             _ => Err(ArithmeticError::TypeMismatch),
         }

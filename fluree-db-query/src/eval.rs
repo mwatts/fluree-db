@@ -48,10 +48,10 @@ use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FlakeValue};
-use fluree_db_core::DatatypeConstraint;
-use num_traits::Zero;
 use crate::var_registry::VarId;
+use fluree_db_core::DatatypeConstraint;
 use helpers::eval_cached_bool_predicate;
+use num_traits::Zero;
 use std::sync::Arc;
 
 impl Expression {

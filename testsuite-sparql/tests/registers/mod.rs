@@ -69,8 +69,12 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     // empty named graphs; gated on decision D-6, expected to remain
     // registered after PR-G1 (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
-    // expression/aggregate cluster: COUNT(DISTINCT *) needs a
-    // rows-distinct IR aggregate (1) — PR-X2
+    // COUNT(DISTINCT *): DEFERRED — the parser accepts it but the lowerer
+    // rejects it (lower/aggregate.rs); greening needs a new CountDistinctAll IR
+    // variant + whole-row group-operator plumbing (the operators feed each
+    // aggregate one input-var column, not the whole solution). Perf-neutral
+    // (per-group, off the per-row hot path); a standalone post-wave-3 follow-up,
+    // NOT X3 — PR-X2 (decision-owner).
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-count-rows-distinct",
 ];
 
@@ -137,7 +141,9 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
-    // W-2 serialization cluster: string-escape serialization (2)
+    // quotes-3/4: D5b scan-path — pattern-object datatype drop (ninth-audit
+    // reclassified these here from serialization); deferred with the scan-path
+    // carve-out (open-eq-02 / eq-graph / dawg-lang-3) — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-4",
     // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
@@ -162,23 +168,38 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-not-eq",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-simple",
     // D5 datatype-aware `=`/`!=` (rdf_term_equal) greened eq-2-1/eq-2-2 (numeric
-    // promotion + foreign-datatype distinctness) and open-eq-04. eq-4 remains: a
-    // foreign-datatype binding still value-matches a plain-string constant on the
-    // eval path (foreign-datatype Sid→IRI decode gap on the filter side).
+    // promotion + foreign-datatype distinctness) and open-eq-04. eq-4 remains:
+    // its foreign literal arrives as a late-materialized EncodedLit (scan+filter
+    // path), whose datatype-aware carry is on the binary-index hot path
+    // (bench-sensitive, D5b class); the join-materialized Lit path is already
+    // fixed — the same "zzz"^^:myType is correctly distinct in eq-2-1 — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-4",
+    // eq-dateTime: temporal `=` — a plain string vs xsd:dateTime and timezone-
+    // instant handling; needs temporal value semantics beyond the filter lattice
+    // — PR-X2 (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
-    // joint PR-G1 (GRAPH-variable semantics) + PR-X2 (D5 value equality);
-    // the second lander removes these (3)
+    // eq-graph-1/2/4: NOT filter equality — each is a bare BGP `{ ?x :p <const> }`
+    // (no GRAPH keyword, no FILTER), so the constant OBJECT is matched on the scan
+    // path, which ignores the exact term (`:p 1` also matches "01"/1.0e0). Same
+    // D5b scan-path class as open-eq-02; the earlier "GRAPH-var / pr-g1" note was
+    // a misnomer — PR-X2 (scan-path carve-out, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
     // expr-ops {add,subtract,multiply,divide}-numbers-cast + unplus-2/unminus-2:
     // greened by D4 numeric promotion (xsd:float first-class, double∘decimal→
     // double) — PR-X2
+    // date-1: xsd:date `=` — Fluree drops the timezone, so "2006-08-23" ≡
+    // "2006-08-23Z" ≡ "2006-08-23+00:00"; needs temporal value semantics — PR-X2
+    // (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
+    // open-eq-02: D5b scan-path — the BGP object `"a"^^t:type1` matches
+    // `"a"^^t:type2`; a deliberately-disabled per-flake scan datatype constraint,
+    // deferred to protect the bench budget (spec-sanctioned carve-out) — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
-    // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need typed-
+    // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need BOTH the
+    // scan-path EncodedLit datatype-carry (bench-sensitive, D5b class) AND typed-
     // literal *constants* to carry their datatype (lower_typed_literal drops it);
     // open-eq-07/08/10/11/12 now select the correct 12/42/52/52/10-row set but
     // stay non-isomorphic on blank-node OUTPUT identity (the same object bnode is
