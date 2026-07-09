@@ -1708,7 +1708,9 @@ impl RefPublisher for RaftNameService {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
             SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
-            SmResponse::LedgerRetracted { ledger_id } => Err(NameServiceError::Retracted(ledger_id)),
+            SmResponse::LedgerRetracted { ledger_id } => {
+                Err(NameServiceError::Retracted(ledger_id))
+            }
             // `IndexAhead` from an `IndexHead` CAS proposing past
             // the branch's commit watermark maps to a `Conflict`
             // with no actual value.

@@ -574,8 +574,7 @@ where
                 // (shutdown window, or the task died). The blob
                 // leaks; log its CID so an operator or offline
                 // sweep can reclaim it.
-                if let Err(tokio::sync::mpsc::error::SendError((ledger_id, cid))) =
-                    tx.send(release)
+                if let Err(tokio::sync::mpsc::error::SendError((ledger_id, cid))) = tx.send(release)
                 {
                     tracing::warn!(
                         %ledger_id,
@@ -783,9 +782,7 @@ mod tests {
         let mut poisoned = Response::Poisoned {
             ledger_id: "test/db:main".into(),
             queue_id: 7,
-            reason: crate::raft::state_machine::PoisonReason::BodyMalformed {
-                error: "x".into(),
-            },
+            reason: crate::raft::state_machine::PoisonReason::BodyMalformed { error: "x".into() },
             released_envelope: Some(cid(3)),
         };
         assert_eq!(

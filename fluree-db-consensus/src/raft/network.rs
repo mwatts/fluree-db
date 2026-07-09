@@ -277,9 +277,8 @@ impl HttpRaftNetwork {
             ))))
         })?;
 
-        outcome.map_err(|w| {
-            RPCError::RemoteError(RemoteError::new(self.target, into_raft_error(w)))
-        })
+        outcome
+            .map_err(|w| RPCError::RemoteError(RemoteError::new(self.target, into_raft_error(w))))
     }
 }
 
@@ -663,10 +662,12 @@ mod tests {
                 offset: 4096,
             },
         };
-        let outcome: Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>> =
-            Err(RaftError::APIError(InstallSnapshotError::SnapshotMismatch(
-                mismatch,
-            )));
+        let outcome: Result<
+            InstallSnapshotResponse<NodeId>,
+            RaftError<NodeId, InstallSnapshotError>,
+        > = Err(RaftError::APIError(InstallSnapshotError::SnapshotMismatch(
+            mismatch,
+        )));
         round_trip(&outcome);
     }
 

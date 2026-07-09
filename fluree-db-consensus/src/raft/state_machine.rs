@@ -735,9 +735,7 @@ impl From<&serde_json::Value> for CanonicalValue {
                 }
             }
             serde_json::Value::String(s) => Self::String(s.clone()),
-            serde_json::Value::Array(items) => {
-                Self::Array(items.iter().map(Self::from).collect())
-            }
+            serde_json::Value::Array(items) => Self::Array(items.iter().map(Self::from).collect()),
             serde_json::Value::Object(map) => Self::Object(
                 map.iter()
                     .map(|(k, v)| (k.clone(), Self::from(v)))
@@ -758,7 +756,9 @@ impl From<&CanonicalValue> for serde_json::Value {
             CanonicalValue::String(s) => Self::String(s.clone()),
             CanonicalValue::Array(items) => Self::Array(items.iter().map(Self::from).collect()),
             CanonicalValue::Object(map) => Self::Object(
-                map.iter().map(|(k, v)| (k.clone(), Self::from(v))).collect(),
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from(v)))
+                    .collect(),
             ),
         }
     }
@@ -1927,7 +1927,11 @@ fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> O
     })
 }
 
-fn apply_compare_and_set_ref(state: &mut NameServiceState, log_index: u64, args: RefCas) -> Response {
+fn apply_compare_and_set_ref(
+    state: &mut NameServiceState,
+    log_index: u64,
+    args: RefCas,
+) -> Response {
     let RefCas {
         ledger_id,
         branch,
@@ -4977,7 +4981,10 @@ mod tests {
         let bytes = postcard::to_allocvec(&stored).expect("stored status postcard-encodes");
         let decoded: StoredStatus = postcard::from_bytes(&bytes).expect("decodes");
         assert_eq!(decoded, stored);
-        assert_eq!(StatusValue::from(&StoredStatus::initial()), StatusValue::initial());
+        assert_eq!(
+            StatusValue::from(&StoredStatus::initial()),
+            StatusValue::initial()
+        );
 
         let config_value = ConfigValue::new(
             2,
@@ -4992,7 +4999,10 @@ mod tests {
         let bytes = postcard::to_allocvec(&stored).expect("stored config postcard-encodes");
         let decoded: StoredConfig = postcard::from_bytes(&bytes).expect("decodes");
         assert_eq!(decoded, stored);
-        assert_eq!(ConfigValue::from(&StoredConfig::unborn()), ConfigValue::unborn());
+        assert_eq!(
+            ConfigValue::from(&StoredConfig::unborn()),
+            ConfigValue::unborn()
+        );
         assert_eq!(
             StoredConfig::from(&ConfigValue::unborn()),
             StoredConfig::unborn(),
@@ -5677,7 +5687,11 @@ mod tests {
         assert!(matches!(child, Response::Purged { .. }));
         // Parent's child count is now 0.
         assert_eq!(
-            state.refs.get(&RefKey::new("test/db", "main")).unwrap().branches,
+            state
+                .refs
+                .get(&RefKey::new("test/db", "main"))
+                .unwrap()
+                .branches,
             0
         );
 

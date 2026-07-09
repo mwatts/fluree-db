@@ -390,10 +390,9 @@ impl FlureeServer {
             });
         }
         let graceful = shutdown.clone();
-        let serve =
-            axum::serve(listener, self.router).with_graceful_shutdown(async move {
-                graceful.cancelled().await;
-            });
+        let serve = axum::serve(listener, self.router).with_graceful_shutdown(async move {
+            graceful.cancelled().await;
+        });
         let result = tokio::select! {
             result = serve => result,
             () = async {
@@ -700,10 +699,8 @@ impl FlureeServerBuilder {
         // advances, but it is bounded and can drop under load — it
         // drives reconciliation, not staleness.)
         #[cfg(feature = "raft")]
-        if let Some(((integration, _), manager)) = self
-            .raft
-            .as_ref()
-            .zip(state_inner.fluree.ledger_manager())
+        if let Some(((integration, _), manager)) =
+            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
         {
             integration.attach_ledger_manager(Arc::clone(manager));
         }

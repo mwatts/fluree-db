@@ -9,8 +9,8 @@
 //! auth gate.
 
 use axum::body::Body;
-use fluree_db_server::routes::build_router;
 use fluree_db_server::config::AdminAuthMode;
+use fluree_db_server::routes::build_router;
 use fluree_db_server::{AppState, ServerConfig, TelemetryConfig};
 use http::{Request, StatusCode};
 use std::sync::Arc;

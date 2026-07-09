@@ -308,9 +308,10 @@ impl Drop for PerLedgerPermit {
         // transient relaxation of the soft per-ledger cap, never a
         // leaked map entry.
         drop(self.permit.take());
-        self.admission_map.remove_if(&self.ledger_id, |_, semaphore| {
-            semaphore.available_permits() == self.per_ledger_limit
-        });
+        self.admission_map
+            .remove_if(&self.ledger_id, |_, semaphore| {
+                semaphore.available_permits() == self.per_ledger_limit
+            });
     }
 }
 

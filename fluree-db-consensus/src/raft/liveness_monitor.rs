@@ -667,7 +667,13 @@ mod tests {
             t += cfg.sample_interval;
             peer_idx += 1;
             leader_idx += 100;
-            let d = tick(&mut tracker, Some(log_id(1, peer_idx)), Some(leader_idx), t, &cfg);
+            let d = tick(
+                &mut tracker,
+                Some(log_id(1, peer_idx)),
+                Some(leader_idx),
+                t,
+                &cfg,
+            );
             assert_eq!(d, None, "not demoted before unreachable_after elapses");
             assert!(
                 tracker.unreachable_since.is_some(),

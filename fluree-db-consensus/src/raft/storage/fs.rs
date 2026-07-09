@@ -549,7 +549,9 @@ impl FsRaftSnapshotStore {
             match fs::remove_file(entry.path()).await {
                 Ok(()) => removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => warn!(file = %name, error = %e, "snapshot reclamation failed to remove file"),
+                Err(e) => {
+                    warn!(file = %name, error = %e, "snapshot reclamation failed to remove file")
+                }
             }
         }
         if removed {

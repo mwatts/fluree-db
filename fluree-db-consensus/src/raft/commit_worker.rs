@@ -1706,10 +1706,10 @@ mod tests {
         .is_rejection());
         assert!(WorkerError::Lagged("commit_t 3 <= head t 5".into()).is_rejection());
 
-        assert!(
-            !WorkerError::Raft("apply_staged_commit POST to leader: operation timed out".into())
-                .is_rejection()
-        );
+        assert!(!WorkerError::Raft(
+            "apply_staged_commit POST to leader: operation timed out".into()
+        )
+        .is_rejection());
         assert!(!WorkerError::Transient("backend blip".into()).is_rejection());
     }
 

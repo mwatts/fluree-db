@@ -584,10 +584,7 @@ mod tests {
             matches!(classified, ForwardError::ReadBody(_)),
             "expected ReadBody, got {classified:?}"
         );
-        assert_eq!(
-            classified.into_response().status(),
-            StatusCode::BAD_GATEWAY
-        );
+        assert_eq!(classified.into_response().status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -668,7 +665,10 @@ mod tests {
             "http://[::ffff:169.254.169.254]/",
             false
         ));
-        assert!(!is_valid_leader_url("http://[::ffff:127.0.0.1]:8080", false));
+        assert!(!is_valid_leader_url(
+            "http://[::ffff:127.0.0.1]:8080",
+            false
+        ));
         assert!(!is_valid_leader_url("http://[::ffff:0.0.0.0]:8080", false));
         // And still rejected even in the single-host posture, where
         // only genuine loopback is meant to be allowed.
