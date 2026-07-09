@@ -85,6 +85,11 @@ struct DetectedCrawl<'a> {
     context: Option<&'a JsonValue>,
     /// The crawl's subject LIMIT, if any.
     limit: Option<usize>,
+    /// The crawl's subject OFFSET (0 when absent). Applied to the grouped
+    /// SUBJECTS (not the flat triples), so the flat scan must fetch enough
+    /// triples to cover `offset + limit` subjects and grouping then skips the
+    /// first `offset`.
+    offset: usize,
     /// Which projection shape this crawl requests.
     projection: CrawlProjection,
 }
@@ -141,6 +146,7 @@ pub(crate) async fn expand_wildcard_crawl(
         where_clause,
         context,
         limit,
+        offset,
         projection,
     }) = detect_wildcard_crawl(input)
     else {
@@ -150,10 +156,16 @@ pub(crate) async fn expand_wildcard_crawl(
     // Rewrite the crawl into a flat scan: keep the original WHERE (it binds and
     // filters `?s`), then project the columns the projection needs. The flat scan
     // is LIMITed to bound work (an unbounded multi-scan join over a remote table
-    // does not early-terminate); the subject LIMIT is re-applied exactly after
-    // grouping.
-    let flat_limit =
-        limit.map(|n| (n.saturating_add(1)).saturating_mul(TRIPLES_PER_SUBJECT_BUDGET));
+    // does not early-terminate); the subject LIMIT/OFFSET are re-applied exactly
+    // after grouping. The flat triple budget must cover `offset + limit` subjects
+    // (the OFFSET is on grouped subjects, not flat triples), so paging forward
+    // fetches — and then skips — the earlier subjects.
+    let flat_limit = limit.map(|n| {
+        offset
+            .saturating_add(n)
+            .saturating_add(1)
+            .saturating_mul(TRIPLES_PER_SUBJECT_BUDGET)
+    });
     let flat_query = build_flat_query(subject_var, where_clause, context, flat_limit, &projection);
 
     // This is a browse ("View Instances") crawl: render R2RML RefObjectMap objects
@@ -281,11 +293,13 @@ pub(crate) async fn expand_wildcard_crawl(
         }
     }
 
-    // Assemble per-subject JSON-LD documents, honoring the crawl's subject LIMIT.
+    // Assemble per-subject JSON-LD documents, honoring the crawl's subject
+    // OFFSET then LIMIT (subject order is the deterministic scan order, so paging
+    // is stable across requests).
     let normalize = format_config.normalize_arrays;
     let take = limit.unwrap_or(usize::MAX);
     let mut docs: Vec<JsonValue> = Vec::new();
-    for key in order.into_iter().take(take) {
+    for key in order.into_iter().skip(offset).take(take) {
         let acc = subjects.remove(&key).expect("accumulated subject");
         let mut doc = Map::new();
         doc.insert("@id".to_string(), json!(compactor.compact_id_iri(&key)));
@@ -412,11 +426,17 @@ fn detect_wildcard_crawl(input: &JsonValue) -> Option<DetectedCrawl<'_>> {
         .get("limit")
         .and_then(JsonValue::as_u64)
         .map(|n| n as usize);
+    let offset = obj
+        .get("offset")
+        .and_then(JsonValue::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     Some(DetectedCrawl {
         subject_var: subject_var.as_str(),
         where_clause,
         context: obj.get("@context"),
         limit,
+        offset,
         projection,
     })
 }
@@ -554,17 +574,20 @@ mod tests {
             "@context": {"v": "http://example/org/ns"},
             "select": {"?s": ["*"]},
             "where": {"@id": "?s", "@type": "v:Geography"},
-            "limit": 3
+            "limit": 3,
+            "offset": 6
         });
         let DetectedCrawl {
             subject_var,
             where_clause,
             context,
             limit,
+            offset,
             projection,
         } = detect_wildcard_crawl(&input).expect("wildcard crawl");
         assert_eq!(subject_var, "?s");
         assert_eq!(limit, Some(3));
+        assert_eq!(offset, 6);
         assert!(context.is_some());
         assert_eq!(where_clause, &json!({"@id": "?s", "@type": "v:Geography"}));
         assert!(matches!(projection, CrawlProjection::Wildcard));
@@ -1062,6 +1085,52 @@ mod e2e {
         assert_eq!(docs.len(), 2, "LIMIT 2 must return exactly 2 subjects");
     }
 
+    // (g) LIMIT + OFFSET paginates over subjects: page 2 is the NEXT subjects, not
+    //     page 1 again, and an offset past the end returns [].
+    #[tokio::test]
+    async fn crawl_wildcard_offset_paginates_subjects() {
+        let mapping = CompiledR2rmlMapping::new(vec![tm(
+            "#People",
+            "people",
+            "http://example.org/person/{id}",
+            "http://example.org/Person",
+            "http://example.org/name",
+            "name",
+        )]);
+        let mut tables = HashMap::new();
+        tables.insert(
+            "people".to_string(),
+            vec![id_str_batch("name", &[1, 2, 3], &["Alice", "Bob", "Cara"])],
+        );
+        let provider = MockCrawlProvider::new(mapping, tables);
+        let (_ledger, view) = genesis_view();
+
+        let paged = |limit: u64, offset: u64| {
+            json!({
+                "@context": {"v": "http://example.org/"},
+                "select": {"?s": ["*"]},
+                "where": {"@id": "?s", "@type": "v:Person"},
+                "limit": limit,
+                "offset": offset
+            })
+        };
+        let page1 = run_crawl(&provider, &view, &paged(2, 0)).await;
+        let page2 = run_crawl(&provider, &view, &paged(2, 2)).await;
+        assert_eq!(page1.len(), 2, "page 1 = first 2 subjects");
+        assert_eq!(page2.len(), 1, "page 2 = the remaining 1 subject (3 total)");
+        // The two pages must not overlap (the OFFSET bug returned page 1 again).
+        let disjoint = ids(&page1).is_disjoint(&ids(&page2));
+        assert!(
+            disjoint,
+            "pages must not overlap: {:?} vs {:?}",
+            ids(&page1),
+            ids(&page2)
+        );
+        // Offset past the end -> empty.
+        let past = run_crawl(&provider, &view, &paged(2, 10)).await;
+        assert!(past.is_empty(), "offset past the end returns no subjects");
+    }
+
     /// A batch with `id` (Int64), one nullable String column, and one FK column
     /// (`fk_col`, Int64) — a child row that carries its own FK value.
     fn id_str_fk_batch(str_col: &str, fk_col: &str, rows: &[(i64, &str, i64)]) -> ColumnBatch {
@@ -1276,6 +1345,39 @@ mod e2e {
             !provider.scanned_tables().contains(&"airports".to_string()),
             "parent Airport table must not be scanned: {:?}",
             provider.scanned_tables()
+        );
+    }
+
+    // A directly-bound-subject var-predicate inspect (`<iri> ?p ?o`) scans ONLY
+    // the TriplesMap whose subject template can produce the IRI — not every table.
+    // (This is the exact lowered shape a single-subject detail view should send:
+    // a constant `@id`, which lowers to `subject_constant=Some` and hits the
+    // prune. A VALUES-bound `?s` stays a variable and does NOT — the detail view
+    // must send the constant-subject form.)
+    #[tokio::test]
+    async fn bound_subject_inspect_prunes_to_matching_table() {
+        let provider = two_table_provider(); // People person/{id} + Orders order/{id}
+        let (_ledger, view) = genesis_view();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let query = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": ["?p", "?o"],
+            "where": {"@id": "http://example.org/person/1", "?p": "?o"}
+        });
+        fluree
+            .query_view_with_r2rml_options(
+                &view,
+                QueryInput::JsonLd(&query),
+                &provider,
+                &provider,
+                QueryExecutionOptions::new(),
+            )
+            .await
+            .expect("bound-subject inspect query succeeds");
+        assert_eq!(
+            provider.scanned_tables(),
+            vec!["people".to_string()],
+            "bound subject person/1 must prune to the People table only (not Orders)"
         );
     }
 }

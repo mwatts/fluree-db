@@ -608,6 +608,26 @@ impl R2rmlScanOperator {
                             return false;
                         }
                     }
+                    // subject_constant prune: a bound subject IRI can only come
+                    // from a TriplesMap whose template subject can PRODUCE it, and
+                    // every IRI a template yields starts with the template's
+                    // constant prefix (the text before the first `{`, emitted
+                    // verbatim by `expand_template`). So a subject IRI that does
+                    // not start with this TM's constant prefix provably cannot be
+                    // produced here — skip it. This turns a bound-subject inspect
+                    // (`<iri> ?p ?o`) from a fan-out over every table into a scan
+                    // of just the subject's own table (the per-row match at
+                    // `subject_term_matches_iri` already enforces equality, so
+                    // this is a necessary-condition prune: it can only over-keep,
+                    // never drop a real match). Only a template subject is
+                    // prunable; a column/constant subject (no template) is kept.
+                    if let Some(ref subject_iri) = self.pattern.subject_constant {
+                        if let Some(template) = tm.subject_map.template.as_deref() {
+                            if !subject_iri.starts_with(super::rewrite::constant_prefix(template)) {
+                                return false;
+                            }
+                        }
+                    }
                     true
                 })
                 .collect()
@@ -634,6 +654,10 @@ impl R2rmlScanOperator {
         let mut seen: HashSet<String> = HashSet::new();
 
         for triples_map in &triples_maps {
+            // Cancellation checkpoint before each TriplesMap's table scan: a
+            // multi-TriplesMap pattern issues one `scan_table` (catalog loadTable
+            // + plan) per map here without returning to `next_batch`.
+            ctx.check_cancelled()?;
             if !seen.insert(triples_map.iri.clone()) {
                 continue;
             }
@@ -784,6 +808,11 @@ impl R2rmlScanOperator {
                 .collect();
 
             for pom in &filtered_poms {
+                // Cancellation checkpoint before each FK-parent scan: a subject
+                // with many RefObjectMap POMs scans one parent dimension per POM
+                // here. (Known residual: `collect_stream` then drains one parent
+                // fully before the next poll — acceptable, parents are small dims.)
+                ctx.check_cancelled()?;
                 if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
                     let mut parent_join_cols: Vec<String> = rom
                         .parent_columns()
@@ -939,6 +968,11 @@ impl R2rmlScanOperator {
             let mut window: Vec<ColumnBatch> = Vec::new();
             let mut rows = 0usize;
             while rows < progress.window_rows {
+                // Cancellation checkpoint at row-group granularity: stop before
+                // pulling (and decoding) the next Parquet batch. This is the
+                // load-bearing poll for a runaway streaming scan of a large fact
+                // table — a pure relaxed-atomic flag read, unmeasurable here.
+                ctx.check_cancelled()?;
                 match progress.tms[i].stream.next().await {
                     Some(batch) => {
                         let batch = batch?;
@@ -1899,6 +1933,13 @@ impl Operator for R2rmlScanOperator {
             .collect();
 
         loop {
+            // Cancellation checkpoint at the top of the internal loop: this loop
+            // can pull many windows / files / child batches before returning a
+            // full output batch, so the runner's between-`next_batch` check would
+            // otherwise never run for a whole-table scan. Covers the loop's
+            // non-advancing branches (overflow drain, child pull) that site 2
+            // does not.
+            ctx.check_cancelled()?;
             // 1. Drain overflow from a prior window before doing more work.
             while !self.pending.is_empty() && columns[0].len() < ctx.batch_size {
                 let row = self.pending.pop_front().unwrap();

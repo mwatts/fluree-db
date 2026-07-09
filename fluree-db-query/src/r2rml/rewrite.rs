@@ -824,8 +824,10 @@ fn wildcard_class_fusion_is_safe(mapping: &CompiledR2rmlMapping, class_iri: &str
 }
 
 /// The constant prefix of an `rr:template` — everything before the first `{`
-/// placeholder (the whole string when there is no placeholder).
-fn constant_prefix(template: &str) -> &str {
+/// placeholder (the whole string when there is no placeholder). Emitted verbatim
+/// by `expand_template`, so every IRI a template can produce starts with it —
+/// which is what makes the operator's bound-subject TriplesMap prune sound.
+pub(crate) fn constant_prefix(template: &str) -> &str {
     match template.find('{') {
         Some(i) => &template[..i],
         None => template,
