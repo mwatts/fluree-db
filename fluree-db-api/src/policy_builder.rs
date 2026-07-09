@@ -99,7 +99,8 @@ pub fn resolve_policy_source_g_ids(
 /// 2. **policy_class**: Query for policies of the given class types
 /// 3. **policy**: Parse inline policy JSON-LD
 ///
-/// Priority: identity > policy_class > policy
+/// Priority: (identity + policy_class: classes select, identity binds) >
+/// identity > policy_class > policy
 ///
 /// # Arguments
 ///
@@ -257,7 +258,8 @@ async fn build_policy_context_from_opts_inner(
     // when we have a concrete SID), not for gating access — `opts.default_allow`
     // governs in all three cases.
     //
-    // Priority: cross-ledger restrictions > identity > policy_class > policy >
+    // Priority: cross-ledger restrictions > (identity + policy_class: classes
+    // select, identity binds) > identity > policy_class > policy >
     // policy_values["?$identity"]
     let (identity_sid, restrictions) = if let Some(mut merged) = cross_ledger_restrictions {
         // Cross-ledger short-circuit: the resolver already materialized
@@ -303,6 +305,37 @@ async fn build_policy_context_from_opts_inner(
             merged.extend(parse_inline_policy(snapshot, policy_json)?);
         }
         (identity_sid, merged)
+    } else if let (Some(identity_iri), Some(classes)) = (
+        &opts.identity,
+        opts.policy_class.as_ref().filter(|c| !c.is_empty()),
+    ) {
+        // Same-ledger identity + explicit `policy-class`: the request's
+        // classes select the policy set; the identity is BIND-ONLY — it
+        // resolves to populate `?$identity` for f:query rules and never
+        // drives rule selection. This mirrors the cross-ledger identity
+        // contract above.
+        //
+        // Without this arm, a request carrying both fields silently ignored
+        // `policy-class` and fell through to identity-mode selection below —
+        // which yields an empty policy set (deny-all under default-deny)
+        // whenever the identity has no `f:policyClass` triples in the
+        // ledger, and can never work for identities that are not resolvable
+        // IRIs (bare emails / UUID subjects minted by application auth
+        // systems). Gateways that resolve grant-derived classes per request
+        // and forward them alongside the authenticated identity depend on
+        // the classes being honored.
+        let identity_sid =
+            resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
+                .await?;
+        if let Some(sid) = &identity_sid {
+            policy_values.insert("?$identity".to_string(), sid.clone());
+        }
+        let mut restrictions =
+            load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?;
+        if let Some(policy_json) = &opts.policy {
+            restrictions.extend(parse_inline_policy(snapshot, policy_json)?);
+        }
+        (identity_sid, restrictions)
     } else if let Some(identity_iri) = &opts.identity {
         match load_policies_by_identity(snapshot, overlay, to_t, identity_iri, policy_graphs)
             .await?
