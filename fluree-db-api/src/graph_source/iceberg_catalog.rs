@@ -134,7 +134,7 @@ pub struct CatalogBrowse {
 
 /// Build a REST catalog client from a connection, or a clear typed error for
 /// Direct mode (which has no catalog to browse/list).
-fn rest_catalog_client(
+pub(crate) fn rest_catalog_client(
     conn: &IcebergConnectionConfig,
     op: &str,
 ) -> Result<(RestCatalogClient, String, Option<String>)> {
@@ -707,7 +707,7 @@ pub async fn preview_iceberg_table(
 /// Build S3 storage for reading manifests during a Tier-B preview, mirroring the
 /// scan path's policy: vended credentials when the catalog delegated them,
 /// otherwise the ambient AWS credential chain.
-async fn build_preview_storage(
+pub(crate) async fn build_preview_storage(
     conn: &IcebergConnectionConfig,
     credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
 ) -> Result<S3IcebergStorage> {
