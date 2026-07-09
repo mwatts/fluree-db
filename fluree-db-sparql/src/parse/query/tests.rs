@@ -3309,20 +3309,25 @@ fn test_single_trailing_semicolon_after_update_is_legal() {
 
 #[test]
 fn test_cross_operation_bnode_label_reuse_rejected() {
-    // W3C syntax-update-54: a blank node label is scoped to one operation;
-    // reusing it in a later operation of the same request is an error.
+    // W3C syntax-update-54: a blank node label in GROUND DATA is scoped to one
+    // operation; reusing it in a later INSERT DATA / DELETE DATA of the same
+    // request is a syntax error.
     assert_parse_error(
         "PREFIX : <http://www.example.org/> \
          INSERT DATA { _:b1 :p :o } ; INSERT DATA { _:b1 :p :o }",
         "blank node label",
     );
-    // Template reuse across Modify operations is the same violation.
-    assert_parse_error(
+    // Template bnode reuse across MODIFY (INSERT/DELETE ... WHERE) operations is
+    // NOT a violation — template blank nodes are per-solution/per-operation
+    // (CONSTRUCT-style), so the two `_:b1` denote DISTINCT nodes. W3C's approved
+    // positive tests `insert-where-same-bnode`/`-2` require this to parse and
+    // execute successfully.
+    let ast = assert_parses(
         "PREFIX : <http://www.example.org/> \
          INSERT { _:b1 :p ?o } WHERE { ?s :q ?o } ; \
          INSERT { _:b1 :p ?o } WHERE { ?s :q ?o }",
-        "blank node label",
     );
+    assert_eq!(update_request(&ast).operations.len(), 2);
     // Reuse *within* one operation stays legal.
     let ast = assert_parses(
         "PREFIX : <http://www.example.org/> \

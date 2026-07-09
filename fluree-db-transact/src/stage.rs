@@ -12,12 +12,16 @@
 use crate::error::{Result, TransactError};
 use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
-use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnType};
+use crate::ir::{GraphMgmtOp, GraphSel, GraphTarget, TemplateTerm, TripleTemplate, Txn, TxnType};
 use crate::namespace::NamespaceRegistry;
+use fluree_db_core::comparator::IndexType;
+use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+use fluree_db_core::query_bounds::RangeTest;
+use fluree_db_core::range::RangeMatch;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeValue, GraphId, Sid};
+use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, populate_class_cache, PolicyContext, PolicyDecision, PolicyError,
@@ -601,6 +605,14 @@ pub async fn stage(
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
 ) -> Result<(StagedLedger, NamespaceRegistry)> {
+    // SPARQL graph-management verbs (CLEAR/DROP/COPY/MOVE/ADD) execute by a
+    // whole-graph scan + retract/re-home at staging time rather than by the
+    // template/WHERE pipeline below. Dispatch before any hot-path setup so the
+    // ordinary insert/upsert/update path is byte-identical.
+    if txn.graph_mgmt.is_some() {
+        return stage_graph_mgmt(ledger, txn, ns_registry, options).await;
+    }
+
     let span = tracing::debug_span!("txn_stage",
         current_t = ledger.t(),
         txn_type = ?txn.txn_type,
@@ -1007,6 +1019,265 @@ pub async fn stage(
             assertions = assertions,
             retractions = retractions,
             "transaction staging completed"
+        );
+
+        Ok((
+            StagedLedger::new(ledger, flakes, &reverse_graph)?,
+            ns_registry,
+        ))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Content identity of a flake, ignoring its graph, transaction time, and
+/// assertion flag. Two flakes with the same identity denote "the same triple"
+/// and may be moved between graphs by carrying only a different `g`.
+type FlakeContent = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
+
+fn flake_content(f: &Flake) -> FlakeContent {
+    (
+        f.s.clone(),
+        f.p.clone(),
+        f.o.clone(),
+        f.dt.clone(),
+        f.m.clone(),
+    )
+}
+
+/// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
+/// novelty view as of the ledger's current `t`).
+async fn scan_graph_flakes(
+    ledger: &LedgerState,
+    g_id: GraphId,
+    tracker: Option<&Tracker>,
+) -> Result<Vec<Flake>> {
+    let db_ref = match tracker {
+        Some(t) => ledger.as_graph_db_ref(g_id).with_tracker(t),
+        None => ledger.as_graph_db_ref(g_id),
+    };
+    // Unbounded SPOT scan (empty match, `>= min`) returns the whole graph.
+    db_ref
+        .range(IndexType::Spot, RangeTest::Ge, RangeMatch::new())
+        .await
+        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))
+}
+
+/// Resolve the ledger `GraphId` and graph `Sid` for a named graph IRI, if it
+/// is registered (populated) in the ledger. Returns `None` for a graph that
+/// does not exist — which, in Fluree's model, is indistinguishable from an
+/// empty one (roadmap D-6), so callers treat "no g_id" as "no flakes".
+fn resolve_named_graph(
+    ledger: &LedgerState,
+    ns_registry: &mut NamespaceRegistry,
+    iri: &str,
+) -> Option<(GraphId, Sid)> {
+    ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri(iri)
+        .map(|g_id| (g_id, ns_registry.sid_for_iri(iri)))
+}
+
+/// Execute a SPARQL graph-management operation (CLEAR/DROP/COPY/MOVE/ADD).
+///
+/// Produces retraction and/or re-homed assertion flakes by scanning whole
+/// graphs at staging time, then runs them through the same policy enforcement
+/// and [`StagedLedger`] construction as any other transaction. CLEAR/DROP
+/// retract every flake in the target graph(s); COPY/MOVE/ADD scan the source
+/// and re-assert its facts into the destination (re-homing by rewriting only
+/// the flake's `g`), clearing the destination first for COPY/MOVE and the
+/// source afterward for MOVE. Because whole flakes are copied verbatim,
+/// datatypes, language tags, and list-index metadata are preserved exactly.
+async fn stage_graph_mgmt(
+    ledger: LedgerState,
+    txn: Txn,
+    mut ns_registry: NamespaceRegistry,
+    options: StageOptions<'_>,
+) -> Result<(StagedLedger, NamespaceRegistry)> {
+    let op = txn
+        .graph_mgmt
+        .as_ref()
+        .expect("stage_graph_mgmt called without a graph_mgmt directive");
+    let span = tracing::debug_span!("txn_stage_graph_mgmt", ?op);
+    async move {
+        // Backpressure + per-transaction baseline fuel, mirroring `stage`.
+        if let Some(config) = options.index_config {
+            if ledger.at_max_novelty(config) {
+                return Err(TransactError::NoveltyAtMax);
+            }
+        }
+        if let Some(tracker) = options.tracker {
+            tracker.consume_fuel(TXN_BASELINE_MICRO_FUEL)?;
+        }
+
+        let new_t = ledger.t() + 1;
+        let mut flakes: Vec<Flake> = Vec::new();
+        // Ledger g_id -> graph Sid, for every named graph our flakes touch;
+        // becomes the reverse routing map for novelty application / policy.
+        let mut graph_sids: HashMap<GraphId, Sid> = HashMap::new();
+
+        match op {
+            GraphMgmtOp::Clear(target) => {
+                // Resolve the target to a set of (g_id, Option<graph Sid>) —
+                // `None` Sid = the default graph (g_id 0).
+                let mut targets: Vec<(GraphId, Option<Sid>)> = Vec::new();
+                match target {
+                    GraphTarget::Default => targets.push((0, None)),
+                    GraphTarget::Graph(iri) => {
+                        if let Some((g_id, sid)) =
+                            resolve_named_graph(&ledger, &mut ns_registry, iri)
+                        {
+                            targets.push((g_id, Some(sid)));
+                        }
+                        // Nonexistent named graph: nothing to clear (a no-op).
+                    }
+                    GraphTarget::Named | GraphTarget::All => {
+                        if matches!(target, GraphTarget::All) {
+                            targets.push((0, None));
+                        }
+                        // Every *user* named graph (g_id >= 3); the reserved
+                        // txn-meta (1) and config (2) graphs are Fluree-internal
+                        // and never part of the W3C dataset.
+                        let user_graphs: Vec<(GraphId, String)> = ledger
+                            .snapshot
+                            .graph_registry
+                            .iter_entries()
+                            .filter(|(g_id, _)| *g_id >= FIRST_USER_GRAPH_ID)
+                            .map(|(g_id, iri)| (g_id, iri.to_string()))
+                            .collect();
+                        for (g_id, iri) in user_graphs {
+                            let sid = ns_registry.sid_for_iri(&iri);
+                            targets.push((g_id, Some(sid)));
+                        }
+                    }
+                }
+
+                for (g_id, sid) in targets {
+                    if let Some(sid) = sid {
+                        graph_sids.insert(g_id, sid);
+                    }
+                    for mut f in scan_graph_flakes(&ledger, g_id, options.tracker).await? {
+                        f.op = false;
+                        f.t = new_t;
+                        flakes.push(f);
+                    }
+                }
+            }
+
+            GraphMgmtOp::Transfer {
+                from,
+                to,
+                clear_dest,
+                clear_src,
+            } => {
+                // `from == to` is a spec no-op for ADD/COPY/MOVE.
+                if from != to {
+                    // Resolve the source (existing only) and destination.
+                    let (src_g_id, _src_sid): (Option<GraphId>, Option<Sid>) = match from {
+                        GraphSel::Default => (Some(0), None),
+                        GraphSel::Graph(iri) => {
+                            match resolve_named_graph(&ledger, &mut ns_registry, iri) {
+                                Some((g_id, sid)) => (Some(g_id), Some(sid)),
+                                None => (None, None),
+                            }
+                        }
+                    };
+                    // Destination may be brand new — provision its ledger g_id.
+                    let (dest_g_id, dest_sid): (GraphId, Option<Sid>) = match to {
+                        GraphSel::Default => (0, None),
+                        GraphSel::Graph(iri) => {
+                            let g_id = ledger
+                                .snapshot
+                                .graph_registry
+                                .provisional_ids(std::slice::from_ref(iri))
+                                .get(iri.as_str())
+                                .copied()
+                                .expect("provisional_ids returns every requested IRI");
+                            let sid = ns_registry.sid_for_iri(iri);
+                            (g_id, Some(sid))
+                        }
+                    };
+                    if let Some(sid) = &dest_sid {
+                        graph_sids.insert(dest_g_id, sid.clone());
+                    }
+
+                    let src_flakes = match src_g_id {
+                        Some(g) => scan_graph_flakes(&ledger, g, options.tracker).await?,
+                        None => Vec::new(),
+                    };
+                    let dest_flakes =
+                        scan_graph_flakes(&ledger, dest_g_id, options.tracker).await?;
+
+                    let src_contents: HashSet<FlakeContent> =
+                        src_flakes.iter().map(flake_content).collect();
+                    let dest_contents: HashSet<FlakeContent> =
+                        dest_flakes.iter().map(flake_content).collect();
+
+                    // COPY/MOVE: retract destination facts the source lacks.
+                    // (ADD keeps the destination intact.) Facts common to both
+                    // are left in place, so no assert+retract of the same fact.
+                    if *clear_dest {
+                        for f in &dest_flakes {
+                            if !src_contents.contains(&flake_content(f)) {
+                                let mut r = f.clone();
+                                r.op = false;
+                                r.t = new_t;
+                                flakes.push(r);
+                            }
+                        }
+                    }
+
+                    // Assert source facts not already present in the destination,
+                    // re-homed by rewriting only `g`.
+                    for f in &src_flakes {
+                        if !dest_contents.contains(&flake_content(f)) {
+                            let mut a = f.clone();
+                            a.op = true;
+                            a.t = new_t;
+                            a.g = dest_sid.clone();
+                            flakes.push(a);
+                        }
+                    }
+
+                    // MOVE: clear the source afterward (retract all of it). The
+                    // source flakes live in a different graph than the
+                    // destination assertions, so there is no cancellation.
+                    if *clear_src {
+                        if let Some(src_g) = src_g_id {
+                            for mut f in src_flakes {
+                                if let Some(g_sid) = &f.g {
+                                    graph_sids.entry(src_g).or_insert_with(|| g_sid.clone());
+                                }
+                                f.op = false;
+                                f.t = new_t;
+                                flakes.push(f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Charge per-flake fuel, mirroring `stage`.
+        if let Some(tracker) = options.tracker {
+            tracker.consume_fuel(flakes.len() as u64)?;
+        }
+
+        let reverse_graph = build_reverse_graph_lookup(&graph_sids);
+
+        // Policy enforcement (skipped for root), identical to `stage`.
+        if let Some(policy) = options.policy_ctx {
+            if !policy.wrapper().is_root() {
+                enforce_modify_policies(&flakes, policy, &ledger, options.tracker, &reverse_graph)
+                    .await?;
+            }
+        }
+
+        tracing::info!(
+            flake_count = flakes.len(),
+            retractions = flakes.iter().filter(|f| !f.op).count(),
+            "graph-management staging completed"
         );
 
         Ok((

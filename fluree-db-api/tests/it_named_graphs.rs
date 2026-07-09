@@ -11,8 +11,11 @@
 
 #![cfg(feature = "native")]
 
-use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
+use crate::support::{
+    self, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
+};
 use fluree_db_api::{FlureeBuilder, LedgerManagerConfig};
+use fluree_db_transact::Txn;
 use serde_json::json;
 
 // =============================================================================
@@ -1899,4 +1902,104 @@ async fn test_named_graph_retraction() {
             assert_eq!(arr.len(), 3, "should have 3 active users at t=1: {arr:?}");
         })
         .await;
+}
+
+// =============================================================================
+// PR-U3 — graph-management query-surface parity (transact builder / Txn IR)
+// =============================================================================
+
+/// Count the triples currently visible in named graph `iri` of `ledger`.
+async fn count_in_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    iri: &str,
+) -> usize {
+    let sparql = format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}");
+    let result = support::query_sparql(fluree, ledger, &sparql)
+        .await
+        .expect("graph count query");
+    let v = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    match v.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    }
+}
+
+/// PR-U3 query-surface parity (compliance case 2): the SPARQL 1.1 Update
+/// graph-management verbs are a genuinely new *capability* (retract-all /
+/// copy a whole graph), so they are exposed on the non-SPARQL transact surface
+/// too — `Txn::clear_graph`/`drop_graph`/`copy_graph` (shared by the JSON-LD
+/// and FQL transact paths, since all lower to the one `Txn` IR + staging).
+/// This test drives that builder API directly (no SPARQL text) and asserts the
+/// outcome is identical to the equivalent SPARQL `CLEAR`/`COPY GRAPH`.
+#[tokio::test]
+async fn test_graph_mgmt_transact_builder_parity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let g3 = "http://example.org/g3";
+
+    let seed = format!(
+        r#"INSERT DATA {{
+            GRAPH <{g1}> {{ <http://example.org/s1> <http://example.org/p> "in-g1" }}
+            GRAPH <{g2}> {{ <http://example.org/s2> <http://example.org/p> "in-g2" }}
+        }}"#
+    );
+
+    // --- Builder-API path: clear_graph + copy_graph via the Txn IR ---
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-parity-builder:main");
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 1);
+    assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 1);
+
+    // copy_graph(g1 -> g3): g3 gains g1's content.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::copy_graph(g1, g3))
+        .execute()
+        .await
+        .expect("Txn::copy_graph")
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g3).await,
+        1,
+        "copy_graph copied g1 into g3"
+    );
+
+    // clear_graph(g1): g1 emptied, g2 and the g3 copy untouched.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::clear_graph(g1))
+        .execute()
+        .await
+        .expect("Txn::clear_graph")
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g1).await,
+        0,
+        "clear_graph emptied g1"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        1,
+        "g2 untouched"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g3).await,
+        1,
+        "g3 copy kept"
+    );
+
+    // --- SPARQL path: identical outcome for CLEAR GRAPH (parity) ---
+    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-parity-sparql:main");
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &seed).await.ledger;
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("CLEAR GRAPH <{g1}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_s, g1).await,
+        0,
+        "SPARQL CLEAR GRAPH matches the builder clear_graph"
+    );
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 1);
 }
