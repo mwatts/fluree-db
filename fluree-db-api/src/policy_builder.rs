@@ -99,7 +99,8 @@ pub fn resolve_policy_source_g_ids(
 /// 2. **policy_class**: Query for policies of the given class types
 /// 3. **policy**: Parse inline policy JSON-LD
 ///
-/// Priority: identity > policy_class > policy
+/// Priority: (identity + policy_class: classes select, identity binds) >
+/// identity > policy_class > policy
 ///
 /// # Arguments
 ///
@@ -257,7 +258,8 @@ async fn build_policy_context_from_opts_inner(
     // when we have a concrete SID), not for gating access — `opts.default_allow`
     // governs in all three cases.
     //
-    // Priority: cross-ledger restrictions > identity > policy_class > policy >
+    // Priority: cross-ledger restrictions > (identity + policy_class: classes
+    // select, identity binds) > identity > policy_class > policy >
     // policy_values["?$identity"]
     let (identity_sid, restrictions) = if let Some(mut merged) = cross_ledger_restrictions {
         // Cross-ledger short-circuit: the resolver already materialized
