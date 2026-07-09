@@ -171,6 +171,7 @@ impl Fluree {
             db.default_context.as_ref(),
             params,
             Some((&*db.overlay, db.graph_id)),
+            db.policy_enforcer().map(|e| &**e),
         )?;
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -192,6 +193,7 @@ impl Fluree {
             &db.snapshot,
             db.default_context.as_ref(),
             Some((&*db.overlay, db.graph_id)),
+            db.policy_enforcer().map(|e| &**e),
         )?;
         maybe_wrap_for_graph_source(db, &mut parsed);
         self.execute_cypher_ir(db, vars, parsed, 0.0).await

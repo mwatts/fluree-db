@@ -3880,8 +3880,8 @@ async fn guard_bound_subject_binds_object_only() {
 /// predicate-var binding, materialization would bind `?o` across every predicate
 /// with `?p` left NULL. It is left unconverted for normal evaluation. A bound
 /// subject with a CONSTANT predicate still converts.
-#[test]
-fn bound_subject_variable_predicate_not_converted() {
+#[tokio::test]
+async fn bound_subject_variable_predicate_not_converted() {
     let (_fluree, ledger) = edw_guard_ledger();
     let mut vars = VarRegistry::new();
     let p = vars.get_or_insert("?p");

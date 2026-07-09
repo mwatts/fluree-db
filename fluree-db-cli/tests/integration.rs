@@ -2800,6 +2800,60 @@ fn load_csv_upserts_via_cypher_template() {
 }
 
 #[test]
+fn load_csv_dedups_within_batch_merge_key() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    // Two rows in the same batch share id=5, which doesn't exist yet — the
+    // NOT EXISTS MERGE guard is evaluated once per row against the same
+    // pre-write snapshot, so without within-batch dedup both would pass and
+    // create duplicate Person nodes.
+    let csv_path = tmp.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n5,Alice\n5,Bob\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+
+    // Last row in the batch wins the value, matching sequential upsert order.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
 fn load_csv_via_jsonld_template_injects_values() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
