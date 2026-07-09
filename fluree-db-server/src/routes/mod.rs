@@ -23,7 +23,7 @@ mod storage_proxy;
 mod stream_query;
 mod stubs;
 mod submissions;
-mod transact;
+pub(crate) mod transact;
 #[cfg(feature = "shacl")]
 mod validate;
 

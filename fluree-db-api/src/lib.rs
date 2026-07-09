@@ -43,6 +43,9 @@ pub mod config_resolver;
 pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
+pub mod cypher_import;
+mod cypher_procedures;
+pub mod cypher_txn;
 pub mod cypher_write;
 pub mod dataset;
 mod error;
@@ -159,8 +162,8 @@ pub use ledger_manager::{
 pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
-    AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
-    MergePreview, MergePreviewOpts,
+    AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
+    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, DEFAULT_MAX_CHANGES,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
@@ -3451,14 +3454,14 @@ impl Fluree {
     /// `docs/concepts/cypher.md` for the surface.
     ///
     /// Context resolution: the ledger's configured `default_context`
-    /// (if any) supplies `@vocab` and bare-identifier overrides.
-    /// A CAS read or parse failure on a configured context
-    /// propagates as an error — writes never silently fall back to
-    /// the built-in vocab when a custom context was specified.
-    /// The built-in fallback (`http://example.org/`) applies only
-    /// when (a) the ledger has no nameservice record yet
-    /// (genesis / pre-commit), or (b) the record exists but no
-    /// `default_context` CID is configured.
+    /// (if any) supplies `@vocab` and bare-identifier overrides
+    /// (RDF-compat mode). A CAS read or parse failure on a configured
+    /// context propagates as an error — writes never silently fall
+    /// back to bare names when a custom context was specified. Bare
+    /// namespace-0 names (the default) apply only when (a) the ledger
+    /// has no nameservice record yet (genesis / pre-commit), or
+    /// (b) the record exists but no `default_context` CID is
+    /// configured.
     pub async fn transact_cypher(
         &self,
         ledger: LedgerState,
@@ -3484,11 +3487,97 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<TransactResult> {
+        Ok(self
+            .transact_cypher_returning(ledger, cypher, params)
+            .await?
+            .0)
+    }
+
+    /// Like [`transact_cypher_with_params`](Self::transact_cypher_with_params)
+    /// but also answers a trailing `RETURN` on the write statement: the second
+    /// tuple element is the Cypher-JSON envelope of the created entities
+    /// (`None` when the statement has no RETURN clause). See
+    /// [`crate::cypher_write::plan_write_return`] for the v1 surface.
+    ///
+    /// ## Scripts
+    ///
+    /// A semicolon-separated script of write statements executes
+    /// sequentially, one commit per statement, matching `cypher-shell`
+    /// autocommit semantics: later statements see earlier ones' effects, a
+    /// failure aborts the remainder but keeps prior commits, and only the
+    /// final statement may carry a `RETURN`. (For atomic multi-statement,
+    /// use an explicit Bolt transaction.) Statement splitting respects
+    /// string literals, backticked identifiers, and comments.
+    pub async fn transact_cypher_returning(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<(TransactResult, Option<serde_json::Value>)> {
+        let statements = crate::cypher_import::split_statements(cypher);
+        if statements.len() > 1 {
+            let mut ledger = ledger;
+            let (last, init) = statements.split_last().expect("len > 1");
+            for (i, stmt) in init.iter().enumerate() {
+                if !crate::cypher_write::cypher_statement_is_write(stmt)? {
+                    return Err(ApiError::cypher(
+                        format!(
+                            "statement {} of the script is a read — a script executes write \
+                             statements; only the final statement may carry a RETURN",
+                            i + 1
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                ledger = self
+                    .transact_cypher_statement(ledger, stmt, params)
+                    .await?
+                    .0
+                    .ledger;
+            }
+            return self.transact_cypher_statement(ledger, last, params).await;
+        }
+        // Single statement (any trailing `;` was consumed by the splitter).
+        let single = statements.first().map_or(cypher, String::as_str);
+        self.transact_cypher_statement(ledger, single, params).await
+    }
+
+    /// Execute exactly one Cypher write statement (the single-commit body of
+    /// [`Self::transact_cypher_returning`]).
+    async fn transact_cypher_statement(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<(TransactResult, Option<serde_json::Value>)> {
+        // Plan the RETURN from the same parse+substitution the write plan
+        // uses; a Some plan needs a caller-known skolem id so the created
+        // Sids are reconstructible post-commit.
+        let return_plan = {
+            match crate::query::helpers::substituted_cypher_ast(cypher, params) {
+                Ok(ast) => crate::cypher_write::plan_write_return(&ast)
+                    .map_err(|e| ApiError::cypher(e, Vec::new()))?,
+                // Parse errors surface with full diagnostics below.
+                Err(_) => None,
+            }
+        };
+        let skolem_txn_id = return_plan
+            .as_ref()
+            .map(|_| fluree_db_transact::generate_txn_id());
+
         let plan = self
-            .cypher_write_plan(cypher, params, ledger.ledger_id(), &ledger.snapshot)
+            .cypher_write_plan_with_skolem(
+                cypher,
+                params,
+                ledger.ledger_id(),
+                &ledger.snapshot,
+                skolem_txn_id.clone(),
+            )
             .await?;
-        let txn = match plan {
-            crate::cypher_write::WritePlan::Single(txn) => *txn,
+        let resolved = match plan {
+            crate::cypher_write::WritePlan::Single(txn) => {
+                crate::cypher_write::ResolvedConditional::single(*txn)
+            }
             crate::cypher_write::WritePlan::Conditional(cw) => {
                 // Unwrapped probe: this method has no policy. See the method doc.
                 let probe = GraphDb::from_ledger_state(&ledger);
@@ -3496,7 +3585,19 @@ impl Fluree {
                     .await?
             }
         };
-        self.stage_owned(ledger).txn(txn).execute().await
+        let mut builder = self.stage_owned(ledger).txn(resolved.primary);
+        if let Some(followup) = resolved.followup {
+            builder = builder.txn_followup(followup);
+        }
+        let result = builder.execute().await?;
+
+        let rows = match (&return_plan, &skolem_txn_id) {
+            (Some(plan), Some(id)) => {
+                Some(crate::cypher_write::write_return_rows(plan, id, &result.ledger).await?)
+            }
+            _ => None,
+        };
+        Ok((result, rows))
     }
 
     /// Parse + param-substitute a Cypher write and classify it as a single
@@ -3508,29 +3609,37 @@ impl Fluree {
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
     ) -> Result<crate::cypher_write::WritePlan> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+        self.cypher_write_plan_with_skolem(cypher, params, ledger_id, snapshot, None)
+            .await
+    }
+
+    /// [`cypher_write_plan`](Self::cypher_write_plan) with a caller-supplied
+    /// skolemization id (`TxnOpts::skolem_txn_id`), which makes the write's
+    /// created-entity Sids reconstructible — the mechanism behind
+    /// `CREATE … RETURN n` (see [`crate::cypher_write::write_return_rows`]).
+    pub async fn cypher_write_plan_with_skolem(
+        &self,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        skolem_txn_id: Option<String>,
+    ) -> Result<crate::cypher_write::WritePlan> {
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
+
+        // Validate a trailing RETURN up front (lowering ignores it): the v1
+        // surface is bare created-entity variables, and it never combines with
+        // the conditional (probe-based) shapes.
+        crate::cypher_write::plan_write_return(&ast)
+            .map_err(|e| ApiError::cypher(e, Vec::new()))?;
 
         if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
             return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
         }
-        let txn = self
+        let mut txn = self
             .lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await?;
+        txn.opts.skolem_txn_id = skolem_txn_id;
         Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
     }
 
@@ -3552,8 +3661,9 @@ impl Fluree {
         probe_view: GraphDb,
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
-    ) -> Result<fluree_db_transact::ir::Txn> {
+    ) -> Result<crate::cypher_write::ResolvedConditional> {
         use crate::cypher_write::ConditionalCypherWrite;
+        use crate::cypher_write::ResolvedConditional;
         // Attach the ledger's default context so the probe resolves bare
         // identifiers the same way the write does.
         let default_context = match self.get_default_context(ledger_id).await {
@@ -3564,28 +3674,72 @@ impl Fluree {
         let probe_view = probe_view.with_default_context(default_context);
 
         match cw {
-            ConditionalCypherWrite::MergeOnMatch(merge) => {
-                let node = &merge.pattern.parts[0].head;
-                // ON MATCH SET references the MERGE variable, so the node needs one.
-                if node.var.is_none() {
-                    return Err(ApiError::cypher(
-                        "MERGE … ON MATCH SET requires a node variable".to_string(),
-                        Vec::new(),
-                    ));
-                }
-                let probe = crate::cypher_write::build_merge_probe_ast(node);
+            ConditionalCypherWrite::MergeSet { merge, trailing } => {
+                let part = &merge.pattern.parts[0];
+                let probe = if part.tail.is_empty() {
+                    // The SET items reference the MERGE variable, so the node
+                    // needs one.
+                    if part.head.var.is_none() {
+                        return Err(ApiError::cypher(
+                            "MERGE with ON MATCH SET or a trailing SET requires a node variable"
+                                .to_string(),
+                            Vec::new(),
+                        ));
+                    }
+                    crate::cypher_write::build_merge_probe_ast(&part.head)
+                } else {
+                    crate::cypher_write::build_merge_path_probe_ast(merge)
+                };
                 let exists = self
                     .query_cypher_ast(&probe_view, &probe)
                     .await?
                     .row_count()
                     > 0;
                 let ast = if exists {
-                    crate::cypher_write::build_on_match_ast(merge)
+                    crate::cypher_write::build_on_match_ast(merge, trailing)
                 } else {
-                    crate::cypher_write::build_create_ast(merge)
+                    crate::cypher_write::build_create_ast(merge, trailing)
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
+            }
+            ConditionalCypherWrite::MergePerRowSet(update) => {
+                // Per-row find-or-create (relationship, or an UNWIND-batch node
+                // upsert) with an ON MATCH / trailing SET. Decompose into two
+                // branches over the same leading rows, staged into one commit:
+                // the ON MATCH SET over already-existing edges/nodes FIRST (it
+                // only mutates properties, never existence), then the create
+                // branch over the absent rows (its NOT EXISTS guard is thus
+                // unaffected by the first branch). No probe needed — each branch's
+                // guard partitions the rows.
+                let merge = update
+                    .write_clauses
+                    .iter()
+                    .find_map(|w| match w {
+                        fluree_db_cypher::ast::WriteClause::Merge(m) => Some(m),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        ApiError::cypher(
+                            "per-row MERGE plan has no MERGE clause".to_string(),
+                            Vec::new(),
+                        )
+                    })?;
+                let on_match_ast =
+                    crate::cypher_write::build_merge_per_row_on_match_ast(update, merge);
+                let create_ast = crate::cypher_write::build_merge_per_row_create_ast(update);
+                let primary = self
+                    .lower_cypher_ast_to_txn(&on_match_ast, ledger_id, snapshot)
+                    .await?;
+                let followup = self
+                    .lower_cypher_ast_to_txn(&create_ast, ledger_id, snapshot)
+                    .await?;
+                Ok(ResolvedConditional {
+                    primary,
+                    followup: Some(followup),
+                })
             }
             ConditionalCypherWrite::DeleteNode(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3627,8 +3781,10 @@ impl Fluree {
                 // No relationships → the node retraction is identical to
                 // DETACH DELETE.
                 let ast = crate::cypher_write::build_detach_delete_ast(update);
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
             }
             ConditionalCypherWrite::DeleteRel(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3681,8 +3837,10 @@ impl Fluree {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
             }
         }
     }
@@ -3702,6 +3860,8 @@ impl Fluree {
             &probe_ast,
             &probe_view.snapshot,
             probe_view.default_context.as_ref(),
+            Some((&*probe_view.overlay, probe_view.graph_id)),
+            probe_view.policy_enforcer().map(|e| &**e),
         )?;
 
         let target_var = vars.get(&target.name).ok_or_else(|| {
@@ -3786,27 +3946,7 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<fluree_db_transact::ir::Txn> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-
-        // Substitute `$param` references before lowering. Always run (empty
-        // map when no params were supplied) so an unfilled `$param` reports a
-        // clear missing-parameter error.
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
         self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await
     }
@@ -3825,8 +3965,9 @@ impl Fluree {
         // write Cypher resolves bare identifiers the same way `query_cypher`
         // does. `Ok(None)` (no default_context configured) and
         // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
-        // context"; every other error propagates so writes never silently land
-        // under the built-in vocab when a custom context couldn't be loaded.
+        // context" (bare namespace-0 names); every other error propagates so
+        // writes never silently land under bare names when a custom context
+        // couldn't be loaded.
         let default_context = match self.get_default_context(ledger_id).await {
             Ok(ctx) => ctx,
             Err(ApiError::NotFound(_)) => None,
@@ -3834,10 +3975,8 @@ impl Fluree {
         };
         let (vocab, overrides) =
             crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
-        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
-            vocab: Some(vocab),
-            overrides,
-        };
+        let cypher_opts =
+            fluree_db_transact::lower_cypher_update::CypherLowerOpts { vocab, overrides };
 
         let mut ns = NamespaceRegistry::from_db(snapshot);
         Ok(
