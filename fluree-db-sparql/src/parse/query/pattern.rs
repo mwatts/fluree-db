@@ -762,6 +762,15 @@ impl super::Parser<'_> {
             return Some(Some(Term::Literal(lit)));
         }
 
+        // RDF 1.2 triple term *value* `<<( s p o )>>` as an inline-data
+        // value (`basic-tripleterm-05`). Blank nodes are not values in a
+        // VALUES block, so disallow them inside the term; accept-then-defer
+        // (D-1) — lowering rejects the term with `not_implemented`.
+        if self.stream.check(&TokenKind::TripleTermStart) {
+            let tt = self.parse_triple_term_value(false)?;
+            return Some(Some(Term::TripleTerm(Box::new(tt))));
+        }
+
         None
     }
 

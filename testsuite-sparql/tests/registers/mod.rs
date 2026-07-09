@@ -389,44 +389,14 @@ pub const SPARQL12_CODEPOINT_ESCAPES: &[&str] = &[];
 
 pub const SPARQL12_SYNTAX_TRIPLE_TERMS_NEGATIVE: &[&str] = &[];
 
-// SPARQL 1.2 triple-term *value* syntax (bare `<<( )>>` outside the
-// object-of-rdf:reifies position, and the TRIPLE/SUBJECT/PREDICATE/
-// OBJECT/isTRIPLE builtins). The reifier forms (buckets A/D) were
-// greened by burn-down PR-W2A; the 27 entries below are buckets B/C,
-// owned by sibling PR-W2BC under decision D-1 (accept-then-defer) —
-// see docs/audit/burn-down/ROADMAP.md §2/§4 and
-// docs/audit/burn-down/sparql12-wave2-triple-terms.md §1.2/§1.3.
-pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
-    // bucket B — triple-term builtins not in the lexer/AST (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-05",
-    // bucket C — parser rejects bare triple-term values (24)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-05",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-06",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-07",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-tripleterm-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#bnode-tripleterm-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-all",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-tripleterm",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#compound-tripleterm-subject",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#expr-tripleterm-06",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#inside-tripleterm-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#nested-tripleterm-02",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#subject-tripleterm",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-01",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-03",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-04",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#update-tripleterm-05",
-];
+// SPARQL 1.2 triple-term syntax is fully accepted (accept-then-defer,
+// decision D-1): reifier forms (buckets A/D) by PR-W2A; the
+// TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE builtins (bucket B) and bare
+// `<<( )>>` triple-term values (bucket C) by PR-W2BC. All parse + validate;
+// evaluation is deferred to the first-class-triple-term epic (ROADMAP §2/§4,
+// docs/audit/burn-down/sparql12-wave2-triple-terms.md §1.2/§1.3), so the
+// sibling SPARQL12_EVAL_TRIPLE_TERMS register still stands.
+pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 
 // Blocked on Turtle-star data loading and engine triple-term support —
 // audit §4.3 / Phase D. Re-baseline this whole register after Turtle-star

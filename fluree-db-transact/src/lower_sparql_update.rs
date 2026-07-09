@@ -46,10 +46,10 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri,
-    IriValue, Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue,
-    PropertyPath, QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst,
-    SubjectTerm, Term, TriplePattern, UpdateOperation,
+    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri, IriValue,
+    Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue, PropertyPath,
+    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
+    TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use rustc_hash::FxHashMap;
@@ -405,6 +405,9 @@ fn subject_to_object(s: &SubjectTerm) -> Term {
         SubjectTerm::BlankNode(b) => Term::BlankNode(b.clone()),
         SubjectTerm::QuotedTriple(_) => {
             unreachable!("RDF-star quoted triples are rejected before annotation expansion")
+        }
+        SubjectTerm::TripleTerm(_) => {
+            unreachable!("SPARQL 1.2 triple-term values are rejected before annotation expansion")
         }
     }
 }
@@ -1457,6 +1460,10 @@ fn subject_to_unresolved_delete_where(
             feature: "RDF-star quoted triple",
             span: qt.span,
         }),
+        SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
+        }),
     }
 }
 
@@ -1506,6 +1513,10 @@ fn object_to_unresolved_delete_where(
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
             span: qt.span,
         }),
+        Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
+        }),
     }
 }
 
@@ -1541,6 +1552,13 @@ fn lower_triple_to_delete_template_delete_where(
             return Err(LowerError::UnsupportedFeature {
                 feature: "RDF-star quoted triple",
                 span: qt.span,
+            });
+        }
+        SubjectTerm::TripleTerm(tt) => {
+            return Err(LowerError::UnsupportedFeature {
+                feature:
+                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                span: tt.span,
             });
         }
     };
@@ -1585,6 +1603,13 @@ fn lower_triple_to_delete_template_delete_where(
             return Err(LowerError::UnsupportedFeature {
                 feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
                 span: qt.span,
+            });
+        }
+        Term::TripleTerm(tt) => {
+            return Err(LowerError::UnsupportedFeature {
+                feature:
+                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                span: tt.span,
             });
         }
     };
@@ -1709,6 +1734,10 @@ fn subject_to_template(
             feature: "RDF-star quoted triple",
             span: qt.span,
         }),
+        SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
+        }),
     }
 }
 
@@ -1770,6 +1799,10 @@ fn object_to_template(
         Term::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
             span: qt.span,
+        }),
+        Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
         }),
     }
 }

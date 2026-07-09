@@ -2552,11 +2552,13 @@ fn annotation_on_literal_object_parses_cleanly() {
 }
 
 #[test]
-fn triple_term_outside_rdf_reifies_is_rejected() {
-    assert_parse_error(
-        &format!("{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"),
-        "object of rdf:reifies",
-    );
+fn triple_term_outside_rdf_reifies_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): a bare `<<( s p o )>>` triple-term
+    // value in object position for a non-`rdf:reifies` predicate now parses
+    // (W3C `basic-tripleterm-02`); evaluation is rejected at lower time.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"
+    ));
 }
 
 #[test]
@@ -2646,26 +2648,25 @@ fn interleaved_reifiers_and_blocks_follow_attachment_rule() {
 // ----- Existing legacy `<< s p ?o >> f:t ?t` form regression check ---------
 
 #[test]
-fn rdf_reifies_in_insert_data_is_rejected_with_clear_error() {
-    // The rdf:reifies + triple-term form is WHERE-only in v1.
-    // SPARQL UPDATE uses the `~ {| |}` form instead.
-    assert_parse_error(
-        &format!(
-            "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
-        ),
-        "object of rdf:reifies",
-    );
+fn rdf_reifies_triple_term_in_insert_data_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): the ground triple-term value parses;
+    // it is rejected at lower time (transact reports the deferred feature),
+    // not at parse. (Cf. the WHERE-only executable `rdf:reifies` form.)
+    assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
+    ));
 }
 
 #[test]
-fn rdf_reifies_in_insert_template_is_rejected_with_clear_error() {
-    assert_parse_error(
-        &format!(
-            "{RDF_PREFIX}{EX_PREFIX}\
-             INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
-        ),
-        "object of rdf:reifies",
-    );
+fn rdf_reifies_triple_term_in_insert_template_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): a triple-term value is accepted in
+    // an INSERT template regardless of predicate and rejected at lower time,
+    // not at parse. (The executable `rdf:reifies` reifier form is WHERE-only;
+    // here `<<( … )>>` is a plain deferred triple-term value.)
+    assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}\
+         INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
+    ));
 }
 
 #[test]
@@ -2747,8 +2748,13 @@ fn annotation_block_with_path_verb_parses() {
 fn standalone_triple_term_still_rejected() {
     // W3C NEGATIVE tripleterm-separate-01: `<<( ?s ?p ?o )>> .` — a
     // bare triple term is a value, not a statement (contrast the
-    // standalone REIFIED triple, which is valid).
-    assert_parse_error("SELECT * WHERE { <<( ?s ?p ?o )>> . }", "unexpected token");
+    // standalone REIFIED triple, which is valid). Now that triple-term
+    // *values* are accepted (D-1), the subject parses but the missing
+    // predicate-object list is rejected with a targeted message.
+    assert_parse_error(
+        "SELECT * WHERE { <<( ?s ?p ?o )>> . }",
+        "a bare triple term is not a statement",
+    );
 }
 
 #[test]
@@ -2945,7 +2951,6 @@ fn test_bind_scope_filter_var_not_in_scope_accepted() {
         "PREFIX : <http://example.org/> SELECT * WHERE { ?s :p ?o FILTER(?f) BIND(1 AS ?f) }",
     );
 }
-
 
 // =========================================================================
 // V1: dot structure inside group graph patterns (W3C syn-bad-02..14)

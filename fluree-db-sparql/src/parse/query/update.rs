@@ -47,6 +47,17 @@ pub(super) fn collect_template_bnode_labels(
                         }
                     }
                 }
+                // A triple-term value subject (deferred, D-1) — mirror the
+                // reified-triple recursion so any labeled blank node inside
+                // is still collected.
+                SubjectTerm::TripleTerm(tt) => {
+                    from_subject(&tt.subject, out);
+                    if let Term::BlankNode(bn) = &tt.object {
+                        if let BlankNodeValue::Labeled(label) = &bn.value {
+                            out.push((label.clone(), bn.span));
+                        }
+                    }
+                }
                 SubjectTerm::Var(_) | SubjectTerm::Iri(_) => {}
             }
         }
