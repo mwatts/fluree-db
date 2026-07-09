@@ -156,6 +156,14 @@ pub(crate) async fn expand_wildcard_crawl(
         limit.map(|n| (n.saturating_add(1)).saturating_mul(TRIPLES_PER_SUBJECT_BUDGET));
     let flat_query = build_flat_query(subject_var, where_clause, context, flat_limit, &projection);
 
+    // This is a browse ("View Instances") crawl: render R2RML RefObjectMap objects
+    // by templating the parent IRI from the child row's own FK columns instead of
+    // scanning every FK-parent table to verify referential integrity. The operator
+    // applies this ONLY to the injected true-wildcard scan (`?s ?p ?o`), never to a
+    // predicate-filtered ref used as a subject filter, so a `Predicates` crawl or a
+    // ref-binding WHERE keeps the scan + dangling-FK semantics and its subject set.
+    let execution = execution.with_trust_fk_refs(true);
+
     let result = fluree
         .query_view_with_r2rml_options(
             view,
@@ -717,7 +725,7 @@ mod e2e {
         ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
     };
     use fluree_db_r2rml::mapping::{
-        CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, TriplesMap,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1052,5 +1060,222 @@ mod e2e {
         let (_ledger, view) = genesis_view();
         let docs = run_crawl(&provider, &view, &person_crawl(json!(["*"]), Some(2))).await;
         assert_eq!(docs.len(), 2, "LIMIT 2 must return exactly 2 subjects");
+    }
+
+    /// A batch with `id` (Int64), one nullable String column, and one FK column
+    /// (`fk_col`, Int64) — a child row that carries its own FK value.
+    fn id_str_fk_batch(str_col: &str, fk_col: &str, rows: &[(i64, &str, i64)]) -> ColumnBatch {
+        let schema = BatchSchema::new(vec![
+            FieldInfo {
+                name: "id".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: str_col.to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: fk_col.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ]);
+        ColumnBatch::new(
+            Arc::new(schema),
+            vec![
+                Column::Int64(rows.iter().map(|(i, _, _)| Some(*i)).collect()),
+                Column::String(
+                    rows.iter()
+                        .map(|(_, s, _)| Some((*s).to_string()))
+                        .collect(),
+                ),
+                Column::Int64(rows.iter().map(|(_, _, f)| Some(*f)).collect()),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A batch with `id` (Int64) and two FK columns (Int64) — an edge/self-ref
+    /// child with two FKs to the SAME parent (the collision regression).
+    fn id_two_fk_batch(fk1: &str, fk2: &str, rows: &[(i64, i64, i64)]) -> ColumnBatch {
+        let schema = BatchSchema::new(vec![
+            FieldInfo {
+                name: "id".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: fk1.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: fk2.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ]);
+        ColumnBatch::new(
+            Arc::new(schema),
+            vec![
+                Column::Int64(rows.iter().map(|(i, _, _)| Some(*i)).collect()),
+                Column::Int64(rows.iter().map(|(_, a, _)| Some(*a)).collect()),
+                Column::Int64(rows.iter().map(|(_, _, b)| Some(*b)).collect()),
+            ],
+        )
+        .unwrap()
+    }
+
+    // A trusted `["*"]` browse crawl renders a RefObjectMap object as a templated
+    // parent IRI built from the CHILD's own FK column, WITHOUT scanning the parent
+    // table — for both a present FK and a dangling one (the browse relaxation).
+    #[tokio::test]
+    async fn crawl_ref_templated_from_child_without_parent_scan() {
+        let mapping = CompiledR2rmlMapping::new(vec![
+            // Child: Customer with a scalar `name` and a ref to Account.
+            TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://example.org/customer/{id}")
+                .with_class("http://example.org/Customer")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://example.org/name"),
+                    object_map: ObjectMap::column("name"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://example.org/account"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Account",
+                        "account_id",
+                        "id",
+                    )),
+                }),
+            // Parent: Account, subject templated on its PK `id`.
+            tm(
+                "#Account",
+                "accounts",
+                "http://example.org/account/{id}",
+                "http://example.org/Account",
+                "http://example.org/label",
+                "label",
+            ),
+        ]);
+        let mut tables = HashMap::new();
+        // Customer 1 → account 10 (present); Customer 2 → account 99 (DANGLING).
+        tables.insert(
+            "customers".to_string(),
+            vec![id_str_fk_batch(
+                "name",
+                "account_id",
+                &[(1, "Alice", 10), (2, "Bob", 99)],
+            )],
+        );
+        tables.insert(
+            "accounts".to_string(),
+            vec![id_str_batch("label", &[10], &["Acct-10"])],
+        );
+        let provider = MockCrawlProvider::new(mapping, tables);
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Customer"}
+        });
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 2, "two Customer instances");
+        let serialized = serde_json::to_string(&docs).unwrap();
+        // Present FK renders the templated parent IRI from the child's account_id.
+        assert!(
+            serialized.contains("account/10"),
+            "present FK must render the templated parent IRI: {serialized}"
+        );
+        // Dangling FK (account 99, no such Account row) still renders a templated
+        // IRI — the intended browse relaxation.
+        assert!(
+            serialized.contains("account/99"),
+            "dangling FK must render a templated IRI (browse relaxation): {serialized}"
+        );
+        // The parent (Account) table is NEVER scanned; the child IS.
+        assert!(
+            !provider.scanned_tables().contains(&"accounts".to_string()),
+            "parent Account table must not be scanned: {:?}",
+            provider.scanned_tables()
+        );
+        assert!(
+            provider.scanned_tables().contains(&"customers".to_string()),
+            "child Customer table must be scanned"
+        );
+    }
+
+    // Two FKs from one child to the SAME parent each resolve their OWN FK column
+    // (regression for the child-agnostic shortcut: a child-specific placeholder
+    // keyed by the shared parent `LookupCacheKey` would render BOTH as the origin).
+    #[tokio::test]
+    async fn crawl_two_fks_to_same_parent_render_distinct() {
+        let mapping = CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Flight", "flights")
+                .with_subject_template("http://example.org/flight/{id}")
+                .with_class("http://example.org/Flight")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://example.org/origin"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Airport",
+                        "origin_id",
+                        "id",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://example.org/destination"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Airport", "dest_id", "id",
+                    )),
+                }),
+            tm(
+                "#Airport",
+                "airports",
+                "http://example.org/airport/{id}",
+                "http://example.org/Airport",
+                "http://example.org/code",
+                "code",
+            ),
+        ]);
+        let mut tables = HashMap::new();
+        tables.insert(
+            "flights".to_string(),
+            vec![id_two_fk_batch("origin_id", "dest_id", &[(1, 100, 200)])],
+        );
+        tables.insert(
+            "airports".to_string(),
+            vec![id_str_batch("code", &[100, 200], &["AAA", "BBB"])],
+        );
+        let provider = MockCrawlProvider::new(mapping, tables);
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Flight"}
+        });
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 1);
+        let serialized = serde_json::to_string(&docs).unwrap();
+        assert!(
+            serialized.contains("airport/100"),
+            "origin must render airport/100: {serialized}"
+        );
+        assert!(
+            serialized.contains("airport/200"),
+            "destination must render airport/200 (distinct from origin): {serialized}"
+        );
+        assert!(
+            !provider.scanned_tables().contains(&"airports".to_string()),
+            "parent Airport table must not be scanned: {:?}",
+            provider.scanned_tables()
+        );
     }
 }

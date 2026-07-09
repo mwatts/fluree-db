@@ -1113,6 +1113,10 @@ impl FusedR2rmlAggregateOperator {
             ctx.active_snapshot,
             mapping.as_deref(),
             ctx.reasoning_active,
+            // Count/aggregate path never merges a projected type-var (it folds
+            // scalar columns and materializes no type rows); keep the two-scan
+            // rewrite so the browse merge is confined to the crawl projection path.
+            false,
         );
         if rr.unconverted_count > 0 {
             return Ok(None);

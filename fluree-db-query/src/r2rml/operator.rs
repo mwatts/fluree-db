@@ -41,10 +41,13 @@ use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::ColumnBatchStream;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TriplesMap};
+use fluree_db_r2rml::mapping::{
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, RefObjectMap,
+    TriplesMap,
+};
 use fluree_db_r2rml::materialize::{
-    get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch,
-    reverse_subject_template, RdfTerm,
+    expand_template, get_join_key_from_batch, materialize_object_from_batch,
+    materialize_subject_from_batch, reverse_subject_template, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -60,6 +63,67 @@ pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
 
 /// Composite key for caching a parent lookup: `(parent_tm_iri, sorted_parent_join_cols)`.
 type LookupCacheKey = (String, Vec<String>);
+
+/// A child-templated `RefObjectMap` shortcut: render the parent subject IRI
+/// directly from the child row's own FK columns via the parent's subject
+/// template, with NO scan of the parent table.
+///
+/// Valid only when the parent subject is a pure IRI template whose placeholder
+/// columns are all FK join columns (so every placeholder is resolvable from the
+/// child's own FK value) and the FK is single-column. Used ONLY on the trusted
+/// browse-crawl path ([`ExecutionContext::trust_fk_refs`]) for the injected
+/// true-wildcard scan: it skips the parent-table existence check, so a
+/// present-but-dangling FK renders a templated IRI instead of yielding no triple.
+/// A matched (non-dangling) FK renders a byte-identical IRI to the parent-scan
+/// path — same template, same `iri_escape`, and the join guarantees the child FK
+/// value equals the parent key. Child-agnostic (holds only the parent template),
+/// so two FKs from one child to the SAME parent share a [`LookupCacheKey`]
+/// without colliding: each resolves its own FK value at materialize time.
+struct RefShortcut {
+    subject_template: String,
+}
+
+/// Build a [`RefShortcut`] for a `RefObjectMap`, or `None` (keep the parent scan)
+/// when the parent subject is not provably child-templatable:
+/// - not a pure IRI template (uses `rr:column` / `rr:constant`, or a non-IRI
+///   term type such as a blank node), or
+/// - a template placeholder is not one of the FK join columns (the child row does
+///   not carry its value — e.g. a subject keyed on a non-FK column), or
+/// - the FK is composite (`join_conditions.len() != 1`): the parent lookup keys
+///   on SORTED parent columns while the child key is built in declared order, so
+///   a composite render could transpose columns. Refused for the MVP (auto-
+///   generated Iceberg mappings are single-column FK → PK); composite falls back
+///   to the scan, which stays authoritative.
+fn build_ref_shortcut(parent_tm: &TriplesMap, rom: &RefObjectMap) -> Option<RefShortcut> {
+    let sm = &parent_tm.subject_map;
+    if sm.column.is_some() || sm.constant.is_some() || !sm.generates_iri() {
+        return None;
+    }
+    let template = sm.template.as_ref()?;
+    if rom.join_conditions.len() != 1 {
+        return None;
+    }
+    // Extract the template's placeholder columns from the template string itself
+    // rather than trusting `subject_map.template_columns` to be populated (some
+    // builders set the template without extracting its columns). Every placeholder
+    // must be an FK join column so it is resolvable from the child's own FK value;
+    // a placeholder-less (constant) template can't vary per FK, so fall back to the
+    // scan.
+    let template_cols = extract_template_columns(template);
+    if template_cols.is_empty() {
+        return None;
+    }
+    let parent_cols = rom.parent_columns();
+    if !template_cols
+        .iter()
+        .all(|c| parent_cols.contains(&c.as_str()))
+    {
+        return None;
+    }
+    Some(RefShortcut {
+        subject_template: template.clone(),
+    })
+}
 
 /// Target number of table rows to materialize into bindings per parallel window.
 ///
@@ -123,6 +187,10 @@ struct TmStream {
     stream: ColumnBatchStream,
     exhausted: bool,
     parent_lookups: HashMap<LookupCacheKey, ParentLookup>,
+    /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
+    /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
+    /// a given `LookupCacheKey` populates exactly one of the two maps.
+    ref_shortcuts: HashMap<LookupCacheKey, RefShortcut>,
     join: JoinPlan,
 }
 
@@ -417,6 +485,7 @@ impl R2rmlScanOperator {
         triples_map: &TriplesMap,
         batches: &[ColumnBatch],
         parent_lookups: &HashMap<LookupCacheKey, ParentLookup>,
+        ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Vec<Vec<(VarId, Binding)>>> {
         use rayon::prelude::*;
@@ -424,7 +493,16 @@ impl R2rmlScanOperator {
         let pattern = &self.pattern;
         let per_batch: Vec<Vec<Vec<(VarId, Binding)>>> = batches
             .par_iter()
-            .map(|batch| materialize_batch(pattern, triples_map, batch, parent_lookups, &encoder))
+            .map(|batch| {
+                materialize_batch(
+                    pattern,
+                    triples_map,
+                    batch,
+                    parent_lookups,
+                    ref_shortcuts,
+                    &encoder,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(per_batch.into_iter().flatten().collect())
     }
@@ -668,6 +746,19 @@ impl R2rmlScanOperator {
             // predicate filter. Parent (dimension) tables are small and consumed
             // whole into the lookup, so they are not streamed.
             let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
+            let mut ref_shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+            // Trusted browse crawl (`trust_fk_refs`) over the injected TRUE-wildcard
+            // scan (`?s ?p ?o`): render RefObjectMap objects by templating the
+            // parent IRI from the child's own FK columns and SKIP the parent-table
+            // scan. Gated on the exact true-wildcard shape (the `else => true`
+            // branch of `filtered_poms` below) so a predicate-filtered ref (a WHERE
+            // `?s <ref> ?o` join) or a star/predicate-list crawl keeps the scan +
+            // dangling-FK semantics and its subject set — a ref used as a subject
+            // filter must not be relaxed to a match.
+            let ref_template_shortcut = ctx.trust_fk_refs
+                && !self.has_star_members()
+                && self.pattern.predicate_filter.is_none()
+                && self.pattern.object_var.is_some();
             let star_preds = self.pattern_predicates();
             let filtered_poms: Vec<_> = triples_map
                 .predicate_object_maps
@@ -703,7 +794,12 @@ impl R2rmlScanOperator {
                     let lookup_key: LookupCacheKey =
                         (rom.parent_triples_map.clone(), parent_join_cols.clone());
 
-                    if parent_lookups.contains_key(&lookup_key) {
+                    // A given key populates exactly one of the two maps; skip if
+                    // either already holds it (else the 2nd POM sharing a parent
+                    // re-introduces the parent scan we removed).
+                    if parent_lookups.contains_key(&lookup_key)
+                        || ref_shortcuts.contains_key(&lookup_key)
+                    {
                         continue;
                     }
 
@@ -717,6 +813,20 @@ impl R2rmlScanOperator {
                             continue;
                         }
                     };
+
+                    // Trusted browse crawl: if the parent subject is provably
+                    // templatable from the child's FK columns, store a shortcut and
+                    // skip the parent scan (the ref IRI is rendered from the child
+                    // at materialize time; dangling-FK relaxed). Falls through to
+                    // the scan when not provably safe (composite FK, non-template /
+                    // column / constant / blank-node parent subject, non-FK
+                    // template column) — the scan then stays authoritative.
+                    if ref_template_shortcut {
+                        if let Some(shortcut) = build_ref_shortcut(parent_tm, rom) {
+                            ref_shortcuts.insert(lookup_key, shortcut);
+                            continue;
+                        }
+                    }
 
                     let parent_table = match parent_tm.table_name() {
                         Some(name) => name,
@@ -770,6 +880,7 @@ impl R2rmlScanOperator {
                 stream,
                 exhausted: false,
                 parent_lookups,
+                ref_shortcuts,
                 join,
             });
         }
@@ -857,6 +968,7 @@ impl R2rmlScanOperator {
                 triples_map,
                 &window,
                 &progress.tms[i].parent_lookups,
+                &progress.tms[i].ref_shortcuts,
                 ctx,
             )?;
 
@@ -1200,6 +1312,7 @@ fn materialize_pom_object(
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
     parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
 ) -> Result<Option<RdfTerm>> {
     if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
         let child_columns: Vec<String> = rom
@@ -1207,6 +1320,9 @@ fn materialize_pom_object(
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect();
+        // A null value in any join column means no FK reference at all → no triple
+        // (both the scan and the shortcut agree; the shortcut relaxes only a
+        // present-but-dangling FK, never a null one).
         let child_key = match get_join_key_from_batch(&child_columns, iceberg_batch, table_row_idx)
         {
             Some(k) => k,
@@ -1219,6 +1335,25 @@ fn materialize_pom_object(
             .collect();
         parent_join_cols.sort();
         let lookup_key = (rom.parent_triples_map.clone(), parent_join_cols);
+        // Trusted browse crawl: render the parent IRI from the child's own FK
+        // columns via the parent subject template — no parent scan. `child_key`
+        // is in `child_columns()` (declared) order, positionally aligned with
+        // `parent_columns()`; `build_ref_shortcut` only fires for a single-column
+        // FK, so this is one pair. Byte-identical to the scan path for a matched
+        // row (same template + `iri_escape`; the join guarantees the child FK
+        // value equals the parent key), differing only for a dangling FK (a
+        // templated IRI instead of no triple — the intended browse relaxation).
+        if let Some(sc) = ref_shortcuts.get(&lookup_key) {
+            let values: HashMap<String, Option<String>> = rom
+                .parent_columns()
+                .iter()
+                .zip(&child_key)
+                .map(|(pc, cv)| ((*pc).to_string(), Some(cv.clone())))
+                .collect();
+            return Ok(expand_template(&sc.subject_template, &values)
+                .ok()
+                .map(RdfTerm::iri));
+        }
         Ok(parent_lookups
             .get(&lookup_key)
             .and_then(|l| l.get(&child_key))
@@ -1365,6 +1500,7 @@ fn materialize_batch(
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
     parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
     // Precompute each decimal constant's canonical string once (not per row), so
@@ -1419,9 +1555,13 @@ fn materialize_batch(
                     .iter()
                     .filter(|p| p.predicate_map.as_constant() == Some(*pred))
                 {
-                    if let Some(t) =
-                        materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
-                    {
+                    if let Some(t) = materialize_pom_object(
+                        pom,
+                        iceberg_batch,
+                        table_row_idx,
+                        parent_lookups,
+                        ref_shortcuts,
+                    )? {
                         vals.push(encoder.encode(&t));
                     }
                 }
@@ -1450,6 +1590,7 @@ fn materialize_batch(
                             iceberg_batch,
                             table_row_idx,
                             parent_lookups,
+                            ref_shortcuts,
                         )? {
                             let numeric = object_column_is_numeric(pom, iceberg_batch);
                             if rdf_term_eq_object_constant_cached(
@@ -1517,9 +1658,13 @@ fn materialize_batch(
                         .as_deref()
                         .is_some_and(|pf| pom.predicate_map.as_constant() == Some(pf))
                 }) {
-                    if let Some(t) =
-                        materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
-                    {
+                    if let Some(t) = materialize_pom_object(
+                        pom,
+                        iceberg_batch,
+                        table_row_idx,
+                        parent_lookups,
+                        ref_shortcuts,
+                    )? {
                         let numeric = object_column_is_numeric(pom, iceberg_batch);
                         if rdf_term_eq_object_constant_cached(
                             &t,
@@ -1574,27 +1719,64 @@ fn materialize_batch(
                 .as_deref()
                 .is_none_or(|pf| pom.predicate_map.as_constant() == Some(pf))
         }) {
-            if let Some(t) =
-                materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
-            {
+            if let Some(t) = materialize_pom_object(
+                pom,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+            )? {
                 let object_binding = encoder.encode(&t);
-                // Allocate at the final capacity (subject? + predicate? + object)
-                // so the pushes below never reallocate — this is the hottest scan
+                // Build the (subject?, predicate?, object) prefix once. Capacity
+                // accounts for the extra type slot (a fused browse crawl also
+                // projects `?type`) so no push reallocates on this hottest scan
                 // path.
-                let mut row = Vec::with_capacity(3);
+                let cap = if pattern.type_var.is_some() { 4 } else { 3 };
+                let mut base = Vec::with_capacity(cap);
                 if let Some(sv) = pattern.subject_var {
-                    row.push((sv, subject_binding.clone()));
+                    base.push((sv, subject_binding.clone()));
                 }
                 // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
                 // `?p` to this POM's predicate IRI. A templated (non-constant)
                 // predicate leaves `?p` unbound for that triple.
                 if let Some(pv) = pattern.predicate_var {
                     if let Some(pred_iri) = pom.predicate_map.as_constant() {
-                        row.push((pv, Binding::iri(pred_iri)));
+                        base.push((pv, Binding::iri(pred_iri)));
                     }
                 }
-                row.push((obj_var, object_binding));
-                produced.push(row);
+                base.push((obj_var, object_binding));
+                // When the pattern ALSO projects a type-var (a browse crawl fused
+                // its `?s a ?type` into this wildcard), emit each `(predicate,
+                // object)` row once per declared class — the per-`(p,o)` × class
+                // cartesian, identical to the two-scan `wildcard ⋈ type-var` inner
+                // join. Without a type-var the behavior is byte-identical to before.
+                match pattern.type_var {
+                    None => produced.push(base),
+                    Some(tv) => {
+                        let classes = triples_map.classes();
+                        match classes.len() {
+                            // A classless scanned map keeps its `(p,o)` triple with
+                            // `?type` unbound — never drop the wildcard binding.
+                            // (Unreachable while fused, since `class_filter` prunes
+                            // to classed maps; kept for two-scan parity and the
+                            // future non-`["*"]` crawl shapes.)
+                            0 => produced.push(base),
+                            // Common case: exactly one class — bind it, no clone.
+                            1 => {
+                                base.push((tv, Binding::iri(classes[0].as_str())));
+                                produced.push(base);
+                            }
+                            // Multi-class: clone the `(p,o)` prefix once per class.
+                            _ => {
+                                for class_iri in classes {
+                                    let mut row = base.clone();
+                                    row.push((tv, Binding::iri(class_iri.as_str())));
+                                    produced.push(row);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1827,6 +2009,59 @@ mod tests {
     use super::*;
     use crate::r2rml::{ObjectConstant, ScanValue};
     use fluree_db_r2rml::materialize::RdfTerm;
+
+    #[test]
+    fn build_ref_shortcut_accepts_only_child_templatable_single_col() {
+        use fluree_db_r2rml::mapping::SubjectMap;
+        // Parent subject templated on its PK `id`; single-column FK account_id → id.
+        let parent =
+            TriplesMap::new("#Account", "accounts").with_subject_template("http://ex/account/{id}");
+        let rom = RefObjectMap::new("#Account", "account_id", "id");
+        let sc = build_ref_shortcut(&parent, &rom).expect("single-col PK-template is templatable");
+        assert_eq!(sc.subject_template, "http://ex/account/{id}");
+
+        // Reject: composite FK (the parent lookup keys on sorted cols vs the child's
+        // declared order — refuse rather than risk a transposed IRI).
+        let mut composite = RefObjectMap::new("#Account", "a", "x");
+        composite.add_condition("b", "y");
+        assert!(
+            build_ref_shortcut(&parent, &composite).is_none(),
+            "composite FK must be refused"
+        );
+
+        // Reject: template placeholder is not an FK join column (subject keyed on
+        // `name`, FK joins on `id`) — the child row does not carry `name`.
+        let parent_nonfk = TriplesMap::new("#Account", "accounts")
+            .with_subject_template("http://ex/account/{name}");
+        assert!(
+            build_ref_shortcut(&parent_nonfk, &rom).is_none(),
+            "non-FK template column must be refused"
+        );
+
+        // Reject: column-subject parent (rr:column) — not a template.
+        let mut parent_col = TriplesMap::new("#Account", "accounts");
+        parent_col.subject_map = SubjectMap::column("uri");
+        assert!(
+            build_ref_shortcut(&parent_col, &rom).is_none(),
+            "column subject must be refused"
+        );
+
+        // Reject: constant-subject parent (rr:constant).
+        let mut parent_const = TriplesMap::new("#Account", "accounts");
+        parent_const.subject_map = SubjectMap::constant("http://ex/the-account");
+        assert!(
+            build_ref_shortcut(&parent_const, &rom).is_none(),
+            "constant subject must be refused"
+        );
+
+        // Reject: blank-node parent subject (term type is not IRI).
+        let mut parent_bnode = TriplesMap::new("#Account", "accounts");
+        parent_bnode.subject_map = SubjectMap::template("http://ex/account/{id}").as_blank_node();
+        assert!(
+            build_ref_shortcut(&parent_bnode, &rom).is_none(),
+            "blank-node subject must be refused"
+        );
+    }
 
     #[test]
     fn object_constant_matching() {

@@ -61,6 +61,13 @@ pub struct R2rmlRewriteResult {
 ///   (see [`class_fusion_is_safe`]). `None` disables class fusion — always
 ///   correct, just less optimal — so callers that can cheaply load the mapping
 ///   should pass it.
+/// * `crawl_active` - Whether this rewrite serves a graph-source subgraph "browse"
+///   crawl (sourced from `ExecutionContext::trust_fk_refs`, which only the crawl
+///   sets). When `true`, a lone projected type-var (`?s a ?type`) co-located with
+///   the crawl's wildcard is MERGED into the wildcard so the crawl is a single
+///   LIMIT-budgeted scan (see [`try_fuse_wildcard_class`]). Gated on the crawl so
+///   hand-written SPARQL `{?s a :C . ?s ?p ?o . ?s a ?t}` keeps its known-correct
+///   two-scan plan rather than the fused per-TriplesMap cartesian.
 /// * `reasoning_active` - Whether an RDFS/OWL/datalog entailment mode is active
 ///   for this query. When `true`, the wildcard→class fusion
 ///   ([`try_fuse_wildcard_class`]) is refused: that fusion prunes TriplesMaps by
@@ -79,6 +86,7 @@ pub fn rewrite_patterns_for_r2rml(
     snapshot: &LedgerSnapshot,
     mapping: Option<&CompiledR2rmlMapping>,
     reasoning_active: bool,
+    crawl_active: bool,
 ) -> R2rmlRewriteResult {
     let mut result_patterns = Vec::with_capacity(patterns.len());
     let mut converted = 0;
@@ -142,6 +150,7 @@ pub fn rewrite_patterns_for_r2rml(
                         snapshot,
                         mapping,
                         reasoning_active,
+                        crawl_active,
                     );
                     converted += r.converted_count;
                     unconverted += r.unconverted_count;
@@ -245,6 +254,7 @@ pub fn rewrite_patterns_for_r2rml(
                     class,
                     mapping,
                     reasoning_active,
+                    crawl_active,
                 )
             });
         if !fused {
@@ -657,18 +667,31 @@ fn is_standalone_type_var(rp: &R2rmlPattern, subject: VarId) -> bool {
 }
 
 /// Try to fuse the lone class `class` into a same-subject standalone wildcard by
-/// setting its (and any co-located type-var scan's) `class_filter`. Returns
-/// `true` iff a wildcard was constrained (so the caller drops the now-redundant
-/// class scan). Refuses — leaving the wildcard unconstrained and the class scan
-/// standalone — when reasoning is active, the kill-switch is off, the mapping is
-/// unavailable, there is no wildcard to constrain, or the fusion is not provably
-/// safe ([`wildcard_class_fusion_is_safe`]).
+/// setting its `class_filter`. Returns `true` iff a wildcard was constrained (so
+/// the caller drops the now-redundant class scan). Refuses — leaving the wildcard
+/// unconstrained and the class scan standalone — when reasoning is active, the
+/// kill-switch is off, the mapping is unavailable, there is no wildcard to
+/// constrain, or the fusion is not provably safe ([`wildcard_class_fusion_is_safe`]).
+///
+/// Type-var handling has two modes:
+/// - **Browse crawl** (`crawl_active`, exactly one co-located `?s a ?type`): MERGE
+///   the type-var into the wildcard (set `wildcard.type_var`) and REMOVE the
+///   standalone type-var pattern, so the crawl is a SINGLE scan that receives the
+///   downstream LIMIT budget (the standalone type-var is otherwise the topmost
+///   budgeted scan and starves the wildcard). The fused operator then emits the
+///   per-`(predicate,object)` × declared-class cartesian — identical to the
+///   two-scan inner join for the single-TriplesMap-per-subject case, which the
+///   crawl regroup dedups regardless.
+/// - **Otherwise** (hand-written SPARQL, multiple type-vars, or fusion off): leave
+///   the type-var a standalone scan and only class-constrain it, preserving the
+///   known-correct two-scan plan.
 fn try_fuse_wildcard_class(
-    patterns: &mut [Pattern],
+    patterns: &mut Vec<Pattern>,
     subject: VarId,
     class: &str,
     mapping: Option<&CompiledR2rmlMapping>,
     reasoning_active: bool,
+    crawl_active: bool,
 ) -> bool {
     // Reasoning refusal: the class prune is an EXACT `rr:class` match, so a
     // subject entailed into a superclass whose TriplesMap declares only a
@@ -692,17 +715,57 @@ fn try_fuse_wildcard_class(
     if !wildcard_class_fusion_is_safe(mapping, class) {
         return false;
     }
+
+    // Decide whether to MERGE the projected type-var into the wildcard. Only for
+    // the browse crawl, and only when EXACTLY ONE standalone type-var exists for
+    // this subject: `R2rmlPattern::type_var` is an `Option<VarId>` (holds one), so
+    // a `?s a ?t1 . ?s a ?t2` shape must keep the two-scan plan rather than drop a
+    // binding. Capture the type-var's VarId now (before the mutation loop).
+    let type_var_count = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)))
+        .count();
+    let do_merge = crawl_active && type_var_count == 1;
+    let merged_type_var: Option<VarId> = if do_merge {
+        patterns.iter().find_map(|p| match p {
+            Pattern::R2rml(rp) if is_standalone_type_var(rp, subject) => rp.type_var,
+            _ => None,
+        })
+    } else {
+        None
+    };
+
     let mut fused = false;
     for p in patterns.iter_mut() {
         if let Pattern::R2rml(rp) = p {
             if is_standalone_wildcard(rp, subject) {
                 rp.class_filter = Some(class.to_string());
+                // Merge: bind the projected class in the SAME scan.
+                if let Some(tv) = merged_type_var {
+                    rp.type_var = Some(tv);
+                }
                 fused = true;
-            } else if is_standalone_type_var(rp, subject) {
+            } else if is_standalone_type_var(rp, subject) && !do_merge {
+                // Two-scan path: class-constrain the standalone type-var so its
+                // scan is subject-only over the queried class's TriplesMaps.
+                // On the merge path we deliberately leave it untouched (no
+                // `class_filter`) so `is_standalone_type_var` still matches it
+                // for removal below.
                 rp.class_filter = Some(class.to_string());
             }
         }
     }
+
+    // Remove the now-merged standalone type-var (only on the success path, and
+    // only when merging). It still matches `is_standalone_type_var` because the
+    // merge branch above left its `class_filter` unset. Removal is by predicate
+    // (not index), scoped to this subject, so it cannot disturb another subject's
+    // patterns as the caller iterates its class groups.
+    if fused && do_merge {
+        patterns
+            .retain(|p| !matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)));
+    }
+
     fused
 }
 
@@ -1311,7 +1374,11 @@ mod tests {
 
     /// Run the crawl-shaped pattern set (`?s ?p ?o` + `?s a ?t` + `?s a CLASS`)
     /// through the rewriter and return the resulting R2RML patterns.
-    fn rewrite_crawl(mapping: &CompiledR2rmlMapping, reasoning_active: bool) -> Vec<R2rmlPattern> {
+    fn rewrite_crawl(
+        mapping: &CompiledR2rmlMapping,
+        reasoning_active: bool,
+        crawl_active: bool,
+    ) -> Vec<R2rmlPattern> {
         use fluree_db_core::LedgerSnapshot;
         const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
         let snapshot = LedgerSnapshot::genesis("test/main");
@@ -1338,6 +1405,7 @@ mod tests {
             &snapshot,
             Some(mapping),
             reasoning_active,
+            crawl_active,
         )
         .patterns
         .into_iter()
@@ -1358,7 +1426,9 @@ mod tests {
 
     #[test]
     fn wildcard_fusion_constrains_wildcard_and_type_var_when_safe() {
-        let pats = rewrite_crawl(&single_class_mapping(), false);
+        // crawl_active = false → the hand-written / non-crawl two-scan plan: the
+        // type-var is NOT merged, just class-constrained alongside the wildcard.
+        let pats = rewrite_crawl(&single_class_mapping(), false, false);
         // Fusion consumes the standalone class scan: only the wildcard + type-var
         // remain, both now class-constrained.
         assert_eq!(pats.len(), 2, "class scan should be consumed by fusion");
@@ -1376,7 +1446,7 @@ mod tests {
 
     #[test]
     fn wildcard_fusion_refused_when_reasoning_active() {
-        let pats = rewrite_crawl(&single_class_mapping(), true);
+        let pats = rewrite_crawl(&single_class_mapping(), true, false);
         // Refused: wildcard stays unconstrained and the class scan is standalone.
         let wildcard = pats
             .iter()
@@ -1403,7 +1473,7 @@ mod tests {
             .with_subject_template("http://example.org/person/{id}")
             .with_predicate_object(pom("http://example.org/email", "email"));
         let mapping = CompiledR2rmlMapping::new(vec![tm_a, tm_b]);
-        let pats = rewrite_crawl(&mapping, false);
+        let pats = rewrite_crawl(&mapping, false, false);
         let wildcard = pats
             .iter()
             .find(|p| p.predicate_var.is_some())
@@ -1415,5 +1485,90 @@ mod tests {
         assert!(pats
             .iter()
             .any(|p| p.class_filter.as_deref() == Some(CLASS) && p.predicate_var.is_none()));
+    }
+
+    #[test]
+    fn crawl_merge_fuses_type_var_into_single_scan() {
+        // crawl_active = true → the browse merge: the projected type-var is folded
+        // into the wildcard and the standalone type-var scan is removed, leaving
+        // EXACTLY ONE R2RML scan that binds ?p/?o AND ?type and carries the class
+        // filter. This is what makes the single scan receive the LIMIT budget.
+        let pats = rewrite_crawl(&single_class_mapping(), false, true);
+        assert_eq!(
+            pats.len(),
+            1,
+            "browse merge must collapse wildcard + type-var into one scan: {pats:?}"
+        );
+        let fused = &pats[0];
+        assert!(
+            fused.predicate_var.is_some(),
+            "fused scan keeps the wildcard"
+        );
+        assert!(
+            fused.object_var.is_some(),
+            "fused scan keeps the object var"
+        );
+        assert!(
+            fused.type_var.is_some(),
+            "fused scan absorbs the projected type-var"
+        );
+        assert_eq!(
+            fused.class_filter.as_deref(),
+            Some(CLASS),
+            "fused scan is class-constrained"
+        );
+    }
+
+    #[test]
+    fn crawl_merge_refused_for_two_type_vars() {
+        // Two projected type-vars on one subject cannot both fit an Option<VarId>;
+        // the merge is refused (keeps the two-scan plan) so no binding is dropped.
+        use fluree_db_core::LedgerSnapshot;
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let mapping = single_class_mapping();
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Var(VarId(3)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Var(VarId(4)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Iri(CLASS.into()),
+            )),
+        ];
+        let pats: Vec<R2rmlPattern> = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            true,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect();
+        // Two standalone type-vars survive (no merge), plus the wildcard.
+        let type_var_scans = pats.iter().filter(|p| p.type_var.is_some()).count();
+        assert_eq!(
+            type_var_scans, 2,
+            "two type-vars must NOT be merged (would drop a binding): {pats:?}"
+        );
     }
 }
