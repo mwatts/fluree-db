@@ -124,6 +124,9 @@ mod r2rml;
 mod iceberg_catalog;
 
 #[cfg(feature = "iceberg")]
+mod iceberg_sample;
+
+#[cfg(feature = "iceberg")]
 mod iceberg_generate;
 
 #[cfg(feature = "iceberg")]
@@ -144,6 +147,9 @@ pub use iceberg_catalog::{
     CatalogBrowse, ColumnInfo, ColumnStats, PartitionFieldInfo, SnapshotRef, SortFieldInfo,
     StatsCompleteness, StatsTier, TableIdentifier, TablePreview, TableRef, TableSchema,
 };
+
+#[cfg(feature = "iceberg")]
+pub use iceberg_sample::{sample_column_values, sample_iceberg_rows};
 
 // Internal-only: the virtual-dataset `/info` row-count fetch (ledger_info.rs)
 // reuses the shared REST-client cache key and the metadata→schema extraction that
