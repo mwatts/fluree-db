@@ -108,6 +108,7 @@ fn numeric_f64(v: &ComparableValue) -> Option<f64> {
     match v.clone().coerce_numeric_operand() {
         ComparableValue::Long(n) => Some(n as f64),
         ComparableValue::Double(d) => Some(d),
+        ComparableValue::Float(f) => Some(f as f64),
         ComparableValue::Decimal(d) => d.to_string().parse().ok(),
         ComparableValue::BigInt(n) => n.to_string().parse().ok(),
         _ => None,

@@ -328,6 +328,15 @@ pub fn eval_concat<R: RowAccess>(
     // Per W3C: preserve language tag only if ALL args have the same tag
     let mut common_lang: Option<Option<Arc<str>>> = None;
     for arg in args {
+        // CONCAT requires string arguments (§17.4.3.5). A non-string bound value
+        // (e.g. an xsd:integer) or an unbound argument is a type error, so the
+        // whole result is unbound — not silently skipped/coerced (concat02).
+        let Some(val) = arg.eval_to_comparable(row, ctx)? else {
+            return Ok(None);
+        };
+        let Some(s) = val.as_str() else {
+            return Ok(None);
+        };
         let lang = extract_lang_tag(arg, row, ctx);
         match &common_lang {
             None => common_lang = Some(lang),
@@ -337,11 +346,7 @@ pub fn eval_concat<R: RowAccess>(
                 }
             }
         }
-        if let Some(val) = arg.eval_to_comparable(row, ctx)? {
-            if let Some(s) = val.as_str() {
-                result.push_str(s);
-            }
-        }
+        result.push_str(s);
     }
     let lang = common_lang.flatten();
     Ok(Some(string_with_lang(&result, lang)))

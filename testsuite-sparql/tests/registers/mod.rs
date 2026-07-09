@@ -49,14 +49,12 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     // dataset-model concern orthogonal to the UPDATE verbs). Permanent
     // divergence. (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
-    // expression/aggregate cluster (2) — PR-X2: agg-err-01 = aggregate must
-    // poison (unbind) on non-numeric group members; agg02 = COUNT(?var)
-    // re-typed as xsd:int — fix site UNCONFIRMED (it is NOT the
-    // group_aggregate finalize; probe before fixing)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-err-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg02",
-    // expression/aggregate cluster: COUNT(DISTINCT *) needs a
-    // rows-distinct IR aggregate (1) — PR-X2
+    // COUNT(DISTINCT *): DEFERRED — the parser accepts it but the lowerer
+    // rejects it (lower/aggregate.rs); greening needs a new CountDistinctAll IR
+    // variant + whole-row group-operator plumbing (the operators feed each
+    // aggregate one input-var column, not the whole solution). Perf-neutral
+    // (per-group, off the per-row hot path); a standalone post-wave-3 follow-up,
+    // NOT X3 — PR-X2 (decision-owner).
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-count-rows-distinct",
 ];
 
@@ -79,9 +77,8 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 ];
 
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
-    // result mismatch (3)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat02",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang03-rdf11",
+    // fully green: concat02 (CONCAT type-errors on a non-string argument) and
+    // strlang03-rdf11 (case-insensitive language-tag comparison) — PR-X2
 ];
 
 pub const SPARQL11_GROUPING: &[&str] = &[];
@@ -121,47 +118,66 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
-    // W-2 serialization cluster: string-escape serialization (2)
+    // quotes-3/4: D5b scan-path — pattern-object datatype drop (ninth-audit
+    // reclassified these here from serialization); deferred with the scan-path
+    // carve-out (open-eq-02 / eq-graph / dawg-lang-3) — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
+    // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
+    // (numeric-zero/empty-string falsy; ill-typed/lang/IRI/unbound → type error
+    // excluding the row) — D-EBV, PR-X2
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
+    // dawg-lang-3: pattern-object language tag dropped on the scan path
+    // (`?x :p "string"@EN` matches every lexical "string" regardless of @lang)
+    // — D5b scan-path family, PR-X2 (owned with open-eq-02 / quotes-3/4)
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-3",
+    // dawg-langMatches-4: `!langMatches(lang(?v),"*")` where ?v is an IRI —
+    // LANG of a non-literal must raise a type error that excludes the row (the
+    // negation of an error is an error), not evaluate to "" — PR-X2 follow-up
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-langMatches-basic",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-str-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-str-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-eq",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-not-eq",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#sameTerm-simple",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-2-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-2-2",
+    // D5 datatype-aware `=`/`!=` (rdf_term_equal) greened eq-2-1/eq-2-2 (numeric
+    // promotion + foreign-datatype distinctness) and open-eq-04. eq-4 remains:
+    // its foreign literal arrives as a late-materialized EncodedLit (scan+filter
+    // path), whose datatype-aware carry is on the binary-index hot path
+    // (bench-sensitive, D5b class); the join-materialized Lit path is already
+    // fixed — the same "zzz"^^:myType is correctly distinct in eq-2-1 — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-4",
+    // eq-dateTime: temporal `=` — a plain string vs xsd:dateTime and timezone-
+    // instant handling; needs temporal value semantics beyond the filter lattice
+    // — PR-X2 (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
-    // joint PR-G1 (GRAPH-variable semantics) + PR-X2 (D5 value equality);
-    // the second lander removes these (3)
+    // eq-graph-1/2/4: NOT filter equality — each is a bare BGP `{ ?x :p <const> }`
+    // (no GRAPH keyword, no FILTER), so the constant OBJECT is matched on the scan
+    // path, which ignores the exact term (`:p 1` also matches "01"/1.0e0). Same
+    // D5b scan-path class as open-eq-02; the earlier "GRAPH-var / pr-g1" note was
+    // a misnomer — PR-X2 (scan-path carve-out, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#add-numbers-cast",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#divide-numbers-cast",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#multiply-numbers-cast",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#subtract-numbers-cast",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#unminus-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-ops/manifest#unplus-2",
+    // expr-ops {add,subtract,multiply,divide}-numbers-cast + unplus-2/unminus-2:
+    // greened by D4 numeric promotion (xsd:float first-class, double∘decimal→
+    // double) — PR-X2
+    // date-1: xsd:date `=` — Fluree drops the timezone, so "2006-08-23" ≡
+    // "2006-08-23Z" ≡ "2006-08-23+00:00"; needs temporal value semantics — PR-X2
+    // (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
+    // open-eq-02: D5b scan-path — the BGP object `"a"^^t:type1` matches
+    // `"a"^^t:type2`; a deliberately-disabled per-flake scan datatype constraint,
+    // deferred to protect the bench budget (spec-sanctioned carve-out) — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-04",
+    // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need BOTH the
+    // scan-path EncodedLit datatype-carry (bench-sensitive, D5b class) AND typed-
+    // literal *constants* to carry their datatype (lower_typed_literal drops it);
+    // open-eq-07/08/10/11/12 now select the correct 12/42/52/52/10-row set but
+    // stay non-isomorphic on blank-node OUTPUT identity (the same object bnode is
+    // re-minted per binding) — orthogonal to the equality lattice.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-05",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-06",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-07",
@@ -176,15 +192,9 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-4",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-03",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-04",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-05",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-21",
-    // tP-29/30 expect ASK=false and previously "passed" only because
-    // DATATYPE(expr) errored; evaluating expression arguments unmasks the
-    // D4 numeric-promotion defect (double/decimal, float) — PR-X2.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-29",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-30",
+    // type-promotion-03/04/05/21 (double∘decimal, float-float/decimal/short
+    // promotion) and the tP-29/30 "-fail" ASKs (double+decimal is double not
+    // decimal; float+decimal is float not decimal) — D4 numeric promotion, PR-X2
     // query execution error: PR-BASE (relative-IRI/BASE resolution at lower
     // time); its lexer half lands in PR-1 (1)
 ];
@@ -360,7 +370,12 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
 ];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[
-    // result mismatch (1)
+    // not-not: the D-EBV fix makes !!?v unbind for the language-tagged,
+    // xsd:dateTime and IRI VALUES rows, but the `"z"^^xsd:boolean` row is stored
+    // coerced to Boolean(false) — an ill-typed literal is canonicalized, losing
+    // both its lexical form and its ill-typedness — so its EBV is (wrongly)
+    // false, not a type error. Blocked on ill-typed-literal preservation (D6 /
+    // PR-X3, decision D-11), not on the EBV logic.
     "https://w3c.github.io/rdf-tests/sparql/sparql12/expression/manifest#not-not",
 ];
 
