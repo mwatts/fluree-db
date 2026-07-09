@@ -67,8 +67,7 @@ pub const SPARQL11_BINDINGS: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph",
 ];
 
-pub const SPARQL11_CONSTRUCT: &[&str] = &[
-];
+pub const SPARQL11_CONSTRUCT: &[&str] = &[];
 
 pub const SPARQL11_EXISTS: &[&str] = &[
     // result mismatch (1)

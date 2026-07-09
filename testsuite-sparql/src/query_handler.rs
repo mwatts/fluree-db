@@ -354,7 +354,11 @@ fn dataset_clause_graphs(sparql: &str) -> Vec<(String, String)> {
 
     let mut seen = std::collections::HashSet::new();
     let mut graphs = Vec::new();
-    for iri in clause.default_graphs.iter().chain(clause.named_graphs.iter()) {
+    for iri in clause
+        .default_graphs
+        .iter()
+        .chain(clause.named_graphs.iter())
+    {
         let iri = iri.to_string();
         if seen.insert(iri.clone()) {
             graphs.push((iri.clone(), iri));
