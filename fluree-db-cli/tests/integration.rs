@@ -2719,3 +2719,211 @@ fn validate_rejects_unknown_fail_on() {
         .code(2)
         .stderr(predicate::str::contains("unknown --fail-on"));
 }
+
+#[test]
+fn load_csv_upserts_via_cypher_template() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    let csv_path = tmp.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n1,Alice\n2,Bob\n").unwrap();
+
+    // First load: create both people from CSV via a per-row MERGE template.
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded 2 rows"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+
+    // Second load upserts: id 1 updates in place, id 3 is new — no duplicates.
+    std::fs::write(&csv_path, "id,name\n1,Alice2\n3,Carol\n").unwrap();
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice2"))
+        .stdout(predicate::str::contains("Carol"));
+}
+
+#[test]
+fn load_csv_dedups_within_batch_merge_key() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "people"])
+        .assert()
+        .success();
+
+    // Two rows in the same batch share id=5, which doesn't exist yet — the
+    // NOT EXISTS MERGE guard is evaluated once per row against the same
+    // pre-write snapshot, so without within-batch dedup both would pass and
+    // create duplicate Person nodes.
+    let csv_path = tmp.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n5,Alice\n5,Bob\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "people",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--cypher",
+            "MERGE (n:Person {id: row.id}) SET n.name = row.name",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+
+    // Last row in the batch wins the value, matching sequential upsert order.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "people",
+            "--cypher",
+            "MATCH (n:Person) RETURN n.name AS name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
+fn load_csv_via_jsonld_template_injects_values() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "folks"])
+        .assert()
+        .success();
+
+    // Seed two subjects keyed by ex:id.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-l",
+            "folks",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:p1", "ex:id": "1", "ex:name": "Alice"},
+                {"@id": "ex:p2", "ex:id": "2", "ex:name": "Bob"}
+            ]}"#,
+        ])
+        .assert()
+        .success();
+
+    // CSV of emails keyed by the same id; the JSON-LD template matches each
+    // subject via its ex:id and adds an ex:email. The batch rides in as the
+    // update's `values` clause, binding `?id` / `?email` per CSV column.
+    let csv_path = tmp.path().join("emails.csv");
+    std::fs::write(&csv_path, "id,email\n1,alice@ex.org\n2,bob@ex.org\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args([
+            "load",
+            "folks",
+            "--from",
+            csv_path.to_str().unwrap(),
+            "--jsonld",
+            r#"{"@context": {"ex": "http://example.org/"}, "where": {"@id": "?s", "ex:id": "?id"}, "insert": {"@id": "?s", "ex:email": "?email"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Loaded 2 rows"));
+
+    // Both emails are now attached to the matched subjects.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "folks",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "select": {"?s": ["ex:name", "ex:email"]}, "where": {"@id": "?s", "ex:email": "?email"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alice@ex.org"))
+        .stdout(predicate::str::contains("bob@ex.org"));
+}
+
+#[test]
+fn load_requires_a_template_flag() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "empty"])
+        .assert()
+        .success();
+    let csv_path = tmp.path().join("x.csv");
+    std::fs::write(&csv_path, "id\n1\n").unwrap();
+    fluree_cmd(&tmp)
+        .args(["load", "empty", "--from", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--cypher").or(predicate::str::contains("--jsonld")));
+}

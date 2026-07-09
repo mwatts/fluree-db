@@ -53,6 +53,7 @@ pub(crate) mod fast_string_prefix_count_all;
 pub(crate) mod fast_sum_strlen_group_concat;
 pub(crate) mod fast_union_star_count_all;
 pub(crate) mod fast_vector_topk;
+pub(crate) mod fast_whole_graph_agg;
 pub mod filter;
 pub(crate) mod filter_fold;
 pub mod geo_rewrite;
@@ -71,6 +72,7 @@ pub(crate) mod object_binding;
 pub mod offset;
 pub mod operator;
 pub mod optional;
+pub(crate) mod optional_filter_fold;
 pub mod parse;
 pub mod plan_node;
 pub mod planner;
@@ -334,6 +336,14 @@ pub async fn execute_where_streaming<'a>(
         });
     }
 
+    // Plan with the same cached stats view the read path uses — without it,
+    // `reorder_patterns` falls back to default selectivities, where a bound-
+    // object seek (`?a <id> 4112` → 1 row) ties with a class scan
+    // (`?a rdf:type User` → N rows) and lowering order wins, turning an
+    // update's anchored MATCH into a full label scan.
+    let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+    let stats = stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false);
+
     let mut ctx = ExecutionContext::from_graph_db_ref(db, vars).with_strict_bind_errors();
     if let Some(ds) = dataset {
         ctx = ctx.with_dataset(ds);
@@ -341,7 +351,7 @@ pub async fn execute_where_streaming<'a>(
     let mut operator = build_where_operators_seeded(
         None,
         patterns,
-        None,
+        stats,
         None,
         &temporal_mode::PlanningContext::current(),
     )?;

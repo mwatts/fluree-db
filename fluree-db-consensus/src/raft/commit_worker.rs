@@ -621,6 +621,7 @@ impl Worker {
                     query,
                     params.as_ref(),
                     &governance,
+                    txn_opts.skolem_txn_id.clone(),
                 )
                 .await
                 .map_err(|e| stage_failure(&format!("cypher lowering failed: {e}")))?,
@@ -639,7 +640,12 @@ impl Worker {
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
             TransactionBody::Cypher { .. } => {
-                staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                let resolved = cypher_txn.expect("cypher_txn is Some for a Cypher body");
+                let staged = staged.txn(resolved.primary);
+                match resolved.followup {
+                    Some(followup) => staged.txn_followup(followup),
+                    None => staged,
+                }
             }
         };
 

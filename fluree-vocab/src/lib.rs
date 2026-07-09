@@ -1568,6 +1568,12 @@ pub mod fluree {
 
     /// "This commit" placeholder IRI (scheme form, used without prefix definition)
     pub const COMMIT_THIS_SCHEME: &str = "fluree:commit:this";
+
+    /// db:Node — existence marker class for LPG nodes created with no labels
+    /// and no properties (Cypher `CREATE ()`). An RDF subject needs at least
+    /// one triple to exist; this class provides it. Hidden from Cypher
+    /// `labels()`.
+    pub const NODE: &str = "https://ns.flur.ee/db#Node";
 }
 
 /// Namespace codes for IRI encoding

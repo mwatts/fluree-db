@@ -645,8 +645,14 @@ pub async fn stage(
             ])
         };
 
-        // Generate transaction ID for blank node skolemization
-        let txn_id = generate_txn_id();
+        // Transaction ID for blank node skolemization — caller-supplied when
+        // created-entity Sids must be reconstructible (Cypher write RETURN),
+        // otherwise generated.
+        let txn_id = txn
+            .opts
+            .skolem_txn_id
+            .clone()
+            .unwrap_or_else(generate_txn_id);
 
         // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
         let graph_sids: HashMap<GraphId, Sid> = txn

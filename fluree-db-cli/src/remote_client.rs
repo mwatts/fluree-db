@@ -1241,6 +1241,30 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Execute a Cypher write (with optional parameters) via the update
+    /// endpoint. The body is the `{cypher, params}` envelope the server's
+    /// `application/cypher` handler accepts — the transport behind `fluree
+    /// load`'s batched `UNWIND $batch` upserts.
+    pub async fn update_cypher(
+        &self,
+        ledger: &str,
+        cypher: &str,
+        params: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        let envelope = match params {
+            Some(p) => serde_json::json!({ "cypher": cypher, "params": p }),
+            None => serde_json::json!({ "cypher": cypher }),
+        };
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Json(&envelope)),
+        )
+        .await
+    }
+
     // =========================================================================
     // Ledger Info / Exists
     // =========================================================================

@@ -4546,6 +4546,72 @@ async fn sparql_xsd_cast_double_from_integer() {
     assert_eq!(jsonld, json!([[42.0]]));
 }
 
+/// Issue #1445 (W3C csv03): a stored `xsd:double` serializes in the W3C
+/// canonical lexical form (`1.0E6`) across every RDF-lexical result format —
+/// SPARQL-JSON, SPARQL-XML, CSV, and TSV — while the JSON-LD surface keeps
+/// emitting a native JSON number (query-surface parity guard).
+#[tokio::test]
+async fn sparql_double_canonical_lexical_form_across_formats() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:double-formats");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:s6",
+        "ex:score": {"@value": "1.0E6", "@type": "xsd:double"}
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?v WHERE { ex:s6 ex:score ?v }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("double query");
+
+    // SPARQL Results JSON: canonical lexical string + datatype.
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let binding = &sparql_json["results"]["bindings"][0]["v"];
+    assert_eq!(binding["value"], json!("1.0E6"), "{sparql_json}");
+    assert_eq!(
+        binding["datatype"],
+        json!("http://www.w3.org/2001/XMLSchema#double"),
+        "{sparql_json}"
+    );
+
+    // SPARQL Results XML: canonical lexical inside <literal>.
+    let xml = format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::sparql_xml(),
+    )
+    .expect("sparql xml");
+    assert!(xml.contains(">1.0E6</literal>"), "{xml}");
+
+    // CSV / TSV: canonical lexical cell.
+    let csv = result.to_csv(&ledger.snapshot).expect("to_csv");
+    assert_eq!(csv, "v\n1.0E6\n");
+    let tsv = result.to_tsv(&ledger.snapshot).expect("to_tsv");
+    assert_eq!(tsv, "v\n1.0E6\n");
+
+    // JSON-LD parity guard: same value stays a native JSON number.
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([[1_000_000.0]]));
+    assert!(
+        jsonld[0][0].is_number(),
+        "JSON-LD double must stay a JSON number: {jsonld}"
+    );
+}
+
 #[tokio::test]
 async fn sparql_integer_division_yields_decimal() {
     // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal:
