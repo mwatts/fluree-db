@@ -87,8 +87,6 @@ pub const SPARQL11_BINDINGS: &[&str] = &[
 ];
 
 pub const SPARQL11_CONSTRUCT: &[&str] = &[
-    // dataset: FROM/FROM NAMED unsupported on single-ledger GraphDb (1) — PR-G2
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/construct/manifest#constructwhere04",
     // parse-time rejection of RDF collection syntax in the CONSTRUCT
     // template (NOT a query-execution error); once PR-1 lands collections it
     // becomes the CONSTRUCT-template blank-node instantiation gap — W-2
@@ -210,19 +208,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // D4 numeric-promotion defect (double/decimal, float) — PR-X2.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-29",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/type-promotion/manifest#type-promotion-30",
-    // dataset: FROM/FROM NAMED unsupported on single-ledger GraphDb (12)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-01",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-02",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-03",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-04",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-05",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-09b",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-10b",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/dataset/manifest#dawg-dataset-12b",
     // query execution error: PR-BASE (relative-IRI/BASE resolution at lower
     // time); its lexer half lands in PR-1 (1)
 ];
