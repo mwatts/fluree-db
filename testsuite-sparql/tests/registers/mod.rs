@@ -87,11 +87,6 @@ pub const SPARQL11_BINDINGS: &[&str] = &[
 ];
 
 pub const SPARQL11_CONSTRUCT: &[&str] = &[
-    // parse-time rejection of RDF collection syntax in the CONSTRUCT
-    // template (NOT a query-execution error); once PR-1 lands collections it
-    // becomes the CONSTRUCT-template blank-node instantiation gap — W-2
-    // serialization cluster; stays registered through PR-1 (1)
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/construct/manifest#constructlist",
 ];
 
 pub const SPARQL11_EXISTS: &[&str] = &[
@@ -152,9 +147,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-5",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/boolean-effective-value/manifest#dawg-bev-6",
-    // W-2 serialization cluster: reification output in CONSTRUCT (2)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/construct/manifest#construct-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",

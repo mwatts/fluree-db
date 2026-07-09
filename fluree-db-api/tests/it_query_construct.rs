@@ -401,3 +401,100 @@ async fn sparql_construct_default_format_yields_jsonld_graph() {
         "each constructed node carries an @id"
     );
 }
+
+/// PR-W2 regression: a SPARQL CONSTRUCT whose template contains a blank node
+/// must instantiate a FRESH blank node per solution row — shared by every
+/// template triple within the row, distinct across rows. Before the fix,
+/// template blank nodes lowered to never-bound variables that the output path
+/// dropped, so the graph came back empty (W3C data-r2 construct-3/4,
+/// data-sparql11 constructlist).
+///
+/// This mirrors construct-3: an anonymous `[ ... ]` reification node linking
+/// rdf:subject / rdf:predicate / rdf:object for every matched triple.
+#[tokio::test]
+async fn sparql_construct_anonymous_bnode_template_is_fresh_per_solution() {
+    assert_reification_construct(
+        "PREFIX person: <http://example.org/Person#> \
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+         CONSTRUCT { [ rdf:subject ?s ; rdf:predicate person:handle ; rdf:object ?h ] } \
+         WHERE { ?s person:handle ?h }",
+    )
+    .await;
+}
+
+/// PR-W2 regression, construct-4 shape: a *labeled* template blank node (`_:a`)
+/// is likewise scoped to each solution — every row mints its own `_:a`, so the
+/// output has one reification node per match, not a single shared node.
+#[tokio::test]
+async fn sparql_construct_labeled_bnode_template_is_fresh_per_solution() {
+    assert_reification_construct(
+        "PREFIX person: <http://example.org/Person#> \
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+         CONSTRUCT { _:a rdf:subject ?s ; rdf:predicate person:handle ; rdf:object ?h } \
+         WHERE { ?s person:handle ?h }",
+    )
+    .await;
+}
+
+/// Shared body for the two reification-CONSTRUCT regressions above. Four people
+/// carry `person:handle`, so a correct engine emits four independent reification
+/// blank nodes, each linking exactly subject+predicate+object for its solution.
+async fn assert_reification_construct(sparql: &str) {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT with a blank-node template must execute");
+
+    let graph = out
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("CONSTRUCT output is a JSON-LD @graph object");
+
+    // Fresh blank node per solution: four people have person:handle, so four
+    // separate reification nodes — never a single merged node nor an empty graph.
+    assert_eq!(
+        graph.len(),
+        4,
+        "expected one fresh blank node per solution, got: {out:#}"
+    );
+
+    let mut ids = std::collections::HashSet::new();
+    for node in graph {
+        let obj = node.as_object().expect("each @graph entry is an object");
+
+        // Each reification node is a blank node — an explicit `_:` @id or an
+        // anonymous node — never an IRI subject.
+        if let Some(id) = obj.get("@id").and_then(JsonValue::as_str) {
+            assert!(
+                id.starts_with("_:"),
+                "reification node must be a blank node, got @id {id}"
+            );
+            assert!(
+                ids.insert(id.to_string()),
+                "template blank labels must be distinct across solutions: {id}"
+            );
+        }
+
+        // The single per-solution blank node links all three reification
+        // predicates (subject/predicate/object) within its row.
+        let props = obj.keys().filter(|k| !k.starts_with('@')).count();
+        assert_eq!(
+            props, 3,
+            "each reification bnode carries subject+predicate+object: {node:#}"
+        );
+    }
+
+    // Data still flows through: every handle appears as an rdf:object value.
+    let dump = out.to_string();
+    for handle in ["jdoe", "bbob", "jbob", "dankeshön"] {
+        assert!(
+            dump.contains(handle),
+            "handle {handle} missing from CONSTRUCT output: {out:#}"
+        );
+    }
+}
