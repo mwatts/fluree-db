@@ -10,6 +10,11 @@
 //! - Ref-only traversal: Only follows edges where object is a Sid (IRI reference)
 //! - Short-circuits on cycles to prevent infinite loops
 //! - Safety bound on max visited nodes to prevent runaway closure enumeration
+//! - Zero-length matches of a SPARQL `elt*` / `elt?` path with both endpoints
+//!   unbound range over **every RDF term of the active graph** (subjects and
+//!   objects of any predicate, literals included — SPARQL 1.1 §18.4), not just
+//!   the nodes touched by the path predicate. Cypher var-length shapes
+//!   (untyped wildcard or hop-bounded) keep node-set semantics.
 //!
 //! # Correlated execution modes
 //!
@@ -39,7 +44,8 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::{
-    range_with_overlay, Flake, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
+    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, IndexType, RangeMatch, RangeOptions,
+    RangeTest, Sid,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -94,8 +100,12 @@ pub struct PropertyPathOperator {
     state: OperatorState,
     /// Safety bound for maximum visited nodes
     max_visited: usize,
-    /// Results buffer for unseeded mode
-    results_buffer: Option<Vec<(Sid, Sid)>>,
+    /// Results buffer for unseeded mode.
+    ///
+    /// Pairs carry full output terms (not just node ids): a zero-length
+    /// `elt*` / `elt?` match can bind either endpoint to a literal, which a
+    /// `(Sid, Sid)` pair cannot represent (pp16).
+    results_buffer: Option<Vec<(Binding, Binding)>>,
     /// Results buffer index
     results_idx: usize,
     /// Current child batch being processed (correlated mode)
@@ -588,10 +598,116 @@ impl PropertyPathOperator {
         Ok(results)
     }
 
+    /// Whether zero-length matches of this pattern range over the whole
+    /// graph's term universe (SPARQL 1.1 §18.4 `ZeroOrMorePath`/`ZeroOrOnePath`
+    /// with both endpoints unbound) rather than the nodes touched by the path
+    /// predicates.
+    ///
+    /// True only for the SPARQL-lowered shape: a typed (non-wildcard),
+    /// unbounded (`min_hops`/`max_hops` unset) `*` or `?` path. Cypher
+    /// var-length shapes — the untyped wildcard path and any hop-bounded
+    /// range — keep the historical node-set behavior: Cypher paths range
+    /// over nodes, not RDF terms.
+    fn zero_length_spans_all_terms(&self) -> bool {
+        !self.pattern.wildcard
+            && self.pattern.min_hops.is_none()
+            && self.pattern.max_hops.is_none()
+            && matches!(
+                self.pattern.modifier,
+                PathModifier::ZeroOrMore | PathModifier::ZeroOrOne
+            )
+    }
+
+    /// Every distinct RDF term of the active graph — each subject and each
+    /// object (ref or literal) of any predicate — as output-ready bindings.
+    ///
+    /// This is the universe a zero-length `elt*` / `elt?` match pairs with
+    /// itself when both endpoints are variables (pp16): per SPARQL 1.1 §18.4
+    /// it spans *all* terms of the graph, including literals and terms only
+    /// touched by predicates outside the path. The `f:reifies` sidecar is
+    /// skipped (an implementation detail hidden from variable-predicate
+    /// reads); `rdf:type` triples are real data and are included.
+    ///
+    /// Runs one policy-filtered full scan of the active graph. Only reached
+    /// for both-variable unbounded `*`/`?` paths — already a full-closure
+    /// enumeration — never for the bound-endpoint traversals.
+    ///
+    /// The output is inherently O(graph): §18.4 mandates every graph term as a
+    /// zero-length self-pair, so the size cannot be reduced without dropping
+    /// correct answers (that was the pp16 bug — the universe deliberately
+    /// spans terms touched only by non-path predicates, and literals). Because
+    /// this runs *before* the guarded BFS it cannot borrow that guard, so it
+    /// polls cancellation itself, like every other loop here: a runaway
+    /// `?s :p* ?o` is bounded by the query's timeout/cancellation — the right
+    /// axis for an inherently full-graph enumeration. A hard term cap is
+    /// deliberately NOT applied: `max_visited` is a traversal-depth bound
+    /// (always `DEFAULT_MAX_VISITED`) and capping the universe by it would
+    /// reject spec-valid queries on modestly large graphs. (The
+    /// `range_with_overlay` read still materializes the scan, as the wildcard
+    /// closure does; bounding the *input* is a separate, broader change.)
+    async fn zero_length_universe(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Binding>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let flakes = range_with_overlay(
+            db,
+            ctx.binary_g_id,
+            overlay,
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new(),
+            RangeOptions::new().with_to_t(to_t),
+        )
+        .await?;
+        let flakes = self.filter_edges(ctx, flakes).await?;
+
+        let mut seen_nodes: HashSet<Sid> = HashSet::new();
+        // Literal term identity is (value, datatype-or-lang) — `Binding` has
+        // no `Hash` impl, so dedupe on the raw pair.
+        let mut seen_lits: HashSet<(FlakeValue, DatatypeConstraint)> = HashSet::new();
+        let mut out: Vec<Binding> = Vec::new();
+        for flake in flakes {
+            // Interruptible like every other traverse/closure loop in this
+            // file. This pre-BFS full-graph scan can't inherit the BFS's
+            // cancellation poll, so it polls here — a large `?s :p* ?o` stays
+            // killable by the query timeout instead of running to completion.
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            if fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
+                continue;
+            }
+            let Flake { s, o, dt, m, .. } = flake;
+            if seen_nodes.insert(s.clone()) {
+                out.push(Binding::sid(s));
+            }
+            match o {
+                FlakeValue::Ref(obj) => {
+                    if seen_nodes.insert(obj.clone()) {
+                        out.push(Binding::sid(obj));
+                    }
+                }
+                val => {
+                    let dtc = match m.and_then(|meta| meta.lang.map(Arc::from)) {
+                        Some(lang) => DatatypeConstraint::LangTag(lang),
+                        None => DatatypeConstraint::Explicit(dt),
+                    };
+                    if seen_lits.insert((val.clone(), dtc.clone())) {
+                        out.push(Binding::Lit {
+                            val,
+                            dtc,
+                            t: None,
+                            op: None,
+                            p_id: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Compute full transitive closure for a predicate (both vars unbound).
     ///
     /// Returns pairs (start, reachable) consistent with modifier semantics.
-    async fn compute_closure(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Sid, Sid)>> {
+    /// Pairs are full terms: zero-length matches can bind literals (pp16).
+    async fn compute_closure(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Binding, Binding)>> {
         // Composite hops aren't a single readable edge, so the in-memory
         // adjacency shortcut below doesn't apply. Seed from every node that can
         // begin a hop and run the composite-aware forward traversal from each.
@@ -606,21 +722,33 @@ impl PropertyPathOperator {
             let mut out = Vec::new();
             for start in &starts {
                 for reachable in self.traverse_forward(ctx, start).await? {
-                    out.push((start.clone(), reachable));
+                    out.push((Binding::sid(start.clone()), Binding::sid(reachable)));
                 }
             }
-            // For `*`/`?` the zero-length path pairs every node in the path's
-            // domain with itself. `traverse_forward` already emits `(n, n)` for
-            // start nodes; add the self-pair for domain nodes that are only
-            // composite *endpoints* (never a hop start), matching the
-            // simple-path closure which tracks both subjects and objects.
+            // For `*`/`?` the zero-length path pairs each term of the
+            // zero-length universe with itself. `traverse_forward` already
+            // emits `(n, n)` for start nodes, so only add self-pairs for
+            // terms that never begin a hop. For the SPARQL shape that
+            // universe is every term of the graph (pp16); for hop-bounded
+            // (Cypher) shapes it stays the composite path's own domain.
             if matches!(
                 self.pattern.modifier,
                 PathModifier::ZeroOrMore | PathModifier::ZeroOrOne
             ) {
-                for node in self.composite_domain_nodes(ctx).await? {
-                    if !start_set.contains(&node) {
-                        out.push((node.clone(), node));
+                if self.zero_length_spans_all_terms() {
+                    for term in self.zero_length_universe(ctx).await? {
+                        if let Binding::Sid { sid, .. } = &term {
+                            if start_set.contains(sid) {
+                                continue;
+                            }
+                        }
+                        out.push((term.clone(), term));
+                    }
+                } else {
+                    for node in self.composite_domain_nodes(ctx).await? {
+                        if !start_set.contains(&node) {
+                            out.push((Binding::sid(node.clone()), Binding::sid(node)));
+                        }
                     }
                 }
             }
@@ -679,18 +807,33 @@ impl PropertyPathOperator {
             }
         }
 
-        let mut out: Vec<(Sid, Sid)> = Vec::new();
+        let mut out: Vec<(Binding, Binding)> = Vec::new();
 
-        // ZeroOrOne (`p?`): each node maps to itself (zero-length) and to its
-        // direct neighbors (one hop) — no closure.
+        // Zero-length matches for the SPARQL `*`/`?` shape: every term of the
+        // graph pairs with itself (pp16 — includes literals and terms only
+        // touched by non-path predicates). The per-start depth-0 emissions
+        // below are suppressed in this mode so no self-pair is duplicated.
+        // Wildcard/bounded (Cypher) shapes keep the node-set behavior.
+        let spans_all_terms = self.zero_length_spans_all_terms();
+        if spans_all_terms {
+            for term in self.zero_length_universe(ctx).await? {
+                out.push((term.clone(), term));
+            }
+        }
+
+        // ZeroOrOne (`p?`): each node maps to itself (zero-length; via the
+        // universe above in SPARQL mode) and to its direct neighbors (one
+        // hop) — no closure.
         if self.pattern.modifier == PathModifier::ZeroOrOne {
             for n in &nodes {
                 let mut seen: HashSet<Sid> = HashSet::from([n.clone()]);
-                out.push((n.clone(), n.clone()));
+                if !spans_all_terms {
+                    out.push((Binding::sid(n.clone()), Binding::sid(n.clone())));
+                }
                 if let Some(nexts) = adj.get(n) {
                     for m in nexts {
                         if seen.insert(m.clone()) {
-                            out.push((n.clone(), m.clone()));
+                            out.push((Binding::sid(n.clone()), Binding::sid(m.clone())));
                         }
                     }
                 }
@@ -713,7 +856,7 @@ impl PropertyPathOperator {
                 seen_at_depth.insert((start.clone(), 0));
                 let mut emitted: HashSet<Sid> = HashSet::new();
                 if self.emit_at_depth(0) {
-                    out.push((start.clone(), start.clone()));
+                    out.push((Binding::sid(start.clone()), Binding::sid(start.clone())));
                     emitted.insert(start.clone());
                 }
                 let mut depth = 0u32;
@@ -731,7 +874,10 @@ impl PropertyPathOperator {
                         if let Some(nexts) = adj.get(node) {
                             for n in nexts {
                                 if self.emit_at_depth(next_depth) && emitted.insert(n.clone()) {
-                                    out.push((start.clone(), n.clone()));
+                                    out.push((
+                                        Binding::sid(start.clone()),
+                                        Binding::sid(n.clone()),
+                                    ));
                                 }
                                 if seen_at_depth.insert((n.clone(), next_depth)) {
                                     next_frontier.push(n.clone());
@@ -749,8 +895,13 @@ impl PropertyPathOperator {
             let mut visited: HashSet<Sid> = HashSet::new();
             let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
 
-            if self.pattern.modifier == PathModifier::ZeroOrMore && self.emit_at_depth(0) {
-                out.push((start.clone(), start.clone()));
+            // In SPARQL mode the zero-length universe above already emitted
+            // every self-pair (including this start's).
+            if self.pattern.modifier == PathModifier::ZeroOrMore
+                && self.emit_at_depth(0)
+                && !spans_all_terms
+            {
+                out.push((Binding::sid(start.clone()), Binding::sid(start.clone())));
             }
             visited.insert(start.clone());
             if self.can_expand(0) {
@@ -774,14 +925,17 @@ impl PropertyPathOperator {
                             && n == start
                         {
                             if self.emit_at_depth(next_depth) {
-                                out.push((start.clone(), start.clone()));
+                                out.push((
+                                    Binding::sid(start.clone()),
+                                    Binding::sid(start.clone()),
+                                ));
                             }
                             added_self_via_cycle = true;
                             continue;
                         }
                         if visited.insert(n.clone()) {
                             if self.emit_at_depth(next_depth) {
-                                out.push((start.clone(), n.clone()));
+                                out.push((Binding::sid(start.clone()), Binding::sid(n.clone())));
                             }
                             if self.can_expand(next_depth) {
                                 queue.push_back((n.clone(), next_depth));
@@ -958,7 +1112,7 @@ impl PropertyPathOperator {
                 let reachable = self.traverse_forward(ctx, subj).await?;
                 reachable
                     .into_iter()
-                    .map(|obj| (subj.clone(), obj))
+                    .map(|obj| (Binding::sid(subj.clone()), Binding::sid(obj)))
                     .collect()
             }
             (Ref::Var(_), Ref::Sid(obj)) => {
@@ -966,7 +1120,7 @@ impl PropertyPathOperator {
                 let sources = self.traverse_backward(ctx, obj).await?;
                 sources
                     .into_iter()
-                    .map(|subj| (subj, obj.clone()))
+                    .map(|subj| (Binding::sid(subj), Binding::sid(obj.clone())))
                     .collect()
             }
             (Ref::Var(_), Ref::Var(_)) => self.compute_closure(ctx).await?,
@@ -981,7 +1135,7 @@ impl PropertyPathOperator {
                     _ => unreachable!(),
                 };
                 if self.path_exists(ctx, subj, obj).await? {
-                    vec![(subj.clone(), obj.clone())]
+                    vec![(Binding::sid(subj.clone()), Binding::sid(obj.clone()))]
                 } else {
                     vec![]
                 }
@@ -1133,9 +1287,9 @@ impl PropertyPathOperator {
                         if let Some(col) = child_batch.column(*var) {
                             row.push(col[row_idx].clone());
                         } else if Some(*var) == subj_var {
-                            row.push(Binding::sid(subj.clone()));
+                            row.push(subj.clone());
                         } else if Some(*var) == obj_var {
-                            row.push(Binding::sid(obj.clone()));
+                            row.push(obj.clone());
                         } else {
                             row.push(Binding::Unbound);
                         }
@@ -1200,6 +1354,17 @@ impl Operator for PropertyPathOperator {
                 return Ok(None);
             }
 
+            // A both-constant path (e.g. `:a0 (:p)* :a1`, pp36) binds no
+            // variables, so `in_schema` is empty and `Batch::new` would infer
+            // `len = 0` from the missing first column, silently dropping the
+            // existence row (`test_batch_new_loses_len_for_empty_schema`).
+            // Mirror `GraphOperator`/`SubqueryOperator::drain_buffer`: emit an
+            // empty-schema batch that preserves the row count (out_schema is
+            // also empty here, so there is nothing to trim).
+            if self.in_schema.is_empty() {
+                return Ok(Some(Batch::empty_schema_with_len(batch_results.len())));
+            }
+
             // Build columns
             let mut columns: Vec<Vec<Binding>> = self
                 .in_schema
@@ -1219,9 +1384,9 @@ impl Operator for PropertyPathOperator {
             for (subj, obj) in batch_results {
                 for (col_idx, var) in self.in_schema.iter().enumerate() {
                     if Some(*var) == subj_var {
-                        columns[col_idx].push(Binding::sid(subj.clone()));
+                        columns[col_idx].push(subj.clone());
                     } else if Some(*var) == obj_var {
-                        columns[col_idx].push(Binding::sid(obj.clone()));
+                        columns[col_idx].push(obj.clone());
                     } else {
                         columns[col_idx].push(Binding::Unbound);
                     }
@@ -1274,6 +1439,14 @@ impl Operator for PropertyPathOperator {
             }
 
             if !all_rows.is_empty() {
+                // Same empty-schema guard as unseeded mode (pp36): a
+                // both-constant path over a variable-free child produces rows
+                // with no columns; preserve the row count instead of letting
+                // `Batch::new` collapse it to zero.
+                if self.in_schema.is_empty() {
+                    return Ok(Some(Batch::empty_schema_with_len(all_rows.len())));
+                }
+
                 // Build batch from rows
                 let mut columns: Vec<Vec<Binding>> = self
                     .in_schema

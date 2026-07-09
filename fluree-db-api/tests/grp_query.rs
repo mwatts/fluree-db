@@ -13,6 +13,8 @@ mod it_query_dataset;
 mod it_query_datatype;
 #[path = "it_query_explain_native.rs"]
 mod it_query_explain_native;
+#[path = "it_query_expression_semantics.rs"]
+mod it_query_expression_semantics;
 #[path = "it_query_fuel_bound_object.rs"]
 mod it_query_fuel_bound_object;
 #[path = "it_query_fulltext.rs"]
@@ -37,6 +39,8 @@ mod it_query_optional_hashjoin;
 mod it_query_post_order_limit;
 #[path = "it_query_property.rs"]
 mod it_query_property;
+#[path = "it_query_rdf_list_parity.rs"]
+mod it_query_rdf_list_parity;
 #[path = "it_query_reverse.rs"]
 mod it_query_reverse;
 #[path = "it_query_typed_json.rs"]

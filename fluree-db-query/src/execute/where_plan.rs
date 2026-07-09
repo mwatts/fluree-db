@@ -700,8 +700,17 @@ impl BindPattern {
         if crate::filter::contains_exists(expr) {
             return None;
         }
-        let required_vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
-        required_vars.is_subset(bound_vars).then(|| Self {
+        let mut required_vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
+        if !required_vars.is_subset(bound_vars) {
+            return None;
+        }
+        // A BIND containing BNODE(...) is solution-scoped (§17.4.2.9): pin it
+        // after every pattern already collected so it never evaluates against
+        // a partial join prefix (which would collapse per-solution identity).
+        if expr.contains_bnode() {
+            required_vars.extend(bound_vars.iter().copied());
+        }
+        Some(Self {
             required_vars,
             var,
             expr: expr.clone(),
