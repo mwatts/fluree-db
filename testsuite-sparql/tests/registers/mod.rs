@@ -124,11 +124,12 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // result mismatch (83); subgroup ownership per
     // docs/audit/burn-down/ROADMAP.md §6.1
     //
-    // W-1 algebra cluster: nested-group FILTER sees enclosing-scope
-    // variables; nested-OPTIONAL / join variable-scope semantics (5)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#filter-nested-2",
+    // W-1 algebra cluster (3): join-combo-2 = GRAPH ?g default-graph
+    // enumeration (PR-G1); nested-opt-1/2 = correlated-OPTIONAL independence
+    // (PR-W1-OPT). filter-nested-2 (nested-group FILTER scope) and join-scope-1
+    // (sub-SELECT merge of an OPTIONAL-produced correlation var) are fixed
+    // (PR-W1 Families A/B).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-scope-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
     // PR-BASE: relative-IRI/BASE resolution in query output (2)
@@ -193,9 +194,10 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-10",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-11",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-12",
-    // W-1 algebra cluster: FILTER-scope / nested-OPTIONAL semantics;
-    // optional-complex-2 is additionally gated on PR-G1 (GRAPH ?x) (4)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional-filter/manifest#dawg-optional-filter-005-not-simplified",
+    // optional cluster (3): all three optional-complex-* use GRAPH ?x/?g and
+    // are gated on PR-G1 (GRAPH-variable semantics). dawg-optional-filter-005's
+    // doubly-nested `OPTIONAL { { ... FILTER } }` scope leak is fixed (PR-W1
+    // Family A).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-4",
