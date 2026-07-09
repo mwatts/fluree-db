@@ -645,6 +645,126 @@ async fn happy_path_follower_forwards_to_leader() {
     }
 }
 
+/// Regression test for the event-bus wiring bug fixed in this branch.
+///
+/// Before the fix, the raft `StateMachineAdapter` emitted
+/// `NameServiceEvent`s on `RaftIntegration::event_bus`, but the
+/// `/v1/fluree/events` SSE endpoint subscribed on the *other* bus
+/// (`Fluree::event_bus()`) — a distinct instance. Runtime commits
+/// on the raft path therefore never surfaced to SSE subscribers
+/// (peers, tooling). The snapshot the events endpoint sends on
+/// connect still populated per-ledger records because it reads
+/// straight from the nameservice, so the bug hid — connection-time
+/// data appeared, subsequent inserts did not.
+///
+/// This test opens an SSE subscription BEFORE any inserts happen,
+/// then does a live insert, and asserts an `ns-record` event with
+/// `commit_t = 1` arrives on the stream within a short window.
+/// Would fail against pre-fix code (stream stays silent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sse_events_endpoint_emits_runtime_raft_commits() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(CLUSTER_SIZE).await;
+    cluster.bootstrap().await;
+
+    let ledger = "raft:sse-runtime";
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
+
+    // Subscribe against a follower — the interesting case, because
+    // the state machine adapter applies on every node and we want
+    // to verify the follower's SSE endpoint sees runtime events too.
+    let follower = cluster.pick_follower().await;
+    let follower_url = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id == follower)
+        .map(|n| n.public_url.clone())
+        .expect("follower node has a URL");
+
+    // Long-timeout client for the SSE stream; the normal 10s
+    // read-timeout on `cluster.client` would kill an idle stream
+    // before we insert.
+    let sse_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .no_gzip()
+        .build()
+        .expect("build sse client");
+
+    let events_url = format!("{follower_url}/v1/fluree/events?all=true");
+    let resp = sse_client
+        .get(&events_url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("SSE subscribe");
+    assert!(
+        resp.status().is_success(),
+        "SSE endpoint returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    // Drive the byte stream on a background task, accumulating raw
+    // bytes into a shared buffer that the main task can scan.
+    let buffer = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+    let buffer_bg = Arc::clone(&buffer);
+    let stream_task = tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => buffer_bg.lock().await.extend_from_slice(&bytes),
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Give the SSE endpoint a moment to emit its connection-time
+    // snapshot (which contains the ledger at commit_t=0), so any
+    // event we observe after this point is genuinely live.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Fire the runtime insert. Post-fix, this should produce an
+    // `ns-record` event with commit_t=1 on the SSE stream.
+    cluster
+        .insert_subject(cluster.nodes[0].node_id, ledger, "alice", "Alice")
+        .await;
+
+    // Poll the accumulated bytes for the runtime event. Give it a
+    // generous budget — raft apply + SSE emit is well under a
+    // second on a quiet machine, but CI can be slow.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_runtime_event = false;
+    while Instant::now() < deadline {
+        let buf = buffer.lock().await;
+        let text = String::from_utf8_lossy(&buf);
+        // Look for an ns-record event whose data payload includes
+        // `"commit_t":1`. commit_t=0 is the snapshot state (the
+        // create landing); commit_t=1 is the runtime insert.
+        if text
+            .split("event: ns-record")
+            .skip(1)
+            .any(|block| block.contains("\"commit_t\":1"))
+        {
+            saw_runtime_event = true;
+            break;
+        }
+        drop(buf);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    stream_task.abort();
+
+    assert!(
+        saw_runtime_event,
+        "did not observe an ns-record event for commit_t=1 within 10s — the raft state-machine \
+         adapter's event bus is not reaching the SSE endpoint. Captured stream so far:\n{}",
+        String::from_utf8_lossy(&buffer.lock().await),
+    );
+}
+
 /// Many transactions fan out to every node in parallel; the final
 /// state matches the union of all writes and every node sees it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

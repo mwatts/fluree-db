@@ -560,6 +560,22 @@ impl FlureeServerBuilder {
         // deployment mode. Raft mode wires `RaftNameService` so
         // every node's reads observe replicated state; default mode
         // uses whatever the storage backend implies.
+        //
+        // Raft-mode also threads the integration's
+        // `LedgerEventBus` into Fluree. Without this, the
+        // state-machine adapter emits `NameServiceEvent`s on the
+        // integration's private bus while the events endpoint and
+        // Fluree's own cache reconciler subscribe on
+        // `Fluree::event_bus()` — a different bus instance.
+        // Runtime raft commits then never surface to SSE
+        // subscribers (peers, external tools), because nothing
+        // bridges the two. Passing the same `Arc` here makes both
+        // sides observe the same broadcast channel.
+        #[cfg(feature = "raft")]
+        let raft_event_bus = self
+            .raft
+            .as_ref()
+            .map(|(integration, _)| std::sync::Arc::clone(&integration.event_bus));
         #[cfg(feature = "raft")]
         let (fluree, cache_stats_handle) = if let Some(raft_ns) = raft_nameservice.as_ref() {
             // RaftNameService satisfies the full
@@ -569,12 +585,12 @@ impl FlureeServerBuilder {
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher> =
                 raft_ns.clone();
             let ns_mode = fluree_db_api::NameServiceMode::ReadWrite(publisher);
-            state::build_fluree_with_nameservice(&self.config, ns_mode).await?
+            state::build_fluree_with_nameservice(&self.config, ns_mode, raft_event_bus).await?
         } else {
-            state::build_default_fluree(&self.config).await?
+            state::build_default_fluree(&self.config, raft_event_bus).await?
         };
         #[cfg(not(feature = "raft"))]
-        let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config).await?;
+        let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config, None).await?;
 
         #[allow(unused_mut)]
         let mut state_inner =
@@ -651,19 +667,6 @@ impl FlureeServerBuilder {
             }
             None => None,
         };
-
-        // Subscribe Fluree's `LedgerManager` to the raft integration's
-        // event bus so commit / index applies reconcile cached state
-        // on every node, not just the one that staged the commit.
-        #[cfg(feature = "raft")]
-        if let Some(((integration, _), mgr)) =
-            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
-        {
-            fluree_db_api::spawn_local_cache_event_listener(
-                Arc::clone(&integration.event_bus),
-                Arc::clone(mgr),
-            );
-        }
 
         // Per-node worker supervisor. Runs on every node (leader and
         // followers alike) because distributed workers can land
