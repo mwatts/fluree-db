@@ -132,6 +132,9 @@ mod iceberg_generate;
 #[cfg(feature = "iceberg")]
 mod iceberg_validate;
 
+#[cfg(feature = "iceberg")]
+mod ephemeral;
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 
