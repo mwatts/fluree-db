@@ -66,6 +66,7 @@ pub mod hash_join;
 pub mod having;
 pub mod ir;
 pub mod join;
+pub mod lang_support;
 pub mod limit;
 pub mod materializer;
 pub mod minus;

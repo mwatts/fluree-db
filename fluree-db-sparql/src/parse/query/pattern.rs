@@ -475,7 +475,18 @@ impl super::Parser<'_> {
         let mut data: Vec<Vec<Option<Term>>> = Vec::new();
 
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
-            if multi_var {
+            if vars.is_empty() {
+                // Zero-variable data block (`VALUES () { () … }`): each row
+                // is `()` — lexed as a single Nil token — and carries no
+                // bindings (`InlineDataFull ::= ( NIL | … ) '{' ( … | NIL )* '}'`).
+                if self.stream.match_token(&TokenKind::Nil) {
+                    data.push(Vec::new());
+                } else {
+                    self.stream
+                        .error_at_current("expected '()' row in zero-variable VALUES data block");
+                    self.stream.advance();
+                }
+            } else if multi_var {
                 // Multiple variables: expect parenthesized row
                 if let Some(row) = self.parse_values_row(vars.len()) {
                     data.push(row);
@@ -513,6 +524,13 @@ impl super::Parser<'_> {
     /// Returns variables either from `?var` or `(?var1 ?var2 ...)`.
     fn parse_values_variables(&mut self) -> Option<Vec<Var>> {
         let mut vars = Vec::new();
+
+        // `VALUES () { … }` — a NIL var list (`InlineDataFull ::= ( NIL |
+        // '(' Var* ')' ) …`) declares zero variables. `()` lexes as one Nil
+        // token, so the LParen branch below never sees the empty case.
+        if self.stream.match_token(&TokenKind::Nil) {
+            return Some(vars);
+        }
 
         // Check for parenthesized list
         if self.stream.match_token(&TokenKind::LParen) {

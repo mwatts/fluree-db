@@ -1720,6 +1720,52 @@ mem:fact-01kwsmdy5pms38yy81d0bdxprb a mem:Fact ;
     mem:branch "feature/merge-preview-changes" ;
     mem:createdAt "2026-07-05T17:15:17.046896+00:00"^^xsd:dateTime .
 
+mem:decision-01kx0v325fhgme9a3yfn7cjqtq a mem:Decision ;
+    mem:content "Policy condition unification (user-decided 2026-07): state graph IRIs are f:preState/f:postState (NOT f:pre/f:post); every f:query condition is an ASK contract regardless of language — JSON-LD gains the existing `{\"ask\": ...}` query form as preferred spelling (parse/mod.rs already parses ask; policy parser must accept it), SPARQL ASK/SELECT as-is, Cypher reserved via f:cypher datatype (read-only MATCH, ≥1 row = allow, $this/$identity/$value as native Cypher parameters). Per-policy f:queryState selector = whole-condition state switch for graph-less languages; SPARQL GRAPH f:postState for in-query mixing. Design doc: docs/design/policy-condition-languages.md." ;
+    mem:tag "ask" ;
+    mem:tag "conditions" ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "policy" ;
+    mem:tag "prestate-poststate" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/policy-condition-languages.md" ;
+    mem:artifactRef "fluree-db-query/src/parse/mod.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:26:21.743914+00:00"^^xsd:dateTime ;
+    mem:rationale "Naming settled before deployment (annoying to change after policies ship). Cypher $param syntax coinciding with SHACL-SPARQL $this convention is the unification hinge." .
+
+mem:fact-01kx0tafnf825th2w2q4z46a66 a mem:Fact ;
+    mem:content "Write verbs LANDED on feature/policy-write-intents (1792293ed): f:action accepts f:create/f:update/f:delete; PolicyRestriction.verbs: Option<WriteVerbs> (None = legacy bare f:modify, pre-state class matching); WriteFlakeInfo carries lifecycle + pre/union classes + type_object_class; stage.rs classify_subject_lifecycle probes pre-state only when has_write_verb_policies(). rdf:type flakes match class policies by OBJECT class under verbs. Branch also has: by_class modify index (d0b6d8868), inline-policy merge fix (135fca8ef), SPARQL f:query (0a6c5e5e4). Remaining roadmap: schema-flake write bypass, $value/$op bindings, f:pre/f:post state graphs, f:onShape." ;
+    mem:tag "create-intent" ;
+    mem:tag "lifecycle" ;
+    mem:tag "policy" ;
+    mem:tag "write-verbs" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_policy_verbs.rs" ;
+    mem:artifactRef "fluree-db-policy/src/evaluate.rs" ;
+    mem:artifactRef "fluree-db-policy/src/types.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:12:56.367344+00:00"^^xsd:dateTime .
+
+mem:fact-01kx0wpcatfkav62h6ng3nw4dp a mem:Fact ;
+    mem:content "Cypher policy conditions LANDED (0ddc990e9): f:cypher datatype on f:query; read-only MATCH...RETURN, ≥1 row = allow; write/schema/procedure statements rejected at build → Deny. $this/$identity are Cypher PARAMETERS carrying IRI strings (substitute_params pre-lowering — no variable seeding, unlike SPARQL's Pattern::Values); unbound identity → null param. Lowering has NO ledger @vocab (executor lacks a context handle) — conditions must use backtick-quoted full IRIs on @vocab ledgers. Hook: lang_support::CypherSupport registered from api cypher_lang.rs. JSON-LD ask form also landed (ed8d0e623): {\"ask\": X} normalizes to {\"where\": X}; both keys fails closed." ;
+    mem:tag "ask" ;
+    mem:tag "conditions" ;
+    mem:tag "cypher" ;
+    mem:tag "f-cypher-datatype" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_lang.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_policy_cypher_conditions.rs" ;
+    mem:artifactRef "fluree-db-query/src/lang_support.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:54:23.322509+00:00"^^xsd:dateTime ;
+    mem:rationale "The vocab caveat is the sharpest future gotcha; the params-vs-values seeding difference matters for the upcoming $value/state-graphs work." .
+
 mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
     mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
     mem:tag "crate-boundary" ;
@@ -2044,6 +2090,50 @@ mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
     mem:branch "fix/langstring-novelty-dedup-1273" ;
     mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
     mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
+
+mem:fact-01kwzz0ynexdgwfrw9vvsd7xfe a mem:Fact ;
+    mem:content "f:query / f:rule are language-discriminated by RDF datatype: @json or bare string → JSON-LD (legacy); `f:sparql` (https://ns.flur.ee/db#sparql; f:cypher reserved) → SPARQL. PolicyQuery = { source, language: PolicyQueryLanguage (non_exhaustive) }; WirePolicyValue::Query { source, language }. SPARQL policies must be ASK/SELECT (no grouping), evaluated as existence checks; SPARQL rules must be CONSTRUCT...WHERE with BGP + comparison FILTERs only (OPTIONAL/UNION/paths → rule skipped with warning). Build-time parse validation preserves fail-closed deny. Tests: it_policy_sparql.rs (grp_policy), it_datalog_rules_sparql.rs (grp_reasoning)." ;
+    mem:tag "datalog" ;
+    mem:tag "f-sparql-datatype" ;
+    mem:tag "policy" ;
+    mem:tag "policy-query-language" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/datalog-rules.md" ;
+    mem:artifactRef "docs/security/policy-model.md" ;
+    mem:artifactRef "fluree-db-api/src/policy_builder.rs" ;
+    mem:artifactRef "fluree-db-policy/src/types.rs" ;
+    mem:artifactRef "fluree-db-query/src/datalog_rules.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T04:15:52.494354+00:00"^^xsd:dateTime .
+
+mem:fact-01kwzz1e0t51fjfgr6bmbqpmnb a mem:Fact ;
+    mem:content "SPARQL support for policies/rules uses a OnceLock hook registry because fluree-db-sparql depends on fluree-db-query (the query crate cannot call the parser). lang_support.rs defines SparqlSupport { lower_policy_query, lower_rule }; api's sparql_lang.rs implements+registers via ensure_sparql_support_registered(), called from FlureeBuilder::finalize_with_backend (all build terminals), make_policy_query_value, and policy_view wire translation. QueryPolicyExecutor::evaluate_sparql fails CLOSED if unregistered. Binding keys \"?$this\"/\"?$identity\" map to SPARQL names \"?this\"/\"?identity\" (strip \"?$\"→\"?\"); seeded via directly-built Pattern::Values, unbound identity → Binding::Unbound (mirrors JSON null VALUES cell)." ;
+    mem:tag "crate-layering" ;
+    mem:tag "executor" ;
+    mem:tag "lang-support-registry" ;
+    mem:tag "policy" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/sparql_lang.rs" ;
+    mem:artifactRef "fluree-db-query/src/lang_support.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T04:16:08.218859+00:00"^^xsd:dateTime .
+
+mem:fact-01kx0h97eybzh5g0bkaw3dr0f3 a mem:Fact ;
+    mem:content "Test-harness trap: `normalize_rows` (fluree-db-api/tests/support/mod.rs) only sorts rows — it does NOT flatten. With `\"select\": [\"?x\"]` (array select) each row is a one-element ARRAY, so `normalize_rows(..).contains(&json!(\"ex:thing\"))` is always false; use scalar select `\"select\": \"?x\"` (flat string rows) for contains-style assertions. This trap produced a false \"bound literal objects don't match the reasoning-derived overlay\" diagnosis — DISPROVEN: bound bool/long/string objects match derived-overlay facts correctly in all combinations (base-present or derived-only predicate, JSON-LD or SPARQL rules)." ;
+    mem:tag "derived-overlay" ;
+    mem:tag "gotcha" ;
+    mem:tag "normalize-rows" ;
+    mem:tag "reasoning" ;
+    mem:tag "select-shape" ;
+    mem:tag "tests" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_datalog_rules_sparql.rs" ;
+    mem:artifactRef "fluree-db-api/tests/support/mod.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T09:34:58.014473+00:00"^^xsd:dateTime .
 
 mem:fact-01kqfy6r0w86fcsd9km0707xzg a mem:Fact ;
     mem:content "v3 commit envelope reader at `legacy_v3.rs:305-309` deliberately stubs `graph_delta = HashMap::new()` since v3 never encoded the field. Envelope-only walkers (`first_t_where_graph_registered`) therefore return `None` on any chain that includes v3 commits, regardless of whether the named graph was actually registered. Callers that rely on the result for short-circuiting must either fall through to a full load on `None`, detect v3 envelopes and signal \"inconclusive\", or accept silent correctness regressions on legacy chains." ;
