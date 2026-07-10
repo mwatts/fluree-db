@@ -3,8 +3,8 @@
   "target": "native-sf01",
   "blessed_from": {
     "target": "native-sf01",
-    "run_id": "01KX6KH5SWTV8PXP3QDCVNW9Z9",
-    "commit": "5d6d28a50"
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
   },
   "entries": {
     "q001": {
@@ -28,7 +28,7 @@
       }
     },
     "q003": {
-      "hot_wall_ms_median": 14,
+      "hot_wall_ms_median": 13,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -38,7 +38,7 @@
       }
     },
     "q004": {
-      "hot_wall_ms_median": 15,
+      "hot_wall_ms_median": 14,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -48,7 +48,7 @@
       }
     },
     "q005": {
-      "hot_wall_ms_median": 2,
+      "hot_wall_ms_median": 3,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -58,7 +58,7 @@
       }
     },
     "q006": {
-      "hot_wall_ms_median": 16,
+      "hot_wall_ms_median": 15,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -68,7 +68,7 @@
       }
     },
     "q007": {
-      "hot_wall_ms_median": 10,
+      "hot_wall_ms_median": 8,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -78,7 +78,7 @@
       }
     },
     "q008": {
-      "hot_wall_ms_median": 757,
+      "hot_wall_ms_median": 747,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -88,7 +88,7 @@
       }
     },
     "q009": {
-      "hot_wall_ms_median": 772,
+      "hot_wall_ms_median": 724,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -98,7 +98,7 @@
       }
     },
     "q010": {
-      "hot_wall_ms_median": 859,
+      "hot_wall_ms_median": 853,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -108,7 +108,7 @@
       }
     },
     "q011": {
-      "hot_wall_ms_median": 314,
+      "hot_wall_ms_median": 305,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -118,7 +118,7 @@
       }
     },
     "q012": {
-      "hot_wall_ms_median": 1129,
+      "hot_wall_ms_median": 1031,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -128,7 +128,7 @@
       }
     },
     "q013": {
-      "hot_wall_ms_median": 1714,
+      "hot_wall_ms_median": 1597,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -138,7 +138,7 @@
       }
     },
     "q014": {
-      "hot_wall_ms_median": 212,
+      "hot_wall_ms_median": 183,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -148,7 +148,7 @@
       }
     },
     "q015": {
-      "hot_wall_ms_median": 431,
+      "hot_wall_ms_median": 419,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -158,7 +158,7 @@
       }
     },
     "q016": {
-      "hot_wall_ms_median": 735,
+      "hot_wall_ms_median": 697,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -168,46 +168,6 @@
       }
     },
     "q017": {
-      "hot_wall_ms_median": 158,
-      "counters": {
-        "spans": {},
-        "files_selected": 0,
-        "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 0
-      }
-    },
-    "q018": {
-      "hot_wall_ms_median": 124,
-      "counters": {
-        "spans": {},
-        "files_selected": 0,
-        "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 0
-      }
-    },
-    "q019": {
-      "hot_wall_ms_median": 228,
-      "counters": {
-        "spans": {},
-        "files_selected": 0,
-        "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 0
-      }
-    },
-    "q020": {
-      "hot_wall_ms_median": 307,
-      "counters": {
-        "spans": {},
-        "files_selected": 0,
-        "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 0
-      }
-    },
-    "q021": {
       "hot_wall_ms_median": 136,
       "counters": {
         "spans": {},
@@ -217,8 +177,48 @@
         "file_size": 0
       }
     },
+    "q018": {
+      "hot_wall_ms_median": 132,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q019": {
+      "hot_wall_ms_median": 224,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q020": {
+      "hot_wall_ms_median": 311,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q021": {
+      "hot_wall_ms_median": 134,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
     "q022": {
-      "hot_wall_ms_median": 402,
+      "hot_wall_ms_median": 379,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -228,7 +228,7 @@
       }
     },
     "q023": {
-      "hot_wall_ms_median": 382,
+      "hot_wall_ms_median": 341,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -238,7 +238,7 @@
       }
     },
     "q024": {
-      "hot_wall_ms_median": 279,
+      "hot_wall_ms_median": 267,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -248,7 +248,7 @@
       }
     },
     "q025": {
-      "hot_wall_ms_median": 33,
+      "hot_wall_ms_median": 31,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -258,7 +258,7 @@
       }
     },
     "q026": {
-      "hot_wall_ms_median": 39,
+      "hot_wall_ms_median": 38,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -268,7 +268,7 @@
       }
     },
     "q027": {
-      "hot_wall_ms_median": 1274,
+      "hot_wall_ms_median": 1229,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -278,7 +278,7 @@
       }
     },
     "q028": {
-      "hot_wall_ms_median": 65,
+      "hot_wall_ms_median": 61,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -288,7 +288,7 @@
       }
     },
     "q029": {
-      "hot_wall_ms_median": 168,
+      "hot_wall_ms_median": 177,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -298,7 +298,7 @@
       }
     },
     "q030": {
-      "hot_wall_ms_median": 882,
+      "hot_wall_ms_median": 862,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -308,7 +308,7 @@
       }
     },
     "q031": {
-      "hot_wall_ms_median": 212,
+      "hot_wall_ms_median": 200,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -318,7 +318,7 @@
       }
     },
     "q032": {
-      "hot_wall_ms_median": 277,
+      "hot_wall_ms_median": 253,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -338,7 +338,7 @@
       }
     },
     "q034": {
-      "hot_wall_ms_median": 172,
+      "hot_wall_ms_median": 176,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -348,7 +348,7 @@
       }
     },
     "q035": {
-      "hot_wall_ms_median": 0,
+      "hot_wall_ms_median": 1,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -378,7 +378,7 @@
       }
     },
     "q038": {
-      "hot_wall_ms_median": 221,
+      "hot_wall_ms_median": 213,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -398,7 +398,7 @@
       }
     },
     "q040": {
-      "hot_wall_ms_median": 375,
+      "hot_wall_ms_median": 366,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -408,7 +408,7 @@
       }
     },
     "q041": {
-      "hot_wall_ms_median": 320,
+      "hot_wall_ms_median": 302,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -428,7 +428,7 @@
       }
     },
     "q043": {
-      "hot_wall_ms_median": 166,
+      "hot_wall_ms_median": 168,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -448,7 +448,7 @@
       }
     },
     "q045": {
-      "hot_wall_ms_median": 153,
+      "hot_wall_ms_median": 149,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -458,7 +458,7 @@
       }
     },
     "q046": {
-      "hot_wall_ms_median": 207,
+      "hot_wall_ms_median": 202,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -468,7 +468,7 @@
       }
     },
     "q047": {
-      "hot_wall_ms_median": 163,
+      "hot_wall_ms_median": 154,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -478,7 +478,7 @@
       }
     },
     "q048": {
-      "hot_wall_ms_median": 253,
+      "hot_wall_ms_median": 229,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -488,7 +488,7 @@
       }
     },
     "q049": {
-      "hot_wall_ms_median": 65,
+      "hot_wall_ms_median": 62,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -508,7 +508,7 @@
       }
     },
     "q051": {
-      "hot_wall_ms_median": 480,
+      "hot_wall_ms_median": 475,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -518,7 +518,7 @@
       }
     },
     "q052": {
-      "hot_wall_ms_median": 1256,
+      "hot_wall_ms_median": 1177,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -528,7 +528,7 @@
       }
     },
     "q053": {
-      "hot_wall_ms_median": 408,
+      "hot_wall_ms_median": 386,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -538,7 +538,7 @@
       }
     },
     "q054": {
-      "hot_wall_ms_median": 3,
+      "hot_wall_ms_median": 2,
       "counters": {
         "spans": {},
         "files_selected": 0,

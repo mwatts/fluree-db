@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "target": "virtual-sf01",
+  "blessed_from": {
+    "target": "virtual-sf01",
+    "run_id": "01KX6MDZ0MSZMJBX1S7NWAY90J",
+    "commit": "5d6d28a50"
+  },
+  "entries": {
+    "q001": {
+      "hot_wall_ms_median": 2277,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 7,
+            "total_us": 1442336,
+            "max_us": 252685
+          },
+          "r2rml.scan_table": {
+            "n": 7,
+            "total_us": 680885,
+            "max_us": 114394
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 7366656
+      }
+    },
+    "q003": {
+      "hot_wall_ms_median": 277,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 160702,
+            "max_us": 160702
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 97491,
+            "max_us": 97491
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 626688
+      }
+    },
+    "q005": {
+      "hot_wall_ms_median": 3498,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 12,
+            "total_us": 2079952,
+            "max_us": 222666
+          },
+          "r2rml.scan_table": {
+            "n": 12,
+            "total_us": 1157349,
+            "max_us": 109296
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 10510848
+      }
+    },
+    "q006": {
+      "hot_wall_ms_median": 2522,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 7,
+            "total_us": 1224846,
+            "max_us": 229132
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 337737,
+            "max_us": 337737
+          },
+          "r2rml.scan_table": {
+            "n": 7,
+            "total_us": 1107119,
+            "max_us": 452164
+          }
+        },
+        "files_selected": 1,
+        "files_pruned": 0,
+        "estimated_row_count": 15000,
+        "file_size": 7634944
+      }
+    },
+    "q007": {
+      "hot_wall_ms_median": 277,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 165070,
+            "max_us": 165070
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 94646,
+            "max_us": 94646
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 275456
+      }
+    },
+    "q011": {
+      "hot_wall_ms_median": 3216,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 91,
+            "total_us": 18993881,
+            "max_us": 359432
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 593679,
+            "max_us": 593679
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 688529,
+            "max_us": 688529
+          }
+        },
+        "files_selected": 91,
+        "files_pruned": 7579,
+        "estimated_row_count": 2136,
+        "file_size": 647168
+      }
+    },
+    "q022": {
+      "hot_wall_ms_median": 630,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 274462,
+            "max_us": 274462
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 104788,
+            "max_us": 104788
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 5988864
+      }
+    },
+    "q025": {
+      "hot_wall_ms_median": 180000,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 6965,
+            "total_us": 1468019063,
+            "max_us": 687812
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1231349,
+            "max_us": 1231349
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 1337249,
+            "max_us": 1337249
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 47317504
+      }
+    },
+    "q034": {
+      "hot_wall_ms_median": 2,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q040": {
+      "hot_wall_ms_median": 180000,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 6812,
+            "total_us": 1455952114,
+            "max_us": 471255
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 2662418,
+            "max_us": 2662418
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 2783573,
+            "max_us": 2783573
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 45340672
+      }
+    },
+    "q042": {
+      "hot_wall_ms_median": 2903,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 9,
+            "total_us": 1159384,
+            "max_us": 222764
+          },
+          "iceberg.scan_plan": {
+            "n": 3,
+            "total_us": 792688,
+            "max_us": 298547
+          },
+          "r2rml.scan_table": {
+            "n": 9,
+            "total_us": 1686495,
+            "max_us": 386500
+          }
+        },
+        "files_selected": 3,
+        "files_pruned": 0,
+        "estimated_row_count": 1500,
+        "file_size": 2049024
+      }
+    },
+    "q049": {
+      "hot_wall_ms_median": 4806,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 14,
+            "total_us": 2619460,
+            "max_us": 251049
+          },
+          "r2rml.scan_table": {
+            "n": 14,
+            "total_us": 1327378,
+            "max_us": 116526
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 39367168
+      }
+    },
+    "q050": {
+      "hot_wall_ms_median": 120000,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 358,
+            "total_us": 67762007,
+            "max_us": 411456
+          },
+          "r2rml.load_table": {
+            "n": 6,
+            "total_us": 9635659,
+            "max_us": 2112173
+          },
+          "r2rml.scan_table": {
+            "n": 358,
+            "total_us": 46430711,
+            "max_us": 2212050
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 132022272
+      }
+    },
+    "q051": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q053": {
+      "hot_wall_ms_median": 180000,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 6212,
+            "total_us": 1465944591,
+            "max_us": 724635
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1448310,
+            "max_us": 1448310
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 1553929,
+            "max_us": 1553929
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 34985984
+      }
+    },
+    "q054": {
+      "hot_wall_ms_median": 2362,
+      "counters": {
+        "spans": {
+          "iceberg.parquet_read": {
+            "n": 8,
+            "total_us": 1441783,
+            "max_us": 231602
+          },
+          "r2rml.scan_table": {
+            "n": 8,
+            "total_us": 760533,
+            "max_us": 97440
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 7415808
+      }
+    }
+  }
+}

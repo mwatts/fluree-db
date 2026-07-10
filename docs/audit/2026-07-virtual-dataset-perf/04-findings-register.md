@@ -7,7 +7,7 @@
 
 This is the first native-vs-virtual parity comparison on SF01. Each finding below is one row of the smoke run, classed and grounded in the exact record data (rows / result-hash equality / wall-ms both targets / pathway span counts), with a suspected mechanism anchored to the inventory and a hypothesis linkage. **Correctness findings rank above perf findings** — a wrong answer is worse than a slow one.
 
-**Headline:** 5 of 16 smoke queries are **correct and hash-equal** to native (q001, q003, q006, q007, q011, q022, q054 — see F6). The rest split into **two silent-empty correctness bugs** (F1, F2), **one silent-divergence** (F3, mechanism confirmed), **two canonicalization-suspects** (F4), and **four perf-DNFs** (F5), plus a **harness span-coverage note** (F7).
+**Headline:** 7 of 16 smoke queries are **correct and hash-equal** to native (q001, q003, q006, q007, q011, q022, q054 — see F6). The rest split into **two silent-empty correctness bugs** (F1, F2), **one silent-divergence** (F3, root-caused), **two corpus-determinism defects** (F4, engine exonerated), and **four perf-DNFs** (F5), plus a **harness span-coverage note** (F7).
 
 ---
 
@@ -64,29 +64,31 @@ This is the first native-vs-virtual parity comparison on SF01. Each finding belo
 
 ---
 
-## F3 — Bound-subject wildcard drops the `rdf:type` triple *(correctness-divergence — mechanism confirmed)*
+## F3 — Bound-subject wildcard drops the `rdf:type` triple *(correctness-divergence — CONFIRMED, root-caused)*
 
 **Query.** q042 `{ <edw/store/1> ?p ?o } UNION { <edw/store/2> ?p ?o } UNION { <edw/store/3> ?p ?o }` (BI-19, three-store detail).
 
-**Evidence.** native **24 rows** vs virtual **21 rows** — exactly **3 rows lost**, hashes NE. `files_selected=3` (the prefix-prune correctly hit one file per store). Native `--keep-heads` shows the 24 rows include exactly **three `rdf:type → edw:Store` triples** (one per store); the arithmetic is `24 = 3 × 8` (8 triples/store incl. type) vs virtual `21 = 3 × 7`. **The 3 lost rows are the `rdf:type` class-membership triples.**
+**Evidence.** native **24 rows** vs virtual **21 rows** — exactly **3 rows lost**, hashes NE. `files_selected=3` (the prefix-prune correctly hit one file per store). Per bound subject, **virtual emits exactly the 7 POM predicates** (`edw:channel`, `edw:geography`, `edw:name`, `edw:openDate`, `edw:regionManager`, `edw:storeId`, `edw:storeType`) and **omits `rdf:type`**; native emits **8** (those 7 + `rdf:type → edw:Store`). So each of the 3 UNION arms loses exactly its one type row: `24 = 3 × 8` → `21 = 3 × 7`. Confirmed by native `--keep-heads` (three `rdf:type → edw:Store` rows present natively).
 
-**Suspected mechanism.** A bound-subject **true wildcard** (`<iri> ?p ?o`) on virtual materializes the TriplesMap's `PredicateObjectMap`s (the 7 column/ref predicates) but **does not emit the `rr:class`-derived `rdf:type` triple** — the class is carried on the SubjectMap (`rr:class edw:Store`, `enterprise.ttl:85`), not as a POM, and the wildcard materialization path iterates POMs only (inventory §2's wildcard handling binds `type_var` only when the query has an explicit `?s a ?t`, `[rewrite.rs:657-667]`; a plain `?p`/`?o` wildcard has no type var, so the class triple is never produced). Native, being a materialized graph, stores the `rdf:type` triple explicitly and returns it.
+**Root cause (confirmed).** The bound-subject wildcard scan (`<iri> ?p ?o`) **never emits the SubjectMap's `rr:class` triple**. The class is carried on the SubjectMap (`rr:class edw:Store`, `enterprise.ttl:85`), not as a POM, so the POM-iterating materialization skips it. The `predicate_var`/`type_var` binding added in **#1450 (`81b0ec601`)** covers the **subject-VAR** wildcard path (`?s ?p ?o`); the **bound-subject variant** — `new_bound_subject` → the operator's bound-subject scan on the **`a5528e880` prefix-prune path** — was not given the same class-emission, so it returns POMs only. The two wildcard paths diverged on class semantics.
 
-**Why it matters.** This is a **silent, systematic** under-count for every bound-subject inspector / entity-detail view on virtual — the exact "subject inspector" shape the prefix-prune was built for (inventory §7). Any UI that reads `<entity> ?p ?o` and expects the type will not see it.
+**User-visible impact.** The **solo UI subject inspector** (which reads `<entity> ?p ?o`) is **missing `@type` for every virtual-dataset subject** — entity detail views silently lack the class. Systematic, deterministic, on the exact shape the prefix-prune (§7) was built for.
 
-**Hypothesis linkage.** Not a perf hypothesis — a correctness gap in the wildcard materialization (adjacent to §2/§7). **Recommend** a targeted fix: emit the `rr:class` `rdf:type` triple(s) when a wildcard binds `?p`/`?o` with no type var. Confirm with a `--keep-heads` virtual re-run diffing against the native 24 (the team's "investigate-next" — the mechanism is now confirmed by arithmetic + native heads; the virtual head-diff is the final nail).
+**Hypothesis linkage.** Not a perf hypothesis — a correctness gap in the bound-subject wildcard materialization (adjacent to §2/§7). **Fix surface is small and deterministic:** emit the `rr:class` `rdf:type` row(s) for the matching TriplesMap(s) in the bound-subject wildcard branch, honoring the same class semantics as the subject-var path (#1450).
 
 ---
 
-## F4 — Hash mismatches with equal row counts *(canonicalization-suspect)*
+## F4 — Hash mismatches with equal row counts *(corpus-defect — nondeterministic-selection; engine EXONERATED)*
 
-Two queries return the **same row count** as native but a **different result-hash**. Neither is yet a confirmed data bug — both need a `--keep-heads` cell-level diff (the parity runs did not retain heads).
+Two queries return the **same row count** as native but a **different result-hash**. Both are **corpus determinism defects, not engine bugs** — resolved by head-row diff (same values, different tied/arbitrary subset). The engine is exonerated on both.
 
-**q005** — supplier scorecard, 20/20 rows, NE. Projects `edw:rating` (`xsd:double`). Prime suspect: **float canonicalization drift** — native and virtual may emit the double with different lexical forms or datatype tags (`decimal` vs `double`), and while `canon` quantizes doubles to 12 significant digits `[canon.rs:143-153]`, a value tagged `decimal` on one side and `double` on the other takes different canonicalization branches `[canon.rs:116-141]`. **Next step:** diff the 20 head rows; if only the `?r` column differs, it is canonicalization, not data.
+**q005** — supplier scorecard, 20/20 rows, NE. `ORDER BY DESC(?r) LIMIT 20` over many suppliers **tied at `rating = 4.99`**: each target returns a different *but equally correct* subset of the tied rows (head-row diff: identical values, different tied suppliers selected at the LIMIT boundary). A top-k over ties with no unique tiebreaker is inherently nondeterministic. **Not a float-canonicalization bug** (the earlier suspicion) — the values match; only *which* tied rows survive the cut differs.
 
-**q049** — CONSTRUCT customer→region, 5000/5000 nodes, NE. This NE is **expected and not a data bug**: the CONSTRUCT hash is a serialized-`@graph`-node multiset `[canon.rs:canonicalize_graph]`, and JSON-LD compaction/key-order can differ between the native and virtual formatters even for an isomorphic graph. Cross-engine CONSTRUCT hash equality is explicitly **not yet asserted** (documented in `canon`); only node count (5000 = 5000 ✓) and single-engine stability are. **Next step:** treat q049 hash as informational until a graph-isomorphism canonicalizer lands (a harness follow-up).
+**q049** — CONSTRUCT customer→region, 5000/5000 nodes, NE. `LIMIT 5000` over **~300K current customers with NO `ORDER BY`**: any 5000 are a valid answer, and the two engines pick different (equally correct) 5000. Not the CONSTRUCT node-serialization concern flagged earlier — it is the same unordered-LIMIT nondeterminism.
 
-**Hypothesis linkage.** None (correctness-plumbing). F4-q005 gates whether float-bearing aggregates (q005/q008/q010/q014/q018/q025/q026/q040/q041/q048/q050/q051) can be hash-compared at all; resolve it before trusting any float projection's parity.
+**Fix (corpus, not engine).** These drive the follow-up **corpus determinism amendment** (see `03-corpus-design.md` §5): q005 (ORDER BY + LIMIT) gets a **unique tiebreaker** appended to its sort key so hash gating stays exact and its perf shape is unchanged (still top-k over a full scan, H2 intact); q049 (pure unordered LIMIT, any-k valid) is gated on **row count + invariants** via a new manifest `hash_gate: "rows_only"` rather than an exact hash.
+
+**Hypothesis linkage.** None (corpus hygiene). This class matters because it would otherwise mask real divergences: an unordered-LIMIT or untie-broken top-k **cannot** be hash-gated, so every such query in the corpus must be either tiebroken or `rows_only`-gated before its parity is trusted — the amendment audits all LIMIT-bearing queries for exactly this.
 
 ---
 
@@ -123,6 +125,20 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 ---
 
+## F8 — Cold q001 loads six tables for a single-table query *(perf-ratio / over-scan — investigate at WP7)*
+
+**Query.** q001 `?s a edw:Store ; edw:name ?n ; edw:channel ?ch ; edw:storeType ?t` (BI-01, single-class single-table star, 500 rows).
+
+**Evidence.** WP6 cold exec-one record (`cache_state=cold`, virtual-sf01): wall **20,760 ms**, of which **`r2rml.load_table` n=6, ~12.04 s** across six tables; `files_selected=6`; `estimated_row_count=450,000`. A query that needs **one** `DIM_STORE` scan (500 rows) loaded **six** tables and planned for 450K rows. (The warm smoke rep — §0 evidence table — shows q001 at 7 `scan_table` spans / 2271 ms; the cold penalty is the 6× `loadTable` OAuth/catalog cost, ~2 s each.)
+
+**Suspected mechanism (candidate, not yet root-caused).** This is the **tier-2 over-scan class** the inventory §2 covers — the subject-only prune / class fusion not firing for a *star-with-column-members* shape. q001 is `?s a Store` fused with three column-POM members (name/channel/storeType); it is **not** `is_subject_only_pattern` (§2, `operator.rs:382` — that requires no predicate members), so it takes the star path. Two candidates for the 6-table fan-out: (a) the class filter is not pruning TriplesMap resolution to `DIM_STORE` (class fusion `fuse_class_if_safe`/`class_fusion_is_safe` not applied — e.g. mapping-unavailable at plan time, `rewrite.rs:572-624`), so the star resolves against multiple maps; or (b) ref-POM **parent prefetch** — `DIM_STORE` carries `edw:geography`→Geography and `edw:regionManager`→Employee ref POMs, and if the star's `build_progress` builds parent lookups for POMs beyond the queried predicates (`operator.rs:769-903`), it would scan parent dims that q001 never projects. Six ≈ Store + a fan-out of parents/maps; the `estimated_row_count=450,000` (≫ 500) points at maps/tables other than `DIM_STORE` being planned.
+
+**Why it matters.** If 5 of the 6 `loadTable`s are dead work, cold latency on the *simplest* dimension query is ~3× worse than necessary — and this shape (typed single-dimension list) is the single most common BI-tool query. High-ROI cold-latency target.
+
+**Hypothesis linkage.** H7 (cold/warm structure — the `loadTable` fixed cost) amplified by an over-scan (§2). **WP7 action:** confirm which 6 tables load (Jaeger/`scan_table` span names) and which of candidate (a)/(b) fires; the fix is to make the class fusion + subject-projection prune fire for the star-with-column-members shape so only `DIM_STORE` loads.
+
+---
+
 ## Summary & routing
 
 | Finding | Class | Query | Root | Fix owner |
@@ -130,9 +146,10 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | **F1** | correctness-silent-empty | q034 | `PropertyPath` (transitive) not converted; sub-scope escapes GRAPH-error guard | engine (rewrite/graph) |
 | **F2** | correctness-silent-empty | q051 | `Subquery` not converted; same guard gap | engine (same fix as F1) |
 | **F3** | correctness-divergence | q042 | wildcard omits `rr:class` `rdf:type` triple | engine (R2RML materialize) |
-| **F4** | canonicalization-suspect | q005, q049 | float lexical/datatype drift (q005); CONSTRUCT node-hash not isomorphism (q049) | harness (canon) + head-diff |
+| **F4** | corpus-defect (nondeterministic-selection) | q005, q049 | untie-broken top-k over rating ties (q005); unordered `LIMIT` over 300K (q049) — **engine exonerated** | corpus (determinism amendment §5) |
 | **F5** | perf-dnf | q050, q025, q040, q053 | H3 correlated rebuild (q050 377 scans), H1/H6/H8 | roadmap (WP8) |
 | **F6** | positive-control | q001/03/06/07/11/22/54 | correctness parity; fused-agg 1.52×; H4-date prunes 98.8% | — |
 | **F7** | harness-note | (all) | `scan_plan` conditional on pushdown branch | harness (WP6 span tuning) |
+| **F8** | perf-ratio / over-scan | q001 (cold) | 6 `loadTable`s for a 1-table query — class fusion / subject-prune not firing on star-with-column-members (§2); or ref-POM parent prefetch | WP7 investigate → engine |
 
-**The two correctness bugs (F1/F2) share one root** and are the highest priority — they deliver wrong answers as silent successes. **F3 is a second, independent correctness gap** on the most common inspector shape. **F5-q050** is the sharpest perf signal (dims-only, 377 scans). **F4-q005 must be resolved** before any float-bearing parity is trusted. These four feed the WP7 diagnosis and WP8 roadmap; F7 feeds back into WP6 harness tuning.
+**The two correctness bugs (F1/F2) share one root** and are the highest priority — they deliver wrong answers as silent successes. **F3 is a second, independent correctness gap** (root-caused) on the most common inspector shape — small fix surface, high user-visible impact (missing `@type` in the solo subject inspector). **F5-q050** is the sharpest perf signal (dims-only, 377 scans). **F4 is corpus hygiene, not an engine bug** — but it must be fixed (the determinism amendment) so nondeterministic-selection queries stop masking real divergences. F1/F2/F3/F5 feed the WP7 diagnosis and WP8 roadmap; F4 feeds the corpus determinism amendment; F7 feeds back into WP6 harness tuning.

@@ -275,6 +275,16 @@ Base cardinalities (from the assignment; these are the row-count oracles):
 
 **Join fan-out notes:** fact→fact joins do not multiply when the FK is many-to-one to the parent's PK (each order-line has exactly one order), so Q12/Q15 rows are bounded by the child fact's count, not a product. `OPTIONAL`/`NOT EXISTS` (Q16, Q17, Q53) preserve/anti-select the left cardinality.
 
+### 5.1 Determinism amendment (hash-gate policy)
+
+The first SF01 parity run (`04-findings-register.md` F4) exposed two queries whose native and virtual results were *equally correct* but hashed differently — a **corpus determinism defect**, not an engine bug: `Q05` (`ORDER BY DESC(rating) LIMIT 20` with many `rating=4.99` ties) and `Q49` (`LIMIT 5000` over ~300K rows with no `ORDER BY`). A nondeterministic selection cannot be hash-gated, and left unaddressed it would mask real divergences. Policy, applied to **every LIMIT-bearing query** (audited by `.rq` file against the native truncation):
+
+1. **`ORDER BY … LIMIT` (top-k) → unique tiebreaker.** Append a unique var (the subject IRI or a key/group var) to the sort key so the selected rows — and the exact result hash — are deterministic across engines. The perf shape is unchanged (still top-k over a full scan; H2 intact). Applied to **Q05** (`… DESC(?r) ?sup`), **Q12** (`… DESC(?u) ?pn`), **Q46** (`… DESC(?tot) ?oid`). These stay hash-gated (`Full`).
+2. **Unordered `LIMIT` that truncates a larger set → `hash_gate: "rows_only"`.** When any `k` rows are a valid answer, gate on **row count + invariants**, not an exact hash. New optional manifest field `hash_gate` (default `"full"`; enum `full`/`rows_only` in `corpus.rs`). Applied to the 9 queries whose native result equals the LIMIT (truncated): **Q15, Q16, Q28, Q29, Q31, Q45, Q48, Q49, Q53**.
+3. **`LIMIT` as a non-binding cap (native rows < LIMIT) → stays `Full`.** The complete unordered set is an order-independent multiset and hashes deterministically (Q17, Q19, Q20, Q21, Q30, Q34, Q35, Q47, Q52).
+
+Each affected `.rq` header records its treatment (a `# Determinism:` line). **Compare/bless wiring:** the gate reads `QueryDef.hash_gate` and, on `RowsOnly`, must **skip the result-hash equality assertion** and pass on row-count-within-`expected_rows` instead (the hook belongs in the WP6 `baseline::check` correctness path; described for that owner, not wired here to avoid a concurrent-edit collision on `baseline.rs`).
+
 ---
 
 ## 6. Ordering & nondeterminism (per query, for the bless oracle)

@@ -332,7 +332,8 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q016",
@@ -354,7 +355,8 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q017",
@@ -616,7 +618,8 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q029",
@@ -633,7 +636,8 @@
       "expected_rows": 100,
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q030",
@@ -675,7 +679,8 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q032",
@@ -955,7 +960,8 @@
       "expected_rows": 10,
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q046",
@@ -1015,7 +1021,8 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q049",
@@ -1039,7 +1046,8 @@
       "timeout_s": 180,
       "subsets": [
         "smoke"
-      ]
+      ],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q050",
@@ -1135,7 +1143,8 @@
       "timeout_s": 180,
       "subsets": [
         "smoke"
-      ]
+      ],
+      "hash_gate": "rows_only"
     },
     {
       "id": "q054",
