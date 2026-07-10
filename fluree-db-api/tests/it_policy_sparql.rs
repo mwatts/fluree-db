@@ -441,5 +441,8 @@ async fn sparql_policy_positional_identity_bound_still_allows() {
     let arr = rows.as_array().unwrap();
 
     assert_eq!(arr.len(), 1, "only Alice's SSN should be visible: {arr:?}");
-    assert_eq!(arr[0].as_array().unwrap()[1].as_str().unwrap(), "111-11-1111");
+    assert_eq!(
+        arr[0].as_array().unwrap()[1].as_str().unwrap(),
+        "111-11-1111"
+    );
 }

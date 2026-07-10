@@ -613,7 +613,11 @@ mod tests {
         ] {
             match binding_for_value(&value) {
                 Binding::Lit { dtc, .. } => {
-                    assert_eq!(dtc.datatype(), &Sid::new(ns, name), "datatype for {value:?}");
+                    assert_eq!(
+                        dtc.datatype(),
+                        &Sid::new(ns, name),
+                        "datatype for {value:?}"
+                    );
                 }
                 other => panic!("faithful {value:?} must seed a Lit, got {other:?}"),
             }
