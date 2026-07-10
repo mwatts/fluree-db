@@ -1,0 +1,9 @@
+{
+  "id": "virtual-sf01",
+  "kind": "virtual",
+  "fluree_home": "/Users/ajohnson/horizon-demo/.fluree",
+  "alias": "enterprise",
+  "description": "Virtual R2RML/Iceberg graph source over the Snowflake-managed ENTERPRISE_DEMO warehouse at SF01 scale (schema DW_SF01). This is the scale-matched counterpart of native-sf01, so result hashes are directly comparable once loaded.",
+  "status": "pending",
+  "status_reason": "Snowflake schema DW_SF01 not loaded yet; register the SF01 virtual source and repoint fluree_home/alias before use."
+}

@@ -1,0 +1,17 @@
+# q004 filter_order
+# Intent: numeric range FILTER + ORDER BY over a single dimension. Exercises the
+#   filter_range and order_by pathways; on the virtual side the FILTER is a
+#   candidate for Iceberg predicate pushdown / row-group skipping.
+# BI lineage: "Which are our most expensive products (list price over $100)?"
+#   (TODO: confirm canonical BI question.)
+# Predicates verified against enterprise.ttl DimProduct: name, listPrice (xsd:double).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?product ?name ?listPrice
+WHERE {
+  ?product a edw:Product ;
+           edw:name ?name ;
+           edw:listPrice ?listPrice .
+  FILTER(?listPrice > 100)
+}
+ORDER BY DESC(?listPrice)
+LIMIT 10

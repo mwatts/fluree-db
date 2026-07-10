@@ -1,0 +1,376 @@
+//! Per-query execution: open a target, run a query with priming + measured
+//! reps, capture pathway spans, and fold the result into a [`RunRecord`].
+//!
+//! ## Runtime & the non-Send R2RML path
+//!
+//! The R2RML/Iceberg query future is **not** `Send` (it holds Parquet reader
+//! state across awaits), so it cannot be `tokio::spawn`ed. We run it with
+//! `Runtime::block_on` on the calling thread instead. The runtime is
+//! **multi-thread** on purpose: the Iceberg reader fans out per-file Parquet
+//! decode with its own `tokio::spawn`, which needs worker threads to run in
+//! parallel — a current-thread runtime would serialize decode and distort the
+//! measurement.
+//!
+//! ## Deadlines
+//!
+//! Each execution gets a fresh [`QueryCancellation`]. A watchdog task
+//! cooperatively cancels it at the deadline so the scan *stops* (the R2RML
+//! operators poll the handle). A `tokio::time::timeout` at `deadline + grace` is
+//! the hard backstop; if it fires, the future is dropped mid-scan — see the
+//! caveat in the crate README. Either way the outcome is [`Status::Dnf`] with the
+//! wall recorded as the deadline cap.
+//!
+//! ## Span capture
+//!
+//! The `BenchSpanCapture` layer is installed **once** at [`Engine::new`] (global
+//! subscriber). Reps run strictly sequentially and `take()` drains the sink after
+//! each, so each rep's counters are isolated even though the sink is process-global.
+
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde_json::Value;
+
+use fluree_bench_support::tracing::{span_name_filter, BenchSpanCapture};
+use fluree_db_api::{Fluree, FlureeBuilder, FormatterConfig, QueryExecutionOptions};
+use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+
+use crate::schema::{Counters, RunRecord, Status};
+use crate::targets::Target;
+use crate::{canon, spans};
+
+/// Seconds to sleep between executions against a virtual (live-Snowflake) target.
+const PACE_SECS: u64 = 2;
+/// Grace added to the cooperative deadline before the hard `timeout` backstop.
+const GRACE_SECS: u64 = 5;
+/// A first measured rep slower than this collapses the run to a single rep.
+const ADAPTIVE_STOP: Duration = Duration::from_secs(60);
+/// Heads retained under `--keep-heads`.
+const HEADS: usize = 20;
+
+/// Reps + deadline for one query on one target.
+pub struct RunParams {
+    pub timeout: Duration,
+    pub reps: usize,
+    pub keep_heads: bool,
+}
+
+/// The execution engine: one tokio runtime + one global span-capture sink for
+/// the whole process.
+pub struct Engine {
+    rt: tokio::runtime::Runtime,
+    capture: BenchSpanCapture,
+    worker_threads: usize,
+}
+
+/// One execution's raw outcome (pre-record).
+struct Outcome {
+    wall: Duration,
+    status: Status,
+    rows: usize,
+    hash: String,
+    counters: Counters,
+    heads: Option<Vec<String>>,
+    error: Option<String>,
+}
+
+impl Engine {
+    /// Build the runtime and install the span-capture subscriber (once).
+    pub fn new() -> Result<Self> {
+        let capture = install_span_capture();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building multi-thread tokio runtime")?;
+        let worker_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Ok(Self {
+            rt,
+            capture,
+            worker_threads,
+        })
+    }
+
+    /// Human-readable runtime shape for the run header.
+    pub fn runtime_shape(&self) -> String {
+        format!("tokio-multi-thread(worker_threads={})", self.worker_threads)
+    }
+
+    /// Open a target's on-disk store. Reuse the returned handle across all
+    /// queries for that target so the ledger/leaflet caches stay warm.
+    pub fn open(&self, target: &Target) -> Result<Fluree> {
+        let storage = target.storage_dir();
+        if !storage.exists() {
+            anyhow::bail!(
+                "storage dir {} does not exist for target '{}'",
+                storage.display(),
+                target.id
+            );
+        }
+        // Enter the runtime so builder-side spawns (if any) have a reactor.
+        let _guard = self.rt.enter();
+        FlureeBuilder::file(storage.to_string_lossy().to_string())
+            // The store is already indexed; vbench only reads. No background
+            // indexer, but keep the default ledger cache so hot reps are hot.
+            .without_indexing()
+            .build()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "opening target '{}' at {}: {e}",
+                    target.id,
+                    storage.display()
+                )
+            })
+    }
+
+    /// Run one query on one target: priming rep (discarded) + measured reps, then
+    /// the median-wall rep's record.
+    pub fn run_query(
+        &self,
+        fluree: &Fluree,
+        target: &Target,
+        query_id: &str,
+        sparql: &str,
+        params: &RunParams,
+    ) -> RunRecord {
+        let is_virtual = target.is_virtual();
+
+        // Priming rep (discarded): warms ledger/leaflet caches (native) and the
+        // cross-query catalog cache (virtual).
+        if is_virtual {
+            self.pace();
+        }
+        let _ = self.exec_once(fluree, target, sparql, params.timeout, false);
+
+        let mut outcomes: Vec<Outcome> = Vec::with_capacity(params.reps.max(1));
+        for i in 0..params.reps.max(1) {
+            if is_virtual {
+                self.pace();
+            }
+            let outcome = self.exec_once(fluree, target, sparql, params.timeout, params.keep_heads);
+            let first_over_budget = i == 0 && outcome.wall > ADAPTIVE_STOP;
+            let dnf = outcome.status == Status::Dnf;
+            outcomes.push(outcome);
+            // Adaptive: a first measured rep over the budget (or any dnf) means
+            // one rep is enough — don't burn time (or Snowflake quota) repeating.
+            if first_over_budget || dnf {
+                break;
+            }
+        }
+
+        self.build_record(query_id, target, is_virtual, "hot", outcomes)
+    }
+
+    /// Single execution (no priming) — the cold-mode hook behind `exec-one`.
+    pub fn exec_one(
+        &self,
+        fluree: &Fluree,
+        target: &Target,
+        query_id: &str,
+        sparql: &str,
+        timeout: Duration,
+        keep_heads: bool,
+    ) -> RunRecord {
+        if target.is_virtual() {
+            self.pace();
+        }
+        let outcome = self.exec_once(fluree, target, sparql, timeout, keep_heads);
+        self.build_record(query_id, target, target.is_virtual(), "cold", vec![outcome])
+    }
+
+    /// A trivial probe execution for `setup --verify`. Returns wall time and the
+    /// formatted SPARQL-JSON document, or a hard error.
+    pub fn probe(
+        &self,
+        fluree: &Fluree,
+        target: &Target,
+        sparql: &str,
+        timeout: Duration,
+    ) -> Result<(Duration, Value)> {
+        let is_virtual = target.is_virtual();
+        let alias = target.alias.clone();
+        let start = Instant::now();
+        let out = self.rt.block_on(async move {
+            tokio::time::timeout(timeout, async move {
+                // Bind the Graph to a local so the builder can borrow it across
+                // the conditional `with_r2rml()` split without the temporary
+                // being dropped mid-chain.
+                let graph = fluree.graph(&alias);
+                let builder = graph
+                    .query()
+                    .sparql(sparql)
+                    .format(FormatterConfig::sparql_json());
+                let builder = if is_virtual { builder.with_r2rml() } else { builder };
+                builder.execute_formatted().await
+            })
+            .await
+        });
+        let wall = start.elapsed();
+        match out {
+            Ok(Ok(doc)) => Ok((wall, doc)),
+            Ok(Err(e)) => Err(anyhow::anyhow!("query error: {e}")),
+            Err(_) => Err(anyhow::anyhow!("probe timed out after {}s", timeout.as_secs())),
+        }
+    }
+
+    fn pace(&self) {
+        std::thread::sleep(Duration::from_secs(PACE_SECS));
+    }
+
+    fn exec_once(
+        &self,
+        fluree: &Fluree,
+        target: &Target,
+        sparql: &str,
+        timeout: Duration,
+        keep_heads: bool,
+    ) -> Outcome {
+        // Isolate this rep's capture from any stray spans.
+        let _ = self.capture.take();
+
+        let cancel = QueryCancellation::new();
+        let exec_opts = QueryExecutionOptions::new().with_cancellation(cancel.clone());
+        let grace = Duration::from_secs(GRACE_SECS);
+
+        // Watchdog: cooperatively cancel at the deadline so the scan stops.
+        let watchdog = {
+            let cancel = cancel.clone();
+            self.rt.spawn(async move {
+                tokio::time::sleep(timeout).await;
+                cancel.cancel_with(QueryCancellationReason::Timeout);
+            })
+        };
+
+        let is_virtual = target.is_virtual();
+        let alias = target.alias.clone();
+
+        let start = Instant::now();
+        let result = self.rt.block_on(async move {
+            let fut = async move {
+                // Bind the Graph to a local (see `probe` for the borrow rationale).
+                let graph = fluree.graph(&alias);
+                let builder = graph
+                    .query()
+                    .sparql(sparql)
+                    .format(FormatterConfig::sparql_json())
+                    .execution_options(exec_opts);
+                let builder = if is_virtual { builder.with_r2rml() } else { builder };
+                builder.execute_formatted().await
+            };
+            tokio::time::timeout(timeout + grace, fut).await
+        });
+        let elapsed = start.elapsed();
+        watchdog.abort();
+
+        let captured = self.capture.take();
+        let counters = spans::aggregate(&captured);
+        let timed_out = cancel.reason() == Some(QueryCancellationReason::Timeout);
+
+        match result {
+            Ok(Ok(doc)) => {
+                let canonical = canon::canonicalize_sparql_json(&doc);
+                let rows = canonical.rows;
+                let heads = keep_heads.then(|| canonical.heads(HEADS));
+                let hash = canonical.hash;
+                Outcome {
+                    wall: elapsed,
+                    status: Status::Ok,
+                    rows,
+                    hash,
+                    heads,
+                    counters,
+                    error: None,
+                }
+            }
+            Ok(Err(_e)) if timed_out => Outcome {
+                // Cooperative cancel returned an engine error; record the cap.
+                wall: timeout,
+                status: Status::Dnf,
+                rows: 0,
+                hash: String::new(),
+                heads: None,
+                counters,
+                error: Some(format!("deadline exceeded ({}s)", timeout.as_secs())),
+            },
+            Ok(Err(e)) => Outcome {
+                wall: elapsed,
+                status: Status::Error,
+                rows: 0,
+                hash: String::new(),
+                heads: None,
+                counters,
+                error: Some(e.to_string()),
+            },
+            Err(_elapsed) => Outcome {
+                // Hard backstop fired — future dropped mid-scan.
+                wall: timeout,
+                status: Status::Dnf,
+                rows: 0,
+                hash: String::new(),
+                heads: None,
+                counters,
+                error: Some(format!(
+                    "hard timeout backstop ({}s); scan may still be draining",
+                    (timeout + grace).as_secs()
+                )),
+            },
+        }
+    }
+
+    fn build_record(
+        &self,
+        query_id: &str,
+        target: &Target,
+        is_virtual: bool,
+        cache_state: &str,
+        outcomes: Vec<Outcome>,
+    ) -> RunRecord {
+        debug_assert!(!outcomes.is_empty(), "at least one measured rep");
+        let all_walls_ms: Vec<u64> = outcomes.iter().map(|o| ms(o.wall)).collect();
+        let mut order: Vec<usize> = (0..outcomes.len()).collect();
+        order.sort_by_key(|&i| outcomes[i].wall);
+        let median_pos = order[(outcomes.len() - 1) / 2];
+        let chosen = &outcomes[median_pos];
+        let spans_missing = spans::spans_missing(&chosen.counters, is_virtual);
+        RunRecord {
+            query_id: query_id.to_string(),
+            target: target.id.clone(),
+            cache_state: cache_state.to_string(),
+            rep: median_pos,
+            reps: outcomes.len(),
+            wall_ms: ms(chosen.wall),
+            all_walls_ms,
+            status: chosen.status,
+            rows: chosen.rows,
+            result_hash: chosen.hash.clone(),
+            counters: chosen.counters.clone(),
+            spans_missing,
+            error: chosen.error.clone(),
+            heads: chosen.heads.clone(),
+        }
+    }
+}
+
+/// Milliseconds of a `Duration`, saturating.
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Extract the single scalar COUNT value from a `SELECT (COUNT(*) AS ?n)` result.
+pub fn scalar_count(doc: &Value) -> Option<u64> {
+    let bindings = doc.get("results")?.get("bindings")?.as_array()?;
+    let first = bindings.first()?.as_object()?;
+    let cell = first.values().next()?;
+    cell.get("value")?.as_str()?.trim().parse::<u64>().ok()
+}
+
+/// Install the pathway span-capture subscriber (once per process).
+fn install_span_capture() -> BenchSpanCapture {
+    use tracing_subscriber::prelude::*;
+    let capture = BenchSpanCapture::new();
+    let layer = capture.layer(Some(spans::SPAN_ALLOWLIST));
+    let allowlist: Vec<String> = spans::SPAN_ALLOWLIST.iter().map(|s| (*s).to_string()).collect();
+    let _ = tracing_subscriber::registry()
+        .with(layer.with_filter(span_name_filter(Some(allowlist))))
+        .try_init();
+    capture
+}

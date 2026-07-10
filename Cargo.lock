@@ -2436,6 +2436,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-bench-virtual"
+version = "4.1.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fluree-bench-support",
+ "fluree-db-api",
+ "fluree-db-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "fluree-db-api"
 version = "4.1.1"
 dependencies = [

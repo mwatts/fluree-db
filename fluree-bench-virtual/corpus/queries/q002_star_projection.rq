@@ -1,0 +1,15 @@
+# q002 star_projection
+# Intent: single-table star projection — one subject bound to several columns of
+#   the same dimension. Exercises the bgp_star pathway (no cross-table join).
+# BI lineage: "List stores with their id, name and store type."  (TODO: confirm
+#   canonical BI question.)
+# Predicates verified against enterprise.ttl DimStore: storeId, name, storeType.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?store ?storeId ?name ?storeType
+WHERE {
+  ?store a edw:Store ;
+         edw:storeId ?storeId ;
+         edw:name ?name ;
+         edw:storeType ?storeType .
+}
+LIMIT 10

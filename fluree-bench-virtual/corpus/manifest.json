@@ -1,0 +1,67 @@
+{
+  "corpus_version": 1,
+  "description": "vbench seed corpus: dims-only SPARQL queries that run identically against the native materialized ledger (enterprise-sf01) and any R2RML/Iceberg virtual target. Every query is tagged and carries a (placeholder) BI question; expected_rows is exact where deterministic and a [min,max] range where join/filter/group cardinality depends on the dataset scale.",
+  "tags": ["bgp_star", "join", "filter_range", "order_by", "group_by", "aggregate", "count"],
+  "queries": [
+    {
+      "id": "q001",
+      "file": "queries/q001_count_class.rq",
+      "bi_question": "How many stores does the enterprise operate? (placeholder — confirm against BI catalog)",
+      "tags": ["count", "aggregate"],
+      "tables": ["DIM_STORE"],
+      "class": "dims-only",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": ["smoke"]
+    },
+    {
+      "id": "q002",
+      "file": "queries/q002_star_projection.rq",
+      "bi_question": "List stores with their id, name and store type. (placeholder)",
+      "tags": ["bgp_star"],
+      "tables": ["DIM_STORE"],
+      "class": "dims-only",
+      "expected_rows": 10,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": ["smoke"]
+    },
+    {
+      "id": "q003",
+      "file": "queries/q003_fk_join.rq",
+      "bi_question": "Where are our stores located (city / region)? (placeholder)",
+      "tags": ["join"],
+      "tables": ["DIM_STORE", "DIM_GEOGRAPHY"],
+      "class": "dims-only",
+      "expected_rows": [1, 10],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": ["smoke"]
+    },
+    {
+      "id": "q004",
+      "file": "queries/q004_filter_order.rq",
+      "bi_question": "Which are our most expensive products (list price over $100)? (placeholder)",
+      "tags": ["filter_range", "order_by"],
+      "tables": ["DIM_PRODUCT"],
+      "class": "dims-only",
+      "expected_rows": [1, 10],
+      "order_sensitive": "by_keys",
+      "timeout_s": 120,
+      "subsets": ["smoke"]
+    },
+    {
+      "id": "q005",
+      "file": "queries/q005_group_rollup.rq",
+      "bi_question": "How is our customer base distributed across segments? (placeholder)",
+      "tags": ["group_by", "aggregate"],
+      "tables": ["DIM_CUSTOMER"],
+      "class": "dims-only",
+      "expected_rows": [1, 50],
+      "order_sensitive": "by_keys",
+      "timeout_s": 120,
+      "subsets": ["smoke"]
+    }
+  ]
+}
