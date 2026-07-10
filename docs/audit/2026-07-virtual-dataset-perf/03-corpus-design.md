@@ -50,7 +50,7 @@ The framing: an end-user has bound this Snowflake warehouse as a virtual dataset
 
 ## 2. Feature tags (closed enum) and hypothesis linkage
 
-Feature tags (from the assignment; every query carries ≥1): `bgp_star`, `join`, `fk_chain`, `filter_range`, `filter_string`, `filter_date`, `optional`, `union`, `aggregate`, `count`, `group_by`, `having`, `order_by`, `distinct`, `subquery`, `values`, `negation`, `property_path`, `construct`.
+Feature tags (from the assignment; every query carries ≥1): `bgp_star`, `join`, `fk_chain`, `filter_range`, `filter_string`, `filter_date`, `filter_iri`, `optional`, `union`, `aggregate`, `count`, `group_by`, `having`, `order_by`, `distinct`, `subquery`, `values`, `negation`, `property_path`, `construct`. (`filter_iri` was added this revision — an IRI / `=` / `IN` equality on a term-typed value, distinct from lexical `filter_string` and numeric/date `filter_range`; it labels the FILTER arm of the VALUES-vs-FILTER A/B, Q40/Q41.)
 
 Hypotheses (see `02-hypothesis-map.md`): **H1** fact decode wall · **H2** budget-absorb modifiers · **H3** correlated-join rebuild · **H4** decimal/double pruning blindness · **H5** no COUNT manifest shortcut · **H6** aggregate+join misses fused path · **H7** cold/warm structure · **H8** non-lowered forms (VALUES/subquery/path).
 
@@ -70,11 +70,11 @@ Business: list stores with channel and type.
 
 ### BI-02 — Store detail *(point lookup; positive control for prefix-prune)*
 Business: show everything about one store.
-- **Q02** `<edw/store/42> ?p ?o` — tags: `bgp_star` (bound-subject wildcard). Tables: Store (via prefix-prune, inventory §7). **dims-only**. H: H2/H3 **positive control** (should stay ~1 table, sub-second). Rows: **~13** (one per Store predicate incl. FK objects). order: none. float: `latitude`/`longitude` absent on Store — no.
+- **Q02** `<edw/store/42> ?p ?o` — tags: `bgp_star` (bound-subject wildcard). Tables: Store (via prefix-prune, inventory §7). **dims-only**. H: H2/H3 **positive control** (should stay ~1 table, sub-second). Rows: **~7-8** (one per Store predicate — `storeId`/`name`/`channel`/`storeType`/`openDate`/`geography`/`regionManager`; +`rdf:type` if the wildcard emits the class). order: none. float: `latitude`/`longitude` absent on Store — no.
 
 ### BI-03 — Geographic coverage *(single-dim; distinct + string filter)*
 Business: where do we operate?
-- **Q03** `SELECT DISTINCT ?region WHERE { ?g a edw:Geography ; edw:region ?region }` — tags: `distinct`, `bgp_star`. Tables: Geography. **dims-only**. H: H2 (DISTINCT drains — dims-only control). Rows: **[4,8]** (distinct regions). order: none (sort by value). float: no.
+- **Q03** `SELECT DISTINCT ?region WHERE { ?g a edw:Geography ; edw:region ?region }` — tags: `distinct`, `bgp_star`. Tables: Geography. **dims-only**. H: — (dims-only DISTINCT; a "DISTINCT drains its input" illustration, but with **no LIMIT** it is not an H2 budget case — it is here for `distinct` feature coverage). Rows: **[4,8]** (distinct regions). order: none (sort by value). float: no.
 - **Q04** `?g a edw:Geography ; edw:region "EMEA" ; edw:city ?city` — tags: `filter_string`, `bgp_star`. Tables: Geography. **dims-only**. H: — (string equality via class scan). Rows: **[~500, ~6000]** (cities in one region; bound by 25K geography rows). order: none. float: no.
 
 ### BI-04 — Supplier scorecard *(dim⋈dim join; H3 + H2 dims-only controls)*
@@ -93,7 +93,7 @@ Business: total order revenue by customer region.
 
 ### BI-07 — Revenue time-series *(fact⋈date; fiscal fields; H2 grouped ORDER BY)*
 Business: order revenue by fiscal year and quarter.
-- **Q10** `SELECT ?year ?q (SUM(?tot) AS ?rev) WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:dateDim ?d . ?d edw:year ?year ; edw:quarter ?q } GROUP BY ?year ?q ORDER BY ?year ?q` — tags: `aggregate`, `group_by`, `order_by`, `join`, `fk_chain`. Tables: Order⋈Date. **fact-touching**. H: **H6**, **H3** (fact⋈date), **H1**, **H2** (ORDER BY on grouped output — small output but full 180K scan). Rows: **[~12, ~40]** (years×quarters; date spans ~2019-2024 ⇒ ~7,670 days/365 ≈ 21 yrs? use bound). order: by_keys. float: **yes**.
+- **Q10** `SELECT ?year ?q (SUM(?tot) AS ?rev) WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:dateDim ?d . ?d edw:year ?year ; edw:quarter ?q } GROUP BY ?year ?q ORDER BY ?year ?q` — tags: `aggregate`, `group_by`, `order_by`, `join`, `fk_chain`. Tables: Order⋈Date. **fact-touching**. H: **H6**, **H3** (fact⋈date), **H1**. (No `LIMIT`, so *not* an H2 case — the ORDER BY is on the small grouped output; the 180K scan is unavoidable regardless.) Rows: **[~12, ~84]** (distinct order-years × 4 quarters; DIM_DATE spans ~21 yrs / 7,670 days, so ≤ 84). order: by_keys. float: **yes**.
 - **Q11** `?o a edw:Order ; edw:orderDate ?od . FILTER(?od >= "2024-01-01"^^xsd:date && ?od < "2024-04-01"^^xsd:date)` — tags: `filter_date`, `bgp_star`. Tables: Order. **fact-touching**. H: **H1**, **H4 date-positive-control** (date FILTER on a physically-date column **prunes**, inventory §6/§7; the ttl keeps `*_DATE` literals precisely for partition pruning `[ttl:5-6]`). Rows: **[~5000, ~15000]** (one quarter of 180K). order: none. float: no.
 
 ### BI-08 — Top products by units *(multi-fact→dim; top-k; SCD; subquery)*
@@ -123,20 +123,20 @@ Business: large journal postings; audit windows.
 
 ### BI-13 — Customer segmentation *(SCD-2 is_current; the correctness trap)*
 Business: current customers by segment; the mistake if you forget SCD.
-- **Q22** `SELECT ?seg (COUNT(?c) AS ?n) WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:segment ?seg } GROUP BY ?seg` — tags: `aggregate`, `count`, `group_by`, `bgp_star`. Tables: Customer. **dims-only**. H: **H6 fused-agg positive** (single-dim; but note bool FILTER `isCurrent true` is a scan-local filter, inventory §13), **H2 DISTINCT-family**. Rows: **[4,8]** (segments); **COUNT sums to 300000** (current). order: none. float: no.
+- **Q22** `SELECT ?seg (COUNT(?c) AS ?n) WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:segment ?seg } GROUP BY ?seg` — tags: `aggregate`, `count`, `group_by`, `bgp_star`. Tables: Customer. **dims-only**. H: **H6 fused-agg positive** (single-dim GROUP BY → fused; bool FILTER `isCurrent true` is a scan-local filter, inventory §13). (No LIMIT ⇒ not H2.) Rows: **[4,8]** (segments); **COUNT sums to 300000** (current). order: none. float: no.
 - **Q23** same as Q22 **without** `isCurrent true` — tags: same. **dims-only**. H: **correctness-nuance pair** (documents the SCD trap). Rows: segments same, **COUNT sums to 390000** (300K current + 90K history). order: none. float: no. *This pair is a correctness oracle, not a perf pair: the counts MUST differ by the 90K SCD history rows.*
 - **Q24** `?c a edw:Customer ; edw:isCurrent true ; edw:birthYear ?by . FILTER(?by >= 1980 && ?by <= 1989)` — tags: `filter_range`, `bgp_star`. Tables: Customer. **dims-only**. H: **H4 int control** (integer prunes — but dims-only, 1 file). Rows: **[~30000, ~90000]** (1980s cohort of 300K current). order: none. float: no.
 
 ### BI-14 — Support quality *(behavioral; HAVING; single-table vs joined agg)*
 Business: problem product categories; SLA by priority.
 - **Q25** `SELECT ?cat (AVG(?csat) AS ?avg) (COUNT(?t) AS ?n) WHERE { ?t a edw:SupportTicket ; edw:csatScore ?csat ; edw:product ?p . ?p edw:category ?cat } GROUP BY ?cat HAVING (AVG(?csat) < 3)` — tags: `aggregate`, `group_by`, `having`, `join`, `fk_chain`. Tables: SupportTicket⋈Product. **fact-touching**. H: **H6** (agg+join declines fused), **H3**, **H1** (40K ticket scan). Rows: **[0, ~20]** (categories below 3). order: none. float: **yes** (AVG). *SCD: joins Product on key; category is version-stable — no isCurrent needed.*
-- **Q26** `SELECT ?prio (AVG(?rh) AS ?avghrs) WHERE { ?t a edw:SupportTicket ; edw:priority ?prio ; edw:resolutionHours ?rh } GROUP BY ?prio ORDER BY DESC(?avghrs)` — tags: `aggregate`, `group_by`, `order_by`, `bgp_star`. Tables: SupportTicket. **fact-touching**. H: **H6 negative control** (single-table → fused; contrast Q25), **H2**, **H1**. Rows: **[3,5]** (priorities). order: by_keys. float: **yes** (AVG).
+- **Q26** `SELECT ?prio (AVG(?rh) AS ?avghrs) WHERE { ?t a edw:SupportTicket ; edw:priority ?prio ; edw:resolutionHours ?rh } GROUP BY ?prio ORDER BY DESC(?avghrs)` — tags: `aggregate`, `group_by`, `order_by`, `bgp_star`. Tables: SupportTicket. **fact-touching**. H: **H6 negative control** (single-table → fused; contrast Q25), **H1**. (No LIMIT ⇒ not H2; ORDER BY is on the small grouped output.) Rows: **[3,5]** (priorities). order: by_keys. float: **yes** (AVG).
 
 ### BI-15 — Web behavior *(largest fact, 1M rows; funnel; union; date)*
 Business: engagement by type/device; purchase funnel.
 - **Q27** `SELECT ?et ?dev (COUNT(?e) AS ?n) WHERE { ?e a edw:WebEvent ; edw:eventType ?et ; edw:deviceType ?dev } GROUP BY ?et ?dev` — tags: `aggregate`, `count`, `group_by`, `bgp_star`. Tables: WebEvent. **fact-touching**. H: **H1 heaviest** (1M-row single-table scan), **H6 fused positive**. Rows: **[~15, ~40]** (types×devices). order: none. float: no.
 - **Q28** `?e a edw:WebEvent ; edw:eventType "purchase" ; edw:product ?p . ?p edw:name ?pn` — tags: `filter_string`, `join`, `fk_chain`. Tables: WebEvent⋈Product. **fact-touching**. H: **H1** (1M scan), **H3**. Rows: **[~50000, ~200000]** (purchase events). order: none. float: no.
-- **Q29** `{ ?e a edw:WebEvent ; edw:eventType "purchase" } UNION { ?e a edw:WebEvent ; edw:eventType "add_to_cart" }` — tags: `union`, `bgp_star`. Tables: WebEvent. **fact-touching**. H: **H1** (union of two full scans, inventory §13 routes each branch), **H2** (UNION absorbs a LIMIT). Rows: **[~100000, ~400000]**. order: none. float: no.
+- **Q29** `{ ?e a edw:WebEvent ; edw:eventType "purchase" } UNION { ?e a edw:WebEvent ; edw:eventType "add_to_cart" } LIMIT 100` — tags: `union`, `bgp_star`. Tables: WebEvent. **fact-touching**. H: **H1** (union of two full scans, inventory §13 routes each branch), **H2** (UnionOperator absorbs the LIMIT — both branch scans still run full; §12). Rows: **exactly 100** (LIMIT; [~100000, ~400000] match). order: none. float: no.
 - **Q30** `?e a edw:WebEvent ; edw:eventDate ?ed . FILTER(?ed >= "2024-06-01"^^xsd:date && ?ed < "2024-07-01"^^xsd:date)` — tags: `filter_date`, `bgp_star`. Tables: WebEvent. **fact-touching**. H: **H1**, **H4 date control** (prunes on 1M-row table — the highest-value pruning demo). Rows: **[~80000, ~90000]** (one month of 1M). order: none. float: no.
 
 ### BI-16 — Inventory positions *(stockout risk; var-vs-var filter; store rollup)*
@@ -160,8 +160,8 @@ Business: how big is each table?
 ### BI-19 — Constrained-subject equivalence *(H8: VALUES vs FILTER vs bound-subject)*
 Business: revenue for three specific stores — expressed three ways.
 - **Q40** `SELECT ?tot WHERE { VALUES ?store { <edw/store/1> <edw/store/2> <edw/store/3> } ?o a edw:Order ; edw:store ?store ; edw:orderTotal ?tot }` — tags: `values`, `join`, `fk_chain`. Tables: Order⋈Store. **fact-touching**. H: **H8** (VALUES not lowered → the store constraint does NOT become a scan filter; full 180K order scan), **H1**. Rows: **[0, ~1000]**. order: none. float: **yes**.
-- **Q41** `?o a edw:Order ; edw:store ?store ; edw:orderTotal ?tot FILTER(?store = <edw/store/1> || ?store = <edw/store/2> || ?store = <edw/store/3>)` — tags: `filter_string` (IRI equality; see §7 enum gap), `join`, `fk_chain`. Tables: Order⋈Store. **fact-touching**. H: **H8 contrast** (FILTER form — same full scan; the A/B twin of Q40). Rows: same as Q40. order: none. float: yes.
-- **Q42** `{ <edw/store/1> ?p1 ?o1 } UNION { <edw/store/2> ?p2 ?o2 } UNION { <edw/store/3> ?p3 ?o3 }` — tags: `union`, `values`(-semantics), `bgp_star`. Tables: Store (prefix-prune per bound subject). **dims-only**. H: **H8 positive control** (bound subjects → prefix-prune, inventory §7 — the *fast* way to pin specific entities). Rows: **~39** (3 × ~13 Store predicates). order: none. float: no.
+- **Q41** `?o a edw:Order ; edw:store ?store ; edw:orderTotal ?tot FILTER(?store = <edw/store/1> || ?store = <edw/store/2> || ?store = <edw/store/3>)` — tags: `filter_iri`, `join`, `fk_chain`. Tables: Order⋈Store. **fact-touching**. H: **H8 contrast** (FILTER form — same full scan; the A/B twin of Q40). Rows: same as Q40. order: none. float: yes.
+- **Q42** `{ <edw/store/1> ?p1 ?o1 } UNION { <edw/store/2> ?p2 ?o2 } UNION { <edw/store/3> ?p3 ?o3 }` — tags: `union`, `values`(-semantics), `bgp_star`. Tables: Store (prefix-prune per bound subject). **dims-only**. H: **H8 positive control** (bound subjects → prefix-prune, inventory §7 — the *fast* way to pin specific entities). Rows: **~21-24** (3 × ~7-8 Store predicates). order: none. float: no.
 
 ### BI-20 — Error boundary *(unconvertible bound objects → whole-GRAPH error)*
 Business: (adversarial) a natural-language filter an LLM might emit that the R2RML router rejects.
@@ -192,7 +192,11 @@ Business: web events for a set of watch-list products; dormant customers.
 - **Q52** `SELECT ?et WHERE { VALUES ?p { <edw/product/10> <edw/product/20> } ?e a edw:WebEvent ; edw:product ?p ; edw:eventType ?et }` — tags: `values`, `join`, `fk_chain`. Tables: WebEvent⋈Product. **fact-touching**. H: **H8** (VALUES over a 1M-row fact → full scan), **H1**. Rows: **[0, ~2000]**. order: none. float: no.
 - **Q53** `?c a edw:Customer ; edw:isCurrent true ; edw:customerId ?cid FILTER NOT EXISTS { ?o a edw:Order ; edw:customer ?c }` — tags: `negation`, `join`, `bgp_star`. Tables: Customer, Order. **fact-touching**. H: **H1** (order scan under NOT EXISTS), **H3**. Rows: **[0, 300000]** (customers with no order). order: none. float: no. SCD: `isCurrent true`.
 
-**Total: 53 queries across 25 BI questions** (within the 40–80 target).
+### BI-26 — IRI-equality control *(filter_iri #2; object-IRI equality gets no prune)*
+Business: employees assigned to a specific store — the object-IRI-equality form (the dims-only twin of Q41's fact-side `filter_iri`).
+- **Q54** `?e a edw:Employee ; edw:name ?en ; edw:store ?st FILTER(?st = <edw/store/1>)` — tags: `filter_iri`, `bgp_star`. Tables: Employee (the store IRI is the materialized FK object — no join to DIM_STORE). **dims-only**. H: — (dims-only control; object-IRI equality is **operator-only** — unlike a bound *subject* it does not prefix-prune, inventory §6/§7 — so a full Employee scan runs. This is the `filter_iri` ≥2 control and the dims-only twin of Q41). Rows: **[~5, ~60]** (employees at one store; 5,000 employees / 500 stores ≈ 10 avg). order: none. float: no.
+
+**Total: 54 queries across 26 BI questions** (within the 40–80 target).
 
 ---
 
@@ -203,7 +207,7 @@ Business: web events for a set of watch-list products; dormant customers.
 | H | Queries | Count | Dims-only control present? |
 |---|---|---|---|
 | **H1** fact decode wall | Q08,Q10,Q11,Q12,Q13,Q14,Q15,Q16,Q17,Q18,Q19,Q20,Q21,Q25,Q26,Q27,Q28,Q29,Q30,Q31,Q32,Q36,Q37,Q39,Q40,Q41,Q45,Q46,Q47,Q48,Q51,Q52,Q53 | 33 | n/a (H1 is fact-only; dim scans Q01/Q03 are the "no decode wall" baseline) |
-| **H2** budget-absorb | Q03(dim DISTINCT), Q05(dim ORDER BY), Q10, Q22, Q26, Q29, Q45(control), Q46(primary), Q47 | 9 | **yes** — Q03, Q05 (dims-only ORDER BY/DISTINCT); Q45 pure-LIMIT control + Q46 fact ORDER BY |
+| **H2** budget-absorb *(every member has a LIMIT — the budget-absorption is the mechanism)* | Q05(dim ORDER BY+LIMIT), Q12(fact GROUP BY+ORDER BY+LIMIT), Q29(fact UNION+LIMIT), Q45(fact pure-LIMIT **control**), Q46(fact ORDER BY+LIMIT **primary**), Q47(fact DISTINCT+LIMIT) | 6 | **yes** — Q05 dims-only ORDER BY+LIMIT control; Q46 fact ORDER BY+LIMIT; Q45 pure-LIMIT early-terminate control. (Q03/Q10/Q22/Q26 exercise the same operators *without* a LIMIT, so they are H1/H6 not H2 — see their entries.) |
 | **H3** correlated join | Q05(dim⋈dim), Q08(fact⋈dim), Q12, Q15(fact⋈fact), Q16, Q25, Q31, Q32, Q33(dim self-join), Q48, Q49, Q50 | 12 | **yes** — Q05, Q33, Q49, Q50 (dims-only); fact⋈dim Q08; fact⋈fact stress Q15 |
 | **H4** decimal/double blind | Q19(decimal PRIMARY), Q18(double), Q06(double dim) ‖ controls: Q20(date-prune), Q21(int-prune), Q24(int), Q30(date on 1M) | 3 blind + 4 controls | **yes** — Q06/Q24 dims-only; Q19 fact decimal vs Q20/Q21 pruning positives on the **same** GL table |
 | **H5** COUNT no manifest | Q36(Order 180K), Q37(WebEvent 1M), Q38(Customer 300K), Q39(GL 250K) | 4 | **yes** — Q38 dims-only |
@@ -219,8 +223,9 @@ Business: web events for a set of watch-list products; dormant customers.
 | `join` | Q05,Q08,Q10,Q12,Q13,Q15,Q16,Q17,Q25,Q28,Q31,Q32,Q33,Q35,Q40,Q41,Q48,Q49,Q50,Q51,Q52,Q53 | 22 |
 | `fk_chain` | Q05,Q08,Q10,Q12,Q13,Q15,Q16,Q25,Q28,Q31,Q32,Q33,Q40,Q41,Q48,Q49,Q50,Q52 | 18 |
 | `filter_range` | Q06,Q18,Q19,Q21,Q24,Q31 | 6 |
-| `filter_string` | Q04,Q06,Q28,Q41,Q43 | 5 |
+| `filter_string` | Q04,Q06,Q28,Q43 | 4 |
 | `filter_date` | Q11,Q20,Q30 | 3 |
+| `filter_iri` | Q41,Q54 | 2 |
 | `optional` | Q16,Q50 | 2 |
 | `union` | Q29,Q42 | 2 |
 | `aggregate` | Q07,Q08,Q09,Q10,Q12,Q13,Q14,Q18,Q22,Q25,Q26,Q27,Q32,Q36,Q37,Q38,Q39,Q51 | 18 |
@@ -235,7 +240,7 @@ Business: web events for a set of watch-list products; dormant customers.
 | `property_path` | Q34,Q35 | 2 |
 | `construct` | Q48,Q49 | 2 |
 
-Every hypothesis ≥ 3, every feature ≥ 2. Thinnest margins (worth watching if queries are cut): `optional`, `union`, `having`, `distinct`, `subquery`, `negation`, `property_path`, `construct` each sit at exactly 2.
+Every hypothesis ≥ 3, every feature ≥ 2. Thinnest margins (worth watching if queries are cut): `optional`, `union`, `having`, `distinct`, `subquery`, `negation`, `property_path`, `construct`, `filter_iri` each sit at exactly 2.
 
 ---
 
@@ -262,6 +267,8 @@ Base cardinalities (from the assignment; these are the row-count oracles):
 | FACT_WEB_EVENT | 1,000,000 | largest |
 | FACT_SUPPORT_TICKET | 40,000 | |
 
+**Blessing from the native ledger (the correctness oracle).** The derivations below are *sanity bounds*, not the source of truth. The canonical expected result for every query is **blessed by running it against the WP2-native ledger** (`enterprise-sf01.ttl.zst`, imported + indexed — task WP2-native): the native store holds the identical SF=0.1 data, so its answer (row set + values) is the ground truth the virtual-dataset (Iceberg/R2RML) run must match. The bless step (WP6) executes each `.rq` against the native ledger, canonicalizes per this section's order/float rules, and stores the result in the manifest; the virtual run then asserts equality (correctness) *while* measuring perf (the hypothesis signal). The bounds here let a reviewer spot a grossly wrong bless before it is trusted, and pin the expected-error queries (Q43/Q44) which have no native answer. Two caveats: the native ledger must carry the same SCD history (so Q22/Q23 diverge by 90K — §7 item 3), and the two expected-error queries are asserted by the R2RML router (native has no R2RML layer, so they simply return rows there — do **not** bless them from native).
+
 **Exact-count queries** (derivable from a single table's base count or key domain): Q01 (500), Q32 (500), Q36 (180000), Q37 (1000000), Q38 (300000), Q39 (250000), Q05/Q12 (LIMIT k = exact k), Q45/Q46/Q47 (LIMIT k). **`isCurrent` invariant:** any Customer aggregate is 300,000 with `isCurrent true` and 390,000 without (Q22 vs Q23 — a correctness oracle, not a perf pair). Product current-count is not separately given; treat `< 37,500`, and always pin `isCurrent true` for a stable oracle.
 
 **Bounded `[min,max]` queries** (depend on data distribution the generator controls but we don't have): all `filter_*` result sets, all grouped rollups where the group is a distribution (segments/regions/channels). Where a group domain is structural (regions ≤ Geography.region cardinality; stores = 500) the row count is exact; where it is a value distribution (order status, event type) it is bounded. The WP4 generator should emit the actual group-domain sizes into the manifest so these tighten from `[min,max]` to exact at bless time.
@@ -281,8 +288,8 @@ Base cardinalities (from the assignment; these are the row-count oracles):
 
 ## 7. Open questions for WP4 (manifest generation)
 
-1. **Feature-enum gap: IRI equality.** Q41's `FILTER(?store = <iri> || …)` and set-membership `IN` have no precise tag in the closed enum (`filter_string` is lexical, `filter_range` is numeric/date). Tagged `filter_string` provisionally; recommend adding `filter_iri` (or `filter_eq`) to the enum, or the A/B intent of Q40/Q41 is under-described.
-2. **Property-path outcome (Q34/Q35).** These exercise H8 but their *result* over an R2RML source is a known unknown (paths aren't lowered; there's no ledger index to evaluate them against). WP6 should capture the observed behavior (empty / error / partial) and, if it errors, reclassify these as expected-error like Q43/Q44 rather than perf queries.
-3. **`isCurrent` default.** The corpus pins `isCurrent true` on every Customer/Product analytic. Confirm the generator emits both current and history rows (so Q22/Q23 actually diverge by 90K); if SF=0.1 collapses history, the SCD oracle is void.
+1. **Feature-enum gap: IRI equality. — RESOLVED (team, 2026-07-10).** `filter_iri` added to the enum (§2), Q41 retagged, and a dims-only control Q54 added so the tag meets the ≥2 rule. `filter_iri` = IRI / `=` / `IN` equality on a term-typed value.
+2. **Property-path outcome (Q34/Q35). — DEFERRED, empirical (team, 2026-07-10).** Kept as **observed-behavior probes**, NOT expected-error. The behavior of an unlowered path over the R2RML source will be settled empirically once virtual-SF01 is registered (DW_SF01 load in flight) and reclassified based on what actually happens; do not pre-bless a result.
+3. **`isCurrent` / SCD history. — CONFIRMED live (team, 2026-07-10).** The native sibling carries exactly **300,000 `isCurrent=true` / 390,000 total** Customers, so the Q22/Q23 oracle is exact (diverges by the 90K history rows).
 4. **Group-domain sizes.** To convert `[min,max]` rollup counts to exact oracles, the WP4 generator should export the distinct-value cardinality of each grouping column (region, channel, segment, tenderType, eventType, priority, industry, category) into the manifest.
 5. **Cold-protocol subset (H7).** Designated: Q01, Q08, Q19, Q27, Q36, Q46 (dim, fact⋈dim, decimal-fact, 1M-fact, count, top-k). These run under all three conditions (cold / hot-process / warm-disk); the rest run hot-process only unless a hypothesis deep-dive needs otherwise.
