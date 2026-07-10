@@ -44,6 +44,7 @@ pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
 pub mod cypher_import;
+pub(crate) mod cypher_lang;
 mod cypher_procedures;
 pub mod cypher_txn;
 pub mod cypher_write;
@@ -83,6 +84,7 @@ mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
+pub(crate) mod sparql_lang;
 mod time_resolve;
 pub mod tx;
 pub mod tx_builder;
@@ -2649,6 +2651,11 @@ impl FlureeBuilder {
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let leaflet_cache = make_leaflet_cache(&config);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
+
+        // Register SPARQL lowering hooks for f:sparql policy queries and
+        // datalog rules (idempotent; must precede any policy/rule evaluation).
+        sparql_lang::ensure_sparql_support_registered();
+        cypher_lang::ensure_cypher_support_registered();
 
         let ledger_manager = ledger_cache_config.map(|mut lm_config| {
             if lm_config.leaflet_cache.is_none() {
