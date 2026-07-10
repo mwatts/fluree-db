@@ -232,6 +232,117 @@ fn test_minus_requires_left_pattern() {
 }
 
 #[test]
+fn test_union_of_subselects_preserves_both_arms() {
+    // Regression (azure-chat #42): `{ SELECT ... } UNION { SELECT ... }` used to
+    // drop the UNION entirely — the left sub-SELECT was pushed, then the UNION
+    // token hit "UNION must follow a pattern" and was discarded, collapsing the
+    // query into two independent subqueries. `assert_parses` also guards that no
+    // error diagnostic is emitted. Both arms must survive as a Union of SubSelects.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           { SELECT (?x AS ?n) WHERE { ?s ex:name ?x } } UNION \
+           { SELECT (?y AS ?n) WHERE { ?t ex:label ?y } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Union { left, right, .. } = &q.where_clause.pattern {
+            assert!(
+                matches!(left.as_ref(), GraphPattern::SubSelect { .. }),
+                "left arm should be a sub-SELECT, got {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), GraphPattern::SubSelect { .. }),
+                "right arm should be a sub-SELECT, got {right:?}"
+            );
+        } else {
+            panic!(
+                "Expected Union of sub-SELECTs, got {:?}",
+                q.where_clause.pattern
+            );
+        }
+    }
+}
+
+#[test]
+fn test_union_mixed_group_and_subselect_arms() {
+    // Either arm may be a sub-SELECT; a plain-group left arm must not swallow
+    // the union or drop the sub-SELECT right arm.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           { ?s ex:name ?n } UNION \
+           { SELECT (?y AS ?n) WHERE { ?t ex:label ?y } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Union { left, right, .. } = &q.where_clause.pattern {
+            assert!(
+                !matches!(left.as_ref(), GraphPattern::SubSelect { .. }),
+                "left arm should be a plain group, got {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), GraphPattern::SubSelect { .. }),
+                "right arm should be a sub-SELECT, got {right:?}"
+            );
+        } else {
+            panic!("Expected Union, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+#[test]
+fn test_minus_right_side_subselect_preserved() {
+    // Regression (azure-chat #43): the right arm of MINUS being a sub-SELECT was
+    // parsed as a bare BGP with the `(expr AS ?v)` projection dropped, so MINUS
+    // shared no bound variable with the left and subtracted nothing. The right
+    // arm must remain a sub-SELECT.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           ?s ex:name ?n MINUS \
+           { SELECT (?y AS ?n) WHERE { ?t ex:hidden ?y } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Minus { right, .. } = &q.where_clause.pattern {
+            assert!(
+                matches!(right.as_ref(), GraphPattern::SubSelect { .. }),
+                "MINUS right arm should be a sub-SELECT, got {right:?}"
+            );
+        } else {
+            panic!("Expected Minus, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+#[test]
+fn test_optional_subselect_preserved() {
+    // A sub-SELECT is a valid OPTIONAL body (grammar admits a group here, and a
+    // group may be a SubSelect). It must not be flattened to a bare BGP.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?n WHERE { \
+           ?s ex:name ?n OPTIONAL \
+           { SELECT (COUNT(?t) AS ?c) WHERE { ?t a ex:Thing } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Group { patterns, .. } = &q.where_clause.pattern {
+            let opt = patterns
+                .iter()
+                .find_map(|p| match p {
+                    GraphPattern::Optional { pattern, .. } => Some(pattern),
+                    _ => None,
+                })
+                .expect("expected an OPTIONAL pattern");
+            assert!(
+                matches!(opt.as_ref(), GraphPattern::SubSelect { .. }),
+                "OPTIONAL body should be a sub-SELECT, got {opt:?}"
+            );
+        } else {
+            panic!("Expected Group, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+#[test]
 fn test_values_single_var() {
     let ast = assert_parses(r"SELECT * WHERE { VALUES ?x { 1 2 3 } }");
     if let QueryBody::Select(q) = &ast.body {
@@ -1893,118 +2004,239 @@ fn test_modify_full() {
 }
 
 // ========================================================================
-// RDF Collection (List) Syntax — Error Recovery Tests
+// RDF Collection (List) Syntax — Desugaring Tests (SPARQL 1.1 §4.2.4)
 // ========================================================================
+
+/// Extract the triple patterns of a WHERE clause that is a single BGP.
+fn where_bgp_triples(ast: &SparqlAst) -> &[crate::ast::TriplePattern] {
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    match &q.where_clause.pattern {
+        GraphPattern::Bgp { patterns, .. } => patterns,
+        other => panic!("expected a single BGP, got {other:?}"),
+    }
+}
+
+fn is_full_iri(term_iri: &crate::ast::Iri, expected: &str) -> bool {
+    matches!(&term_iri.value, IriValue::Full(s) if &**s == expected)
+}
 
 #[test]
 fn test_rdf_collection_in_subject_position() {
-    // RDF collection syntax in subject position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { (1 2 3) ?p ?o }");
-    assert!(
-        result.has_errors(),
-        "RDF collection in subject position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
-    );
+    // `(1 2 3) ?p ?o` desugars to 3 rdf:first + 3 rdf:rest triples plus the
+    // main triple, all in one BGP; the subject is the first list cell.
+    let ast = assert_parses("SELECT * WHERE { (1 2 3) ?p ?o }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 7, "3 first + 3 rest + main triple");
+    let firsts = triples
+        .iter()
+        .filter(|t| {
+            matches!(&t.predicate, PredicateTerm::Iri(i) if is_full_iri(i, fluree_vocab::rdf::FIRST))
+        })
+        .count();
+    let rests = triples
+        .iter()
+        .filter(|t| {
+            matches!(&t.predicate, PredicateTerm::Iri(i) if is_full_iri(i, fluree_vocab::rdf::REST))
+        })
+        .count();
+    assert_eq!((firsts, rests), (3, 3));
+    // The chain terminates in rdf:nil.
+    assert!(triples
+        .iter()
+        .any(|t| { matches!(&t.object, Term::Iri(i) if is_full_iri(i, fluree_vocab::rdf::NIL)) }));
+    // The main triple's subject is the head list cell (a blank node).
+    assert!(triples
+        .iter()
+        .any(|t| matches!(&t.subject, SubjectTerm::BlankNode(_))
+            && matches!(&t.predicate, PredicateTerm::Var(v) if &*v.name == "p")));
 }
 
 #[test]
 fn test_rdf_collection_in_object_position() {
-    // RDF collection syntax in object position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { ?s ?p (1 2 3) }");
-    assert!(
-        result.has_errors(),
-        "RDF collection in object position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
-    );
+    let ast = assert_parses("SELECT * WHERE { ?s ?p (1 2 3) }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 7, "main triple + 3 first + 3 rest");
+    // The main triple's object is the head list cell.
+    assert!(triples.iter().any(
+        |t| matches!(&t.predicate, PredicateTerm::Var(v) if &*v.name == "p")
+            && matches!(&t.object, Term::BlankNode(_))
+    ));
 }
 
 #[test]
 fn test_rdf_nil_in_subject_position() {
-    // Empty list () in subject position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { () ?p ?o }");
+    // `()` is the IRI rdf:nil — no list triples.
+    let ast = assert_parses("SELECT * WHERE { () ?p ?o }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 1);
     assert!(
-        result.has_errors(),
-        "Nil in subject position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
+        matches!(&triples[0].subject, SubjectTerm::Iri(i) if is_full_iri(i, fluree_vocab::rdf::NIL))
     );
 }
 
 #[test]
 fn test_rdf_nil_in_object_position() {
-    // Empty list () in object position should produce an error, not hang.
-    let result = parse("SELECT * WHERE { ?s ?p () }");
+    let ast = assert_parses("SELECT * WHERE { ?s ?p () }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 1);
+    assert!(matches!(&triples[0].object, Term::Iri(i) if is_full_iri(i, fluree_vocab::rdf::NIL)));
+}
+
+#[test]
+fn test_nested_rdf_collection() {
+    // `((1 2) (3 4))` — each inner list desugars to 4 triples, the outer
+    // list to 4 more, plus the main triple.
+    let ast = assert_parses("SELECT * WHERE { ((1 2) (3 4)) ?p ?o }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 13);
+}
+
+#[test]
+fn test_rdf_collection_bare_subject() {
+    // `TriplesNode PropertyList` — the predicate-object list is optional for
+    // a collection subject (W3C syntax-lists-03: `SELECT * WHERE { ( ?z ) }`).
+    let ast = assert_parses("SELECT * WHERE { ( ?z ) }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 2, "one first + one rest");
+}
+
+#[test]
+fn test_rdf_collection_then_more_triples() {
+    // The parser continues normally after a collection.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p (1 2) . ?x ?y ?z }");
+    let triples = where_bgp_triples(&ast);
+    assert_eq!(triples.len(), 6, "main + 2 first + 2 rest + second triple");
+}
+
+#[test]
+fn test_property_path_inside_blank_node_property_list() {
+    // `[ :p|:q ?X ]` — a VerbPath inside a blank-node property list emits a
+    // Path pattern whose subject is the fresh blank node (W3C test_63).
+    let ast = assert_parses("PREFIX : <http://example.org/> SELECT ?X WHERE { [ :p|:q|:r ?X ] }");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    match &q.where_clause.pattern {
+        GraphPattern::Path {
+            subject, object, ..
+        } => {
+            assert!(matches!(subject, SubjectTerm::BlankNode(_)));
+            assert!(matches!(object, Term::Var(v) if &*v.name == "X"));
+        }
+        other => panic!("expected a Path pattern, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_values_nil_variable_list() {
+    // `VALUES () { }` and `VALUES () { () }` (W3C test_35a / test_36a).
+    let ast = assert_parses("SELECT * { } VALUES () { }");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let values = q.values.as_ref().expect("trailing VALUES clause");
+    let GraphPattern::Values { vars, data, .. } = &**values else {
+        panic!("expected Values pattern");
+    };
+    assert!(vars.is_empty());
+    assert!(data.is_empty());
+
+    let ast = assert_parses("SELECT * { } VALUES () { () }");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let values = q.values.as_ref().expect("trailing VALUES clause");
+    let GraphPattern::Values { vars, data, .. } = &**values else {
+        panic!("expected Values pattern");
+    };
+    assert!(vars.is_empty());
+    assert_eq!(data.len(), 1, "one empty row");
+    assert!(data[0].is_empty());
+}
+
+#[test]
+fn test_extension_function_nil_arg_list() {
+    // `f()` — an ArgList may be NIL (W3C syntax-function-01..03).
+    assert_parses("PREFIX q: <http://example.org/> SELECT * WHERE { FILTER (q:name()) }");
+    assert_parses("PREFIX q: <http://example.org/> SELECT * WHERE { FILTER (q:name( )) }");
+    assert_parses("PREFIX q: <http://example.org/> SELECT * WHERE { FILTER (q:name(\n)) }");
+}
+
+#[test]
+fn test_order_by_bare_builtin_call() {
+    // `OrderCondition ::= … | Constraint | Var` — a bare BuiltInCall is a
+    // valid ordering condition (W3C syntax-order-07).
+    let ast = assert_parses("SELECT * { ?s ?p ?o } ORDER BY str(?o)");
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let order_by = q.modifiers.order_by.as_ref().expect("ORDER BY clause");
+    assert_eq!(order_by.conditions.len(), 1);
+    assert!(matches!(order_by.conditions[0].expr, OrderExpr::Expr(_)));
+}
+
+#[test]
+fn test_order_by_bare_expression_not_absorbed_as_key() {
+    // `OrderCondition`'s bare form is `Constraint | Var`, never an arbitrary
+    // expression. A trailing operator after a var key must NOT become a second
+    // (spurious) key: pre-fix `ORDER BY ?x - 1` silently parsed as two keys
+    // `[?x, -1]`, corrupting the sort. The `- 1` is not a Constraint, so it is
+    // no longer absorbed — the ORDER BY keeps the single key `?x` (the stray
+    // tail is left for the parser, which currently ignores trailing tokens; a
+    // bare BuiltInCall like `ORDER BY str(?o)` stays valid, see
+    // test_order_by_bare_builtin_call). Regression guard for fluree/db#1452.
+    for q in [
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x - 1",
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x + ?y",
+    ] {
+        let ast = assert_parses(q);
+        let QueryBody::Select(sel) = &ast.body else {
+            panic!("expected SELECT query for {q}");
+        };
+        let ob = sel.modifiers.order_by.as_ref().expect("ORDER BY clause");
+        assert_eq!(ob.conditions.len(), 1, "{q}: arithmetic must not add a key");
+        assert!(
+            matches!(ob.conditions[0].expr, OrderExpr::Var(_)),
+            "{q}: the sole key must be the bare var, got {:?}",
+            ob.conditions[0].expr
+        );
+    }
+    // A *leading* bare arithmetic is not a Constraint at all, so no condition
+    // parses and ORDER BY is empty — a hard error.
     assert!(
-        result.has_errors(),
-        "Nil in object position should produce an error"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("collection")),
-        "Error should mention 'collection': {:?}",
-        result
-            .diagnostics
-            .iter()
-            .map(|d| &d.message)
-            .collect::<Vec<_>>()
+        parse("SELECT * WHERE { ?s ?p ?o } ORDER BY str(?x) - 1").has_errors(),
+        "a bare arithmetic must be rejected as an order condition"
     );
 }
 
 #[test]
-fn test_nested_rdf_collection_no_hang() {
-    // Nested collections should be skipped without hanging.
-    let result = parse("SELECT * WHERE { ((1 2) (3 4)) ?p ?o }");
+fn test_group_by_bare_expression_not_absorbed_as_key() {
+    // `GroupCondition`'s bare form is `BuiltInCall | FunctionCall` (or a
+    // parenthesized `( … )`, or a Var) — never a bare arithmetic. Kept
+    // consistent with ORDER BY (fluree/db#1452): a trailing `- 1` after a var
+    // is not absorbed as a second group key, and a leading bare arithmetic is
+    // rejected. The parenthesized `GROUP BY (?x + 1 AS ?y)` form stays valid
+    // (see test_group_by_with_expression).
+    let ast = assert_parses("SELECT ?x WHERE { ?s :p ?x } GROUP BY ?x - 1");
+    let QueryBody::Select(sel) = &ast.body else {
+        panic!("expected SELECT query");
+    };
+    let gb = sel.modifiers.group_by.as_ref().expect("GROUP BY clause");
+    assert_eq!(gb.conditions.len(), 1, "`- 1` must not add a group key");
+    assert!(matches!(gb.conditions[0], GroupCondition::Var(_)));
+
     assert!(
-        result.has_errors(),
-        "Nested collections should produce errors"
+        parse("SELECT ?x WHERE { ?s :p ?x } GROUP BY str(?x) - 1").has_errors(),
+        "a bare arithmetic must be rejected as a group condition"
     );
 }
 
 #[test]
-fn test_rdf_collection_parser_recovers() {
-    // After skipping a collection, the parser should recover and parse
-    // subsequent triple patterns.
-    let result = parse("SELECT * WHERE { ?s ?p (1 2) . ?x ?y ?z }");
-    assert!(result.has_errors(), "Collection should produce an error");
-    // The AST should still be produced (error recovery, not fatal).
-    assert!(
-        result.ast.is_some(),
-        "Parser should recover and produce an AST despite collection error"
-    );
+fn test_empty_iriref() {
+    // `<>` is a valid (empty, relative) IRI reference (W3C syntax-qname-05).
+    assert_parses("PREFIX : <> SELECT * WHERE { : : : . }");
 }
 
 // ── SERVICE pattern tests ──────────────────────────────────────────

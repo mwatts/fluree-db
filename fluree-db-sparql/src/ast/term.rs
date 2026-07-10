@@ -92,6 +92,30 @@ impl Iri {
             span,
         }
     }
+
+    /// Create a reference to `rdf:first` (RDF collection desugaring).
+    pub fn rdf_first(span: SourceSpan) -> Self {
+        Self {
+            value: IriValue::Full(Arc::from(fluree_vocab::rdf::FIRST)),
+            span,
+        }
+    }
+
+    /// Create a reference to `rdf:rest` (RDF collection desugaring).
+    pub fn rdf_rest(span: SourceSpan) -> Self {
+        Self {
+            value: IriValue::Full(Arc::from(fluree_vocab::rdf::REST)),
+            span,
+        }
+    }
+
+    /// Create a reference to `rdf:nil` (the empty RDF collection `()`).
+    pub fn rdf_nil(span: SourceSpan) -> Self {
+        Self {
+            value: IriValue::Full(Arc::from(fluree_vocab::rdf::NIL)),
+            span,
+        }
+    }
 }
 
 /// The value of an IRI reference.

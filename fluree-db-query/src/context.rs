@@ -1140,7 +1140,7 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Cost: one `TypeId` comparison. Returns `None` when no range provider is
     /// attached (e.g. genesis / metadata-only snapshot).
-    fn extract_binary_store(snapshot: &LedgerSnapshot) -> Option<Arc<BinaryIndexStore>> {
+    pub(crate) fn extract_binary_store(snapshot: &LedgerSnapshot) -> Option<Arc<BinaryIndexStore>> {
         snapshot
             .range_provider
             .as_ref()
