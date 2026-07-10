@@ -380,7 +380,7 @@
     {
       "id": "q018",
       "file": "queries/q018_large_payments_by_tender.rq",
-      "bi_question": "BI-11: What are large payments (over $5000) by tender type?",
+      "bi_question": "BI-11: What are large payments (over $4000) by tender type?",
       "tags": [
         "aggregate",
         "count",
