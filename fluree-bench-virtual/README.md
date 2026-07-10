@@ -23,14 +23,19 @@ in the R2RML/Iceberg read path and the AWS SDK the Snowflake REST catalog needs.
 ## Subcommands
 
 ```sh
-vbench setup --verify [--targets native-sf01,virtual-sf20]
-vbench run   --targets native-sf01[,virtual-sf20] [--subset smoke] [--out FILE] [--keep-heads]
-vbench exec-one --query q001 --target virtual-sf20 [--keep-heads]
-vbench report --run FILE [--json]
+vbench setup --verify [--targets native-sf01,virtual-sf01]
+vbench run   --targets native-sf01[,virtual-sf01] [--subset smoke] [--out FILE] [--keep-heads]
+             [--cache-state hot|cold] [--survey] [--max-queries N] [--max-wall-budget-s S]
+vbench exec-one --query q001 --target virtual-sf01 [--keep-heads] [--cold]
+vbench report   --run FILE [--json]
+vbench baseline --expected [--run FILE | --targets native-sf01] --perf --run FILE [--baseline-dir DIR]
+vbench compare  --run FILE [--baseline-dir DIR] [--gate]
+vbench dashboard --run native.jsonl --run virtual.jsonl [--out FILE] [--title T]
 ```
 
 Global `--corpus-dir` / `--targets-dir` override the defaults (`<crate>/corpus`,
-`<crate>/targets`).
+`<crate>/targets`); global `--cache-dir` pins the binary-index / Iceberg on-disk
+artifact cache to a known directory.
 
 - **setup --verify** — opens each target and runs a trivial probe (`COUNT` of a
   small class). For a native target with `expected_total_triples`, it also
@@ -41,11 +46,70 @@ Global `--corpus-dir` / `--targets-dir` override the defaults (`<crate>/corpus`,
   **median-wall** rep; the reported wall/rows/hash/counters all come from that
   one rep so they are internally consistent. Records stream to `run.jsonl` and
   are flushed after each line, so a crash keeps partial results.
+  - `--cache-state cold` — the **cold protocol**: run each query in a fresh
+    `exec-one --cold` subprocess (empty catalog TTL cache, OAuth token, footer
+    LRU, leaflet cache) whose **child** clears the home-scoped disk artifact
+    cache first, so it pays the full cold cost. No priming; 2 s pacing between
+    children.
+  - `--survey` — mark the run informational: it is **never a gate** (`baseline`
+    refuses it, `compare` skips it). For the live SF20 stress subset.
+  - `--max-queries N` / `--max-wall-budget-s S` — caps that bound live-Snowflake
+    cost: stop after N queries, or once a target's cumulative wall passes S.
 - **exec-one** — a single execution (no priming) printed as one `RunRecord` JSON.
-  This is the hook a future cold-mode protocol builds on.
-- **report** — native-vs-virtual comparison table (per query where both are
-  present): `native ms | virt ms | ratio | scans | load | files pruned/selected
-  | hash`. `--json` emits the structured comparison plus the run meta.
+  It is also the unit the cold protocol spawns per query. `--cold` clears the
+  target's home-scoped disk cache before executing (records `cache_state=cold`).
+- **report** — native-vs-virtual comparison table. `--json` emits structured rows.
+- **baseline** — bless the reference:
+  - `--expected` writes the per-query **native** correctness oracle to
+    `baselines/expected/<qid>.json` (`result_hash`, `rows`, first-20 `head_rows`,
+    provenance). Queries the manifest expects to error on virtual (q043/q044) get
+    **no** expected file — there is nothing to compare a correctly-erroring
+    virtual result against. With no `--run`, a fresh native run is executed.
+  - `--perf` writes the per-target perf reference to `baselines/perf/<target>.json`
+    (`hot_wall_ms_median`, optional `cold_wall_ms`, pathway counters, provenance),
+    merging so a hot run and a later cold run both populate an entry.
+- **compare** — check a run against the blessed baselines: an **expected-hash**
+  check (a virtual result must match the native oracle) plus a **perf ratio** vs
+  the perf baseline, judged against `budgets.json`. `--gate` exits nonzero on any
+  hash mismatch or perf violation. A perf violation is **auto-rerun once**
+  in-process before it's declared red (live-noise discipline); cold records are
+  advisory (never gate); survey runs are skipped.
+- **dashboard** — render one or more runs into a self-contained HTML dashboard
+  (summary tiles + a per-query native-vs-virtual table with ratios, status pills,
+  hash-match, pathway-span counters). Publish the file as an Artifact to share.
+
+### Auth for virtual targets
+
+`virtual-sf01` authenticates to the Snowflake Polaris catalog with the
+`VBENCH_PAT` env var (a read-only `ICEBERG_READER` PAT). Export it before running
+a virtual target, e.g. `export VBENCH_PAT="$(cat ~/.vbench/snowflake-pat.txt)"`.
+The cold subprocesses inherit it. `virtual-sf20` (the `horizon-demo` home)
+carries its own stored auth.
+
+### Baselines, budgets & gating
+
+`baselines/` (checked in — the reference) holds `expected/<qid>.json` +
+`perf/<target>.json`; `budgets.json` (crate root) sets the perf gate:
+`{ default_budget_pct: { native, virtual_hot }, cold: advisory, overrides: {} }`
+— a query's observed hot wall may exceed its blessed baseline by at most that
+percent, with per-query `overrides` winning over the class default. A typical
+loop: `run` native → `baseline --expected --perf` → later `run` (native or
+virtual) → `compare --gate` to catch a correctness break or a perf regression.
+Cold runs, survey runs, and full-vs-smoke stay distinguishable in the record
+(`cache_state`, meta `survey`, meta `subset`) so a `compare` matches like with
+like (`compare` picks the hot or cold baseline wall by the record's `cache_state`).
+
+### Cold-cache layout (verified)
+
+The engine's default disk artifact cache is **machine-global**
+(`$TMPDIR/fluree_binary_cache`), *not* under the target home. So the cold
+protocol pins a **home-scoped** cache dir, `<home>/.vbench-iceberg-cache` (a
+sibling of `storage/`, never `storage/` itself), and clears it before each cold
+exec. `clear_cold_cache` refuses any path whose final component isn't a vbench
+cache name — a guard so the cold protocol can never delete `storage/` or ledger
+data. Verified on `/Users/ajohnson/vbench/.fluree`: cold clearing forces the
+`iceberg.parquet_read` / `r2rml.load_table` spans to fire (they are cache-skipped
+when warm).
 
 ## Targets (`targets/*.json`)
 

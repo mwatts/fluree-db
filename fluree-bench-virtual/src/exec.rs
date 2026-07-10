@@ -26,13 +26,16 @@
 //! subscriber). Reps run strictly sequentially and `take()` drains the sink after
 //! each, so each rep's counters are isolated even though the sink is process-global.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use fluree_bench_support::tracing::{span_name_filter, BenchSpanCapture};
-use fluree_db_api::{Fluree, FlureeBuilder, FormatterConfig, QueryExecutionOptions};
+use fluree_db_api::{
+    Fluree, FlureeBuilder, FormatterConfig, LedgerManagerConfig, QueryExecutionOptions,
+};
 use fluree_db_core::{QueryCancellation, QueryCancellationReason};
 
 use crate::corpus::ExpectedOutcome;
@@ -98,7 +101,11 @@ impl Engine {
 
     /// Open a target's on-disk store. Reuse the returned handle across all
     /// queries for that target so the ledger/leaflet caches stay warm.
-    pub fn open(&self, target: &Target) -> Result<Fluree> {
+    ///
+    /// `cache_dir`, when set, pins the binary-index / Iceberg on-disk artifact
+    /// cache to a known directory (default is `$TMPDIR/fluree_binary_cache`). The
+    /// cold protocol sets it so the parent can clear it between subprocess reps.
+    pub fn open(&self, target: &Target, cache_dir: Option<&Path>) -> Result<Fluree> {
         let storage = target.storage_dir();
         if !storage.exists() {
             anyhow::bail!(
@@ -109,18 +116,19 @@ impl Engine {
         }
         // Enter the runtime so builder-side spawns (if any) have a reactor.
         let _guard = self.rt.enter();
-        FlureeBuilder::file(storage.to_string_lossy().to_string())
+        let mut builder = FlureeBuilder::file(storage.to_string_lossy().to_string())
             // The store is already indexed; vbench only reads. No background
             // indexer, but keep the default ledger cache so hot reps are hot.
-            .without_indexing()
-            .build()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "opening target '{}' at {}: {e}",
-                    target.id,
-                    storage.display()
-                )
-            })
+            .without_indexing();
+        if let Some(dir) = cache_dir {
+            builder = builder.with_ledger_cache_config(LedgerManagerConfig {
+                cache_dir: dir.to_path_buf(),
+                ..Default::default()
+            });
+        }
+        builder.build().map_err(|e| {
+            anyhow::anyhow!("opening target '{}' at {}: {e}", target.id, storage.display())
+        })
     }
 
     /// Run one query on one target: priming rep (discarded) + measured reps, then
@@ -162,7 +170,11 @@ impl Engine {
         self.build_record(query_id, target, is_virtual, "hot", outcomes, expected)
     }
 
-    /// Single execution (no priming) — the cold-mode hook behind `exec-one`.
+    /// Single execution (no priming) — the unit behind `exec-one` and the cold
+    /// protocol. `cold` only labels the record's `cache_state`; the on-disk cache
+    /// clearing happens in the caller (`cmd_exec_one`) *before* `open`, since the
+    /// cache is read at open time. Pacing is the parent's job (2 s between cold
+    /// children), so a single exec-one does not sleep.
     pub fn exec_one(
         &self,
         fluree: &Fluree,
@@ -172,16 +184,15 @@ impl Engine {
         timeout: Duration,
         keep_heads: bool,
         expected: ExpectedOutcome,
+        cold: bool,
     ) -> RunRecord {
-        if target.is_virtual() {
-            self.pace();
-        }
         let outcome = self.exec_once(fluree, target, sparql, timeout, keep_heads);
+        let cache_state = if cold { "cold" } else { "warm" };
         self.build_record(
             query_id,
             target,
             target.is_virtual(),
-            "cold",
+            cache_state,
             vec![outcome],
             expected,
         )
@@ -411,6 +422,84 @@ pub fn scalar_count(doc: &Value) -> Option<u64> {
     cell.get("value")?.as_str()?.trim().parse::<u64>().ok()
 }
 
+// ---------------------------------------------------------------------------
+// Cold protocol: subprocess-of-self + disk-cache clear
+// ---------------------------------------------------------------------------
+
+/// The home-scoped Iceberg / binary-index artifact cache dir vbench pins for the
+/// cold protocol.
+///
+/// The engine's default cache is machine-global (`$TMPDIR/fluree_binary_cache`),
+/// which is neither home-scoped nor safe to clear blindly. So vbench pins a cache
+/// dir *inside the target home* (a sibling of `storage/`, never `storage/`
+/// itself) that a cold `exec-one` owns and can safely empty.
+pub fn target_cache_dir(target: &Target) -> PathBuf {
+    target.fluree_home.join(".vbench-iceberg-cache")
+}
+
+/// Remove the cold cache dir before a cold execution. Refuses any path whose
+/// final component doesn't look like a vbench cache — a guard against ever
+/// deleting `storage/` or ledger data.
+pub fn clear_cold_cache(cache_dir: &Path) -> Result<()> {
+    let name = cache_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !(name.contains("vbench") && name.contains("cache")) {
+        anyhow::bail!(
+            "refusing to clear '{}': not a vbench cache dir (name must contain 'vbench' and 'cache')",
+            cache_dir.display()
+        );
+    }
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(cache_dir)
+            .with_context(|| format!("clearing cold cache {}", cache_dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Cold-run one query by spawning `vbench exec-one --cold` in a fresh subprocess.
+///
+/// The **child** clears the home-scoped disk cache before executing (see
+/// `cmd_exec_one`), and a fresh process empties the in-process caches (catalog
+/// TTL, OAuth token, Parquet footer LRU, leaflet), so the child pays the full
+/// cold cost. The child inherits this process's environment, so `VBENCH_PAT`
+/// flows through to virtual targets. The parent parses the child's stdout
+/// `RunRecord` (already `cache_state = "cold"`). Pacing between children is the
+/// caller's responsibility.
+pub fn cold_run_query(
+    exe: &Path,
+    corpus_dir: &Path,
+    targets_dir: &Path,
+    target: &Target,
+    query_id: &str,
+    keep_heads: bool,
+) -> Result<RunRecord> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--corpus-dir")
+        .arg(corpus_dir)
+        .arg("--targets-dir")
+        .arg(targets_dir)
+        .arg("exec-one")
+        .arg("--query")
+        .arg(query_id)
+        .arg("--target")
+        .arg(&target.id)
+        .arg("--cold");
+    if keep_heads {
+        cmd.arg("--keep-heads");
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("spawning cold exec-one for {query_id}/{}", target.id))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("cold exec-one {query_id}/{} failed: {stderr}", target.id);
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parsing cold exec-one output for {query_id}/{}", target.id))
+}
+
 /// Install the pathway span-capture subscriber (once per process).
 fn install_span_capture() -> BenchSpanCapture {
     use tracing_subscriber::prelude::*;
@@ -421,4 +510,22 @@ fn install_span_capture() -> BenchSpanCapture {
         .with(layer.with_filter(span_name_filter(Some(allowlist))))
         .try_init();
     capture
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_cold_cache_refuses_non_cache_paths() {
+        // The guard must refuse anything that isn't clearly a vbench cache dir —
+        // this is what stops the cold protocol from ever deleting storage/ or
+        // ledger data.
+        assert!(clear_cold_cache(Path::new("/Users/x/vbench/.fluree/storage")).is_err());
+        assert!(clear_cold_cache(Path::new("/var/data/ledger")).is_err());
+        assert!(clear_cold_cache(Path::new("/tmp/enterprise-sf01")).is_err());
+        // A properly-named, nonexistent cache dir is a no-op success.
+        let ok = std::env::temp_dir().join("vbench-nonexistent-iceberg-cache");
+        assert!(clear_cold_cache(&ok).is_ok());
+    }
 }

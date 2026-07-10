@@ -1,0 +1,551 @@
+{
+  "schema_version": 1,
+  "target": "native-sf01",
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6KH5SWTV8PXP3QDCVNW9Z9",
+    "commit": "5d6d28a50"
+  },
+  "entries": {
+    "q001": {
+      "hot_wall_ms_median": 1,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q002": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q003": {
+      "hot_wall_ms_median": 14,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q004": {
+      "hot_wall_ms_median": 15,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q005": {
+      "hot_wall_ms_median": 2,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q006": {
+      "hot_wall_ms_median": 16,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q007": {
+      "hot_wall_ms_median": 10,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q008": {
+      "hot_wall_ms_median": 757,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q009": {
+      "hot_wall_ms_median": 772,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q010": {
+      "hot_wall_ms_median": 859,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q011": {
+      "hot_wall_ms_median": 314,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q012": {
+      "hot_wall_ms_median": 1129,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q013": {
+      "hot_wall_ms_median": 1714,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q014": {
+      "hot_wall_ms_median": 212,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q015": {
+      "hot_wall_ms_median": 431,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q016": {
+      "hot_wall_ms_median": 735,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q017": {
+      "hot_wall_ms_median": 158,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q018": {
+      "hot_wall_ms_median": 124,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q019": {
+      "hot_wall_ms_median": 228,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q020": {
+      "hot_wall_ms_median": 307,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q021": {
+      "hot_wall_ms_median": 136,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q022": {
+      "hot_wall_ms_median": 402,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q023": {
+      "hot_wall_ms_median": 382,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q024": {
+      "hot_wall_ms_median": 279,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q025": {
+      "hot_wall_ms_median": 33,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q026": {
+      "hot_wall_ms_median": 39,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q027": {
+      "hot_wall_ms_median": 1274,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q028": {
+      "hot_wall_ms_median": 65,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q029": {
+      "hot_wall_ms_median": 168,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q030": {
+      "hot_wall_ms_median": 882,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q031": {
+      "hot_wall_ms_median": 212,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q032": {
+      "hot_wall_ms_median": 277,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q033": {
+      "hot_wall_ms_median": 8,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q034": {
+      "hot_wall_ms_median": 172,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q035": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q036": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q037": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q038": {
+      "hot_wall_ms_median": 221,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q039": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q040": {
+      "hot_wall_ms_median": 375,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q041": {
+      "hot_wall_ms_median": 320,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q042": {
+      "hot_wall_ms_median": 0,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q043": {
+      "hot_wall_ms_median": 166,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q044": {
+      "hot_wall_ms_median": 104,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q045": {
+      "hot_wall_ms_median": 153,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q046": {
+      "hot_wall_ms_median": 207,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q047": {
+      "hot_wall_ms_median": 163,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q048": {
+      "hot_wall_ms_median": 253,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q049": {
+      "hot_wall_ms_median": 65,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q050": {
+      "hot_wall_ms_median": 96,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q051": {
+      "hot_wall_ms_median": 480,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q052": {
+      "hot_wall_ms_median": 1256,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q053": {
+      "hot_wall_ms_median": 408,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q054": {
+      "hot_wall_ms_median": 3,
+      "counters": {
+        "spans": {},
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    }
+  }
+}

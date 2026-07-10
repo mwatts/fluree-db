@@ -49,6 +49,11 @@ pub struct RunMeta {
     /// The subset filter applied, if any (e.g. `"smoke"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subset: Option<String>,
+    /// A survey run is informational — capped and rate-limited (typically the
+    /// live SF20 stress subset) and is **never a gate**: `bless` refuses it and
+    /// `check` skips it. Defaults to `false` for older runs missing the field.
+    #[serde(default)]
+    pub survey: bool,
     /// Fingerprint of every target this run touched.
     pub targets: Vec<TargetFingerprint>,
 }

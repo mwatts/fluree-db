@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "_comment": "Perf regression budgets for `vbench compare --gate`. A query's observed hot wall may exceed its blessed baseline by at most `budget_pct` percent before it gates. Cold runs are advisory-only (never gate). `overrides` is keyed by query id and wins over the tag-level defaults.",
+  "default_budget_pct": {
+    "native": 10.0,
+    "virtual_hot": 20.0
+  },
+  "cold": "advisory",
+  "overrides": {}
+}
