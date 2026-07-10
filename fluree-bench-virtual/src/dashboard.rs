@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::corpus::Corpus;
+use crate::corpus::{Corpus, HashGate};
 use crate::schema::{Counters, RunMeta, RunRecord, Status};
 use crate::spans;
 
@@ -218,15 +218,27 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
             worst_ratio = worst_ratio.max(r);
         }
 
-        // Correctness (hash match) where both are Ok.
+        // Correctness where both are Ok. A `rows_only` query (nondeterministic
+        // LIMIT) is gated on row count, not hash — comparing its hash would raise
+        // a false mismatch.
+        let rows_only = q.hash_gate == HashGate::RowsOnly;
         let hash_state = match (nrec, vrec) {
             (Some(n), Some(v)) if n.status == Status::Ok && v.status == Status::Ok => {
                 hash_total += 1;
                 correctness_total += 1;
-                if n.result_hash == v.result_hash {
+                let parity = if rows_only {
+                    n.rows == v.rows
+                } else {
+                    n.result_hash == v.result_hash
+                };
+                if parity {
                     hash_match += 1;
                     correctness_pass += 1;
-                    HashState::Match
+                    if rows_only {
+                        HashState::RowsMatch
+                    } else {
+                        HashState::Match
+                    }
                 } else {
                     HashState::Miss
                 }
@@ -350,6 +362,8 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
 #[derive(Clone, Copy)]
 enum HashState {
     Match,
+    /// Parity confirmed by row count (a `rows_only`-gated query).
+    RowsMatch,
     Miss,
     Na,
 }
@@ -407,6 +421,9 @@ fn cell_status(rec: Option<&RunRecord>) -> String {
 fn cell_hash(state: HashState) -> String {
     match state {
         HashState::Match => "<td class=\"hash match\" data-sort=\"1\">✓</td>".to_string(),
+        HashState::RowsMatch => {
+            "<td class=\"hash match\" data-sort=\"1\">✓ rows</td>".to_string()
+        }
         HashState::Miss => "<td class=\"hash miss\" data-sort=\"0\">✗ mismatch</td>".to_string(),
         HashState::Na => "<td class=\"hash na\" data-sort=\"2\">—</td>".to_string(),
     }

@@ -668,7 +668,9 @@ fn cmd_compare(
         let virt = is_virtual.get(r.target.as_str()).copied().unwrap_or(false);
         let cold = r.cache_state == "cold";
         let budget = budgets.budget_pct(&r.query_id, virt, cold);
-        let mut outcome = baseline::compare_one(r, expected.as_ref(), perf_entry.as_ref(), budget);
+        let hash_gate = corpus.get(&r.query_id).map(|q| q.hash_gate).unwrap_or_default();
+        let mut outcome =
+            baseline::compare_one(r, expected.as_ref(), perf_entry.as_ref(), budget, hash_gate);
 
         // Live-noise discipline: auto-rerun a perf violation once before red.
         if let (Some(p), Some(pct)) = (&outcome.perf, budget) {
@@ -695,7 +697,13 @@ fn cmd_compare(
 
         if outcome.hash.is_fail() {
             fails += 1;
-            println!("FAIL-HASH  {:<6} {:<16} expected≠observed", r.query_id, r.target);
+            let detail = match &outcome.hash {
+                baseline::HashCheck::RowsMismatch { expected, observed } => {
+                    format!("rows-only gate: {expected} → {observed}")
+                }
+                _ => "hash changed".to_string(),
+            };
+            println!("FAIL-PARITY {:<6} {:<16} {detail}", r.query_id, r.target);
         }
         if let Some(p) = &outcome.perf {
             if p.violated {
