@@ -374,6 +374,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         host: prov.host.clone(),
         runtime: engine.runtime_shape(),
         subset: args.subset.map(str::to_string),
+        corpus_version: corpus.corpus_version,
         survey: args.survey,
         targets: resolved.iter().map(target_fingerprint).collect(),
     };
@@ -600,6 +601,7 @@ fn run_corpus(
         host: prov.host.clone(),
         runtime: engine.runtime_shape(),
         subset: subset.map(str::to_string),
+        corpus_version: corpus.corpus_version,
         survey: false,
         targets: resolved.iter().map(target_fingerprint).collect(),
     };

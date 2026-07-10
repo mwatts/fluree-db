@@ -105,6 +105,24 @@ pub enum OrderSensitivity {
     ByKeys,
 }
 
+/// How a query's result is gated in native-vs-virtual comparison.
+///
+/// `Full` (the default) requires an exact result-hash match. `RowsOnly` gates on
+/// row count (plus any invariants) only — for queries whose result is a
+/// **nondeterministic selection**: an unordered `LIMIT` that truncates a larger
+/// set (any `k` rows are a valid answer), which two engines can satisfy with
+/// different-but-equally-correct rows and therefore cannot be hash-compared. An
+/// `ORDER BY … LIMIT` top-k stays `Full` because the corpus appends a unique
+/// tiebreaker to its sort key (see `03-corpus-design.md` §5). Consumed by the
+/// compare/bless gate: on `RowsOnly` it must skip the hash equality check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashGate {
+    #[default]
+    Full,
+    RowsOnly,
+}
+
 /// Expected row count: an exact value or an inclusive `[min, max]` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -154,6 +172,9 @@ pub struct QueryDef {
     /// Per-target-kind expected status. Absent ⇒ expected `ok` everywhere.
     #[serde(default)]
     pub expected_status: ExpectedStatus,
+    /// How native-vs-virtual parity is gated. Absent ⇒ `Full` (exact hash).
+    #[serde(default)]
+    pub hash_gate: HashGate,
 }
 
 impl QueryDef {
@@ -164,7 +185,6 @@ impl QueryDef {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Manifest {
-    #[allow(dead_code)]
     corpus_version: u32,
     #[allow(dead_code)]
     #[serde(default)]
@@ -175,6 +195,9 @@ struct Manifest {
 /// The validated corpus plus the directory its query files live in.
 pub struct Corpus {
     pub dir: PathBuf,
+    /// The manifest's `corpus_version` — recorded in every run's meta so a run
+    /// made against an amended corpus stays distinguishable.
+    pub corpus_version: u32,
     pub queries: Vec<QueryDef>,
 }
 
@@ -188,6 +211,7 @@ impl Corpus {
             .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
         let corpus = Self {
             dir: dir.to_path_buf(),
+            corpus_version: manifest.corpus_version,
             queries: manifest.queries,
         };
         corpus.validate()?;
@@ -306,6 +330,27 @@ mod tests {
         }
     }
 
+    /// The determinism amendment (§5): the nondeterministic-selection queries
+    /// carry `hash_gate = rows_only`; everything else defaults to `Full` (exact
+    /// hash). A default-constructed gate is `Full`.
+    #[test]
+    fn rows_only_hash_gate_marks_nondeterministic_limits() {
+        assert_eq!(HashGate::default(), HashGate::Full);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+        let corpus = Corpus::load(&dir).expect("corpus loads");
+        let rows_only: BTreeSet<&str> = corpus
+            .queries
+            .iter()
+            .filter(|q| q.hash_gate == HashGate::RowsOnly)
+            .map(|q| q.id.as_str())
+            .collect();
+        let expected: BTreeSet<&str> =
+            ["q015", "q016", "q028", "q029", "q031", "q045", "q048", "q049", "q053"]
+                .into_iter()
+                .collect();
+        assert_eq!(rows_only, expected, "rows_only set must match the §5 audit");
+    }
+
     #[test]
     fn expected_status_defaults_to_ok() {
         // A query with no `expected_status` key is expected `ok` on both kinds.
@@ -337,9 +382,11 @@ mod tests {
             timeout_s: 120,
             subsets: vec!["smoke".to_string()],
             expected_status: ExpectedStatus::default(),
+            hash_gate: HashGate::default(),
         };
         let corpus = Corpus {
             dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus"),
+            corpus_version: 2,
             queries: vec![q.clone(), q],
         };
         assert!(corpus.validate().is_err(), "duplicate ids must be rejected");

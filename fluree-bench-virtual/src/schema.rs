@@ -49,6 +49,11 @@ pub struct RunMeta {
     /// The subset filter applied, if any (e.g. `"smoke"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subset: Option<String>,
+    /// The corpus manifest's `corpus_version` this run executed against, so a run
+    /// made before/after a mid-flight corpus amendment stays distinguishable.
+    /// Defaults to `0` for older runs missing the field.
+    #[serde(default)]
+    pub corpus_version: u32,
     /// A survey run is informational — capped and rate-limited (typically the
     /// live SF20 stress subset) and is **never a gate**: `bless` refuses it and
     /// `check` skips it. Defaults to `false` for older runs missing the field.

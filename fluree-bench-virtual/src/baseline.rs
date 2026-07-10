@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::corpus::{Corpus, ExpectedOutcome};
+use crate::corpus::{Corpus, ExpectedOutcome, HashGate};
 use crate::schema::{Counters, RunMeta, RunRecord, Status};
 
 pub const EXPECTED_SCHEMA_VERSION: u32 = 1;
@@ -207,12 +207,16 @@ pub enum HashCheck {
     NoExpected,
     /// The record is a non-ok status, so there's no hash to compare.
     NotApplicable,
+    /// A `Full`-gated query whose result hash changed.
     Mismatch { expected: String, observed: String },
+    /// A `RowsOnly`-gated query (nondeterministic-selection LIMIT) whose row
+    /// count changed — the hash is deliberately not compared for these.
+    RowsMismatch { expected: usize, observed: usize },
 }
 
 impl HashCheck {
     pub fn is_fail(&self) -> bool {
-        matches!(self, Self::Mismatch { .. })
+        matches!(self, Self::Mismatch { .. } | Self::RowsMismatch { .. })
     }
 }
 
@@ -251,22 +255,37 @@ pub fn over_budget(baseline_ms: u64, observed_ms: u64, budget_pct: f64) -> bool 
 }
 
 /// Pure comparison of one record against its blessed oracle + perf entry, under a
-/// budget. `budget_pct == None` means advisory (cold): a ratio is reported but
-/// `violated` is always false.
+/// budget. `hash_gate` selects the correctness check: `Full` compares the result
+/// hash; `RowsOnly` (a nondeterministic-selection LIMIT — any k rows are valid)
+/// compares only the row count. `budget_pct == None` means advisory (cold): a
+/// ratio is reported but `violated` is always false.
 pub fn compare_one(
     record: &RunRecord,
     expected: Option<&ExpectedEntry>,
     perf: Option<&PerfEntry>,
     budget_pct: Option<f64>,
+    hash_gate: HashGate,
 ) -> CompareOutcome {
     // Correctness.
     let hash = match expected {
         None => HashCheck::NoExpected,
         Some(_) if record.status != Status::Ok => HashCheck::NotApplicable,
-        Some(e) if e.result_hash == record.result_hash => HashCheck::Pass,
-        Some(e) => HashCheck::Mismatch {
-            expected: e.result_hash.clone(),
-            observed: record.result_hash.clone(),
+        Some(e) => match hash_gate {
+            HashGate::RowsOnly => {
+                if e.rows == record.rows {
+                    HashCheck::Pass
+                } else {
+                    HashCheck::RowsMismatch {
+                        expected: e.rows,
+                        observed: record.rows,
+                    }
+                }
+            }
+            HashGate::Full if e.result_hash == record.result_hash => HashCheck::Pass,
+            HashGate::Full => HashCheck::Mismatch {
+                expected: e.result_hash.clone(),
+                observed: record.result_hash.clone(),
+            },
         },
     };
 
@@ -349,7 +368,7 @@ mod tests {
             cold_wall_ms: None,
             counters: Counters::default(),
         };
-        let o = compare_one(&r, Some(&e), Some(&p), Some(20.0));
+        let o = compare_one(&r, Some(&e), Some(&p), Some(20.0), HashGate::Full);
         assert_eq!(o.hash, HashCheck::Pass);
         assert!(!o.perf.unwrap().violated, "110 vs 100 is within 20%");
     }
@@ -363,9 +382,25 @@ mod tests {
             cold_wall_ms: None,
             counters: Counters::default(),
         };
-        let o = compare_one(&r, Some(&e), Some(&p), Some(20.0));
+        let o = compare_one(&r, Some(&e), Some(&p), Some(20.0), HashGate::Full);
         assert!(o.hash.is_fail());
         assert!(o.perf.unwrap().violated, "200 vs 100 is 100% over a 20% budget");
+    }
+
+    #[test]
+    fn rows_only_gate_ignores_hash_and_checks_rows() {
+        // A rows_only query: different hash but same row count → PASS.
+        let mut r = rec("q029", "virtual-sf01", "hot", "DIFFERENT_HASH", 100);
+        r.rows = 100;
+        let mut e = expected("q029", "NATIVE_HASH");
+        e.rows = 100;
+        let o = compare_one(&r, Some(&e), None, Some(20.0), HashGate::RowsOnly);
+        assert_eq!(o.hash, HashCheck::Pass, "rows_only ignores the hash difference");
+        // Same query, wrong row count → RowsMismatch (a fail).
+        r.rows = 99;
+        let o = compare_one(&r, Some(&e), None, Some(20.0), HashGate::RowsOnly);
+        assert!(matches!(o.hash, HashCheck::RowsMismatch { .. }));
+        assert!(o.hash.is_fail());
     }
 
     #[test]
@@ -378,7 +413,7 @@ mod tests {
             counters: Counters::default(),
         };
         // budget None == advisory.
-        let o = compare_one(&r, Some(&e), Some(&p), None);
+        let o = compare_one(&r, Some(&e), Some(&p), None, HashGate::Full);
         let perf = o.perf.unwrap();
         assert_eq!(perf.baseline_ms, 1000, "cold compares against cold baseline");
         assert!(!perf.violated, "cold is advisory");
@@ -387,7 +422,7 @@ mod tests {
     #[test]
     fn no_expected_file_is_not_a_fail() {
         let r = rec("q043", "virtual-sf01", "hot", "H", 100);
-        let o = compare_one(&r, None, None, Some(20.0));
+        let o = compare_one(&r, None, None, Some(20.0), HashGate::Full);
         assert_eq!(o.hash, HashCheck::NoExpected);
         assert!(!o.hash.is_fail());
     }
