@@ -3,7 +3,7 @@
 **Date:** 2026-07-10
 **Branch:** `bench/virtual-dataset-corpus` (worktree `db-vbench`), at `a5528e880`
 **Scope:** Every performance strategy on the SPARQL/FQL → R2RML → Iceberg virtual-dataset read path: pattern rewriting (`fluree-db-query/src/r2rml/`), the correlated scan operator, the Iceberg Parquet reader + pruning (`fluree-db-iceberg/`), and the REST/moka/disk cache tiers (`fluree-db-api/src/graph_source/`, `fluree-db-core/src/disk_cache.rs`).
-**Method:** Every load-bearing claim was read directly against source in this worktree and is tagged `[verified <file:line>]`. Where a claim in the source inventory was wrong or imprecise, it is corrected here and flagged in §0. Line numbers are current as of `a5528e880`.
+**Method:** Every load-bearing claim was read directly against source in this worktree and is tagged `[verified <file:line>]`. Where a claim in the source inventory was wrong or imprecise, it is corrected here and flagged in §0. The claims that drive the roadmap ranking (H1, H2, H5, and the §0 corrections) additionally survived an **adversarial second pass** — an attempt to *falsify* each rather than re-confirm it (§0.1 records what that pass changed). Line numbers are current as of `a5528e880`.
 
 This document is the reference substrate for `02-hypothesis-map.md` (H1–H8) and the perf roadmap that follows. Precision over prose: cite the anchor, not the vibe.
 
@@ -11,12 +11,12 @@ This document is the reference substrate for `02-hypothesis-map.md` (H1–H8) an
 
 ## 0. Corrections to the source inventory (read first)
 
-The exploration pass that seeded this document made seven claims that verification changed. Four are **substantive** (a wrong name, a wrong "never," a wrong symbol location, a wrong API shape); three are **location** fixes that matter because the roadmap will edit these exact sites. The strategy semantics are otherwise sound.
+The exploration pass that seeded this document made seven claims that verification changed. Three are **substantive** (a wrong name, a wrong symbol location, a wrong API shape); three are **location** fixes that matter because the roadmap will edit these exact sites; one (C2) is a **refinement that leaves the original claim standing** for a sharper reason than stated. The strategy semantics are otherwise sound.
 
 | # | Claim as received | Correction | Anchor |
 |---|---|---|---|
 | C1 **(substantive)** | Wildcard/class-fusion kill switch is `FLUREE_R2RML_WILDCARD_CLASS_FUSION` | The env var is **`FLUREE_R2RML_CRAWL_CLASS_FUSION`**. The reader fn is *named* `wildcard_class_fusion_enabled()` but reads the `CRAWL` var; it is also read (coupled with crawl-expand) in `crawl.rs`. A/B scripts using the received name would be **no-ops**. | `rewrite.rs:634`; `crawl.rs:335` |
-| C2 **(substantive)** | `!=` never prunes | `!=` **can** prune a row group in the degenerate case where the group's `min == max == excluded literal`. Two different code paths are involved and the received claim conflated them: the FILTER→pushdown collector refuses to *emit* a `!=` scan filter (`cmp_op` returns `None`), **but** a `!=` `ScanFilter` that reaches the reader (e.g. an equality-shaped `NotEq`) is prunable by the row-group engine. | prune: `pruning.rs:192-196`; refuse-to-emit: `rewrite.rs:452`; passthrough: `r2rml.rs:88` |
+| C2 **(refined — claim stands)** | `!=` never prunes | **Correct on the R2RML path** — and for a sharper reason than the phrasing implied. No `!=` scan filter is ever *produced*: `cmp_op` returns `None` for `!=` (`rewrite.rs:452`) and `build_scan_filters` emits **only** `ScanCmpOp::Eq` (`operator.rs:443, 469`). The shared pruning engine *does* support a degenerate `!=` prune (`min==max==lit`, `pruning.rs:192-196`) and `build_iceberg_filter` maps `NotEq→NotEq` (`r2rml.rs:88`), but **both are unreachable from R2RML** (no producer). My first pass wrongly implied `!=` pruning was live here; the adversarial pass (grep for `ScanCmpOp::NotEq` producers) found none. | produce-nothing: `rewrite.rs:452`, `operator.rs:443,469`; dead branches: `pruning.rs:192-196`, `r2rml.rs:88` |
 | C3 **(substantive)** | `ScanValue = Int/Bool/Date/Str ONLY`, defined near `pruning.rs` | `ScanValue` lives in **`fluree-db-query/src/r2rml/provider.rs:43-56`** and has **five** variants: `Bool`, `Int(i64)`, `Date(i32)`, `Str(String)`, **`TemplateKey(String)`**. The "no Decimal / no Double" point holds (both are operator-only); `TemplateKey` (reversed subject-key) was omitted. | `provider.rs:43-56` |
 | C4 **(substantive)** | Per-query snapshot pin via `IcebergCatalogSession.load_tables` *method* | `load_tables` is a **field** (`Mutex<HashMap<..>>`), not a method. The pin is served by `cached_load_table` / `store_load_table` / `pinned_metadata_location`. Behavior: the `metadata_location` is pinned on the **first** store and never changed; a later store (creds refresh) mutates **only** `credentials`. | `catalog_session.rs:88, 99, 115, 131` |
 | C5 *(location)* | `scan_table_inner` spans `r2rml.rs:754-859` | `scan_table_inner` starts at **`r2rml.rs:688`** and runs to ~1220; `754-859` is only the REST-catalog arm inside it. The three-tier dispatch is at `792-796`. | `r2rml.rs:688, 792-796` |
@@ -26,6 +26,14 @@ The exploration pass that seeded this document made seven claims that verificati
 Additionally, the received env-switch list was **incomplete**. Five switches that gate this pathway were missing; they are added to the master table in §13: `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS`, `FLUREE_ICEBERG_LOADTABLE_CACHE`, `FLUREE_ICEBERG_SCAN_CONCURRENCY`, `FLUREE_R2RML_CRAWL_EXPAND`, and the corrected `FLUREE_R2RML_CRAWL_CLASS_FUSION`.
 
 One consistency note for A/B tooling: the fused-aggregate switch matches **exactly** `Ok("0" | "false")` (`fused_aggregate.rs:283-286`), while every other R2RML switch trims + lowercases and also accepts `off` (and, for crawl fusion, `no`). `FLUREE_FUSED_R2RML_AGG=off` or `=FALSE ` therefore does **not** disable the fused aggregate.
+
+### 0.1 What the adversarial pass changed
+
+Four load-bearing claims were stress-tested by trying to break them. Two survived unchanged and stronger, one was refined (C2, above), one had its memory characterization corrected:
+
+- **H1 decode wall — survived, stronger.** `with_row_filter` / `RowSelection` appear **only in comments** across the whole `fluree-db-iceberg` crate (`arrow_reader.rs:10, 136-137`); grep finds **zero** call sites. There is no conditional or flagged row-level-filter path — the decode wall is unconditional.
+- **H2 budget absorb — survived, but "fully materialize" was wrong for ORDER BY.** `ORDER BY … LIMIT k` is compiled to a **streaming top-k** `SortOperator` (bounded heap of `k` (+offset) rows), not a full sort buffer (`operator_tree.rs:3308-3345`, `SortOperator::new_topk` `:3316, 3339`). But top-k **forwards no budget** (no `set_row_budget` in `sort.rs`) and *must* see every input row to rank, so the R2RML scan below is **still fully drained** — H2's scan-cost claim holds; only §12's memory wording is corrected. The native order/limit fast paths (`fast_star_const_order_topk.rs`, `fast_post_order_limit.rs`) are `fast_path_store`-gated (native binary-index only, `fast_star_const_order_topk.rs:50`) and never fire on an Iceberg source, so they don't rescue this case. See §12 for the resulting **fixable-vs-scan-bound** split of the four modifiers.
+- **H5 COUNT gap — survived.** The `R2rmlTableProvider` trait exposes **only** `scan_table` (`provider.rs:150-171`) — no count / row-count entrypoint. The `estimated_row_count` values (`r2rml.rs:1069-1149`) are scan-plan estimates for logging and window sizing, **not** a COUNT answer. There is no shortcut to miss.
 
 ---
 
@@ -138,7 +146,7 @@ Underneath, a `rest_clients` moka caches the authenticated client itself: **max 
 - **Double/Float** → operator-only (`rewrite.rs:502`) and, even if a stat survived, `stat_bounds` has **no** Float32/Float64 arm → `_ => (None,None)` `[verified pruning.rs:319]` (conservative keep).
 - **Date** pushed only against a physically-`date` column, else skipped `[verified r2rml.rs:102-105]`.
 - **Int** outside i32 on an `int` column skipped (no silent `as`-wrap) `[verified r2rml.rs:110-114]`; `TemplateKey` int→int/long/decimal, string→string, else skip `[verified r2rml.rs:127-138]`.
-- **`!=`** (C2): the FILTER path never *emits* it (`cmp_op` `rewrite.rs:452`), but a `NotEq` that reaches the reader **can** prune when `min==max==literal` `[verified pruning.rs:192-196]`; `build_iceberg_filter` does forward `NotEq` `[verified r2rml.rs:88]`.
+- **`!=`** (C2): never prunes on this path — no `NotEq` scan filter is ever produced (`cmp_op` returns `None` `[verified rewrite.rs:452]`; `build_scan_filters` emits only `Eq` `[verified operator.rs:443, 469]`). The engine's degenerate-`!=` prune (`min==max==lit` `[verified pruning.rs:192-196]`) and `build_iceberg_filter`'s `NotEq` arm `[verified r2rml.rs:88]` exist but are unreachable from R2RML (no producer).
 
 **The decode wall (H1's root).** Arrow's `with_row_filter` / `RowSelection` is **deliberately unused**: `RowSelection.skip_records` panics on Snowflake's `DELTA_BINARY_PACKED` integer columns in parquet-rs 54 (`DeltaBitPackDecoder::skip`) `[verified arrow_reader.rs:135-143]`. Consequence: **every surviving row group is fully decoded**, then masked (`:186-191`). Pruning operates at row-group granularity only; there is no row-level skip. The in-engine `FILTER` stays authoritative for correctness.
 
@@ -237,11 +245,18 @@ Underneath, a `rest_clients` moka caches the authenticated client itself: **max 
 
 ## 12. Strategy 11 — ORDER BY / GROUP BY / DISTINCT (generic, non-R2RML-aware)
 
-**What it does — and doesn't.** These sit as generic engine operators **above** the scan and are **not** R2RML-aware. `SortOperator` and `GroupAggregateOperator` fully materialize; `DistinctOperator` streams a per-row dedup but drains its input `[verified distinct.rs:132-153]`. **None overrides `set_row_budget`** (grep-confirmed, §5), so each is a budget sink: a `LIMIT` above them cannot early-terminate the R2RML scan below.
+**What it does — and doesn't.** These sit as generic engine operators **above** the scan and are **not** R2RML-aware. **None overrides `set_row_budget`** (grep-confirmed, §5), so each is a budget sink: a `LIMIT` above them cannot early-terminate the R2RML scan below. The memory footprint varies (`ORDER BY … LIMIT` is a bounded top-k heap, not a full sort buffer — `operator_tree.rs:3308-3345`, `[verified sort.rs:544 new_topk]`), but the **scan is fully drained in every case**.
 
-This is the structural reason H2 dominates the BI workload: the common analytical shape (`ORDER BY … LIMIT`, `SELECT DISTINCT … LIMIT`, `GROUP BY … LIMIT`) places a budget-absorbing operator between the LIMIT and the fact scan.
+This is the structural reason H2 dominates the BI workload: the common analytical shape (`ORDER BY … LIMIT`, `SELECT DISTINCT … LIMIT`, `GROUP BY … LIMIT`, `UNION … LIMIT`) places a budget-absorbing operator between the LIMIT and the fact scan. But the four modifiers are **not equally hard to fix** — an adversarial look splits them:
 
-**Kill switch.** None (generic operators). The relevant lever is §5's `FLUREE_R2RML_LIMIT_PUSHDOWN` for A/B on the pure row-preserving chain.
+| Modifier | Why the scan is full today | Roadmap tractability |
+|---|---|---|
+| `ORDER BY … LIMIT` | Top-k heap `[sort.rs:544]` must see **every** row to rank; forwards no budget | **Scan-bound.** Not budget-fixable — needs a scan-side top-k (heap pushed into the reader on a pushable sort key) or pre-sorted input |
+| `GROUP BY … LIMIT` | Must see every row to form groups (unless sorted by group key) | **Scan-bound** (except the single-table fused-agg case, §11) |
+| `SELECT DISTINCT … LIMIT` | `DistinctOperator` drains its child `[verified distinct.rs:132-153]`; no budget | **Tractable** — a distinct-aware budget could stop after `k` distinct rows are emitted |
+| `UNION … LIMIT` | `UnionOperator` absorbs; branches are individually row-preserving | **Tractable** — the budget could be forwarded to each branch |
+
+**Kill switch.** None (generic operators). The relevant lever is §5's `FLUREE_R2RML_LIMIT_PUSHDOWN` for A/B on the pure row-preserving chain (the control that isolates budget *plumbing* from the modifier *sink*).
 
 ---
 

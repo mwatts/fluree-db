@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-10
 **Branch:** `bench/virtual-dataset-corpus` (worktree `db-vbench`), at `a5528e880`
-**Companion:** `01-pathway-inventory.md` — every mechanism below cites an inventory strategy (§N) and its `[verified file:line]` anchors. Read that first.
+**Companion:** `01-pathway-inventory.md` — every mechanism below cites an inventory strategy (§N) and its `[verified file:line]` anchors. Read that first; its §0.1 records the adversarial pass that stress-tested H1, H2, and H5 (H1 and H5 survived unchanged; H2's *scan-cost* claim survived but its ORDER-BY *memory* claim was corrected to a bounded top-k heap — reflected below).
 
 This map states, for each hypothesis: the **mechanism** (which strategy's presence or absence creates the cost), **why it should dominate**, the **benchmark evidence** that would confirm or refute it (with the specific span/counter and the A/B lever), and the **query shapes** that exercise it. The shapes are catalogued in §H0 and referenced by tag (e.g. `Q-BI-ORDER`). Hypotheses are ranked by expected share of wall-time on the BI corpus; H1 and H2 are the two we expect to dominate.
 
@@ -35,7 +35,7 @@ Scale axis for every shape: **SF01** (dev) vs **SF20** (stress; ~7,670 files/fac
 
 ## H1 — Fact-scan decode wall
 
-**Mechanism.** §6: the Arrow reader **cannot** apply a row-level filter — `RowSelection.skip_records` panics on Snowflake `DELTA_BINARY_PACKED` columns (parquet-rs 54), so `with_row_filter` is deliberately unused `[arrow_reader.rs:135-143]`. Pruning is row-group-granular only `[send_parquet.rs:64-88]`; every **surviving** row group is fully decoded, then masked `[arrow_reader.rs:186-191]`. At SF20 a fact table is ~7,670 files; a selective predicate that survives at row-group granularity still forces a full decode of each surviving group.
+**Mechanism.** §6: the Arrow reader **cannot** apply a row-level filter — `RowSelection.skip_records` panics on Snowflake `DELTA_BINARY_PACKED` columns (parquet-rs 54), so `with_row_filter` is deliberately unused `[arrow_reader.rs:135-143]`. The adversarial pass confirmed `with_row_filter`/`RowSelection` have **zero call sites** in the crate (comments only), so this is unconditional — there is no flagged fast path. Pruning is row-group-granular only `[send_parquet.rs:64-88]`; every **surviving** row group is fully decoded, then masked `[arrow_reader.rs:186-191]`. At SF20 a fact table is ~7,670 files; a selective predicate that survives at row-group granularity still forces a full decode of each surviving group.
 
 **Why it should dominate.** Fact scans are the largest data movement on the path, and decode (not I/O, not materialize) is where the CPU goes when a filter can't shrink the row set pre-decode. Per-file fixed overhead (footer parse, column-chunk setup) compounds ~7,670× at SF20. This is the single most physical cost on the pathway and the hardest to design around.
 
@@ -50,6 +50,8 @@ Scale axis for every shape: **SF01** (dev) vs **SF20** (stress; ~7,670 files/fac
 ## H2 — Budget-swallowing modifiers (the dominant BI shape)
 
 **Mechanism.** §5 + §12: `set_row_budget` is ABSORB-by-default `[operator.rs:98]`, forwarded only through `Limit`/`Offset`/`Project`/`Graph`. `SortOperator`, `DistinctOperator`, `GroupAggregateOperator`, `UnionOperator` have **zero** overrides (grep-confirmed), and `join.rs` absorbs `[join.rs:1114-1127]`. So `ORDER BY` / `DISTINCT` / `GROUP BY` / `UNION` between a `LIMIT` and an R2RML scan turns `LIMIT k` into a **full scan** — the budget never reaches `operator.rs:1957-1985`.
+
+*Adversarial refinement (does not change the ranking):* `ORDER BY … LIMIT` is compiled to a **streaming top-k** heap, not a full sort buffer (`operator_tree.rs:3308-3345`, `sort.rs:544`), so its *memory* is bounded — but top-k must see every input row and forwards no budget, so the **scan is still full**. The native order/limit fast paths are `fast_path_store`-gated (native-index only) and never fire on Iceberg. The four modifiers are **not equally fixable** (inventory §12): `ORDER BY`/`GROUP BY` are genuinely scan-bound (must see all rows), while `DISTINCT`/`UNION` *could* early-terminate but don't — a distinction the roadmap should exploit.
 
 **Why it should dominate.** This is the **most common BI shape**: dashboards issue `ORDER BY measure DESC LIMIT 10`, `SELECT DISTINCT dim LIMIT 50`, `GROUP BY dim … LIMIT`. Each pattern-matches exactly onto a budget-absorbing operator sitting above a fact scan. The user asked for 10 rows; the engine scanned 550M. The 165.7 s `Store ⋈ Geography LIMIT 10` baseline is the signature.
 
