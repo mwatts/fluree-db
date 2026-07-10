@@ -148,6 +148,7 @@ pub fn print_table(meta: &RunMeta, records: &[RunRecord]) {
             Status::Ok => r.virtual_ms.to_string(),
             Status::Dnf => format!("{} DNF", r.virtual_ms),
             Status::Error => "ERR".to_string(),
+            Status::ExpectedError => "xERR".to_string(),
         };
         let hash = match r.hash_match {
             Some(true) => "ok".to_string(),
@@ -179,6 +180,7 @@ fn print_native_only(_meta: &RunMeta, records: &[RunRecord]) {
             Status::Ok => "ok",
             Status::Dnf => "dnf",
             Status::Error => "error",
+            Status::ExpectedError => "xerror",
         };
         println!(
             "{:<8} {:<16} {:>10} {:>8} {:>6}",

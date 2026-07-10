@@ -279,7 +279,8 @@ fn cmd_run(
                 reps,
                 keep_heads,
             };
-            let record = engine.run_query(&fluree, target, &q.id, &sparql, &params);
+            let expected = q.expected_status.for_target(target.is_virtual());
+            let record = engine.run_query(&fluree, target, &q.id, &sparql, &params, expected);
             log_progress(q, &record);
             check_expectations(q, &record);
             writer.write(&Line::Record(record))?;
@@ -306,6 +307,7 @@ fn cmd_exec_one(
     let engine = Engine::new()?;
     let fluree = engine.open(&target)?;
     let sparql = corpus.read_query(q)?;
+    let expected = q.expected_status.for_target(target.is_virtual());
     let record = engine.exec_one(
         &fluree,
         &target,
@@ -313,6 +315,7 @@ fn cmd_exec_one(
         &sparql,
         Duration::from_secs(q.timeout_s),
         keep_heads,
+        expected,
     );
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
@@ -334,6 +337,7 @@ fn log_progress(q: &corpus::QueryDef, record: &RunRecord) {
         Status::Ok => "ok",
         Status::Dnf => "DNF",
         Status::Error => "ERR",
+        Status::ExpectedError => "xERR",
     };
     let missing = if record.spans_missing.is_empty() {
         String::new()

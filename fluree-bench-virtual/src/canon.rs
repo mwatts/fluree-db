@@ -44,6 +44,38 @@ impl Canonical {
     }
 }
 
+/// Canonicalize a query result, dispatching on shape: a JSON-LD graph
+/// (`{"@graph":[...]}` or a bare node array — CONSTRUCT/DESCRIBE) is a node
+/// multiset; anything else is SPARQL-results JSON (SELECT/ASK).
+pub fn canonicalize(doc: &Value) -> Canonical {
+    if doc.get("@graph").is_some() || doc.is_array() {
+        canonicalize_graph(doc)
+    } else {
+        canonicalize_sparql_json(doc)
+    }
+}
+
+/// Canonicalize a JSON-LD graph: each `@graph` node is one canonical row (its
+/// key-ordered serialization), so `rows` is the node count and the hash is an
+/// order-independent multiset over nodes. The CONSTRUCT formatter already sorts
+/// the graph, so serialization is deterministic within one engine. Full
+/// cross-engine RDF isomorphism (blank-node relabeling) is a later refinement —
+/// native-vs-virtual CONSTRUCT hash equality is not yet asserted, only the
+/// node count and single-engine hash stability.
+fn canonicalize_graph(doc: &Value) -> Canonical {
+    let nodes: Vec<Value> = doc
+        .get("@graph")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| doc.as_array().cloned())
+        .unwrap_or_default();
+    let rows: Vec<String> = nodes
+        .iter()
+        .map(|n| serde_json::to_string(n).unwrap_or_default())
+        .collect();
+    finish(rows)
+}
+
 /// Canonicalize a SPARQL-results-JSON document (SELECT or ASK).
 pub fn canonicalize_sparql_json(doc: &Value) -> Canonical {
     // ASK: a single boolean.
@@ -247,6 +279,26 @@ mod tests {
             canonicalize_sparql_json(&bound).hash,
             canonicalize_sparql_json(&unbound).hash
         );
+    }
+
+    #[test]
+    fn construct_graph_counts_nodes_and_is_order_independent() {
+        // A CONSTRUCT/DESCRIBE JSON-LD graph: rows == @graph node count, and the
+        // multiset hash ignores node order.
+        let a = json!({"@graph": [
+            {"@id":"http://x/1","http://p":"a"},
+            {"@id":"http://x/2","http://p":"b"},
+        ]});
+        let b = json!({"@graph": [
+            {"@id":"http://x/2","http://p":"b"},
+            {"@id":"http://x/1","http://p":"a"},
+        ]});
+        let ca = canonicalize(&a);
+        assert_eq!(ca.rows, 2, "two graph nodes");
+        assert_eq!(ca.hash, canonicalize(&b).hash, "node order must not affect the hash");
+        // A SELECT doc still routes to the tabular canonicalizer.
+        let sel = sparql_doc(&["v"], vec![json!({"v":{"type":"uri","value":"http://x/1"}})]);
+        assert_eq!(canonicalize(&sel).rows, 1);
     }
 
     #[test]

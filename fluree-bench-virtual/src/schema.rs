@@ -73,6 +73,12 @@ pub enum Status {
     Error,
     /// Did-not-finish: hit the per-query deadline.
     Dnf,
+    /// Failed with an engine error, but the manifest declared this query is
+    /// *expected* to error on this target kind (e.g. the R2RML router rejects a
+    /// lang-tagged / custom-datatype bound object with a whole-GRAPH-scope error).
+    /// Counts as a pass for gating. See `corpus::ExpectedStatus`.
+    #[serde(rename = "expected_error")]
+    ExpectedError,
 }
 
 /// Aggregated timing for one span name across a single execution.

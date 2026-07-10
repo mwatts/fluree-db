@@ -1,0 +1,7 @@
+# q043 langtag_object_error
+# Intent: Error-boundary: a lang-tagged bound object is unconvertible; the R2RML router fails the whole GRAPH scope on virtual. On native it simply matches nothing (0 rows).
+# BI lineage (BI-20): "Find a customer by a language-tagged name (a query an LLM might emit)."
+# Predicates verified against enterprise.ttl — DimCustomer: name (lang-tagged object).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?c
+WHERE { ?c a edw:Customer ; edw:name "Aziz"@fr . }

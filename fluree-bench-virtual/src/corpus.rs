@@ -13,18 +13,87 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Closed set of pathway tags. Adding a query pathway means adding a variant
-/// here — an unknown tag in the manifest is a load error, not a silent pass.
+/// Closed set of pathway tags (the SPARQL-feature enum from
+/// `docs/audit/2026-07-virtual-dataset-perf/03-corpus-design.md` §2). Adding a
+/// query pathway means adding a variant here — an unknown tag in the manifest is
+/// a load error, not a silent pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tag {
     BgpStar,
     Join,
+    FkChain,
     FilterRange,
-    OrderBy,
-    GroupBy,
+    FilterString,
+    FilterDate,
+    /// IRI / `=` / `IN` equality on a term-typed value (distinct from lexical
+    /// `FilterString` and numeric/date `FilterRange`).
+    FilterIri,
+    Optional,
+    Union,
     Aggregate,
     Count,
+    GroupBy,
+    Having,
+    OrderBy,
+    Distinct,
+    Subquery,
+    Values,
+    Negation,
+    PropertyPath,
+    Construct,
+}
+
+/// A per-target-kind expected terminal outcome. Defaults to [`Self::Ok`], so a
+/// query with no `expected_status` in the manifest is expected to succeed
+/// everywhere (the common case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpectedOutcome {
+    Ok,
+    Error,
+}
+
+impl Default for ExpectedOutcome {
+    fn default() -> Self {
+        Self::Ok
+    }
+}
+
+/// Optional per-target-kind expected status. The error-boundary queries (a
+/// lang-tagged / custom-datatype bound object) return **0 rows on the native
+/// materialized ledger** but **error on a virtual R2RML target** (the router
+/// fails the whole GRAPH scope), so a single `expected_rows` cannot describe
+/// both. When present, an `Error` outcome that matches the expectation for the
+/// running target's kind is recorded as [`crate::schema::Status::ExpectedError`]
+/// (a gating pass) rather than [`crate::schema::Status::Error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedStatus {
+    #[serde(default)]
+    pub native: ExpectedOutcome,
+    /// `virtual` is a Rust keyword, hence the trailing underscore + serde rename.
+    #[serde(default, rename = "virtual")]
+    pub virtual_: ExpectedOutcome,
+}
+
+impl Default for ExpectedStatus {
+    fn default() -> Self {
+        Self {
+            native: ExpectedOutcome::Ok,
+            virtual_: ExpectedOutcome::Ok,
+        }
+    }
+}
+
+impl ExpectedStatus {
+    /// The expected outcome for a target of the given kind.
+    pub fn for_target(&self, is_virtual: bool) -> ExpectedOutcome {
+        if is_virtual {
+            self.virtual_
+        } else {
+            self.native
+        }
+    }
 }
 
 /// Whether row-order carries meaning for a query (metadata only — the result
@@ -82,6 +151,9 @@ pub struct QueryDef {
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
     pub subsets: Vec<String>,
+    /// Per-target-kind expected status. Absent ⇒ expected `ok` everywhere.
+    #[serde(default)]
+    pub expected_status: ExpectedStatus,
 }
 
 impl QueryDef {
@@ -192,9 +264,54 @@ mod tests {
     fn shipped_corpus_is_valid() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
-        assert_eq!(corpus.queries.len(), 5, "seed corpus has five queries");
-        // Every seed query is in the smoke subset.
-        assert_eq!(corpus.select(Some("smoke")).len(), 5);
+        assert_eq!(
+            corpus.queries.len(),
+            54,
+            "full corpus has 54 queries (design Q01-Q54)"
+        );
+        // The smoke subset is a cheap, dims-heavy cover of every feature tag.
+        let smoke = corpus.select(Some("smoke"));
+        assert!(
+            (12..=18).contains(&smoke.len()),
+            "smoke is a ~12-15 query cover, got {}",
+            smoke.len()
+        );
+        // `validate()` already guarantees smoke covers every tag; assert the
+        // load-bearing count so a future trim can't silently shrink coverage.
+        let smoke_tags: BTreeSet<Tag> = corpus
+            .queries
+            .iter()
+            .filter(|q| q.in_subset("smoke"))
+            .flat_map(|q| q.tags.iter().copied())
+            .collect();
+        assert_eq!(smoke_tags.len(), 20, "smoke must exercise all 20 feature tags");
+    }
+
+    /// The error-boundary queries declare `expected_status.virtual = error`
+    /// (they succeed with 0 rows on native, error on a virtual R2RML target).
+    #[test]
+    fn error_boundary_queries_declare_virtual_error() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+        let corpus = Corpus::load(&dir).expect("corpus loads");
+        let boundary: Vec<&QueryDef> = corpus
+            .queries
+            .iter()
+            .filter(|q| q.expected_status.for_target(true) == ExpectedOutcome::Error)
+            .collect();
+        assert_eq!(boundary.len(), 2, "exactly the two lang-tag/custom-datatype probes");
+        for q in boundary {
+            // Native still expects success (0 rows), so its bound must admit 0.
+            assert_eq!(q.expected_status.for_target(false), ExpectedOutcome::Ok);
+            assert!(q.expected_rows.contains(0), "{} native-expects 0 rows", q.id);
+        }
+    }
+
+    #[test]
+    fn expected_status_defaults_to_ok() {
+        // A query with no `expected_status` key is expected `ok` on both kinds.
+        let es = ExpectedStatus::default();
+        assert_eq!(es.for_target(true), ExpectedOutcome::Ok);
+        assert_eq!(es.for_target(false), ExpectedOutcome::Ok);
     }
 
     #[test]
@@ -219,6 +336,7 @@ mod tests {
             order_sensitive: OrderSensitivity::None,
             timeout_s: 120,
             subsets: vec!["smoke".to_string()],
+            expected_status: ExpectedStatus::default(),
         };
         let corpus = Corpus {
             dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus"),

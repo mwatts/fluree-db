@@ -1,0 +1,8 @@
+# q034 manager_chain_path
+# Intent: Transitive property path (manager+). Observed-behavior probe: property paths are NOT lowered to R2RML on virtual targets; on native they traverse the graph.
+# BI lineage (BI-17): "Who is in each employee's full management chain?"
+# Predicates verified against enterprise.ttl — DimEmployee: name, manager (path manager+).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?en ?boss
+WHERE { ?e a edw:Employee ; edw:name ?en ; edw:manager+ ?boss . }
+LIMIT 5000

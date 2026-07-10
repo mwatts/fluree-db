@@ -1,0 +1,7 @@
+# q044 customtype_object_error
+# Intent: Error-boundary: a custom (non-XSD) datatype bound object is unconvertible; virtual fails the GRAPH scope. On native it matches nothing (0 rows).
+# BI lineage (BI-20): "Find a GL entry by a custom-datatype debit literal."
+# Predicates verified against enterprise.ttl — FactGlJournal: debitAmount (custom-datatype object).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?j
+WHERE { ?j a edw:GlJournalEntry ; edw:debitAmount "1000"^^<http://custom.example/money> . }

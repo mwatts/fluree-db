@@ -1,0 +1,8 @@
+# q045 orders_limit
+# Intent: Pure LIMIT over a fact (H2 positive control: budget reaches the scan, early-terminates on virtual).
+# BI lineage (BI-21): "Show me 10 orders."
+# Predicates verified against enterprise.ttl — FactOrder: orderId, orderTotal.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+LIMIT 10

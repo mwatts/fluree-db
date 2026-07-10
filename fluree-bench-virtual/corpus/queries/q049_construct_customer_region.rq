@@ -1,0 +1,9 @@
+# q049 construct_customer_region
+# Intent: CONSTRUCT over a dims-only join.
+# BI lineage (BI-22): "Emit current-customer -> region edges."
+# Predicates verified against enterprise.ttl — DimCustomer: isCurrent, geography; DimGeography: region.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+CONSTRUCT { ?c edw:inRegion ?region . }
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:geography ?g .
+        ?g edw:region ?region . }
+LIMIT 5000

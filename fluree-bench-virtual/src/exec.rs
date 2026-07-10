@@ -35,6 +35,7 @@ use fluree_bench_support::tracing::{span_name_filter, BenchSpanCapture};
 use fluree_db_api::{Fluree, FlureeBuilder, FormatterConfig, QueryExecutionOptions};
 use fluree_db_core::{QueryCancellation, QueryCancellationReason};
 
+use crate::corpus::ExpectedOutcome;
 use crate::schema::{Counters, RunRecord, Status};
 use crate::targets::Target;
 use crate::{canon, spans};
@@ -131,6 +132,7 @@ impl Engine {
         query_id: &str,
         sparql: &str,
         params: &RunParams,
+        expected: ExpectedOutcome,
     ) -> RunRecord {
         let is_virtual = target.is_virtual();
 
@@ -157,7 +159,7 @@ impl Engine {
             }
         }
 
-        self.build_record(query_id, target, is_virtual, "hot", outcomes)
+        self.build_record(query_id, target, is_virtual, "hot", outcomes, expected)
     }
 
     /// Single execution (no priming) — the cold-mode hook behind `exec-one`.
@@ -169,12 +171,20 @@ impl Engine {
         sparql: &str,
         timeout: Duration,
         keep_heads: bool,
+        expected: ExpectedOutcome,
     ) -> RunRecord {
         if target.is_virtual() {
             self.pace();
         }
         let outcome = self.exec_once(fluree, target, sparql, timeout, keep_heads);
-        self.build_record(query_id, target, target.is_virtual(), "cold", vec![outcome])
+        self.build_record(
+            query_id,
+            target,
+            target.is_virtual(),
+            "cold",
+            vec![outcome],
+            expected,
+        )
     }
 
     /// A trivial probe execution for `setup --verify`. Returns wall time and the
@@ -242,6 +252,15 @@ impl Engine {
 
         let is_virtual = target.is_virtual();
         let alias = target.alias.clone();
+        // A CONSTRUCT/DESCRIBE result is an RDF graph, not a solution table:
+        // SPARQL-JSON renders it as empty bindings, so format such queries as
+        // JSON-LD (`{"@graph":[...]}`) and let `canon` count/hash the nodes.
+        let graph_out = is_graph_query(sparql);
+        let fmt = if graph_out {
+            FormatterConfig::jsonld()
+        } else {
+            FormatterConfig::sparql_json()
+        };
 
         let start = Instant::now();
         let result = self.rt.block_on(async move {
@@ -251,7 +270,7 @@ impl Engine {
                 let builder = graph
                     .query()
                     .sparql(sparql)
-                    .format(FormatterConfig::sparql_json())
+                    .format(fmt)
                     .execution_options(exec_opts);
                 let builder = if is_virtual { builder.with_r2rml() } else { builder };
                 builder.execute_formatted().await
@@ -267,7 +286,7 @@ impl Engine {
 
         match result {
             Ok(Ok(doc)) => {
-                let canonical = canon::canonicalize_sparql_json(&doc);
+                let canonical = canon::canonicalize(&doc);
                 let rows = canonical.rows;
                 let heads = keep_heads.then(|| canonical.heads(HEADS));
                 let hash = canonical.hash;
@@ -323,6 +342,7 @@ impl Engine {
         is_virtual: bool,
         cache_state: &str,
         outcomes: Vec<Outcome>,
+        expected: ExpectedOutcome,
     ) -> RunRecord {
         debug_assert!(!outcomes.is_empty(), "at least one measured rep");
         let all_walls_ms: Vec<u64> = outcomes.iter().map(|o| ms(o.wall)).collect();
@@ -331,6 +351,15 @@ impl Engine {
         let median_pos = order[(outcomes.len() - 1) / 2];
         let chosen = &outcomes[median_pos];
         let spans_missing = spans::spans_missing(&chosen.counters, is_virtual);
+        // A hard engine error on a query the manifest declares is *expected* to
+        // error on this target kind is a gating pass, recorded as `ExpectedError`
+        // (not `Error`). A Dnf/Ok is left untouched — an "expected error" that
+        // instead timed out or returned rows is a real signal, not a pass.
+        let status = if chosen.status == Status::Error && expected == ExpectedOutcome::Error {
+            Status::ExpectedError
+        } else {
+            chosen.status
+        };
         RunRecord {
             query_id: query_id.to_string(),
             target: target.id.clone(),
@@ -339,7 +368,7 @@ impl Engine {
             reps: outcomes.len(),
             wall_ms: ms(chosen.wall),
             all_walls_ms,
-            status: chosen.status,
+            status,
             rows: chosen.rows,
             result_hash: chosen.hash.clone(),
             counters: chosen.counters.clone(),
@@ -353,6 +382,25 @@ impl Engine {
 /// Milliseconds of a `Duration`, saturating.
 fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whether a query's result is an RDF graph (CONSTRUCT/DESCRIBE) rather than a
+/// solution table. Such a query must be formatted as JSON-LD — SPARQL-JSON
+/// renders a graph as empty bindings. Scans past leading comments and
+/// `PREFIX`/`BASE` declarations to the first query keyword.
+fn is_graph_query(sparql: &str) -> bool {
+    for raw in sparql.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("PREFIX") || upper.starts_with("BASE") {
+            continue;
+        }
+        return upper.starts_with("CONSTRUCT") || upper.starts_with("DESCRIBE");
+    }
+    false
 }
 
 /// Extract the single scalar COUNT value from a `SELECT (COUNT(*) AS ?n)` result.
