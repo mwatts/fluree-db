@@ -474,7 +474,15 @@ fn parse_blank_node_label(input: &mut Input<'_>) -> ModalResult<TokenKind> {
 }
 
 /// Parse a blank node name (after `_:`).
+///
+/// Grammar: `BLANK_NODE_LABEL ::= '_:' (PN_CHARS_U | [0-9]) ((PN_CHARS | '.')*
+/// PN_CHARS)?` — interior dots (including consecutive ones, `_:a..b`) are
+/// label characters, but the label must not END in a dot. The scan stays
+/// deliberately greedy over `PN_CHARS | '.'` (one branch-light predicate per
+/// char, no lookahead); any trailing dots are then rewound so they lex as the
+/// statement terminator instead: `_:o6.` is `BlankNodeLabel("o6")` + `Dot`.
 fn parse_blank_node_name<'a>(input: &mut Input<'a>) -> ModalResult<&'a str> {
+    let start = input.checkpoint();
     let result: &str = (
         take_while(1, |c: char| is_pn_chars_u(c) || c.is_ascii_digit()),
         take_while(0.., |c: char| is_pn_chars(c) || c == '.'),
@@ -482,8 +490,14 @@ fn parse_blank_node_name<'a>(input: &mut Input<'a>) -> ModalResult<&'a str> {
         .take()
         .parse_next(input)?;
 
-    if result.ends_with('.') {
-        return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
+    let label = result.trim_end_matches('.');
+    if label.len() < result.len() {
+        // Rewind the trailing dots: reset to the start of the name and
+        // re-consume exactly the label bytes, so the token span ends before
+        // the first trailing dot. `label.len()` is a char boundary ('.' is
+        // ASCII) and non-zero (the first char cannot be '.').
+        input.reset(&start);
+        return Ok(input.next_slice(label.len()));
     }
 
     Ok(result)
@@ -930,6 +944,65 @@ mod tests {
 
         let spans = tok_spans("_:b1");
         assert_eq!(spans[0].1, "_:b1");
+    }
+
+    #[test]
+    fn test_blank_node_trailing_dot() {
+        // #1444: a blank-node label must not end in '.', so the dot is the
+        // statement terminator, not a lexical error: `_:o6.` → label + Dot.
+        assert_eq!(
+            tok("_:o6."),
+            vec![TokenKind::BlankNodeLabel, TokenKind::Dot]
+        );
+        let spans = tok_spans("_:o6.");
+        assert_eq!(spans[0].1, "_:o6");
+        assert_eq!(spans[1].1, ".");
+
+        // The space form is unchanged.
+        assert_eq!(
+            tok("_:o6 ."),
+            vec![TokenKind::BlankNodeLabel, TokenKind::Dot]
+        );
+        let spans = tok_spans("_:o6 .");
+        assert_eq!(spans[0].1, "_:o6");
+        assert_eq!(spans[1].1, ".");
+    }
+
+    #[test]
+    fn test_blank_node_interior_dots_unchanged() {
+        // Interior dots — including consecutive ones — are valid label
+        // characters and must keep lexing exactly as before the trailing-dot
+        // rewind (ROADMAP §1.1-9 byte-identity requirement).
+        let spans = tok_spans("_:a.b");
+        assert_eq!(spans, vec![(TokenKind::BlankNodeLabel, "_:a.b")]);
+
+        let spans = tok_spans("_:a..b");
+        assert_eq!(spans, vec![(TokenKind::BlankNodeLabel, "_:a..b")]);
+    }
+
+    #[test]
+    fn test_blank_node_trailing_dot_at_eof() {
+        // `_:a.` with nothing after the dot: label `a`, then Dot, then Eof.
+        assert_eq!(tok("_:a."), vec![TokenKind::BlankNodeLabel, TokenKind::Dot]);
+        let spans = tok_spans("_:a.");
+        assert_eq!(spans[0].1, "_:a");
+        assert_eq!(spans[1].1, ".");
+    }
+
+    #[test]
+    fn test_blank_node_multiple_trailing_dots() {
+        // Every trailing dot is rewound; each lexes as its own Dot token.
+        assert_eq!(
+            tok("_:a..."),
+            vec![
+                TokenKind::BlankNodeLabel,
+                TokenKind::Dot,
+                TokenKind::Dot,
+                TokenKind::Dot
+            ]
+        );
+        let spans = tok_spans("_:a...");
+        assert_eq!(spans[0].1, "_:a");
     }
 
     #[test]
