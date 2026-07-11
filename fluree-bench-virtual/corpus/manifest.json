@@ -920,11 +920,7 @@
       "expected_rows": 0,
       "order_sensitive": "none",
       "timeout_s": 120,
-      "subsets": [],
-      "expected_status": {
-        "native": "ok",
-        "virtual": "error"
-      }
+      "subsets": []
     },
     {
       "id": "q044",
@@ -940,11 +936,7 @@
       "expected_rows": 0,
       "order_sensitive": "none",
       "timeout_s": 120,
-      "subsets": [],
-      "expected_status": {
-        "native": "ok",
-        "virtual": "error"
-      }
+      "subsets": []
     },
     {
       "id": "q045",

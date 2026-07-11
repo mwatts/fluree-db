@@ -71,9 +71,13 @@ artifact cache to a known directory.
 - **compare** — check a run against the blessed baselines: an **expected-hash**
   check (a virtual result must match the native oracle) plus a **perf ratio** vs
   the perf baseline, judged against `budgets.json`. `--gate` exits nonzero on any
-  hash mismatch or perf violation. A perf violation is **auto-rerun once**
-  in-process before it's declared red (live-noise discipline); cold records are
-  advisory (never gate); survey runs are skipped.
+  parity or perf violation. A perf violation is **auto-rerun once** in-process
+  before it's declared red (live-noise discipline); cold records are advisory
+  (never gate); survey runs are skipped. Parity honors each query's
+  `hash_gate`: `full` (default) requires an exact result-hash match; `rows_only`
+  (a nondeterministic-selection `LIMIT`, where any *k* rows are a valid answer)
+  gates on row count instead, since two engines can return different-but-equally-
+  correct rows. The dashboard's hash column applies the same rule (`✓ rows`).
 - **dashboard** — render one or more runs into a self-contained HTML dashboard
   (summary tiles + a per-query native-vs-virtual table with ratios, status pills,
   hash-match, pathway-span counters). Publish the file as an Artifact to share.
