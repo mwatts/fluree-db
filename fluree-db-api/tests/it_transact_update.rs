@@ -2635,4 +2635,42 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
         json!([]),
         "the existential must match every subject in the named graph"
     );
+
+    // Anonymous `[]` existentials take the same rewrite path with the
+    // reserved `_:[]{N}` names — prove the anonymous arm end-to-end too.
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed_graph)
+        .commit()
+        .await
+        .expect("re-seed named graph");
+    let del_graph_anon = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { GRAPH <urn:g1> { [] ex:p ?o } }
+    ";
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del_graph_anon)
+        .commit()
+        .await
+        .expect("anonymous existential in a GRAPH block stays supported");
+    let ledger = fluree.ledger("delwhere:main").await.expect("ledger");
+    let g1_rows = fluree
+        .query_connection(&json!({
+            "@context": ctx.clone(),
+            "from": "delwhere:main#urn:g1",
+            "select": "?o",
+            "where": {"ex:p": "?o"}
+        }))
+        .await
+        .expect("query named graph")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        g1_rows,
+        json!([]),
+        "the anonymous existential must match every subject in the named graph"
+    );
 }
