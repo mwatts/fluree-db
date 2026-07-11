@@ -650,11 +650,26 @@ fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerErro
 }
 
 /// Assign stable variable names for SPARQL blank nodes when lowering
-/// triple-template forms like `DELETE WHERE { ... }`.
+/// DELETE WHERE forms — the triple-only fast path directly, and the
+/// GRAPH-bearing path via [`rewrite_blank_nodes_to_vars`].
 ///
 /// In SPARQL graph patterns, blank node labels behave like locally-scoped
 /// existential variables; lowering rewrites them to query variables with
-/// special names (e.g., `_:b1`).
+/// reserved names. Two invariants keep the reserved namespace airtight:
+///
+/// - Every name starts with `_:`, which can never be lexed as a SPARQL
+///   variable (`?`/`$` names cannot contain `:`), so no user-written
+///   variable can unify with a rewritten existential. The names live only
+///   as opaque registry keys; nothing re-lexes them.
+/// - The anonymous arm mints `_:[]{N}`: `[` is illegal in a
+///   BLANK_NODE_LABEL, so anonymous names are disjoint from the labeled
+///   arm's `_:{label}` for every possible label. (Plain `_:b{N}` collided
+///   with a user-written `_:b0`, silently unifying two distinct
+///   existentials — the same label-space hazard the annotation expansion
+///   avoids with its `__fluree_ann_` prefix.)
+///
+/// Same label ⇒ same name, per SPARQL's blank-node label scoping within a
+/// request.
 struct BlankNodeVarNamer {
     anon_counter: u32,
 }
@@ -703,7 +718,7 @@ impl BlankNodeVarNamer {
         match bn {
             BlankNodeValue::Labeled(label) => Arc::from(format!("_:{label}")),
             BlankNodeValue::Anon => {
-                let name: Arc<str> = Arc::from(format!("_:b{}", self.anon_counter));
+                let name: Arc<str> = Arc::from(format!("_:[]{}", self.anon_counter));
                 self.anon_counter += 1;
                 name
             }
@@ -1074,31 +1089,27 @@ fn lower_delete_where_with_graphs(
 /// SPARQL blank nodes in a graph pattern are locally-scoped existential
 /// variables. Because a DELETE WHERE pattern is used as both the WHERE clause
 /// and the DELETE template, the same variable must appear on both sides, so
-/// the rewrite happens once on the shared AST. Labeled blank nodes map to one
-/// variable per label; each anonymous blank node gets a fresh variable. The
-/// `_fluree_bn_` prefix keeps the synthesized names out of the user's
-/// variable namespace (`?` + `_fluree_` is already reserved by the annotation
-/// machinery). Stable `_:fdb-` ids are left untouched: they denote the stored
-/// node as a constant in both the WHERE lowering and the template lowering.
+/// the rewrite happens once on the shared AST. Naming comes from the shared
+/// [`BlankNodeVarNamer`] — the same scheme the triple-only DELETE WHERE path
+/// ships — whose `_:`-prefixed names cannot be lexed as user variables (the
+/// previous lexable `_fluree_bn_{label}` names let a user-written
+/// `?_fluree_bn_x` in the same request unify with the rewritten existential,
+/// changing which triples get deleted). Both the template lowering and the
+/// staging-time SPARQL WHERE lowering intern the name as an opaque
+/// `"?" + name` registry key; nothing re-lexes it. Stable `_:fdb-` ids are
+/// left untouched: they denote the stored node as a constant in both the
+/// WHERE lowering and the template lowering.
 fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
     use fluree_db_sparql::ast::Var;
 
-    let mut anon_counter: u32 = 0;
+    let mut namer = BlankNodeVarNamer::new();
     let mut rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
-        match &bn.value {
-            BlankNodeValue::Labeled(l) => {
-                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                    None
-                } else {
-                    Some(Var::new(format!("_fluree_bn_{l}"), bn.span))
-                }
-            }
-            BlankNodeValue::Anon => {
-                let v = Var::new(format!("_fluree_bn_anon{anon_counter}"), bn.span);
-                anon_counter += 1;
-                Some(v)
+        if let BlankNodeValue::Labeled(l) = &bn.value {
+            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                return None;
             }
         }
+        Some(Var::new(namer.var_name(&bn.value), bn.span))
     };
 
     let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
@@ -2135,16 +2146,84 @@ mod tests {
         let sparql_where = txn.sparql_where.as_ref().expect("sparql where");
         let rendered = format!("{:?}", sparql_where.pattern);
         assert!(
-            rendered.contains("_fluree_bn_x"),
+            rendered.contains("_:x"),
             "WHERE pattern must reference the shared existential var: {rendered}"
         );
     }
 
     #[test]
+    fn test_delete_where_bnode_vars_cannot_collide_with_user_vars() {
+        // pr-1453 review: the GRAPH path used to mint LEXABLE reserved names
+        // (`_fluree_bn_x`), so a user-written ?_fluree_bn_x in the same
+        // request silently unified with the rewritten existential, changing
+        // which triples get deleted. The shared `_:`-scheme names cannot be
+        // written as SPARQL variables.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE WHERE { GRAPH <urn:g1> { _:x <http://example.org/p> ?_fluree_bn_x } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        let template = &txn.delete_templates[0];
+        let (TemplateTerm::Var(subject), TemplateTerm::Var(object)) =
+            (&template.subject, &template.object)
+        else {
+            panic!("both positions must lower to variables: {template:?}");
+        };
+        assert_ne!(
+            subject, object,
+            "the rewritten existential must not unify with the user's variable"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_anon_bnode_vars_disjoint_from_labels() {
+        // A user-written label `_:b0` and an anonymous `[]` are distinct
+        // existentials. The old `_:b{N}` anonymous names lived inside the
+        // label namespace, so `[]` unified with a user's `_:b0` — deleting
+        // by the JOIN of two patterns that the spec treats independently.
+        // The `_:[]{N}` anonymous namespace cannot be produced by any
+        // BLANK_NODE_LABEL. Pin both DELETE WHERE paths.
+        for input in [
+            // Triple-only fast path (BlankNodeVarNamer used directly).
+            "DELETE WHERE { _:b0 <http://example.org/p> ?o . [] <http://example.org/q> ?r }",
+            // GRAPH path (rewrite_blank_nodes_to_vars, shared namer).
+            "DELETE WHERE { GRAPH <urn:g1> { _:b0 <http://example.org/p> ?o . \
+             [] <http://example.org/q> ?r } }",
+        ] {
+            let parsed = fluree_db_sparql::parse_sparql(input);
+            assert!(
+                !parsed.has_errors(),
+                "parse errors for {input}: {:?}",
+                parsed.diagnostics
+            );
+            let ast = parsed.ast.expect("AST");
+            let mut ns = NamespaceRegistry::new();
+            let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+            let TemplateTerm::Var(labeled) = &txn.delete_templates[0].subject else {
+                panic!("labeled bnode must lower to a variable ({input})");
+            };
+            let TemplateTerm::Var(anon) = &txn.delete_templates[1].subject else {
+                panic!("anonymous bnode must lower to a variable ({input})");
+            };
+            assert_ne!(
+                labeled, anon,
+                "a user label _:b0 must not unify with an anonymous [] existential ({input})"
+            );
+        }
+    }
+
+    #[test]
     fn test_lower_delete_data_blank_node_rejected() {
         // SPARQL 1.1 Update §19.8 note 8: no blank nodes in DELETE DATA.
-        // Enforced at lowering too, since the transact builders lower
-        // without running validate().
+        // Enforced at lowering too, as defense-in-depth for direct
+        // lower_sparql_update_ast callers (the api seam also rejects this
+        // via validate() before lowering).
         let parsed =
             fluree_db_sparql::parse_sparql("DELETE DATA { _:a <http://example.org/p> <urn:o> }");
         let ast = parsed.ast.expect("AST");

@@ -2476,10 +2476,10 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
 
     // _:x is an existential variable: every subject with ex:p matches, so
     // both ex:a's and ex:b's ex:p triples are retracted; ex:b's ex:q stays.
-    let del = r#"
+    let del = r"
         PREFIX ex: <http://example.org/ns/>
         DELETE WHERE { _:x ex:p ?o }
-    "#;
+    ";
     fluree
         .graph("delwhere:main")
         .transact()
@@ -2493,7 +2493,7 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
     let p_rows = support::query_jsonld(
         &fluree,
         &ledger,
-        &json!({"@context": ctx, "select": "?o", "where": {"ex:p": "?o"}}),
+        &json!({"@context": ctx.clone(), "select": "?o", "where": {"ex:p": "?o"}}),
     )
     .await
     .expect("query ex:p")
@@ -2507,7 +2507,7 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
     let q_rows = support::query_jsonld(
         &fluree,
         &ledger,
-        &json!({"@context": ctx, "select": "?o", "where": {"ex:q": "?o"}}),
+        &json!({"@context": ctx.clone(), "select": "?o", "where": {"ex:q": "?o"}}),
     )
     .await
     .expect("query ex:q")
@@ -2528,10 +2528,10 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
         .commit()
         .await
         .expect("seed annotated edge");
-    let del_ann = r#"
+    let del_ann = r"
         PREFIX ex: <http://example.org/ns/>
         DELETE WHERE { ex:s ex:r ex:o {| ex:note ?v |} . }
-    "#;
+    ";
     fluree
         .graph("delwhere:main")
         .transact()
@@ -2539,4 +2539,48 @@ async fn sparql_delete_where_extensions_still_work_at_the_seam() {
         .commit()
         .await
         .expect("anonymous annotation tail in DELETE WHERE stays supported");
+
+    // GRAPH-bearing DELETE WHERE with an existential blank node: exercises
+    // the rewrite-to-reserved-variables path (`rewrite_blank_nodes_to_vars`)
+    // plus the staged SPARQL-WHERE lowering end-to-end — the reserved `_:`
+    // names must round-trip the stored WHERE pattern, bind, and instantiate
+    // the graph-scoped delete templates.
+    let seed_graph = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { GRAPH <urn:g1> { ex:a ex:p "g-one" . ex:b ex:p "g-two" } }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed_graph)
+        .commit()
+        .await
+        .expect("seed named graph");
+    let del_graph = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { GRAPH <urn:g1> { _:s ex:p ?o } }
+    ";
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del_graph)
+        .commit()
+        .await
+        .expect("existential blank node in a GRAPH block stays supported");
+    let g1_rows = fluree
+        .query_connection(&json!({
+            "@context": ctx.clone(),
+            "from": "delwhere:main#urn:g1",
+            "select": "?o",
+            "where": {"ex:p": "?o"}
+        }))
+        .await
+        .expect("query named graph");
+    let ledger = fluree.ledger("delwhere:main").await.expect("ledger");
+    let g1_rows = g1_rows.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        g1_rows,
+        json!([]),
+        "the existential must match every subject in the named graph"
+    );
 }
