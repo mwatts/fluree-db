@@ -233,6 +233,25 @@ impl Corpus {
             .collect()
     }
 
+    /// Select an explicit set of queries by id, returned in **corpus order**
+    /// (stable regardless of the order the ids were listed). Errors if any id is
+    /// unknown. Used to resume a partial run (e.g. the remaining `q019..q054`
+    /// after a crash) in-process so timings stay hot-protocol comparable.
+    pub fn select_by_ids(&self, ids: &[String]) -> Result<Vec<&QueryDef>> {
+        let want: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+        let found: Vec<&QueryDef> = self
+            .queries
+            .iter()
+            .filter(|q| want.contains(q.id.as_str()))
+            .collect();
+        let found_ids: BTreeSet<&str> = found.iter().map(|q| q.id.as_str()).collect();
+        let missing: Vec<&&str> = want.iter().filter(|id| !found_ids.contains(**id)).collect();
+        if !missing.is_empty() {
+            anyhow::bail!("unknown query id(s): {missing:?}");
+        }
+        Ok(found)
+    }
+
     /// Look up a single query by id.
     pub fn get(&self, id: &str) -> Option<&QueryDef> {
         self.queries.iter().find(|q| q.id == id)
@@ -309,6 +328,22 @@ mod tests {
             .flat_map(|q| q.tags.iter().copied())
             .collect();
         assert_eq!(smoke_tags.len(), 20, "smoke must exercise all 20 feature tags");
+    }
+
+    /// `select_by_ids` returns the requested queries in corpus order and rejects
+    /// an unknown id — the resume path's guardrail.
+    #[test]
+    fn select_by_ids_resumes_in_corpus_order_and_rejects_unknown() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+        let corpus = Corpus::load(&dir).expect("corpus loads");
+        // Requested out of order, returned in corpus order.
+        let sel = corpus
+            .select_by_ids(&["q054".to_string(), "q019".to_string(), "q027".to_string()])
+            .unwrap();
+        let ids: Vec<&str> = sel.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, vec!["q019", "q027", "q054"]);
+        // A typo is a hard error, not a silent skip.
+        assert!(corpus.select_by_ids(&["q019".to_string(), "q999".to_string()]).is_err());
     }
 
     /// The error-boundary queries declare `expected_status.virtual = error`

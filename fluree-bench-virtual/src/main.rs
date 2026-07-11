@@ -79,6 +79,10 @@ enum Command {
         /// Restrict to a subset (e.g. smoke).
         #[arg(long)]
         subset: Option<String>,
+        /// Run only these query ids (comma-separated), in corpus order — used to
+        /// resume a partial run in-process (hot-comparable). Overrides --subset.
+        #[arg(long, value_delimiter = ',')]
+        queries: Vec<String>,
         /// Output run.jsonl path (default: <crate>/results/runs/run-<ts>.jsonl).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -91,6 +95,10 @@ enum Command {
         /// Measured reps for virtual targets.
         #[arg(long, default_value_t = DEFAULT_VIRTUAL_REPS)]
         virtual_reps: usize,
+        /// Override the per-query deadline (seconds) for every query, instead of
+        /// the manifest's `timeout_s`. Used by the SF20 survey (slower scale).
+        #[arg(long)]
+        timeout_s: Option<u64>,
         /// Cache regime. `hot` (default) primes once and reuses one handle;
         /// `cold` spawns a fresh `exec-one --cold` subprocess per query that
         /// clears the home-scoped disk artifact cache first.
@@ -201,10 +209,12 @@ fn main() -> Result<()> {
         Command::Run {
             targets,
             subset,
+            queries,
             out,
             keep_heads,
             native_reps,
             virtual_reps,
+            timeout_s,
             cache_state,
             survey,
             max_queries,
@@ -215,10 +225,12 @@ fn main() -> Result<()> {
             cache_dir: cache_dir.as_deref(),
             target_ids: &targets,
             subset: subset.as_deref(),
+            queries: &queries,
             out,
             keep_heads,
             native_reps,
             virtual_reps,
+            timeout_s,
             cold: cache_state == CacheState::Cold,
             survey,
             max_queries,
@@ -334,10 +346,12 @@ struct RunArgs<'a> {
     cache_dir: Option<&'a Path>,
     target_ids: &'a [String],
     subset: Option<&'a str>,
+    queries: &'a [String],
     out: Option<PathBuf>,
     keep_heads: bool,
     native_reps: usize,
     virtual_reps: usize,
+    timeout_s: Option<u64>,
     cold: bool,
     survey: bool,
     max_queries: Option<usize>,
@@ -346,7 +360,12 @@ struct RunArgs<'a> {
 
 fn cmd_run(args: RunArgs) -> Result<()> {
     let corpus = Corpus::load(args.corpus_dir)?;
-    let mut queries = corpus.select(args.subset);
+    // Explicit --queries (a resume) overrides --subset.
+    let mut queries = if args.queries.is_empty() {
+        corpus.select(args.subset)
+    } else {
+        corpus.select_by_ids(args.queries)?
+    };
     if queries.is_empty() {
         anyhow::bail!("no queries match subset {:?}", args.subset);
     }
@@ -437,7 +456,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
                 exec::cold_run_query(&exe, args.corpus_dir, args.targets_dir, target, &q.id, args.keep_heads)?
             } else {
                 let params = RunParams {
-                    timeout: Duration::from_secs(q.timeout_s),
+                    timeout: Duration::from_secs(args.timeout_s.unwrap_or(q.timeout_s)),
                     reps,
                     keep_heads: args.keep_heads,
                 };
