@@ -2213,19 +2213,42 @@ impl crate::Fluree {
 
         let mut txn_meta: Vec<TxnMetaEntry> = Vec::new();
         let mut last_ns_registry: Option<NamespaceRegistry> = None;
+        // Union of every operation's namespace allocations, relative to the
+        // ORIGINAL base. The per-op staging registry allocates namespaces the
+        // lowering delta never saw (most importantly the namespace of a
+        // `GRAPH <iri>` name, split off at staging-time routing) — those must
+        // (i) reach the virtual state so the between-ops apply can route the
+        // op's own flakes (a graph flake's Sid is unresolvable otherwise),
+        // (ii) be baked into the next op's registry base so code assignment
+        // stays globally consistent, and (iii) reach the final commit
+        // envelope even when a later op's registry re-derives them from the
+        // virtual snapshot (which makes them look pre-existing and drop out
+        // of that op's delta).
+        let mut union_ns_delta: std::collections::HashMap<u16, String> =
+            std::collections::HashMap::new();
 
         let op_count = txns.len();
         let mut current = Some(ledger);
         for (i, txn) in txns.into_iter().enumerate() {
             // Captured before staging consumes the Txn; needed to advance
             // the virtual state between operations.
-            let ns_delta = txn.namespace_delta.clone();
             let graph_iris: Vec<String> = txn.graph_delta.values().cloned().collect();
 
             let state = current.take().expect("state threaded through the loop");
             let result = self
                 .stage_transaction_from_txn(state, txn, index_config, policy, tracker)
                 .await?;
+
+            // The op's FULL namespace delta: lowering allocations (adopted
+            // into the staging registry) PLUS staging-time allocations —
+            // relative to the op's base, i.e. the virtual state, which the
+            // union below re-bases onto the original snapshot.
+            let ns_delta = result.ns_registry.delta().clone();
+            for (code, prefix) in &ns_delta {
+                union_ns_delta
+                    .entry(*code)
+                    .or_insert_with(|| prefix.clone());
+            }
 
             for iri in &graph_iris {
                 if seen_graph_iris.insert(iri.clone()) {
@@ -2264,6 +2287,17 @@ impl crate::Fluree {
 
         let mut ns_registry =
             last_ns_registry.expect("multi-op loop staged at least one operation");
+        // Re-adopt the union so the commit envelope's `take_delta` carries
+        // EVERY operation's allocations relative to the original base — the
+        // last op's own delta omits whatever the virtual snapshot already
+        // baked in from earlier ops.
+        ns_registry
+            .adopt_delta_for_persistence(&union_ns_delta)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "multi-op namespace delta union conflicts with final registry: {e}"
+                ))
+            })?;
 
         // Graph routing for the merged view + the union graph delta the
         // commit envelope persists (values drive the registry apply; ids
