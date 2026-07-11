@@ -2,6 +2,7 @@
 //!
 //! Implements logical operators: AND, OR, NOT
 
+use super::compare::{rdf_term_equal, EqOutcome};
 use super::value::ComparableValue;
 use crate::binding::RowAccess;
 use crate::context::ExecutionContext;
@@ -106,7 +107,11 @@ pub fn eval_in<R: RowAccess>(
             let mut found = false;
             for v in &args[1..] {
                 match v.eval_to_comparable(row, ctx) {
-                    Ok(Some(cv)) if cv == tv => {
+                    // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
+                    // like `1 = 1.0` — not the variant-exact derived `==`. The
+                    // §17.4.1.9 error-in-IN 3-valued half is deferred (Ne and a
+                    // type error both read as "no match" here).
+                    Ok(Some(cv)) if matches!(rdf_term_equal(&cv, &tv), EqOutcome::Eq) => {
                         found = true;
                         break;
                     }
@@ -140,7 +145,11 @@ pub fn eval_not_in<R: RowAccess>(
             let mut found = false;
             for v in &args[1..] {
                 match v.eval_to_comparable(row, ctx) {
-                    Ok(Some(cv)) if cv == tv => {
+                    // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
+                    // like `1 = 1.0` — not the variant-exact derived `==`. The
+                    // §17.4.1.9 error-in-IN 3-valued half is deferred (Ne and a
+                    // type error both read as "no match" here).
+                    Ok(Some(cv)) if matches!(rdf_term_equal(&cv, &tv), EqOutcome::Eq) => {
                         found = true;
                         break;
                     }

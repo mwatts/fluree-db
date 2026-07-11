@@ -446,7 +446,7 @@ fn cmp_values_inner(
 
 /// Outcome of RDFterm-equal (`=` / `!=`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EqOutcome {
+pub(crate) enum EqOutcome {
     /// Equal (value equality, or the same term).
     Eq,
     /// Known to be different.
@@ -519,7 +519,7 @@ fn lang_parts(v: &ComparableValue) -> Option<(&str, &str)> {
 /// SPARQL RDFterm-equal (`=`, and negated, `!=`): §17.4.1.7 and the §17.3
 /// operator mapping. Returns a three-valued outcome so an incomparable pair is
 /// a type error (excluding the row) rather than silently `false`/`true`.
-fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
+pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
     // Value-comparable fast path: numeric promotion, string, boolean, temporal.
     // No plain-string↔temporal coercion (equality, not ordering).
     if let Some(ord) = cmp_values_inner(a, b, false) {
