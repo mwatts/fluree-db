@@ -372,6 +372,16 @@ impl GraphOperator {
                 // graph var the inner body actually carries; when the value
                 // was seeded (`seed_graph_var`) it short-circuits on the
                 // `Binding::Iri` fast path.
+                //
+                // Two deliberate edges (PR-1454 review): (1) an inner `?g`
+                // whose binding fails extraction (`extract → None`: a
+                // non-string literal, or an encoded form with no graph view)
+                // compares unequal and the row drops — lossy-but-safe over
+                // erroring mid-merge; (2) extraction honors the documented
+                // string-literal back-compat, so a plain-string graph name
+                // joins the IRI-valued enumeration by VALUE across term
+                // kinds where strict SPARQL term-equality would drop it
+                // (kept for pre-IRI-migration data).
                 if let Some(gvar) = bind_graph_var {
                     if let Some(b) = batch.get(inner_row_idx, gvar) {
                         if !matches!(b, Binding::Unbound | Binding::Poisoned)

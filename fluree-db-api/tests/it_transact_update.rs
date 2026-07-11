@@ -2602,6 +2602,77 @@ async fn sparql_update_constant_iris_resolve_against_base_at_the_seam() {
     );
 }
 
+/// PR-1454 review: the per-operation validation semantics, pinned.
+/// Constraint checks (uniqueness here; policy and SHACL ride the same
+/// per-op pipeline) run against the SEQUENTIAL state after each operation
+/// — a transiently-invalid-but-finally-valid request aborts at the
+/// offending operation. Required for ordered uniqueness; deliberate for
+/// SHACL (no deferred constraints). Documented in docs/query/sparql.md.
+#[tokio::test]
+async fn multi_operation_validation_is_per_operation_not_final_state() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:per-op-validation")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:per-op-validation")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:old ex:email "shared@example.org" }"#,
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    // The final state would be valid (op 2 frees the value), but op 1
+    // transiently duplicates the unique value → the request aborts there.
+    let opts = TxnOpts {
+        unique_properties: Some(vec!["http://example.org/ns/email".to_string()]),
+        ..TxnOpts::default()
+    };
+    let err = fluree
+        .graph("multiop:per-op-validation")
+        .transact()
+        .txn_opts(opts)
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:new ex:email "shared@example.org" } ;
+               DELETE DATA { ex:old ex:email "shared@example.org" }"#,
+        )
+        .commit()
+        .await
+        .expect_err("a transiently-duplicated unique value must abort the request");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected a uniqueness violation, got: {err}"
+    );
+
+    let ledger = fluree
+        .ledger("multiop:per-op-validation")
+        .await
+        .expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s WHERE { ?s ex:email ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "only the seeded holder survives the aborted request: {json}"
+    );
+}
+
 /// PR-1454 review (bplatz): a blank-node label reused across DELETE WHERE
 /// operations is two independently-scoped existential matches — the
 /// request must execute (it used to be rejected as a duplicate label), and

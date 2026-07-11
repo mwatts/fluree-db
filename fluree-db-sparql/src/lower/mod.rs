@@ -150,6 +150,13 @@ type PrefixMap = HashMap<Arc<str>, Arc<str>>;
 /// Resolution happens once here (prepare-time) so every prefixed-name
 /// expansion sees an absolute namespace. Without a BASE, relative namespaces
 /// stay as written.
+///
+/// Deliberate simplifications in loosely-specified territory (PR-1454
+/// review): `prologue.base` is the single FINAL base (last declaration
+/// wins), so a relative PREFIX namespace declared textually BEFORE the
+/// BASE still resolves against it, and a second relative BASE is not
+/// chained against the first. Redeclared prefixes resolve last-wins via
+/// the map insert below.
 fn prologue_environment(prologue: &crate::ast::Prologue) -> (PrefixMap, Option<Arc<str>>) {
     let base = prologue.base.as_ref().map(|b| b.iri.clone());
 

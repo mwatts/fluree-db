@@ -2143,7 +2143,11 @@ impl crate::Fluree {
     /// 1. stage it against the current (virtual) state with the FULL per-op
     ///    pipeline — namespace adoption, policy enforcement, SHACL,
     ///    uniqueness — via `stage_transaction_from_txn`; the final state
-    ///    (base + all N ops) is exactly what op N's validators saw;
+    ///    (base + all N ops) is exactly what op N's validators saw. Per-op
+    ///    validation is a documented semantics choice: a transiently-
+    ///    invalid-but-finally-valid request aborts at the offending
+    ///    operation (required for ordered uniqueness; deliberate for
+    ///    SHACL — no deferred constraints);
     /// 2. fold its flakes into the merged set, re-stamped to the final
     ///    commit `t` (`base.t() + 1`), last-wins per fact identity
     ///    `(g, s, p, o, dt, m)` — so `INSERT x ; DELETE x` nets to the

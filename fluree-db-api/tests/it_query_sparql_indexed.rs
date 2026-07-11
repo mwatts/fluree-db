@@ -9292,6 +9292,10 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
                 bindings[0]["s"]["value"], "ex:s1",
                 "EXISTS must seed the row's own ?g, decoded from EncodedSid: {json}"
             );
+            assert_eq!(
+                bindings[0]["s"]["type"], "uri",
+                "SPARQL results JSON renders IRI bindings as type 'uri': {json}"
+            );
 
             // EncodedLit arm: the string-literal graph name resolves the
             // same named graph (documented back-compat).
