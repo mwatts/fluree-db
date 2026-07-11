@@ -88,7 +88,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Ref::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:b{}", self.vars.len()));
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Ref::Var(var_id))
                 }
             },
@@ -143,7 +143,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Term::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:b{}", self.vars.len()));
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Term::Var(var_id))
                 }
             },
