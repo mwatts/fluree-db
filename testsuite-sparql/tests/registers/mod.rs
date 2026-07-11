@@ -95,8 +95,9 @@ pub const SPARQL11_SUBQUERY: &[&str] = &[
 // expression builtins, FROM/FROM NAMED dataset construction — audit §4.2.
 // (the "GRAPH ?g binding typed as literal" cluster was fixed by #1442/#1443)
 pub const SPARQL10_QUERY_EVAL: &[&str] = &[
-    // result mismatch (83); subgroup ownership per
-    // docs/audit/burn-down/ROADMAP.md §6.1
+    // result-mismatch cluster; subgroup ownership + per-subgroup counts per
+    // docs/audit/burn-down/ROADMAP.md §6.1 (absolute count omitted — it went
+    // stale after the wave-2 register prune; the subgroup counts below are live)
     //
     // W-1 algebra cluster (3): join-combo-2 = GRAPH ?g default-graph
     // enumeration (PR-G1); nested-opt-1/2 = correlated-OPTIONAL independence
@@ -329,13 +330,10 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-9",
     // D-1 triple-terms-as-values: qt:data uses `<<( … )>>`, rejected by
-    // ingest with the specific deferred error — Option-1 epic (10)
+    // ingest with the specific deferred error — Option-1 epic. (op-1/op-2/
+    // order-1/order-2 are D-1-blocked too, but each is registered once, above.)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-9",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-10",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
@@ -347,25 +345,20 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     // harness: the expected-result TriG-star graph fails to parse — the
     // `{| |}` INSERT DATA itself already executes (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
-    // query execution error (1)
+    // query execution error (5). (expr-1/graphs-1/graphs-2 also error at
+    // execution, but each is registered once, above, under its data-load blocker.)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-5",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
-    // D-4 CONSTRUCT annotation projection: lowering returns
-    // "CONSTRUCT projection of edge-annotation metadata" (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    // harness EXPECTED-graph parsing: the update/construct executes but
-    // the expected file embeds star constructs the harness's collector
-    // sink can't parse — construct-5 (`<<( )>>` in expected .ttl),
-    // update-3 (TriG-star in expected .trig; its `{| |}` INSERT DATA
-    // already executes — Option-1 epic scoping intel, roadmap §1.1-11) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
+    // Secondary blockers for tests already registered once above (kept as
+    // intel, not re-listed): construct-4 also hits D-4 CONSTRUCT
+    // annotation-projection lowering ("CONSTRUCT projection of edge-annotation
+    // metadata"); construct-5 and update-3 also fail harness EXPECTED-graph
+    // parsing (star constructs — `<<( )>>` / TriG-star `{| |}` — in the
+    // expected .ttl/.trig the collector sink can't parse). Option-1 epic
+    // scoping intel, roadmap §1.1-11.
 ];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[

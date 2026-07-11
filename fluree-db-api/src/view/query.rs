@@ -659,9 +659,11 @@ impl Fluree {
         };
 
         // `FROM <from> TO <to>` (Fluree history-range extension) is not a plain
-        // within-ledger dataset — leave it to the connection path.
+        // within-ledger dataset — leave it to the connection path. Its own error
+        // (not `cross_ledger_dataset_error`) so the message isn't the misleading
+        // "graph not in this ledger" for what is really a history-range clause.
         if clause.to_graph.is_some() {
-            return Err(cross_ledger_dataset_error());
+            return Err(history_range_dataset_error());
         }
 
         let mut dataset = DataSetDb::new();
@@ -1240,6 +1242,18 @@ fn cross_ledger_dataset_error() -> ApiError {
          A within-ledger dataset names this ledger's graphs (its default graph \
          via the ledger alias, or a registered named graph); use \
          query_connection_sparql for cross-ledger datasets.",
+    )
+}
+
+/// Error for a `FROM <from> TO <to>` history-range clause on the within-ledger
+/// path. Distinct from [`cross_ledger_dataset_error`] because the clause names
+/// a time range, not a cross-ledger graph — reusing the graph-membership
+/// message there would misdescribe the rejection.
+fn history_range_dataset_error() -> ApiError {
+    ApiError::query(
+        "SPARQL `FROM <from> TO <to>` is the Fluree history-range extension, not \
+         a within-ledger dataset clause; issue it through the connection/history \
+         query path.",
     )
 }
 

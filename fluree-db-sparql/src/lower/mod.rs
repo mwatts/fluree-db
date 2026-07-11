@@ -389,6 +389,11 @@ struct LoweringContext<'a, E> {
     pp_counter: u32,
     /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
     order_counter: u32,
+    /// Monotonic counter for anonymous blank-node (`[]`) variables (`_:#anon0`,
+    /// `_:#anon1`, …). The `#` is outside PN_CHARS, so a user-written `_:label`
+    /// can never collide with (and be silently merged into) one of these —
+    /// unlike a `_:b{len}` scheme, which a user's `_:bN` can forge.
+    anon_counter: u32,
     /// Original SPARQL source text (for extracting SERVICE body text).
     source_text: Option<&'a str>,
 }
@@ -413,6 +418,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             agg_counter: 0,
             pp_counter: 0,
             order_counter: 0,
+            anon_counter: 0,
             source_text,
         }
     }

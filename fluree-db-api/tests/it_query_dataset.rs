@@ -2485,6 +2485,56 @@ async fn sparql_within_ledger_from_named_semantics() {
     );
 }
 
+/// P2 (positive): a plain `FROM <ledger-alias>` resolves to THIS ledger's real
+/// default graph — the alias→default-graph branch of
+/// `resolve_within_ledger_graph` (view/query.rs), distinct from the
+/// named-graph `FROM <urn:g1>` cases above where the FROM IRI names a graph in
+/// the registry. Here the FROM IRI is the ledger id itself, so the query sees
+/// the ledger default graph (Alice), not the named graphs (Bob/Carol).
+#[tokio::test]
+async fn sparql_within_ledger_from_alias_scopes_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <wl:main> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("FROM <ledger-alias> must resolve to the ledger's default graph");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
+}
+
+/// P2 (negative): `resolve_within_ledger_graph` matches the alias by EXACT
+/// string (`iri == db.snapshot.ledger_id || iri == db.ledger_id`), so a
+/// mismatched spelling of the ledger id — here `wl`, the name without its
+/// `:main` branch — is not recognized as the default graph and falls through to
+/// the cross-ledger rejection. Documents (locks) the exact-match limitation:
+/// broadening the match is a deliberate DEFER, so this behavior must not
+/// silently change.
+#[tokio::test]
+async fn sparql_within_ledger_from_alias_spelling_mismatch_is_rejected() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <wl> { ?s schema:name ?name }
+    ";
+    let err = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect_err("a mismatched alias spelling must be rejected, not silently matched");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not in this ledger"),
+        "expected the within-ledger cross-ledger rejection, got: {msg}"
+    );
+}
+
 /// Query-surface parity (D-3, Option A): the within-ledger SPARQL `FROM` /
 /// `FROM NAMED` dataset the buffered `query` path now builds is the same
 /// engine/view-level `DataSetDb` / `DatasetOperator` construction the JSON-LD

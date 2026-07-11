@@ -498,3 +498,233 @@ async fn assert_reification_construct(sparql: &str) {
         );
     }
 }
+
+/// Recursively collect every blank-node label (`_:…` string) appearing anywhere
+/// in a JSON-LD value — as an `@id`, as an `@id` object reference, or as a bare
+/// value — so a test can reason about which blank nodes the output actually
+/// contains regardless of nesting/compaction.
+fn collect_blank_ids(v: &JsonValue, out: &mut std::collections::HashSet<String>) {
+    match v {
+        JsonValue::String(s) if s.starts_with("_:") => {
+            out.insert(s.clone());
+        }
+        JsonValue::Array(a) => a.iter().for_each(|x| collect_blank_ids(x, out)),
+        JsonValue::Object(m) => m.values().for_each(|x| collect_blank_ids(x, out)),
+        _ => {}
+    }
+}
+
+/// O7 regression: a bare `[]` template blank must never collide with an explicit
+/// `_:bN` template blank. Before the fix, `[]` lowered to `_:b{len}` (the
+/// current variable count at that point), so a user-written `_:bN` with
+/// `N == len` folded into the SAME template variable → one minted blank instead
+/// of two, silently merging two intended-distinct nodes (a merge the
+/// isomorphism-based W3C CONSTRUCT suite cannot catch). The template below is
+/// shaped so the anon's `len` is 2 (the two WHERE vars `?s`,`?h`) at the first
+/// template triple, aligning the old scheme's `_:b2` with the explicit `_:b2`.
+///
+/// FAILS on the pre-fix lowering (4 merged nodes), PASSES after (8 distinct).
+#[tokio::test]
+async fn sparql_construct_anon_and_labeled_blank_never_merge() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    // `[]` is lowered first (len == 2 WHERE vars → old scheme mints `_:b2`),
+    // then the explicit `_:b2`; the buggy lowering makes them one variable.
+    let sparql = "PREFIX person: <http://example.org/Person#> \
+         CONSTRUCT { [] person:tagQ ?s . _:b2 person:tagP ?s } \
+         WHERE { ?s person:handle ?h }";
+
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    let graph = out
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("CONSTRUCT output is a JSON-LD @graph object");
+
+    // seed_people has 4 handles → 4 solution rows. The `[]` node and the `_:b2`
+    // node are DISTINCT template blanks, so each row yields TWO blank subjects
+    // (one carrying person:tagQ, one carrying person:tagP) = 8 nodes. The buggy
+    // lowering merges them to ONE node per row (both predicates on one blank) =
+    // 4 nodes.
+    assert_eq!(
+        graph.len(),
+        8,
+        "anon `[]` and explicit `_:b2` must stay distinct template blanks \
+         (8 nodes = 2/row × 4 rows); a count of 4 means they merged: {out:#}"
+    );
+
+    // Signature of the merge: a single node carrying BOTH tag predicates. No
+    // output node may carry both.
+    for node in graph {
+        let obj = node.as_object().expect("each @graph entry is an object");
+        let has_p = obj.keys().any(|k| k.contains("tagP"));
+        let has_q = obj.keys().any(|k| k.contains("tagQ"));
+        assert!(
+            !(has_p && has_q),
+            "a single blank carries both tagP and tagQ ⇒ the two template \
+             blanks merged: {node:#}"
+        );
+    }
+}
+
+/// P4 soundness lock: a minted template blank (`cst…`) can never collide with a
+/// STORED data blank (`fdb-…`). A CONSTRUCT that wraps a data blank node inside
+/// a fresh template blank must yield TWO distinct blanks (wrapper ≠ wrapped),
+/// never a single self-referential node. (Holds already because `cst`/`fdb-`
+/// are prefix-disjoint — this locks that invariant into the always-run api
+/// workspace so a future minter change can't regress it invisibly.)
+#[tokio::test]
+async fn sparql_construct_minted_blank_disjoint_from_data_blank() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/construct:datablanks";
+    let db0 = LedgerSnapshot::genesis(ledger_id);
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    // `ex:alice ex:knows _:blank` where `_:blank` is a stored (fdb-) blank node.
+    let tx = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [{"@id": "ex:alice", "ex:knows": {"ex:nick": "Ally"}}]
+    });
+    let committed = fluree
+        .insert(ledger0, &tx)
+        .await
+        .expect("insert data blank");
+    let ledger = committed.ledger;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    // Wrap the data blank `?b` inside a freshly-minted template blank.
+    let sparql = "PREFIX ex: <http://example.org/> \
+         CONSTRUCT { [ ex:wraps ?b ] } WHERE { ?s ex:knows ?b }";
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+
+    let mut blanks = std::collections::HashSet::new();
+    collect_blank_ids(&out, &mut blanks);
+    assert_eq!(
+        blanks.len(),
+        2,
+        "expected two distinct blanks (minted wrapper + stored data blank), a \
+         count of 1 means the minted blank merged with the data blank: {out:#}"
+    );
+
+    // And the wrapper must actually point at the OTHER blank, not itself.
+    let graph = out
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("@graph array");
+    for node in graph {
+        let obj = node.as_object().expect("object node");
+        let (Some(id), Some(wraps)) = (
+            obj.get("@id").and_then(JsonValue::as_str),
+            obj.keys().find(|k| k.contains("wraps")),
+        ) else {
+            continue;
+        };
+        let mut targets = std::collections::HashSet::new();
+        collect_blank_ids(&obj[wraps], &mut targets);
+        assert!(
+            !targets.contains(id),
+            "the minted wrapper blank ex:wraps ITSELF ⇒ merged with the data \
+             blank: {node:#}"
+        );
+    }
+}
+
+/// P4 lock: an RDF collection `( … )` in a CONSTRUCT template desugars to
+/// rdf:first / rdf:rest / rdf:nil cells (fresh `#coll…` blanks, which are
+/// hardened `#`-prefixed and so unforgeable), producing a well-formed list in
+/// the output.
+#[tokio::test]
+async fn sparql_construct_collection_desugars_to_list() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let sparql = "PREFIX person: <http://example.org/Person#> \
+         PREFIX ex: <http://example.org/> \
+         CONSTRUCT { ex:root ex:items ( ?h ) } \
+         WHERE { ?s person:handle ?h }";
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT with a collection object must execute");
+
+    let dump = out.to_string();
+    for frag in ["syntax-ns#first", "syntax-ns#rest", "syntax-ns#nil"] {
+        assert!(
+            dump.contains(frag),
+            "collection did not desugar to an rdf list ({frag} missing): {out:#}"
+        );
+    }
+}
+
+/// P4 lock: nested property lists `[ :p [ :q ?x ] ]` mint DISTINCT blank nodes
+/// for the outer and inner node (both via the parser's hardened `#bnpl…`
+/// scheme), so the output has the inner node linked from the outer, never a
+/// single conflated node.
+#[tokio::test]
+async fn sparql_construct_nested_property_lists_stay_distinct() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let sparql = "PREFIX person: <http://example.org/Person#> \
+         PREFIX ex: <http://example.org/> \
+         CONSTRUCT { [ ex:outer [ ex:inner ?h ] ] } \
+         WHERE { ?s person:handle ?h }";
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT with nested property lists must execute");
+    let graph = out
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("@graph array");
+
+    // 4 rows × 2 nested blanks (outer + inner) = 8 distinct nodes.
+    assert_eq!(
+        graph.len(),
+        8,
+        "nested `[ :outer [ :inner ?h ] ]` must mint 2 distinct blanks per row \
+         (8 total); fewer means the nested blanks conflated: {out:#}"
+    );
+    // The outer node carries ex:outer, the inner carries ex:inner; no single
+    // node carries both.
+    for node in graph {
+        let obj = node.as_object().expect("object node");
+        let has_outer = obj.keys().any(|k| k.contains("outer"));
+        let has_inner = obj.keys().any(|k| k.contains("inner"));
+        assert!(
+            !(has_outer && has_inner),
+            "outer and inner property-list blanks merged: {node:#}"
+        );
+    }
+}
+
+/// P4 negative guardrail (W2BC): CONSTRUCT has no aggregation stage, so an
+/// inline-aggregate ORDER BY (e.g. `ORDER BY COUNT(?h)`) cannot be hoisted and
+/// the query is rejected rather than mis-executed.
+#[tokio::test]
+async fn sparql_construct_aggregate_order_by_is_rejected() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let sparql = "PREFIX person: <http://example.org/Person#> \
+         CONSTRUCT { ?s person:handle ?h } \
+         WHERE { ?s person:handle ?h } ORDER BY (COUNT(?h))";
+    let result = db.query(&fluree).sparql(sparql).execute_formatted().await;
+    assert!(
+        result.is_err(),
+        "CONSTRUCT + inline-aggregate ORDER BY must be rejected, got: {result:#?}"
+    );
+}

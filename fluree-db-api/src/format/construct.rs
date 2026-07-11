@@ -161,12 +161,17 @@ fn row_blank(
         return existing.clone();
     }
     // Reserved `cst` (construct-solution-template) prefix keeps minted labels
-    // provably disjoint from every other blank-node producer — stored/import
-    // blanks (`fdb-…`), BNODE() output (`b{hex}`), and SERVICE passthrough — so a
-    // mixed template (`[ :p ?dataBlank ]`) can never silently merge a minted
-    // blank with a data blank. The W3C CONSTRUCT suite compares by graph
-    // isomorphism and so cannot catch such a merge; the disjoint namespace is the
-    // guarantee.
+    // disjoint from every SANCTIONED blank-node producer: stored/import blanks
+    // (`fdb-…`), the graph-ir sink's unlabeled blanks (`b{n}`), and `BNODE()`
+    // (`_:fdb-{uuid}` no-arg / `_:b{hex}` with a label) are all prefix-disjoint
+    // from `cst`. A remote SERVICE blank is passed through verbatim and so is NOT
+    // disjoint by construction — but in practice it cannot carry a `cst…` label:
+    // external SPARQL endpoints are rejected (`fluree-db-query` service.rs) and
+    // Fluree-to-Fluree remotes only ever emit `fdb-` blanks, so that one case is
+    // held disjoint by runtime enforcement rather than by the namespace itself.
+    // This is what stops a mixed template (`[ :p ?dataBlank ]`) from silently
+    // merging a minted blank with a data blank — a merge the isomorphism-based
+    // W3C CONSTRUCT suite cannot catch.
     let blank = BlankId::new(format!("cst{}", *bnode_counter));
     *bnode_counter += 1;
     row_bnodes.insert(var_id, blank.clone());

@@ -77,14 +77,14 @@ pub struct SubqueryOperator {
     join_keys: Vec<VarId>,
     /// Correlation vars the subquery binds only via `OPTIONAL`/`UNION`/`BIND`
     /// (`correlation_vars \ join_keys`) — not self-produced, so NOT safe hash
-    /// keys, yet present in the subquery's output. In join-mode the subquery is
-    /// evaluated independently (empty seed), so one of these can take a value
-    /// that conflicts with the parent's binding; the merge must then drop the
-    /// row (SPARQL §18.4 keeps only compatible mappings). In per-row mode the var
-    /// is seeded to the parent value, so the merge check is a no-op. Fixes W3C
-    /// `var-scope-join-1` (join-scope-1), where `?X` is bound only by an inner
-    /// `OPTIONAL` and must reconcile against the parent `?X`. See the merge in
-    /// `process_parent_batch`.
+    /// keys, yet present in the subquery's output. They are evaluated UNSEEDED
+    /// (per-row mode seeds only `join_keys`; join-mode seeds nothing), so one of
+    /// these can take a value that conflicts with the parent's binding; the merge
+    /// must then drop the row (SPARQL §18.4 keeps only compatible mappings). The
+    /// merge check is therefore LOAD-BEARING in BOTH modes — it is NOT a per-row
+    /// no-op, so do not gate it on join-mode. Fixes W3C `var-scope-join-1`
+    /// (join-scope-1), where `?X` is bound only by an inner `OPTIONAL` and must
+    /// reconcile against the parent `?X`. See the merge in `process_parent_batch`.
     reconcile_vars: Vec<VarId>,
     /// Whether the subquery is evaluated ONCE and hash-joined (on `join_keys`)
     /// rather than re-executed per parent row. Requires no inner `LIMIT`/`OFFSET`
@@ -442,14 +442,15 @@ impl SubqueryOperator {
             for subquery_row in subquery_results {
                 // Family B — reconcile OPTIONAL/UNION-produced correlation vars.
                 // These are correlation vars the subquery does not self-produce,
-                // so they are not hash join keys; in join-mode the subquery is
-                // evaluated independently and can bind one to a term that
-                // conflicts with the parent's. SPARQL's natural join keeps a
-                // solution only when every shared variable is compatible (equal,
-                // or unbound on either side), so drop a row whose reconcile var is
-                // bound on BOTH sides to different terms (normalized like the hash
-                // key). In per-row mode the var is seeded to the parent value, so
-                // both sides agree and this never fires.
+                // so they are not hash join keys; the subquery binds them
+                // independently (they are never seeded — per-row mode seeds only
+                // `join_keys`) and can bind one to a term that conflicts with the
+                // parent's. SPARQL's natural join keeps a solution only when every
+                // shared variable is compatible (equal, or unbound on either
+                // side), so drop a row whose reconcile var is bound on BOTH sides
+                // to different terms (normalized like the hash key). This check is
+                // load-bearing in BOTH per-row and join mode — it is not a per-row
+                // no-op.
                 if !self.reconcile_vars.is_empty() {
                     let (store, gv) = EqualityNorm::parts(&self.norm);
                     let incompatible = self.reconcile_vars.iter().any(|v| {
