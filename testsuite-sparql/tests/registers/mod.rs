@@ -8,6 +8,28 @@
 //! - a test that passes but IS listed here fails the suite (stale entry —
 //!   remove it in the same change that fixes the feature).
 //!
+//! LIMITATION — what this register CANNOT catch: an *unregistered* test that
+//! PASSES for the wrong reason. The check polices registered-pass (stale) and
+//! unregistered-fail (regression); a false-pass is invisible to it by
+//! construction. Two harness leniencies open that blind spot and need manual
+//! vigilance, not register enforcement:
+//!
+//! - Empty named graphs are not tracked, so CLEAR (graph stays, empty), DROP
+//!   (graph removed) and CREATE (empty graph exists) end-states are partially
+//!   unobservable (see query_handler.rs `run_update_eval_test` step 5). Every
+//!   such test is currently registered below (the grammar does not parse the
+//!   graph-management ops yet). When that grammar lands, they must gain
+//!   explicit end-state assertions or STAY registered — do NOT un-register them
+//!   just because `check_testsuite` reports an "unexpected pass".
+//!
+//! - Net-zero updates (expected end-state == initial state) pass whether or not
+//!   the engine actually ran the update; on their own they confirm end-state
+//!   invariance, not execution. 12 currently-passing update-eval tests are
+//!   net-zero (enumerated in docs/audit/2026-07-sparql-testsuite-audit.md
+//!   §"Net-zero vacuous passes"); the WITH/USING no-op cases
+//!   (dawg-delete-with-03/04, dawg-delete-using-03/04) warrant a manual check,
+//!   since sibling tests in those families are known-broken and registered.
+//!
 //! Grouping comments name the root cause. The full failure taxonomy, root
 //! causes, and burn-down plan live in
 //! `docs/audit/2026-07-sparql-testsuite-audit.md`; policy for adding entries

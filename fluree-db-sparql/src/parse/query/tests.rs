@@ -2178,6 +2178,47 @@ fn test_order_by_bare_builtin_call() {
 }
 
 #[test]
+fn test_order_by_bare_expression_not_absorbed_as_key() {
+    // `OrderCondition`'s bare form is `Constraint | Var`, never an arbitrary
+    // expression. A trailing operator after a var key must NOT become a
+    // second (spurious) key: pre-fix `ORDER BY ?x - 1` silently parsed as
+    // two keys `[?x, -1]`, corrupting the sort (fluree/db#1452). The `- 1`
+    // is not a Constraint, so it is not absorbed — and under the wave-1
+    // trailing-token guard (#1438/D-10a) the unconsumed tail is a loud
+    // parse error instead of silently ignored input. If absorption ever
+    // regressed, these would parse CLEANLY again (two keys, no trailing
+    // error) and this test would fail. A bare BuiltInCall like
+    // `ORDER BY str(?o)` stays valid, see test_order_by_bare_builtin_call.
+    for q in [
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x - 1",
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x + ?y",
+    ] {
+        assert_parse_error_no_ast(q, "unexpected trailing tokens");
+    }
+}
+
+#[test]
+fn test_group_by_bare_expression_not_absorbed_as_key() {
+    // `GroupCondition`'s bare form is `BuiltInCall | FunctionCall` (or a
+    // parenthesized `( … )`, or a Var) — never a bare arithmetic. Kept
+    // consistent with ORDER BY (fluree/db#1452): a trailing `- 1` after a
+    // var key is not absorbed as a second group key — and under the wave-1
+    // trailing-token guard the unconsumed tail is a loud parse error
+    // instead of silently ignored input (absorption regressing would parse
+    // cleanly with two keys, failing this). The parenthesized
+    // `GROUP BY (?x + 1 AS ?y)` form stays valid
+    // (see test_group_by_with_expression).
+    assert_parse_error_no_ast(
+        "SELECT ?x WHERE { ?s :p ?x } GROUP BY ?x - 1",
+        "unexpected trailing tokens",
+    );
+    assert!(
+        parse("SELECT ?x WHERE { ?s :p ?x } GROUP BY str(?x) - 1").has_errors(),
+        "a bare arithmetic must be rejected as a group condition"
+    );
+}
+
+#[test]
 fn test_empty_iriref() {
     // `<>` is a valid (empty, relative) IRI reference (W3C syntax-qname-05).
     assert_parses("PREFIX : <> SELECT * WHERE { : : : . }");

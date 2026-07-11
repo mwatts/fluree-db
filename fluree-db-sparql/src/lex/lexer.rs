@@ -95,6 +95,20 @@ impl<'a> Lexer<'a> {
 /// codepoint escape is copied through byte-identically, so the downstream
 /// string/IRI escape handling is unchanged.
 ///
+/// Two consequences of the pre-pass being global and delimiter-producing —
+/// both intended, both W3C-consistent, and pinned by unit tests because the
+/// suite covers neither:
+/// - Comment-agnostic: an escape inside a `#` comment is decoded like any
+///   other. The pre-pass must precede tokenizing (codepoint-esc-01 encodes a
+///   whole `ASK {}`; esc-07 escapes the whitespace *between* tokens), and
+///   comment stripping is part of tokenizing, so comments are not exempt.
+/// - Delimiter-producing: an escape that decodes to a delimiter acts as that
+///   delimiter. esc-08 decodes an escaped `"` to open a string literal; by
+///   the same rule an escape that decodes to `>` closes an IRI — an IRI whose
+///   body ends in such an escape, `<http://ex/…>`, decodes to `<http://ex/>>`,
+///   i.e. the IRI `http://ex/` plus a stray `>`, not an IRI whose value
+///   contains `>`.
+///
 /// Fast paths (no allocation): input with no backslash at all, and input
 /// whose backslashes never form a `\u`/`\U` codepoint escape (ordinary
 /// string escapes like `\n`).
@@ -1462,6 +1476,39 @@ mod tests {
         assert!(
             tokens.iter().any(|t| matches!(t, TokenKind::Error(_))),
             "invalid post-decode string escape should error: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_codepoint_escape_in_comment_is_decoded() {
+        // The pre-pass is deliberately global and runs before comment
+        // stripping (esc-01 encodes a whole `ASK {}`; esc-07 escapes the
+        // whitespace between tokens), so it does not special-case `#`
+        // comments — an escape inside a comment is decoded like any other.
+        // Intended and W3C-consistent; a known divergence from engines that
+        // treat comments as opaque, pinned so it can't drift silently
+        // (fluree/db#1452 review). `bs` is U+005C (a backslash), built via its
+        // codepoint so this source carries no literal backslash of its own.
+        let bs = char::from_u32(0x5c).unwrap();
+        let input = format!("# a {bs}u0041 b");
+        assert_eq!(unescape_codepoints(&input).as_ref(), "# a A b");
+    }
+
+    #[test]
+    fn test_codepoint_escape_producing_iri_delimiter_closes_iri() {
+        // esc-08 pins that an escape producing a *string* delimiter opens a
+        // string; by the same rule an escape producing `>` closes an IRI. An
+        // IRI whose body ends in a `u003E` escape, `<http://ex/…>`, decodes to
+        // `<http://ex/>>`, so the IRI token is `http://ex/` and the trailing
+        // `>` is separate — not an IRI whose value contains `>`. A corner the
+        // W3C suite omits (fluree/db#1452 review). `bs` is U+005C, built via
+        // its codepoint so this source carries no literal backslash.
+        let bs = char::from_u32(0x5c).unwrap();
+        let input = format!("<http://ex/{bs}u003E>");
+        let tokens = tok(&input);
+        assert_eq!(
+            tokens.first(),
+            Some(&TokenKind::Iri(Arc::from("http://ex/")))
         );
     }
 }

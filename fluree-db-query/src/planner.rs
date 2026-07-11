@@ -1899,6 +1899,9 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
         Pattern::Filter(expr) => expr.referenced_vars(),
         Pattern::Bind { expr, .. } => expr.referenced_vars(),
         Pattern::Unwind { list, .. } => list.referenced_vars(),
+        // Only the start anchors an Enumerate path search; requiring the end
+        // would deadlock when no other pattern produces it.
+        Pattern::ShortestPath(sp) => sp.required_input_vars(),
         // Other patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),

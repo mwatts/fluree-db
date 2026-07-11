@@ -859,6 +859,9 @@ pub enum Function {
     // DateTime functions
     // =========================================================================
     Now,
+    /// Current UTC calendar date (Cypher's zero-arg `date()`; no SPARQL
+    /// builtin maps here).
+    Today,
     Year,
     Month,
     Day,
@@ -1019,6 +1022,13 @@ pub enum Function {
     /// → [`crate::binding::Binding::Path`] with every hop using `predicate`.
     /// Internal; emitted by the var-length path-variable binding.
     MakePath,
+    /// Construct a multi-hop path value from interleaved nodes and per-hop
+    /// relationship values: `MakePathHops(node0, rel1, node1, rel2, node2, …)`
+    /// → [`crate::binding::Binding::Path`]. Each `rel` argument evaluates to a
+    /// [`crate::binding::Binding::Rel`] (a `MakeRel` call or a bound edge
+    /// annotation) already carrying the stored edge orientation. Internal;
+    /// emitted by the fixed multi-hop path-variable binding.
+    MakePathHops,
     /// `keys(node)` — the list of a node's data-property keys (local names),
     /// excluding `rdf:type`, the `f:reifies*` bundle, and relationship (ref)
     /// edges. Produces a [`crate::binding::Binding::List`] of strings.

@@ -227,9 +227,13 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 }
                 // ShortestPath also carries a predicate Sid; apply the same
                 // firewall (no SPARQL surface produces it today, but stay safe).
+                // The wildcard form (`predicate: None`) excludes `f:reifies*`
+                // in the operator's edge-set.
                 Pattern::ShortestPath(sp) => {
-                    if fluree_db_core::is_reserved_reifies_predicate(&sp.predicate) {
-                        return Err(reject_predicate_string(format!("{}", sp.predicate)));
+                    if let Some(pred) = &sp.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(pred) {
+                            return Err(reject_predicate_string(format!("{pred}")));
+                        }
                     }
                 }
                 Pattern::Optional(inner)

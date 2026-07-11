@@ -44,6 +44,7 @@ full = ["native", "credential", "iceberg", "shacl", "ipfs"]
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
+lru = { workspace = true }
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
 fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-policy = { path = "../fluree-db-policy" }
@@ -191,6 +192,26 @@ name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
 [[test]]
+name = "it_query_cypher"
+path = "tests/it_query_cypher.rs"
+
+[[test]]
+name = "it_query_cypher_fullscan"
+path = "tests/it_query_cypher_fullscan.rs"
+
+[[test]]
+name = "it_policy_cypher"
+path = "tests/it_policy_cypher.rs"
+
+[[test]]
+name = "it_csv_import"
+path = "tests/it_csv_import.rs"
+
+[[test]]
+name = "it_cypher_import"
+path = "tests/it_cypher_import.rs"
+
+[[test]]
 name = "it_query_explain"
 path = "tests/it_query_explain.rs"
 
@@ -216,6 +237,11 @@ required-features = ["iceberg"]
 name = "it_iceberg_direct"
 path = "tests/it_iceberg_direct.rs"
 required-features = ["iceberg", "aws-testcontainers"]
+
+[[test]]
+name = "it_tpch_iceberg_bench"
+path = "tests/it_tpch_iceberg_bench.rs"
+required-features = ["iceberg"]
 
 [[test]]
 name = "it_storage_s3_testcontainers"
@@ -287,6 +313,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_property_path"
+harness = false
+
+[[bench]]
+name = "query_hot_whole_graph_agg"
 harness = false
 
 [lints]

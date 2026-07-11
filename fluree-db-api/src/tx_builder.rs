@@ -198,6 +198,12 @@ pub(crate) struct TransactCore<'a> {
     pub(crate) operation: Option<TransactOperation<'a>>,
     /// Pre-built transaction IR (bypasses parsing).
     pub(crate) pre_built_txn: Option<Txn>,
+    /// A second pre-built `Txn` staged into the **same** commit immediately
+    /// after `pre_built_txn`, before publishing. Set only for a per-row
+    /// relationship `MERGE … ON MATCH SET`, whose two disjoint branches
+    /// (`ON MATCH SET`, then create) must commit atomically. See
+    /// [`crate::Fluree::stage_pair_from_txns`].
+    pub(crate) pre_built_txn_followup: Option<Txn>,
     /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
     /// `execute()` so its namespace allocation shares the staging registry.
     pub(crate) pending_sparql: Option<&'a str>,
@@ -214,6 +220,7 @@ impl<'a> TransactCore<'a> {
         Self {
             operation: None,
             pre_built_txn: None,
+            pre_built_txn_followup: None,
             pending_sparql: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -233,6 +240,20 @@ impl<'a> TransactCore<'a> {
             });
         } else {
             self.pre_built_txn = Some(txn);
+        }
+    }
+
+    /// Attach a follow-up `Txn` to stage into the same commit after the primary
+    /// (per-row relationship `MERGE … ON MATCH SET`). Requires the primary
+    /// `pre_built_txn` to be set first.
+    pub(crate) fn set_pre_built_txn_followup(&mut self, txn: Txn) {
+        if self.pre_built_txn.is_none() {
+            self.errors.push(BuilderError::Conflict {
+                field: "operation",
+                message: "follow-up txn requires a primary pre-built txn".to_string(),
+            });
+        } else {
+            self.pre_built_txn_followup = Some(txn);
         }
     }
 
@@ -406,6 +427,13 @@ impl<'a> OwnedTransactBuilder<'a> {
         self
     }
 
+    /// Attach a follow-up `Txn` staged into the same commit after the primary
+    /// (per-row relationship `MERGE … ON MATCH SET`). Requires [`Self::txn`].
+    pub fn txn_followup(mut self, txn: Txn) -> Self {
+        self.core.set_pre_built_txn_followup(txn);
+        self
+    }
+
     // -- Option setters --
 
     /// Set transaction options (author, context, etc.).
@@ -471,16 +499,30 @@ impl<'a> OwnedTransactBuilder<'a> {
                 ns_registry,
                 txn_meta,
                 graph_delta,
-            } = self
-                .fluree
-                .stage_transaction_from_txn(
-                    self.ledger,
-                    txn,
-                    Some(&index_config),
-                    self.core.policy.as_ref(),
-                    Some(&tracker),
-                )
-                .await?;
+            } = if let Some(followup) = self.core.pre_built_txn_followup {
+                // Per-row relationship MERGE … ON MATCH SET: both branches stage
+                // into one commit, or an error returns with nothing committed.
+                self.fluree
+                    .stage_pair_from_txns(
+                        self.ledger,
+                        txn,
+                        followup,
+                        Some(&index_config),
+                        self.core.policy.as_ref(),
+                        Some(&tracker),
+                    )
+                    .await?
+            } else {
+                self.fluree
+                    .stage_transaction_from_txn(
+                        self.ledger,
+                        txn,
+                        Some(&index_config),
+                        self.core.policy.as_ref(),
+                        Some(&tracker),
+                    )
+                    .await?
+            };
 
             // Add extracted transaction metadata and graph delta to commit opts
             let commit_opts = self
@@ -788,6 +830,13 @@ impl<'a> RefTransactBuilder<'a> {
         self
     }
 
+    /// Attach a follow-up `Txn` staged into the same commit after the primary
+    /// (per-row relationship `MERGE … ON MATCH SET`). Requires [`Self::txn`].
+    pub fn txn_followup(mut self, txn: Txn) -> Self {
+        self.core.set_pre_built_txn_followup(txn);
+        self
+    }
+
     /// Set the operation to a SPARQL UPDATE.
     ///
     /// Unlike [`txn`](Self::txn), the query is parsed and lowered during
@@ -1010,15 +1059,29 @@ impl Fluree {
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         if let Some(txn) = core.pre_built_txn {
             let txn_type = txn.txn_type;
-            let stage_result = self
-                .stage_transaction_from_txn(
+            let stage_result = if let Some(followup) = core.pre_built_txn_followup {
+                // Per-row relationship MERGE … ON MATCH SET: stage both branches
+                // against the locked state and merge into one commit. Either both
+                // stage and publish, or an error returns with nothing committed.
+                self.stage_pair_from_txns(
+                    ledger_state,
+                    txn,
+                    followup,
+                    Some(index_config),
+                    core.policy.as_ref(),
+                    Some(tracker),
+                )
+                .await?
+            } else {
+                self.stage_transaction_from_txn(
                     ledger_state,
                     txn,
                     Some(index_config),
                     core.policy.as_ref(),
                     Some(tracker),
                 )
-                .await?;
+                .await?
+            };
             return Ok((stage_result, txn_type, core.commit_opts));
         }
 
