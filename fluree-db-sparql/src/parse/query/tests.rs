@@ -2498,7 +2498,7 @@ fn rdf_reifies_followed_by_sibling_triples_keeps_them_in_bgp() {
 
 // ----- Deferred / rejected shapes ------------------------------------------
 
-fn assert_parse_error(input: &str, needle: &str) {
+fn assert_parse_error(input: &str, needle: &str) -> ParseOutput<SparqlAst> {
     let result = parse(input);
     assert!(
         result.has_errors(),
@@ -2514,6 +2514,20 @@ fn assert_parse_error(input: &str, needle: &str) {
         }
         panic!("expected diagnostic containing {needle:?}");
     }
+    result
+}
+
+/// Like [`assert_parse_error`], but for rejections that must also suppress
+/// AST production (unconsumed trailing input; parse-time semantic rejects):
+/// a diagnostics-ignoring caller — e.g. the public `lower_sparql_update_ast`
+/// entry — must never receive an AST covering only a prefix of the request
+/// (issue #1438).
+fn assert_parse_error_no_ast(input: &str, needle: &str) {
+    let result = assert_parse_error(input, needle);
+    assert!(
+        result.ast.is_none(),
+        "AST must be suppressed, not recovered, for input: {input}"
+    );
 }
 
 #[test]
@@ -3126,20 +3140,24 @@ fn test_subselect_trailing_values_clause() {
 
 #[test]
 fn test_trailing_tokens_after_query_rejected() {
-    assert_parse_error(
+    // Trailing input means the parsed AST covers only a prefix of the
+    // request, so the parser also suppresses AST production — a caller
+    // that never consults diagnostics must not be able to execute the
+    // truncated request.
+    assert_parse_error_no_ast(
         "SELECT * WHERE { ?s ?p ?o } ?x",
         "unexpected trailing tokens",
     );
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "SELECT * WHERE { ?s ?p ?o } <http://example.org/trailing>",
         "unexpected trailing tokens",
     );
     // A stray ';' after a query form is trailing content too.
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "SELECT * WHERE { ?s ?p ?o } ;",
         "unexpected trailing tokens",
     );
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "ASK { ?s ?p ?o } SELECT * WHERE { ?s ?p ?o }",
         "unexpected trailing tokens",
     );
@@ -3150,13 +3168,15 @@ fn test_multi_operation_update_rejected_loudly() {
     // Issue #1438: `INSERT ...; DELETE ...` used to parse as the INSERT
     // alone, silently discarding every following operation (silent data
     // loss at commit time). Until PR-U2 adds real multi-op support, the
-    // request must fail loudly (D-10a interim guard).
-    assert_parse_error(
+    // request must fail loudly (D-10a interim guard) — and the AST must be
+    // suppressed, or a caller of the public `lower_sparql_update_ast` that
+    // skips `has_errors()` would still stage the first operation alone.
+    assert_parse_error_no_ast(
         "PREFIX ex: <http://example.org/> \
          INSERT DATA { ex:s ex:p 1 } ; DELETE DATA { ex:s ex:p 1 }",
         "multi-operation SPARQL UPDATE",
     );
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "PREFIX ex: <http://example.org/> \
          INSERT DATA { ex:s ex:p 1 } ; INSERT DATA { ex:s ex:p 2 }",
         "multi-operation SPARQL UPDATE",
@@ -3169,7 +3189,7 @@ fn test_single_trailing_semicolon_after_update_is_legal() {
     // Update may be empty, so one trailing ';' is valid SPARQL.
     assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
     // ...but only one.
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ; ;",
         "multi-operation SPARQL UPDATE",
     );
