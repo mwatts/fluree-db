@@ -155,6 +155,19 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
+    /// A SPARQL/builder graph-management operation (CLEAR/DROP/COPY/MOVE/ADD)
+    /// resolved a target, source, or destination to a reserved system graph:
+    /// `urn:fluree:{ledger}#config` (g_id 2) or `#txn-meta` (g_id 1). These
+    /// graphs are Fluree-internal — `#config` seeds SHACL/uniqueness governance
+    /// and cross-ledger rules, `#txn-meta` holds commit metadata — and are never
+    /// part of the W3C dataset, so they must never be a graph-management target.
+    /// Mirrors the cross-ledger resolver's reserved-graph guard.
+    #[error("graph-management operation targets reserved system graph <{graph_iri}>; refusing")]
+    ReservedGraphTarget {
+        /// The reserved graph IRI the operation attempted to target.
+        graph_iri: String,
+    },
+
     /// Unique constraint violation (`f:enforceUnique`).
     ///
     /// A property annotated with `f:enforceUnique true` has duplicate values

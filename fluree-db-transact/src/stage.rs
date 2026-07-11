@@ -1047,6 +1047,17 @@ fn flake_content(f: &Flake) -> FlakeContent {
 
 /// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
 /// novelty view as of the ledger's current `t`).
+///
+/// O4 (by design): this scan is NOT view-policy filtered — unlike the
+/// DELETE-WHERE path, which reads through a `QueryPolicyEnforcer`. So the set a
+/// graph-management op (CLEAR/DROP/COPY/MOVE/ADD) acts on is the *modifiable*
+/// set, not *viewable ∩ modifiable*. That is deliberate: `CLEAR`/`DROP` are
+/// unconditional whole-graph operations per SPARQL 1.1 Update §3.2 (view-
+/// filtering them would leave a "cleared" graph non-empty). Modify-policy is
+/// still enforced on the resulting flakes (see `stage_graph_mgmt`), so this is
+/// not a privilege escalation; it only means that under `default_allow` + a
+/// view restriction, a `CLEAR` can retract flakes an equivalent DELETE-WHERE
+/// (which only sees viewable rows) would not.
 async fn scan_graph_flakes(
     ledger: &LedgerState,
     g_id: GraphId,
@@ -1121,6 +1132,14 @@ async fn stage_graph_mgmt(
             GraphMgmtOp::Clear(target) => {
                 // Resolve the target to a set of (g_id, Option<graph Sid>) —
                 // `None` Sid = the default graph (g_id 0).
+                //
+                // N3 (documented footgun): CLEAR/DROP DEFAULT and CLEAR/DROP ALL
+                // retract the WHOLE default graph, including schema flakes
+                // (rdfs:Class, rdfs:subClassOf, …). That is spec-correct — CLEAR
+                // is an unconditional whole-graph retraction — but a one-line
+                // `CLEAR ALL` strips the ontology, and because `is_schema_flake`
+                // exempts schema flakes from modify policy, that retraction is
+                // not policy-blockable.
                 let mut targets: Vec<(GraphId, Option<Sid>)> = Vec::new();
                 match target {
                     GraphTarget::Default => targets.push((0, None)),
@@ -1128,6 +1147,15 @@ async fn stage_graph_mgmt(
                         if let Some((g_id, sid)) =
                             resolve_named_graph(&ledger, &mut ns_registry, iri)
                         {
+                            // B2: reserved system graphs (config = g_id 2,
+                            // txn-meta = g_id 1) are Fluree-internal and never a
+                            // valid CLEAR/DROP target. Reject by IRI here, the way
+                            // the `Named | All` arm below filters them out by g_id.
+                            if g_id < FIRST_USER_GRAPH_ID {
+                                return Err(TransactError::ReservedGraphTarget {
+                                    graph_iri: iri.clone(),
+                                });
+                            }
                             targets.push((g_id, Some(sid)));
                         }
                         // Nonexistent named graph: nothing to clear (a no-op).
@@ -1178,6 +1206,13 @@ async fn stage_graph_mgmt(
                         GraphSel::Default => (Some(0), None),
                         GraphSel::Graph(iri) => {
                             match resolve_named_graph(&ledger, &mut ns_registry, iri) {
+                                // B2: reserved system graphs are never a valid
+                                // COPY/MOVE/ADD source.
+                                Some((g_id, _)) if g_id < FIRST_USER_GRAPH_ID => {
+                                    return Err(TransactError::ReservedGraphTarget {
+                                        graph_iri: iri.clone(),
+                                    });
+                                }
                                 Some((g_id, sid)) => (Some(g_id), Some(sid)),
                                 None => (None, None),
                             }
@@ -1194,6 +1229,13 @@ async fn stage_graph_mgmt(
                                 .get(iri.as_str())
                                 .copied()
                                 .expect("provisional_ids returns every requested IRI");
+                            // B2: reserved system graphs are never a valid
+                            // COPY/MOVE/ADD destination.
+                            if g_id < FIRST_USER_GRAPH_ID {
+                                return Err(TransactError::ReservedGraphTarget {
+                                    graph_iri: iri.clone(),
+                                });
+                            }
                             let sid = ns_registry.sid_for_iri(iri);
                             (g_id, Some(sid))
                         }
@@ -1206,6 +1248,33 @@ async fn stage_graph_mgmt(
                         Some(g) => scan_graph_flakes(&ledger, g, options.tracker).await?,
                         None => Vec::new(),
                     };
+
+                    // O5: re-homing (below) rewrites only each flake's `g`, but an
+                    // edge annotation encodes its edge's graph in the
+                    // `f:reifiesGraph` OBJECT and anchors the bundle by flake-level
+                    // `g`. Moving the bundle to another graph without rewriting
+                    // that object desyncs the two, so `EdgeKey::from_reifies_facts`
+                    // returns `GraphMismatch` and both readers (JSON-LD hydration
+                    // and the attachment indexer) silently drop the annotation.
+                    // Fail loud rather than silently lose data; the full
+                    // reification-aware re-home (rewrite/add/drop `f:reifiesGraph`
+                    // per src/dest graph) is a deferred follow-up. `is_reserved_
+                    // reifies_predicate` matches ANY `f:reifies*` predicate, so
+                    // this also catches a default-graph annotation (which has no
+                    // `f:reifiesGraph` flake) being moved into a named graph.
+                    if src_flakes
+                        .iter()
+                        .any(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+                    {
+                        return Err(TransactError::UnsupportedFeature(
+                            "COPY/MOVE/ADD of a graph containing edge annotations \
+                             (f:reifies*) is not yet supported: re-homing would \
+                             orphan the annotation's reified-graph anchor. Retract \
+                             the annotations first."
+                                .to_string(),
+                        ));
+                    }
+
                     let dest_flakes =
                         scan_graph_flakes(&ledger, dest_g_id, options.tracker).await?;
 
@@ -1217,6 +1286,15 @@ async fn stage_graph_mgmt(
                     // COPY/MOVE: retract destination facts the source lacks.
                     // (ADD keeps the destination intact.) Facts common to both
                     // are left in place, so no assert+retract of the same fact.
+                    //
+                    // O3 (documented consequence of D-6): a nonexistent/typo'd
+                    // source resolved to `None` above and scans as empty
+                    // (roadmap D-6: nonexistent ≡ empty), so a COPY/MOVE with a
+                    // missing source retracts the ENTIRE destination here —
+                    // `COPY <typo> TO <important>` silently empties `<important>`.
+                    // Not erroring on a missing source is inherent to D-6 (an
+                    // empty source is indistinguishable from a missing one); a
+                    // non-SILENT missing-source error is a deferred follow-up.
                     if *clear_dest {
                         for f in &dest_flakes {
                             if !src_contents.contains(&flake_content(f)) {

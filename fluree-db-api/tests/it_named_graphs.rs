@@ -2125,3 +2125,217 @@ async fn test_graph_mgmt_transact_builder_parity() {
     );
     assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 1);
 }
+
+/// Like [`run_sparql_update`] but returns the staging `Result` (mapped to its
+/// error string) instead of `expect`-ing success — for negative tests that
+/// assert an operation is *rejected*.
+async fn try_run_sparql_update(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    sparql: &str,
+) -> std::result::Result<(), String> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    assert!(
+        !parsed.has_errors(),
+        "SPARQL parse errors: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE to Txn IR");
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// B2: graph-management (CLEAR/DROP/COPY/MOVE/ADD) must reject the reserved
+/// system graphs — `#config` (g_id 2, seeds SHACL/uniqueness governance and
+/// cross-ledger rules) and `#txn-meta` (g_id 1, commit metadata) — by IRI, the
+/// same way the `Named`/`All` scope already filters them out by g_id. On
+/// `burndown/wave-3` these operations silently retract governance / shred
+/// commit metadata (CLEAR/DROP) or inject flakes into them (COPY/MOVE/ADD dest);
+/// here every one must error. (Remove the guards and this test fails: the ops
+/// succeed and mutate the reserved graphs.)
+#[tokio::test]
+async fn test_graph_mgmt_rejects_reserved_graph_targets() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-reserved:main";
+    let config_iri = fluree_db_core::config_graph_iri(ledger_id);
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
+    let g1 = "http://example.org/g1";
+
+    // Seed one user graph so COPY/MOVE/ADD have a valid non-reserved end.
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{g1}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // Reserved graph as CLEAR/DROP target, and as COPY/MOVE/ADD source AND
+    // destination — every one must be refused. (`ledger.clone()` is a cheap
+    // Arc bump; `stage_owned` consumes it, so each attempt gets its own.)
+    let reserved_cases = [
+        format!("CLEAR GRAPH <{config_iri}>"),
+        format!("DROP GRAPH <{config_iri}>"),
+        format!("CLEAR GRAPH <{txn_meta_iri}>"),
+        format!("DROP GRAPH <{txn_meta_iri}>"),
+        format!("COPY <{g1}> TO <{config_iri}>"), // reserved destination
+        format!("MOVE <{g1}> TO <{txn_meta_iri}>"), // reserved destination
+        format!("COPY <{config_iri}> TO <{g1}>"), // reserved source
+        format!("ADD <{txn_meta_iri}> TO <{g1}>"), // reserved source
+    ];
+    for sparql in reserved_cases {
+        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&format!("reserved-graph op must be rejected: {sparql}"));
+        assert!(
+            err.contains("reserved system graph"),
+            "expected a reserved-graph rejection for `{sparql}`, got: {err}"
+        );
+    }
+
+    // Control: the same verbs against a normal user graph still succeed, so the
+    // guard rejects the reserved graphs specifically, not graph-management.
+    try_run_sparql_update(&fluree, ledger.clone(), &format!("CLEAR GRAPH <{g1}>"))
+        .await
+        .expect("CLEAR of a user graph must still succeed");
+}
+
+/// O5: COPY/MOVE/ADD of a named graph that contains edge annotations
+/// (`f:reifies*` flakes) must fail loud. Re-homing rewrites only each flake's
+/// `g`, desyncing the `f:reifiesGraph` anchor, so on `burndown/wave-3` the
+/// annotation is silently dropped at read time (both JSON-LD hydration and the
+/// attachment indexer skip a `GraphMismatch` bundle). Here the transfer must
+/// error instead of silently losing the annotation. (Remove the guard and this
+/// test fails: the COPY/MOVE/ADD succeeds and the annotation is lost.)
+#[tokio::test]
+async fn test_graph_mgmt_rejects_annotation_bearing_transfer() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-annotation:main";
+    let g2 = "http://example.org/g2";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Seed an annotated edge: the base triple AND its `f:reifies*` bundle land
+    // in the default graph. SPARQL UPDATE only accepts annotation tails in the
+    // default graph in v1 (the JSON-LD surface can place them in a named graph),
+    // but the guard fires on `f:reifies*` flakes in ANY source graph, so a
+    // default-graph source exercises the same path — and DEFAULT -> named is
+    // itself an orphaning case: the re-homed bundle would need an
+    // `f:reifiesGraph` anchor the source never had.
+    let seed = r#"PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} .
+}"#;
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+
+    for verb in ["COPY", "MOVE", "ADD"] {
+        let sparql = format!("{verb} DEFAULT TO <{g2}>");
+        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&format!("annotation-bearing {verb} must be rejected"));
+        assert!(
+            err.contains("edge annotations"),
+            "expected an annotation-transfer rejection for `{sparql}`, got: {err}"
+        );
+    }
+
+    // Control: COPY of an annotation-free graph still succeeds.
+    let plain_iri = "http://example.org/plain";
+    let plain = format!(
+        r#"INSERT DATA {{ GRAPH <{plain_iri}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &plain).await.ledger;
+    try_run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY <{plain_iri}> TO <http://example.org/plain-copy>"),
+    )
+    .await
+    .expect("COPY of an annotation-free graph must still succeed");
+}
+
+/// Graph management runs the SAME enforce_modify_policies as any other
+/// transaction — the policy is NOT bypassed on the whole-graph scan/re-home
+/// path (stage.rs:1270-1275, a reviewer-praised load-bearing invariant).
+/// Regression-lock for the new path: no prior test exercised a graph-mgmt verb
+/// under a modify PolicyContext (it_policy_named_graphs covers only query/insert).
+/// Passes on both wave-3 and this branch (the gate already exists); this pins it.
+#[tokio::test]
+async fn test_graph_mgmt_honors_modify_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-policy:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // One non-schema flake in the default graph (schema flakes bypass modify
+    // policy via is_schema_flake, so use a plain triple).
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA { <http://example.org/s> <http://example.org/p> "v" }"#,
+    )
+    .await
+    .ledger;
+
+    // View-only, default-deny policy: modifying any flake is forbidden.
+    let policy = json!([{
+        "@id": "ex:viewOnly",
+        "f:action": [{"@id": "f:view"}],
+        "f:allow": true
+    }]);
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        policy: Some(policy),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = fluree_db_api::policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    // CLEAR DEFAULT retracts the seeded flake; enforce_modify_policies must
+    // REJECT it under the view-only policy (policy not bypassed on graph-mgmt).
+    let result = fluree
+        .stage_owned(ledger.clone())
+        .txn(Txn::clear_default_graph())
+        .policy(policy_ctx)
+        .execute()
+        .await;
+    assert!(
+        result.is_err(),
+        "CLEAR under a view-only modify policy must be rejected, not bypassed"
+    );
+
+    // The rejected CLEAR did not commit — the flake is intact.
+    let survived = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT ?p WHERE { <http://example.org/s> ?p ?o }",
+    )
+    .await
+    .expect("post-clear query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    let surviving_rows = match survived.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    };
+    assert_eq!(
+        surviving_rows, 1,
+        "policy-rejected CLEAR must leave the flake intact, got: {survived:?}"
+    );
+}
