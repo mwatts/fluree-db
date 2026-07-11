@@ -438,10 +438,10 @@ pub fn passes_filters(
 /// - a string literal with a NON-xsd:string datatype or a language tag becomes
 ///   a `TypedLiteral` so `=`/`!=` can be datatype-aware (D5/D7).
 ///
-/// The Long, xsd:double and xsd:string/plain-string fast paths are
-/// byte-identical to `TryFrom<&FlakeValue>`; only the xsd:double path pays one
-/// cheap datatype check (float vs double) and the string path one (xsd:string
-/// vs foreign/lang). Foreign string literals are rare (BSBM has none).
+/// The Long fast path is byte-identical to `TryFrom<&FlakeValue>`; the
+/// xsd:double and xsd:string/plain-string paths yield the same `ComparableValue`
+/// but each pay one cheap datatype check (float-vs-double, resp.
+/// xsd:string-vs-foreign/lang). Foreign string literals are rare (BSBM has none).
 fn lit_to_comparable(
     val: &FlakeValue,
     dtc: &DatatypeConstraint,
