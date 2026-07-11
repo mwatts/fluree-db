@@ -1145,8 +1145,13 @@ mod tests {
 
     #[test]
     fn test_using_clause_valid() {
+        // Grammar: UsingClause* comes BEFORE the WHERE clause. The previous
+        // input put USING after WHERE, where it was unparseable trailing
+        // input — the recovered AST contained no USING clause at all, so the
+        // assertion was vacuous (and once trailing input started suppressing
+        // AST production, the vacuity surfaced as a parse failure here).
         let diags = validate_query(
-            "DELETE { ?s ex:p ?o } WHERE { ?s ex:p ?o } USING <http://example.org/graph>",
+            "DELETE { ?s ex:p ?o } USING <http://example.org/graph> WHERE { ?s ex:p ?o }",
         );
         assert!(
             !diags
