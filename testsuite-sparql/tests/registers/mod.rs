@@ -468,31 +468,31 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[
 // ingest (PR-W15) lands: the residual blockers are wave-2 query syntax /
 // triple-term functions / CONSTRUCT projection / result serialization,
 // scoped by the Option-1 first-class-triple-term epic (ROADMAP §2).
+// Each test appears in EXACTLY ONE reason cluster (PR-1454 review found 10
+// entries double-counted across clusters); attribution below re-verified
+// empirically by unregistering and reading the harness's failure reasons.
 pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: Turtle-star data won't parse (13)
+    // data load: Turtle-star data won't parse (11)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-4",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
-    // data load: additionally blocked on TriG GRAPH-block parsing,
-    // orthogonal to star (D-8) (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
-    // data load: Turtle-star data won't parse (22)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-7",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-9",
+    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
+    // (D-8) — 'expected subject, found KwGraph' on data-4.trig (3)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
+    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
+    // (D-8) (2)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
     // D-1 triple-terms-as-values: qt:data uses `<<( … )>>`, rejected by
     // ingest with the specific deferred error — Option-1 epic (10)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
@@ -505,21 +505,11 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
-    // data load: additionally blocked on TriG GRAPH-block parsing,
-    // orthogonal to star (D-8) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-    // harness: the expected-result TriG-star graph fails to parse — the
-    // `{| |}` INSERT DATA itself already executes (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
-    // query execution error (1)
+    // query execution error (5)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-5",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
     // D-4 CONSTRUCT annotation projection: lowering returns
     // "CONSTRUCT projection of edge-annotation metadata" (1)
