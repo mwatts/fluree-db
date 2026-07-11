@@ -46,10 +46,10 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri,
-    IriValue, Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue,
-    PropertyPath, QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst,
-    SubjectTerm, Term, TriplePattern, UpdateOperation,
+    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri, IriValue,
+    Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue, PropertyPath,
+    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
+    TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
 use rustc_hash::FxHashMap;

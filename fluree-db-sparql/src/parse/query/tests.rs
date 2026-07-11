@@ -2928,7 +2928,6 @@ fn test_bind_scope_filter_var_not_in_scope_accepted() {
     );
 }
 
-
 // =========================================================================
 // V1: dot structure inside group graph patterns (W3C syn-bad-02..14)
 // =========================================================================
