@@ -2339,3 +2339,114 @@ async fn test_graph_mgmt_honors_modify_policy() {
         "policy-rejected CLEAR must leave the flake intact, got: {survived:?}"
     );
 }
+
+/// O3: a graph-management transfer (ADD/COPY/MOVE) whose SOURCE graph was never
+/// registered — a typo'd or never-written IRI — must error (SPARQL 1.1 Update
+/// §3.2), not silently empty the destination. On `burndown/wave-3` the missing
+/// source resolves to `None`, scans as empty, and COPY/MOVE clear the entire
+/// destination and copy nothing back in, so `COPY <typo> TO <important>`
+/// silently destroys `<important>` (data loss). Here every non-SILENT transfer
+/// from a missing source is refused and the destination is preserved.
+///
+/// The additive-only registry (roadmap D-6) keeps a never-registered source
+/// (`None` → error) distinguishable from an emptied-but-registered source
+/// (`Some(g_id)` → a legitimate empty source that proceeds); the control at the
+/// end pins that distinction, so the guard rejects typos specifically, not
+/// every empty source.
+///
+/// (Remove the source-resolution guard and this test fails: the non-SILENT
+/// COPY/MOVE/ADD succeed and the destination is emptied — the wave-3 bug.)
+#[tokio::test]
+async fn test_graph_mgmt_missing_source_errors() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-missing-source:main";
+    let dest = "http://example.org/important";
+    let missing = "http://example.org/typo"; // never registered
+
+    // Seed only the destination; the source IRI is never written, so it is
+    // never entered into the graph registry (resolves to `None` at staging).
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{dest}> {{
+            <http://example.org/s1> <http://example.org/p> "a" .
+            <http://example.org/s2> <http://example.org/p> "b"
+        }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    let before = count_in_graph(&fluree, &ledger, dest).await;
+    assert_eq!(before, 2, "destination seeded with two triples");
+
+    // Every non-SILENT transfer verb from the missing source must error, and
+    // the destination must be left intact — the rejected txn never commits, so
+    // the pre-txn snapshot still holds the data. (`ledger.clone()` is a cheap
+    // Arc bump; `stage_owned` consumes it, so each attempt gets its own.)
+    for verb in ["COPY", "MOVE", "ADD"] {
+        let sparql = format!("{verb} <{missing}> TO <{dest}>");
+        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&format!("{verb} from a missing source must be rejected"));
+        assert!(
+            err.contains("does not exist"),
+            "expected a missing-source rejection for `{sparql}`, got: {err}"
+        );
+        assert_eq!(
+            count_in_graph(&fluree, &ledger, dest).await,
+            before,
+            "destination must be preserved after the rejected `{sparql}`"
+        );
+    }
+
+    // SILENT opts into the clear-and-copy-nothing behavior: no error, and the
+    // destination is emptied (COPY overwrites it with the missing source's
+    // empty contents). The user asked to ignore the missing source.
+    let ledger_silent = run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY SILENT <{missing}> TO <{dest}>"),
+    )
+    .await
+    .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_silent, dest).await,
+        0,
+        "COPY SILENT from a missing source clears the destination (opted in)"
+    );
+
+    // Control: a source graph that WAS registered and then emptied (CLEAR keeps
+    // it in the additive-only registry, D-6) is a legitimate empty source, so
+    // COPY from it must NOT error — distinguishing it from the never-registered
+    // case above and proving the guard rejects typos specifically, not every
+    // empty source. Uses an independent ledger so the committed SILENT case
+    // above does not advance this scenario's head.
+    let src = "http://example.org/src";
+    let ledger_ctl = genesis_ledger(&fluree, "it/graph-mgmt-empty-source:main");
+    let seed_ctl = format!(
+        r#"INSERT DATA {{
+            GRAPH <{src}> {{ <http://example.org/x> <http://example.org/p> "seed" }}
+            GRAPH <{dest}> {{ <http://example.org/s1> <http://example.org/p> "a" }}
+        }}"#
+    );
+    let ledger_ctl = run_sparql_update(&fluree, ledger_ctl, &seed_ctl)
+        .await
+        .ledger;
+    // Empty the source but keep it registered.
+    let ledger_ctl = run_sparql_update(&fluree, ledger_ctl, &format!("CLEAR GRAPH <{src}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_ctl, src).await,
+        0,
+        "source graph emptied but still registered"
+    );
+    // Registered-but-empty source: COPY proceeds without error (run_sparql_update
+    // `expect`s staging success, so a spurious rejection would panic here) and
+    // overwrites the destination with the empty source (dest: 1 -> 0).
+    let ledger_ctl = run_sparql_update(&fluree, ledger_ctl, &format!("COPY <{src}> TO <{dest}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_ctl, dest).await,
+        0,
+        "COPY from a legitimately empty (registered) source clears the destination without error"
+    );
+}

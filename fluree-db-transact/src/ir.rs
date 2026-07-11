@@ -228,6 +228,13 @@ pub enum GraphMgmtOp {
         clear_dest: bool,
         /// Retract the source after copying (MOVE only).
         clear_src: bool,
+        /// `SILENT`: suppress the "source graph does not exist" error. Per
+        /// SPARQL 1.1 Update §3.2, a transfer from a never-registered source
+        /// graph errors unless `SILENT`; without the guard COPY/MOVE would
+        /// clear the destination and copy nothing back in, silently emptying it
+        /// (roadmap O3). An emptied-but-registered source is a legitimate empty
+        /// source (registry is additive-only, D-6), not an error.
+        silent: bool,
     },
 }
 
@@ -319,6 +326,9 @@ impl Txn {
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: true,
             clear_src: false,
+            // Builder-API COPY errors on a never-registered source, matching
+            // non-SILENT SPARQL COPY (roadmap O3).
+            silent: false,
         });
         // Register the (possibly-new) destination graph so the commit envelope
         // persists its g_id; `apply_delta` skips already-registered IRIs.

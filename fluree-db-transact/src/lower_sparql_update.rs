@@ -946,6 +946,9 @@ fn lower_transfer(
         to: to.clone(),
         clear_dest,
         clear_src,
+        // Thread SILENT through so staging can suppress the missing-source
+        // error (SPARQL §3.2 / roadmap O3) exactly when the user opted in.
+        silent: t.silent,
     })
     .with_opts(opts);
     // Register a (possibly-new) destination named graph so the commit envelope

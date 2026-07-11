@@ -168,6 +168,20 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// A SPARQL/builder graph-management transfer (ADD/COPY/MOVE) named a
+    /// source graph that has never been registered — a typo'd or never-written
+    /// IRI. Per SPARQL 1.1 Update §3.2, ADD/COPY/MOVE from a nonexistent source
+    /// raise an error unless `SILENT`; without this guard COPY/MOVE clear the
+    /// destination and copy nothing back in, silently emptying it (roadmap O3).
+    /// An emptied-but-once-registered graph resolves to a real g_id (the
+    /// registry is additive-only, D-6) and is a legitimate empty source — it
+    /// proceeds, and does not raise this error.
+    #[error("source graph <{graph_iri}> does not exist for ADD/COPY/MOVE; use SILENT to ignore")]
+    SourceGraphNotFound {
+        /// The missing source graph IRI the transfer attempted to read.
+        graph_iri: String,
+    },
+
     /// Unique constraint violation (`f:enforceUnique`).
     ///
     /// A property annotated with `f:enforceUnique true` has duplicate values

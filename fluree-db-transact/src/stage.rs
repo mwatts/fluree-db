@@ -1198,6 +1198,7 @@ async fn stage_graph_mgmt(
                 to,
                 clear_dest,
                 clear_src,
+                silent,
             } => {
                 // `from == to` is a spec no-op for ADD/COPY/MOVE.
                 if from != to {
@@ -1214,6 +1215,22 @@ async fn stage_graph_mgmt(
                                     });
                                 }
                                 Some((g_id, sid)) => (Some(g_id), Some(sid)),
+                                // O3: a never-registered (typo'd) source IRI
+                                // resolves to `None` here. Per SPARQL 1.1 Update
+                                // §3.2, ADD/COPY/MOVE from a nonexistent source
+                                // MUST error unless SILENT — otherwise COPY/MOVE
+                                // clear the destination (below) and copy nothing
+                                // back in, silently emptying it. The additive-only
+                                // registry (D-6) keeps this distinguishable from an
+                                // emptied-but-registered source, which resolves to
+                                // `Some(g_id)` with zero flakes (a legitimate empty
+                                // source that proceeds). SILENT opts into the
+                                // clear-and-copy-nothing behavior.
+                                None if !*silent => {
+                                    return Err(TransactError::SourceGraphNotFound {
+                                        graph_iri: iri.clone(),
+                                    });
+                                }
                                 None => (None, None),
                             }
                         }
@@ -1287,14 +1304,14 @@ async fn stage_graph_mgmt(
                     // (ADD keeps the destination intact.) Facts common to both
                     // are left in place, so no assert+retract of the same fact.
                     //
-                    // O3 (documented consequence of D-6): a nonexistent/typo'd
-                    // source resolved to `None` above and scans as empty
-                    // (roadmap D-6: nonexistent ≡ empty), so a COPY/MOVE with a
-                    // missing source retracts the ENTIRE destination here —
-                    // `COPY <typo> TO <important>` silently empties `<important>`.
-                    // Not erroring on a missing source is inherent to D-6 (an
-                    // empty source is indistinguishable from a missing one); a
-                    // non-SILENT missing-source error is a deferred follow-up.
+                    // O3: a never-registered (typo'd) source without SILENT
+                    // already errored at source resolution above, so reaching
+                    // here means the source is either the default graph, a
+                    // registered graph (possibly emptied — a legitimate empty
+                    // source), or a missing source the user marked SILENT. In
+                    // every case clearing the destination against an empty
+                    // source (retracting it wholesale) is the intended
+                    // behavior, so this no longer silently loses data on a typo.
                     if *clear_dest {
                         for f in &dest_flakes {
                             if !src_contents.contains(&flake_content(f)) {
