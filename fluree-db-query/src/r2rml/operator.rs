@@ -1813,6 +1813,30 @@ fn materialize_batch(
                 }
             }
         }
+
+        // 0b (fluree/db F3): a bound-subject true wildcard (`<iri> ?p ?o`) must
+        // also emit the `rr:class`-derived `rdf:type` triple(s). The POM loop
+        // above materializes only the data predicates, so without this the
+        // bound-subject inspector shows no `@type` for a virtual-dataset subject
+        // (native returns it). Reached only for the matched subject row (the
+        // `subject_term_matches_iri` gate above `continue`s the rest). Scoped to
+        // a bound subject (`subject_var` is None) with a variable predicate and
+        // no explicit predicate filter or projected type-var: a predicate-
+        // filtered `<iri> edw:name ?o` wants only its predicate, and a fused
+        // `?s a ?type` crawl already projects the class via `type_var`.
+        if pattern.subject_var.is_none()
+            && pattern.predicate_filter.is_none()
+            && pattern.type_var.is_none()
+        {
+            if let Some(pv) = pattern.predicate_var {
+                for class_iri in triples_map.classes() {
+                    produced.push(vec![
+                        (pv, Binding::iri(fluree_vocab::rdf::TYPE)),
+                        (obj_var, Binding::iri(class_iri.as_str())),
+                    ]);
+                }
+            }
+        }
     }
     Ok(produced)
 }
@@ -2377,5 +2401,54 @@ mod tests {
             &RdfTerm::string("http://ex/store/5"),
             "http://ex/store/5"
         ));
+    }
+
+    /// PR-0/0b (fluree/db F3): a bound-subject true wildcard (`<iri> ?p ?o`)
+    /// emits the `rr:class`-derived `rdf:type` triple that the POM loop alone
+    /// omits — otherwise the subject inspector shows no `@type` on virtual.
+    #[test]
+    fn bound_subject_wildcard_emits_rdf_type() {
+        use fluree_db_r2rml::mapping::TriplesMap;
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Arc;
+
+        // DIM_STORE keyed on STORE_KEY, class edw:Store, no data POMs — so the
+        // ONLY output is the class-derived rdf:type row.
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store");
+
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "STORE_KEY".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }]));
+        let batch = ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap();
+
+        // `<http://ex/store/1> ?p ?o` (?p = VarId 1, ?o = VarId 2).
+        let pattern = R2rmlPattern::new_bound_subject("gs:main", "http://ex/store/1", Some(VarId(2)))
+            .with_predicate_var(VarId(1));
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let encoder = LiteralEncoder::build(&tm, &snapshot);
+        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
+            .expect("materialize");
+
+        let iri_of = |b: &Binding| -> String {
+            match b {
+                Binding::Iri(s) => s.to_string(),
+                other => panic!("expected an IRI binding, got {other:?}"),
+            }
+        };
+        assert_eq!(rows.len(), 1, "exactly the one rdf:type row: {rows:?}");
+        let row = &rows[0];
+        let pred = row.iter().find(|(v, _)| *v == VarId(1)).map(|(_, b)| iri_of(b));
+        let obj = row.iter().find(|(v, _)| *v == VarId(2)).map(|(_, b)| iri_of(b));
+        assert_eq!(pred.as_deref(), Some(fluree_vocab::rdf::TYPE), "?p = rdf:type");
+        assert_eq!(obj.as_deref(), Some("http://ex/Store"), "?o = the class IRI");
     }
 }
