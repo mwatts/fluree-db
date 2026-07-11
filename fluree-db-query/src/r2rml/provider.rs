@@ -176,6 +176,32 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         filters: &[ScanFilter],
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
+
+    /// The table's exact live row count from Iceberg manifest metadata — **when,
+    /// and only when, it provably equals a full-scan count** of the rows a bare
+    /// `COUNT(*)` would produce. Lets the fused-aggregate COUNT shortcut answer
+    /// from the manifest `record_count` sum instead of decoding every data file.
+    ///
+    /// `non_null_cols` are the columns that must be non-null for a row to be
+    /// counted (the subject-template key columns + any projected object columns).
+    /// Returns `Some(n)` only if: (1) the snapshot carries **no delete
+    /// manifests** (a merge-on-read delete would make the record_count sum an
+    /// over-count), and (2) **every** `non_null_col` is provably zero-null from
+    /// the manifest stats — an absent/unknown null count is treated as unknown,
+    /// NOT zero. Otherwise returns `Ok(None)` and the caller falls back to the
+    /// scan (which is delete/null-correct). The default is `Ok(None)`, so a
+    /// provider without manifest metadata (or a non-Iceberg source) always falls
+    /// back to the scan.
+    async fn table_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        non_null_cols: &[String],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
+        Ok(None)
+    }
 }
 
 // =============================================================================

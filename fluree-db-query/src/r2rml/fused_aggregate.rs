@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
+use fluree_db_r2rml::mapping::{extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_db_r2rml::materialize::materialize_object_from_batch;
 use fluree_db_tabular::Column;
 use futures::StreamExt;
@@ -698,6 +698,12 @@ struct Resolved {
     /// R2RML star's row-drop: the subject template columns plus every predicate's
     /// object column.
     validity_cols: Vec<String>,
+    /// The columns that must be non-null for the COUNT(*) manifest shortcut to
+    /// equal a full scan — the subject key columns **parsed from the template
+    /// string** (not the loader-only `template_columns` field) plus the object
+    /// columns. Empty means a constant subject (present on every row → the
+    /// shortcut needs no null proof). Consumed only for the bare-COUNT fast path.
+    count_non_null_cols: Vec<String>,
 }
 
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
@@ -905,6 +911,34 @@ impl Operator for FusedR2rmlAggregateOperator {
         } else {
             Some(ctx.to_t)
         };
+
+        // COUNT(*) manifest shortcut: a bare COUNT — exactly one CountRows fold,
+        // no GROUP BY, no FILTER — can be answered from the Iceberg manifest
+        // record_count sum instead of decoding every data file, WHEN the provider
+        // can prove the manifest count equals a full scan: no delete manifests,
+        // and every subject/object validity column provably zero-null. Otherwise
+        // `table_row_count` returns None and the scan below runs (delete/null-
+        // correct). Gated by the same `FLUREE_FUSED_R2RML_AGG` kill switch as the
+        // whole fused path (a disabled switch fails detection, so this is never
+        // reached). The emitted binding is byte-identical to the scan+fold result
+        // (`Acc::Count(n).finalize()`).
+        if resolved.filter.is_none()
+            && resolved.group_cols.is_empty()
+            && matches!(resolved.folds.as_slice(), [Fold::CountRows])
+        {
+            let gs = resolved.pattern.graph_source_id.clone();
+            let table = resolved.table_name.clone();
+            let non_null_cols = resolved.count_non_null_cols.clone();
+            if let Some(n) = table_provider
+                .table_row_count(&gs, &table, &non_null_cols, as_of_t)
+                .await?
+            {
+                self.done = true;
+                self.state = OperatorState::Exhausted;
+                let count = Acc::Count(n).finalize();
+                return Ok(Some(Batch::new(Arc::clone(&self.schema), vec![vec![count]])?));
+            }
+        }
 
         let mut stream = table_provider
             .scan_table(
@@ -1261,14 +1295,29 @@ impl FusedR2rmlAggregateOperator {
         if let Some(c) = &tm.subject_map.column {
             validity_cols.push(c.clone());
         }
+        // Trap-safe subject key columns for the COUNT shortcut's null guard: parse
+        // the template STRING. `SubjectMap.template_columns` is populated only on
+        // the loader path, NOT by `TriplesMap::with_subject_template` (the
+        // fluree/db template_columns gotcha), so trusting the field would leave a
+        // fixture- or non-loader-built mapping's key columns empty and the null
+        // guard would pass vacuously. A constant/column subject has no template
+        // placeholders: a constant subject is on every row (empty set is sound —
+        // count == record_count); a column subject must itself be non-null.
+        let mut count_non_null_cols: Vec<String> = match tm.subject_map.template.as_deref() {
+            Some(t) => extract_template_columns(t),
+            None => tm.subject_map.column.iter().cloned().collect(),
+        };
         let mut obj_vars: Vec<VarId> = pattern.object_var.into_iter().collect();
         obj_vars.extend(pattern.star_bindings.iter().map(|(_, v)| *v));
         for v in obj_vars {
             let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, v) else {
                 return Ok(None);
             };
-            validity_cols.push(col);
+            validity_cols.push(col.clone());
+            count_non_null_cols.push(col);
         }
+        count_non_null_cols.sort();
+        count_non_null_cols.dedup();
         for c in &validity_cols {
             projection.push(c.clone());
         }
@@ -1310,6 +1359,7 @@ impl FusedR2rmlAggregateOperator {
             filter,
             expr_folds,
             validity_cols,
+            count_non_null_cols,
         }))
     }
 }
