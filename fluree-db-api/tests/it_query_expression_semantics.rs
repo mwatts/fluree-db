@@ -642,6 +642,107 @@ async fn jsonld_numeric_promotion_result_datatype() {
     );
 }
 
+/// One node carrying a negative, fractional xsd:float — drives all four numeric
+/// builtins (ABS/ROUND/CEIL/FLOOR) and isNumeric across the rounding directions.
+async fn seed_float(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [{ "@id": "ex:n", "ex:f": { "@value": "-2.5", "@type": "xsd:float" } }]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert").ledger
+}
+
+// B1 — a stored xsd:float must flow through ABS/ROUND/CEIL/FLOOR and isNumeric.
+// On wave-3 the builtins' `Some(_) => Ok(None)` catch-all swallowed
+// ComparableValue::Float, so these returned unbound and isNumeric was false —
+// every ASK below was `false`. Regression for the missing Float arm.
+#[tokio::test]
+async fn sparql_xsd_float_through_numeric_builtins() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_float(&fluree, "x2/floatbuiltins:sparql").await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> ";
+    // Value equality is rendering-independent: the xsd:float compares
+    // numerically against the xsd:decimal constants. ROUND is W3C half-toward-+∞.
+    for expr in [
+        "ABS(?f) = 2.5",
+        "ROUND(?f) = -2",
+        "CEIL(?f) = -2",
+        "FLOOR(?f) = -3",
+        "datatype(ABS(?f)) = xsd:float",
+        "isNumeric(?f)",
+    ] {
+        let q = format!("{p} ASK {{ ex:n ex:f ?f FILTER({expr}) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(true),
+            "{expr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonld_xsd_float_through_numeric_builtins() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_float(&fluree, "x2/floatbuiltins:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?abs", "?isnum"],
+        "where": [
+            { "@id": "ex:n", "ex:f": "?f" },
+            ["bind", "?abs", ["expr", ["abs", "?f"]]],
+            ["bind", "?isnum", ["expr", ["isnumeric", "?f"]]]
+        ]
+    });
+    // ABS keeps the xsd:float datatype; isNumeric(xsd:float) is true. On wave-3
+    // ?abs was unbound (null) and ?isnum false.
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([[{ "@value": "2.5", "@type": "xsd:float" }, true]])
+    );
+}
+
+// O2 — IN / NOT IN use value equality (rdf_term_equal), matching `=`. On wave-3
+// they used the variant-exact derived `==`, so `1 IN (1.0)` was false while
+// `1 = 1.0` was true. (The §17.4.1.9 error-in-IN 3-valued half is deferred.)
+#[tokio::test]
+async fn sparql_in_uses_value_equality() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/in:sparql").await;
+    for (filter, expect) in [
+        ("1 IN (1.0)", true),
+        ("1 = 1.0", true),
+        ("1 NOT IN (1.0)", false),
+        ("1 IN (2.0, 3)", false),
+        ("1 IN (2, 1.0)", true),
+    ] {
+        let q = format!("ASK {{ FILTER({filter}) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(expect),
+            "{filter}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonld_in_uses_value_equality() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/in:jsonld").await;
+    // `(in 1 1.0)` holds by value equality → the row survives (empty on wave-3).
+    // Shared IR: the same eval_in fix serves both surfaces.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["filter", "(in 1 [1.0])"]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["Alice"]]));
+}
+
 /// Four one-property nodes spanning the EBV cases: numeric zero, empty string,
 /// a truthy number and a truthy string.
 async fn seed_ebv(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
@@ -956,6 +1057,73 @@ async fn sparql_concat_non_string_is_type_error() {
     );
 }
 
+/// One node carrying a foreign-datatype (non-xsd) string literal, which
+/// `as_str()` exposes but CONCAT must reject.
+async fn seed_foreign_typed(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [{ "@id": "ex:m", "ex:custom": { "@value": "abc", "@type": "ex:myType" } }]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert").ledger
+}
+
+// N2a — CONCAT type-errors on a foreign-datatype literal (§17.4.3.5). On wave-3
+// "abc"^^ex:myType was concatenated (as_str exposed it) and ?c bound; CONCAT now
+// rejects it → ?c unbound. as_str() itself is unchanged (STR-family still uses it).
+#[tokio::test]
+async fn sparql_concat_rejects_foreign_typed_argument() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_foreign_typed(&fluree, "x2/concat-foreign:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // Foreign-typed arg → CONCAT errors → BOUND(?c) is false.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!(
+                "{p} ASK {{ ex:m ex:custom ?v . BIND(CONCAT(?v, \"z\") AS ?c) FILTER(BOUND(?c)) }}"
+            ),
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+    // Plain-string CONCAT still binds (control — the change is arg-type-specific).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!(
+                "{p} ASK {{ ex:m ex:custom ?v . BIND(CONCAT(\"p\", \"q\") AS ?c) FILTER(BOUND(?c)) }}"
+            ),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}
+
+// D11 (JSON-LD sibling) — CONCAT of a non-string argument is a type error → the
+// BIND leaves the target unbound (null). Pairs with the SPARQL D11 test above.
+#[tokio::test]
+async fn jsonld_concat_non_string_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/concat:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?bad", "?good"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n", "ex:age": "?a" },
+            ["bind", "?bad", ["expr", ["concat", "?n", "?a"]]],
+            ["bind", "?good", ["expr", ["concat", "?n", "?n"]]]
+        ]
+    });
+    // ?a is an integer → CONCAT(?n, ?a) errors → ?bad null; CONCAT(?n, ?n) binds.
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([[null, "AliceAlice"]])
+    );
+}
+
 /// Two groups: one all-numeric, one with a non-numeric (IRI) member.
 async fn seed_groups(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
@@ -986,6 +1154,23 @@ async fn jsonld_avg_poisons_on_non_numeric_member() {
     // member so AVG poisons → ?avg is unbound (null), NOT the average of {4}.
     assert_eq!(
         jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["ex:g1", "2"], ["ex:g2", null]])
+    );
+}
+
+// agg-err-01 (SPARQL sibling) — AVG over a group with a non-numeric member is a
+// type error (the aggregate is unbound), not an average of the numeric subset.
+// Pairs with `jsonld_avg_poisons_on_non_numeric_member`.
+#[tokio::test]
+async fn sparql_avg_poisons_on_non_numeric_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_groups(&fluree, "x2/agg:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    let q =
+        format!("{p} SELECT ?g (AVG(?p) AS ?avg) WHERE {{ ?g ex:p ?p }} GROUP BY ?g ORDER BY ?g");
+    // g1 = avg(1,2,3) = 2 (xsd:decimal "2"); g2 poisons on its non-numeric member → null.
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, &q).await,
         json!([["ex:g1", "2"], ["ex:g2", null]])
     );
 }
