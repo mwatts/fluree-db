@@ -280,6 +280,48 @@ W3C dataset tests select graphs from the test document set. Options:
 Decision deferred to implementation of the dataset category; everything else
 is independent of it.
 
+### 5.4 Net-zero vacuous passes (oracle limitation — PR #1437 review)
+
+The both-way register catches a registered test that starts passing (stale
+entry) and an unregistered test that fails (regression). It is blind, by
+construction, to an *unregistered test that passes for the wrong reason* — a
+false-pass. `UpdateEvaluationTest` has one structural false-pass class: a
+**net-zero** update, whose expected end-state is isomorphic to its initial
+state. Such a test passes whether the engine executed the update correctly or
+did nothing at all (a total no-op — including an `is_empty_transaction` swallow
+in `query_handler.rs::run_update_eval_test` — yields the same store). The
+harness verifies the unchanged end-state but cannot confirm the engine no-op'd
+*for the right reason*.
+
+Enumerated 2026-07-08 (rdflib graph-isomorphism of each test's
+`ut:data`/`ut:graphData` initial state vs its `mf:result` state, intersected
+with the live pass list from `sparql11_update_tests`): **32 of 94
+UpdateEvaluationTests are net-zero; 20 are already registered (known failures),
+leaving 12 that currently pass vacuously**:
+
+| Suite | Test | Shape |
+|---|---|---|
+| basic-update | `insert-data-spo-named3` | INSERT DATA of an already-present triple (idempotent-insert) |
+| delete | `dawg-delete-03`, `dawg-delete-04`, `dawg-delete-07` | DELETE whose WHERE matches nothing |
+| delete | `dawg-delete-using-03`, `dawg-delete-using-04` | USING-scoped DELETE, no match |
+| delete | `dawg-delete-with-03`, `dawg-delete-with-04` | WITH-scoped DELETE of a non-existing triple |
+| delete-data | `dawg-delete-data-03`, `dawg-delete-data-04` | DELETE DATA of absent triples |
+| delete-insert | `dawg-delete-insert-06b` | DELETE/INSERT netting to zero |
+| delete-where | `dawg-delete-where-03` | DELETE WHERE, no match |
+
+All 12 are non-empty-store *invariance* tests (not trivial empty→empty). They
+are **not** register candidates — they return the correct end-state and would
+trip the stale-entry gate if listed. The resolution is vigilance, not
+enforcement: the WITH/USING no-op cases (`dawg-delete-with-03/04`,
+`dawg-delete-using-03/04`) are the ones to watch, because sibling tests in
+those families (`dawg-delete-using-02a`, `dawg-delete-using-06a`) are
+registered as producing the *wrong* graph-store state — so a green net-zero
+sibling can give false confidence that WITH/USING scoping is correct when it is
+only untested for that case. When the expression/scoping burn-down PRs touch
+those families, re-run this enumeration and confirm the no-op cases fail for
+the intended reason under a deliberately-mutating variant. Recorded in the
+`tests/registers/mod.rs` header.
+
 ## 6. Perf-safety discipline (non-negotiable)
 
 Repo priority is speed first, memory second. Correctness fixes must follow the

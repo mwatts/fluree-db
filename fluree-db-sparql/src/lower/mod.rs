@@ -311,9 +311,13 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 }
                 // ShortestPath also carries a predicate Sid; apply the same
                 // firewall (no SPARQL surface produces it today, but stay safe).
+                // The wildcard form (`predicate: None`) excludes `f:reifies*`
+                // in the operator's edge-set.
                 Pattern::ShortestPath(sp) => {
-                    if fluree_db_core::is_reserved_reifies_predicate(&sp.predicate) {
-                        return Err(reject_predicate_string(format!("{}", sp.predicate)));
+                    if let Some(pred) = &sp.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(pred) {
+                            return Err(reject_predicate_string(format!("{pred}")));
+                        }
                     }
                 }
                 Pattern::Optional(inner)
@@ -680,6 +684,32 @@ mod tests {
         encoder.add_namespace("http://schema.org/", 101);
         encoder.add_namespace("http://xmlns.com/foaf/0.1/", 102);
         encoder
+    }
+
+    #[test]
+    fn anonymous_bnode_vars_stay_disjoint_from_user_labels() {
+        // pr-1453 follow-up (same class as the transact-side fix):
+        // anonymous blank nodes minted `_:b{N}` variable names, which live
+        // inside the user label namespace — here the anon mints at
+        // vars.len() == 2, so a user-written _:b2 in the same scope
+        // silently unified with it, joining two independent existentials.
+        // The `_:[]{N}` namespace cannot be written as a BLANK_NODE_LABEL.
+        let (query, _vars) = lower_query_with_vars(
+            "SELECT * WHERE { _:b2 <http://example.org/p> ?o . [] <http://example.org/p> ?o }",
+        )
+        .expect("lowers");
+        let subject_var = |p: &Pattern| match p {
+            Pattern::Triple(t) => match &t.s {
+                Ref::Var(v) => *v,
+                other => panic!("expected var subject, got {other:?}"),
+            },
+            other => panic!("expected triple, got {other:?}"),
+        };
+        assert_ne!(
+            subject_var(&query.patterns[0]),
+            subject_var(&query.patterns[1]),
+            "a user label _:b2 must not unify with an anonymous [] blank node"
+        );
     }
 
     fn lower_query(sparql: &str) -> Result<Query> {

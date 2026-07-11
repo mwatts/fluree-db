@@ -2196,6 +2196,47 @@ fn test_order_by_bare_builtin_call() {
 }
 
 #[test]
+fn test_order_by_bare_expression_not_absorbed_as_key() {
+    // `OrderCondition`'s bare form is `Constraint | Var`, never an arbitrary
+    // expression. A trailing operator after a var key must NOT become a
+    // second (spurious) key: pre-fix `ORDER BY ?x - 1` silently parsed as
+    // two keys `[?x, -1]`, corrupting the sort (fluree/db#1452). The `- 1`
+    // is not a Constraint, so it is not absorbed — and under the wave-1
+    // trailing-token guard (#1438/D-10a) the unconsumed tail is a loud
+    // parse error instead of silently ignored input. If absorption ever
+    // regressed, these would parse CLEANLY again (two keys, no trailing
+    // error) and this test would fail. A bare BuiltInCall like
+    // `ORDER BY str(?o)` stays valid, see test_order_by_bare_builtin_call.
+    for q in [
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x - 1",
+        "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x + ?y",
+    ] {
+        assert_parse_error_no_ast(q, "unexpected trailing tokens");
+    }
+}
+
+#[test]
+fn test_group_by_bare_expression_not_absorbed_as_key() {
+    // `GroupCondition`'s bare form is `BuiltInCall | FunctionCall` (or a
+    // parenthesized `( … )`, or a Var) — never a bare arithmetic. Kept
+    // consistent with ORDER BY (fluree/db#1452): a trailing `- 1` after a
+    // var key is not absorbed as a second group key — and under the wave-1
+    // trailing-token guard the unconsumed tail is a loud parse error
+    // instead of silently ignored input (absorption regressing would parse
+    // cleanly with two keys, failing this). The parenthesized
+    // `GROUP BY (?x + 1 AS ?y)` form stays valid
+    // (see test_group_by_with_expression).
+    assert_parse_error_no_ast(
+        "SELECT ?x WHERE { ?s :p ?x } GROUP BY ?x - 1",
+        "unexpected trailing tokens",
+    );
+    assert!(
+        parse("SELECT ?x WHERE { ?s :p ?x } GROUP BY str(?x) - 1").has_errors(),
+        "a bare arithmetic must be rejected as a group condition"
+    );
+}
+
+#[test]
 fn test_empty_iriref() {
     // `<>` is a valid (empty, relative) IRI reference (W3C syntax-qname-05).
     assert_parses("PREFIX : <> SELECT * WHERE { : : : . }");
@@ -2516,7 +2557,7 @@ fn rdf_reifies_followed_by_sibling_triples_keeps_them_in_bgp() {
 
 // ----- Deferred / rejected shapes ------------------------------------------
 
-fn assert_parse_error(input: &str, needle: &str) {
+fn assert_parse_error(input: &str, needle: &str) -> ParseOutput<SparqlAst> {
     let result = parse(input);
     assert!(
         result.has_errors(),
@@ -2532,6 +2573,20 @@ fn assert_parse_error(input: &str, needle: &str) {
         }
         panic!("expected diagnostic containing {needle:?}");
     }
+    result
+}
+
+/// Like [`assert_parse_error`], but for rejections that must also suppress
+/// AST production (unconsumed trailing input; parse-time semantic rejects):
+/// a diagnostics-ignoring caller — e.g. the public `lower_sparql_update_ast`
+/// entry — must never receive an AST covering only a prefix of the request
+/// (issue #1438).
+fn assert_parse_error_no_ast(input: &str, needle: &str) {
+    let result = assert_parse_error(input, needle);
+    assert!(
+        result.ast.is_none(),
+        "AST must be suppressed, not recovered, for input: {input}"
+    );
 }
 
 #[test]
@@ -2946,7 +3001,6 @@ fn test_bind_scope_filter_var_not_in_scope_accepted() {
     );
 }
 
-
 // =========================================================================
 // V1: dot structure inside group graph patterns (W3C syn-bad-02..14)
 // =========================================================================
@@ -3145,20 +3199,24 @@ fn test_subselect_trailing_values_clause() {
 
 #[test]
 fn test_trailing_tokens_after_query_rejected() {
-    assert_parse_error(
+    // Trailing input means the parsed AST covers only a prefix of the
+    // request, so the parser also suppresses AST production — a caller
+    // that never consults diagnostics must not be able to execute the
+    // truncated request.
+    assert_parse_error_no_ast(
         "SELECT * WHERE { ?s ?p ?o } ?x",
         "unexpected trailing tokens",
     );
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "SELECT * WHERE { ?s ?p ?o } <http://example.org/trailing>",
         "unexpected trailing tokens",
     );
     // A stray ';' after a query form is trailing content too.
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "SELECT * WHERE { ?s ?p ?o } ;",
         "unexpected trailing tokens",
     );
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "ASK { ?s ?p ?o } SELECT * WHERE { ?s ?p ?o }",
         "unexpected trailing tokens",
     );
@@ -3296,7 +3354,7 @@ fn test_single_trailing_semicolon_after_update_is_legal() {
     let ast = assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
     assert_eq!(update_request(&ast).operations.len(), 1);
     // ...but a second ';' is not an operation.
-    assert_parse_error(
+    assert_parse_error_no_ast(
         "PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ; ;",
         "expected query form",
     );

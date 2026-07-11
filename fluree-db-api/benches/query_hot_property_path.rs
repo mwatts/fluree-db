@@ -2,7 +2,7 @@
 //!
 //! Property paths are a hot operator (`fluree-db-query/src/property_path.rs`)
 //! and the burn-down roadmap requires every PR touching it to gate on this
-//! bench (docs/audit/burn-down/ROADMAP.md §2 PR-PP, §7 DoD-3). Three
+//! bench (docs/audit/burn-down/ROADMAP.md §2 PR-PP, §7 DoD-3). Four
 //! scenarios, each pinned to a distinct execution mode of the operator:
 //!
 //! 1. **`*` closure, both endpoints variable** — `?s ex:link* ?o`:
@@ -13,6 +13,10 @@
 //!    (`traverse_forward` BFS — the distinct-node fast path).
 //! 3. **`?` (zero-or-one), both endpoints variable** — `?s ex:link? ?o`:
 //!    the ZeroOrOne closure branch (zero-length universe + one hop).
+//! 4. **Selective `*`, both endpoints variable** — `?s ex:rare* ?o`:
+//!    one `ex:rare` edge, so closure work is trivial but the zero-length
+//!    universe still scans every graph term — isolates the full-graph
+//!    universe-scan cost that a link-everywhere graph would hide.
 //!
 //! Distinct from `query_hot_bsbm.rs` (join/filter/aggregate pipeline) —
 //! this bench stresses transitive traversal and closure materialization.
@@ -29,7 +33,8 @@
 //! (cluster-bounded closures keep output linear in scale, so the bench
 //! measures per-node traversal cost, not a quadratic pair blow-up).
 //! Every node also carries one literal (`ex:name`), so the zero-length
-//! term universe includes literals.
+//! term universe includes literals; a single `ex:rare` edge (fixed, not
+//! scaling with `n_clusters`) backs the selective-predicate scenario.
 //!
 //!   inputs:    BenchScale → n_clusters
 //!              (Tiny=20, Small=200, Medium=2_000, Large=20_000)
@@ -84,6 +89,14 @@ PREFIX ex: <http://example.org/pp/>
 SELECT ?s ?o WHERE { ?s ex:link? ?o }
 ";
 
+/// Selective `*` with both endpoints variable: `ex:rare` has a single edge,
+/// so the closure is trivial but the zero-length universe still scans every
+/// graph term — isolates the full-graph universe-scan cost (fluree/db#1452).
+const Q_RARE: &str = r"
+PREFIX ex: <http://example.org/pp/>
+SELECT ?s ?o WHERE { ?s ex:rare* ?o }
+";
+
 /// Generate the cluster-chain graph as Turtle.
 ///
 /// Per cluster `c` (nodes `n{c}_0 .. n{c}_7`):
@@ -105,6 +118,12 @@ fn cluster_graph_turtle(n_clusters: usize) -> String {
             }
         }
     }
+    // A single selective edge: `ex:rare` has exactly one edge regardless of
+    // scale, so `?s ex:rare* ?o` does trivial closure work while its
+    // zero-length universe still scans every term of the (scaling) graph —
+    // the shape where the full-graph universe scan dominates and that the
+    // `ex:link`-everywhere scenarios cannot expose (fluree/db#1452 review).
+    let _ = writeln!(ttl, "ex:rareA ex:rare ex:rareB .");
     ttl
 }
 
@@ -174,6 +193,7 @@ fn bench_query_hot_property_path(c: &mut Criterion) {
         ("star_closure", Q_STAR),
         ("seq_plus", Q_SEQ),
         ("zero_or_one", Q_ZERO_OR_ONE),
+        ("rare_star", Q_RARE),
     ] {
         group.bench_with_input(
             BenchmarkId::new(name, scale.as_str()),

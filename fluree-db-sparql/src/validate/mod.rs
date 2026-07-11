@@ -57,8 +57,11 @@ const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
 /// Fluree capability configuration.
 ///
 /// Controls which SPARQL features are allowed during validation.
-/// By default, all Fluree-supported features are enabled.
+/// By default, all Fluree-supported features are enabled — except
+/// [`Capabilities::delete_where_extensions`], which defaults to the strict
+/// W3C surface (see its field docs).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// Allow property path operators (+, *, ?, /, |, ^)
     pub property_paths: bool,
@@ -66,6 +69,22 @@ pub struct Capabilities {
     pub minus_operator: bool,
     /// Allow USING clause in updates
     pub using_clause: bool,
+    /// Allow Fluree's documented DELETE WHERE extensions: non-stable blank
+    /// nodes as existential variables (the lowering's deliberate carve-out
+    /// in fluree-db-transact) and anonymous annotation tails (`{| ... |}`),
+    /// whose reifier is minted at lowering (docs/concepts/edge-annotations.md
+    /// "SPARQL UPDATE rules by operation").
+    ///
+    /// `false` — the default — is the strict W3C surface, which rejects both
+    /// (SPARQL 1.1 Update §19.8 grammar note 8, W3C `syntax-update-bad-10`;
+    /// SPARQL 1.2 `syntax-update-anonreifier-01`). The W3C harness and every
+    /// pre-existing caller rely on the strict default; the production
+    /// transact seam (fluree-db-api) opts in via
+    /// [`Capabilities::with_delete_where_extensions`] to keep the shipped
+    /// update surface. Only the two DELETE WHERE rejections are waived —
+    /// DELETE DATA, Modify DELETE templates, and graph-variable rules apply
+    /// on every surface.
+    pub delete_where_extensions: bool,
 }
 
 impl Default for Capabilities {
@@ -74,6 +93,23 @@ impl Default for Capabilities {
             property_paths: true,
             minus_operator: true,
             using_clause: true,
+            delete_where_extensions: false,
+        }
+    }
+}
+
+impl Capabilities {
+    /// The Fluree transact-surface configuration: strict W3C validation with
+    /// the documented DELETE WHERE extensions admitted
+    /// ([`Capabilities::delete_where_extensions`]).
+    ///
+    /// The struct is `#[non_exhaustive]`, so out-of-crate callers cannot use
+    /// functional-update syntax — this constructor is the supported way to
+    /// opt in.
+    pub fn with_delete_where_extensions() -> Self {
+        Self {
+            delete_where_extensions: true,
+            ..Self::default()
         }
     }
 }
@@ -299,11 +335,22 @@ impl<'a> Validator<'a> {
         // rules as Modify apply: `GRAPH <iri>` blocks are supported, graph
         // variables are not (Phase 1), and blank nodes are forbidden
         // (SPARQL 1.1 Update §19.8 grammar note 8).
-        self.validate_update_template_quad_pattern(&delete_where.pattern, "DELETE WHERE", true);
+        //
+        // Under `Capabilities::delete_where_extensions` (the Fluree transact
+        // surface) the two strict-surface rejections below are waived: blank
+        // nodes keep their documented existential-variable semantics and
+        // anonymous annotation tails mint their reifier at lowering. The
+        // graph-variable rejection applies on every surface, and the other
+        // update arms (DELETE DATA, Modify templates) stay strict — the
+        // waiver is scoped to this method by design; see the field docs.
+        let strict = !self.caps.delete_where_extensions;
+        self.validate_update_template_quad_pattern(&delete_where.pattern, "DELETE WHERE", strict);
         // The DELETE WHERE pattern doubles as the delete template —
         // anonymous reifiers are blank nodes, which SPARQL forbids in
         // DELETE templates.
-        self.reject_anonymous_annotations_in_delete(&delete_where.pattern, "DELETE WHERE");
+        if strict {
+            self.reject_anonymous_annotations_in_delete(&delete_where.pattern, "DELETE WHERE");
+        }
     }
 
     /// Validate Modify (INSERT/DELETE with WHERE).
@@ -934,6 +981,97 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Capabilities::delete_where_extensions (the Fluree transact surface)
+    // =========================================================================
+
+    fn validate_with(caps: &Capabilities, sparql: &str) -> Vec<Diagnostic> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        validate(output.ast.as_ref().unwrap(), caps)
+    }
+
+    #[test]
+    fn test_delete_where_extensions_allow_existential_blank_nodes() {
+        // The production transact seam keeps Fluree's documented
+        // existential-variable semantics for DELETE WHERE blank nodes
+        // (fluree-db-transact's lowering carve-out), on the triple-only and
+        // GRAPH-bearing forms alike.
+        let caps = Capabilities::with_delete_where_extensions();
+        let diags = validate_with(&caps, "DELETE WHERE { _:a <http://example.org/p> <urn:o> }");
+        assert!(
+            !has_bnode_in_delete_error(&diags),
+            "existential blank nodes stay legal in DELETE WHERE on the transact surface: {diags:?}"
+        );
+        let diags = validate_with(
+            &caps,
+            "DELETE WHERE { GRAPH <urn:g> { _:x <http://example.org/p> ?o } }",
+        );
+        assert!(
+            !has_bnode_in_delete_error(&diags),
+            "existential blank nodes stay legal inside GRAPH blocks too: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_extensions_allow_anonymous_annotations() {
+        // Anonymous annotation tails in DELETE WHERE mint their reifier at
+        // lowering (AnnotationExpansionMode::DeleteWhere) — the transact
+        // surface has always accepted them (pinned end-to-end by
+        // fluree-db-api's it_query_sparql_annotations.rs).
+        let caps = Capabilities::with_delete_where_extensions();
+        let diags = validate_with(
+            &caps,
+            "DELETE WHERE { <urn:s> <http://example.org/p> <urn:o> {| <http://example.org/q> ?v |} . }",
+        );
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "anonymous annotation tails stay legal in DELETE WHERE on the transact surface: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_extensions_keep_every_other_arm_strict() {
+        // The capability waives ONLY the two DELETE WHERE rejections; the
+        // DELETE DATA and Modify-DELETE-template arms and the graph-variable
+        // rule must stay strict on every surface.
+        let caps = Capabilities::with_delete_where_extensions();
+        let diags = validate_with(&caps, "DELETE DATA { _:a <http://example.org/p> <urn:o> }");
+        assert!(
+            has_bnode_in_delete_error(&diags),
+            "DELETE DATA blank nodes stay rejected: {diags:?}"
+        );
+        let diags = validate_with(
+            &caps,
+            "DELETE { _:b <http://example.org/p> ?o } WHERE { ?s <http://example.org/p> ?o }",
+        );
+        assert!(
+            has_bnode_in_delete_error(&diags),
+            "Modify DELETE-template blank nodes stay rejected: {diags:?}"
+        );
+        let diags = validate_with(&caps, "DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
+            "graph variables stay rejected in DELETE WHERE: {diags:?}"
+        );
+        let diags = validate_with(
+            &caps,
+            "DELETE DATA { <urn:s> <http://example.org/p> <urn:o> {| <http://example.org/q> 1 |} . }",
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == DiagCode::AnonymousAnnotationInGroundData && d.is_error()),
+            "anonymous annotations stay rejected in DELETE DATA: {diags:?}"
+        );
+    }
+
     #[cfg(feature = "lowering")]
     #[test]
     fn test_stable_prefix_stays_in_sync_with_core() {
@@ -1011,8 +1149,13 @@ mod tests {
 
     #[test]
     fn test_using_clause_valid() {
+        // Grammar: UsingClause* comes BEFORE the WHERE clause. The previous
+        // input put USING after WHERE, where it was unparseable trailing
+        // input — the recovered AST contained no USING clause at all, so the
+        // assertion was vacuous (and once trailing input started suppressing
+        // AST production, the vacuity surfaced as a parse failure here).
         let diags = validate_query(
-            "DELETE { ?s ex:p ?o } WHERE { ?s ex:p ?o } USING <http://example.org/graph>",
+            "DELETE { ?s ex:p ?o } USING <http://example.org/graph> WHERE { ?s ex:p ?o }",
         );
         assert!(
             !diags

@@ -476,6 +476,21 @@ async fn resolve_cross_ledger_schema_for_tx(
         })
 }
 
+/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
+/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
+/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
+/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
+/// compiled target index bakes in subclass expansion), and the same shape
+/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
+#[cfg(feature = "shacl")]
+struct CachedShaclCompile {
+    snapshot_t: i64,
+    shacl_epoch: u64,
+    schema_epoch: u64,
+    shapes_g_ids: Vec<GraphId>,
+    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
+}
+
 /// Resolve `f:shapesSource` from a loaded `LedgerConfig` into concrete graph
 /// IDs, against the current snapshot's graph registry.
 ///
@@ -489,20 +504,6 @@ async fn resolve_cross_ledger_schema_for_tx(
 /// same mechanism — schema, policy, and SHACL shapes can live in any graph
 /// the ledger knows about, including the config graph itself.
 #[cfg(feature = "shacl")]
-/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
-/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
-/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
-/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
-/// compiled target index bakes in subclass expansion), and the same shape
-/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
-struct CachedShaclCompile {
-    snapshot_t: i64,
-    shacl_epoch: u64,
-    schema_epoch: u64,
-    shapes_g_ids: Vec<GraphId>,
-    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
-}
-
 pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
@@ -1953,8 +1954,38 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
-        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let (view, ns_registry, txn_meta, graph_delta) = self
+            .stage_view_once(ledger, txn, ns_registry, index_config, policy, tracker)
+            .await?;
+        Ok(StageResult {
+            view,
+            ns_registry,
+            txn_meta,
+            graph_delta,
+        })
+    }
 
+    /// Stage one transaction against `ledger` using a caller-supplied namespace
+    /// registry, returning the staged view, the advanced registry, and the
+    /// transaction's extracted metadata. Threading the registry lets a caller
+    /// stage several transactions into one commit (see
+    /// [`Self::stage_pair_from_txns`]) with consistent first-time namespace
+    /// codes across the merged flake set.
+    async fn stage_view_once(
+        &self,
+        ledger: LedgerState,
+        txn: fluree_db_transact::Txn,
+        mut ns_registry: NamespaceRegistry,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+    ) -> Result<(
+        StagedLedger,
+        NamespaceRegistry,
+        Vec<TxnMetaEntry>,
+        FxHashMap<u16, String>,
+    )> {
         // Adopt any namespace allocations the lowering step already made
         // (e.g. `lower_sparql_update` allocates IRIs against a caller-owned
         // registry to build the templates' Sids). The staging registry must
@@ -2022,6 +2053,67 @@ impl crate::Fluree {
         .await?;
 
         validate_staged_reasoning_modes(&view)?;
+
+        Ok((view, ns_registry, txn_meta, graph_delta))
+    }
+
+    /// Stage an ordered pair of transactions against the same base ledger and
+    /// merge them into a single [`StageResult`], so a subsequent `build_commit`
+    /// publishes both as **one** commit at `t+1`. Both WHERE clauses evaluate
+    /// against the same base state; the namespace registry is threaded from the
+    /// first staging into the second so first-time namespace codes stay
+    /// consistent across the merged flake set.
+    ///
+    /// This backs per-row relationship `MERGE … ON MATCH SET`, which decomposes
+    /// into two disjoint operations — an `ON MATCH SET` over already-existing
+    /// edges, then a find-or-create over the absent rows — that cannot share
+    /// one `Txn`'s WHERE (their guards are `EXISTS` vs `NOT EXISTS`). The two
+    /// write disjoint subjects and the second never reads the first's writes,
+    /// so evaluating both against the same base and concatenating their flakes
+    /// is equivalent to the sequential semantics — with true all-or-nothing
+    /// atomicity: either the merged commit publishes, or an error returns with
+    /// nothing committed.
+    pub(crate) async fn stage_pair_from_txns(
+        &self,
+        ledger: LedgerState,
+        first: fluree_db_transact::Txn,
+        second: fluree_db_transact::Txn,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+    ) -> Result<StageResult> {
+        let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let (view1, ns_registry, mut txn_meta, mut graph_delta) = self
+            .stage_view_once(
+                ledger.clone(),
+                first,
+                ns_registry,
+                index_config,
+                policy,
+                tracker,
+            )
+            .await?;
+        let (view2, ns_registry, meta2, gdelta2) = self
+            .stage_view_once(ledger, second, ns_registry, index_config, policy, tracker)
+            .await?;
+
+        txn_meta.extend(meta2);
+        graph_delta.extend(gdelta2);
+
+        // Concatenate the two staged flake sets into one view over the shared
+        // base. The branches write disjoint subjects (the `ON MATCH SET` over
+        // existing annotation Sids; the create branch over fresh blank nodes +
+        // endpoints), so no assertion/retraction reconciliation is needed.
+        // Cypher writes are default-graph only, so the reverse-graph map is
+        // empty (default-graph flakes route to g_id 0 with no lookup).
+        let (base, mut flakes) = view1.into_parts();
+        let (_, flakes2) = view2.into_parts();
+        flakes.extend(flakes2);
+
+        let reverse_graph: HashMap<fluree_db_core::Sid, GraphId> = HashMap::new();
+        let view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
+            ApiError::internal(format!("merging staged Cypher MERGE branches: {e}"))
+        })?;
 
         Ok(StageResult {
             view,

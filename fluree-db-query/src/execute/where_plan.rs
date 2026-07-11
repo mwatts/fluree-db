@@ -28,7 +28,7 @@ use crate::operator::BoxedOperator;
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
 use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
-use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
+use crate::property_path::PropertyPathOperator;
 use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
@@ -732,6 +732,12 @@ impl BindPattern {
         expr: &Expression,
         bound_vars: &HashSet<VarId>,
     ) -> Option<Self> {
+        // EXISTS / pattern comprehensions are async subqueries resolved
+        // per-row by the standalone BindOperator; the fused join block's
+        // synchronous eval would silently collapse them to false/unbound.
+        if crate::filter::contains_exists(expr) {
+            return None;
+        }
         let mut required_vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
         if !required_vars.is_subset(bound_vars) {
             return None;
@@ -1992,17 +1998,45 @@ pub fn build_where_operators_seeded_with_needed(
                         let mut best_idx: Option<usize> = None;
                         let mut best_est: f64 = f64::INFINITY;
                         for (idx, tp) in triples_for_exec.iter().enumerate().skip(1) {
-                            let has_bounds =
-                                tp.o.as_var()
-                                    .is_some_and(|v| pushdown.object_bounds.contains_key(&v));
-                            if !has_bounds {
+                            let bounds = tp.o.as_var().and_then(|v| pushdown.object_bounds.get(&v));
+                            let Some(bounds) = bounds else {
                                 continue;
-                            }
-                            let est = crate::planner::estimate_triple_row_count(
-                                tp,
-                                &bound_vars,
-                                stats_ref,
-                            );
+                            };
+                            // An EQUALITY bound pins the object to one value, so
+                            // the triple's effective cardinality is the per-value
+                            // row count (count/ndv) — the same estimate a
+                            // bound-object pattern gets — not the full property
+                            // scan the bare triple estimate assumes. Without
+                            // this, a handful of novelty rows on the bounded
+                            // predicate nudge its scan estimate past the class
+                            // anchor's and flip a point lookup (`WHERE n.id =
+                            // $id`) into a full-class probe join.
+                            let equality_value = match (&bounds.lower, &bounds.upper) {
+                                (Some((lo, true)), Some((hi, true))) if lo == hi => {
+                                    Some(lo.clone())
+                                }
+                                _ => None,
+                            };
+                            let est = match equality_value {
+                                Some(v) => {
+                                    let bound_tp = TriplePattern {
+                                        s: tp.s.clone(),
+                                        p: tp.p.clone(),
+                                        o: Term::Value(v),
+                                        dtc: tp.dtc.clone(),
+                                    };
+                                    crate::planner::estimate_triple_row_count(
+                                        &bound_tp,
+                                        &bound_vars,
+                                        stats_ref,
+                                    )
+                                }
+                                None => crate::planner::estimate_triple_row_count(
+                                    tp,
+                                    &bound_vars,
+                                    stats_ref,
+                                ),
+                            };
                             if est < best_est {
                                 best_est = est;
                                 best_idx = Some(idx);
@@ -2275,8 +2309,12 @@ pub fn build_where_operators_seeded_with_needed(
                 let augmented_ref = augmented_rwv.as_deref();
 
                 operator = Some(Box::new(
-                    PropertyPathOperator::new(operator, pp.clone(), DEFAULT_MAX_VISITED)
-                        .with_out_schema(augmented_ref),
+                    PropertyPathOperator::new(
+                        operator,
+                        pp.clone(),
+                        crate::property_path::path_max_visited(),
+                    )
+                    .with_out_schema(augmented_ref),
                 ));
                 i += 1;
             }

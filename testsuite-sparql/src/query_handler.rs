@@ -286,6 +286,16 @@ fn dedup_triples(triples: &mut Vec<Triple>) {
     triples.retain(|t| seen.insert(format!("{t:?}")));
 }
 
+/// Set-equality of two triple lists. Both inputs come from `read_graph_triples`
+/// (already deduplicated), so comparing them as sets is exact. Used to
+/// recognize the engine's default-graph leak into `GRAPH ?g` by content rather
+/// than by the alias string (see `run_update_eval_test` step 5).
+fn triples_eq(a: &[Triple], b: &[Triple]) -> bool {
+    let sa: std::collections::HashSet<String> = a.iter().map(|t| format!("{t:?}")).collect();
+    let sb: std::collections::HashSet<String> = b.iter().map(|t| format!("{t:?}")).collect();
+    sa == sb
+}
+
 /// Enumerate the names of all non-empty named graphs.
 async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<String>> {
     let db = GraphDb::from_ledger_state(ledger);
@@ -305,10 +315,16 @@ async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<
         bail!("Graph enumeration returned non-SELECT results");
     };
     // The engine currently binds `?g` as a plain string literal, not an IRI
-    // term, and also exposes the default graph under the ledger alias (both
-    // registered engine gaps — audit §8). Accept both term kinds so this
-    // enumeration keeps working when the engine is fixed, and exclude the
-    // alias-named default graph: only real named graphs count.
+    // term, and also leaks the default graph into `GRAPH ?g` under the ledger
+    // alias (both registered engine gaps — audit burn-down/named-graph-dataset.md
+    // BUG-1/BUG-2, issue #1279). Accept both term kinds so this enumeration
+    // keeps working when the literal-vs-IRI gap is fixed.
+    //
+    // We deliberately do NOT filter the aliased default graph here by name:
+    // the caller (run_update_eval_test step 5) recognizes it by CONTENT, which
+    // is robust to the engine renaming / IRI-expanding the alias. String-
+    // comparing the alias here would silently break every default-graph update
+    // test the day that representation changes.
     Ok(solutions
         .into_iter()
         .filter_map(|sol| match sol.get("g") {
@@ -316,7 +332,6 @@ async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<
             Some(RdfTerm::Literal { value, .. }) => Some(value.clone()),
             _ => None,
         })
-        .filter(|name| name != TEST_LEDGER)
         .collect())
 }
 
@@ -456,7 +471,7 @@ pub async fn run_update_eval_test(
         test_id,
         "default graph",
         expected_default,
-        actual_default,
+        actual_default.clone(),
         result_data_url,
     )?;
 
@@ -475,24 +490,55 @@ pub async fn run_update_eval_test(
 
     // 5. No unexpected non-empty named graphs.
     //
-    // Note: this compares *non-empty* graphs only. Fluree does not track
-    // empty named graphs as first-class graph-store entries, so tests that
-    // distinguish CLEAR (graph remains, empty) from DROP (graph removed)
-    // cannot observe that difference here.
+    // Two caveats bound what this step can assert:
+    //
+    // (a) The engine leaks the default graph into `GRAPH ?g` under the ledger
+    //     alias (burn-down/named-graph-dataset.md BUG-2 / #1279). We recognize
+    //     that leak by CONTENT — a graph whose triples equal the default-graph
+    //     readback IS the aliased default graph — instead of string-comparing
+    //     the alias, so this survives the engine renaming / IRI-expanding that
+    //     alias (and, once BUG-2 is fixed and the leak disappears, the content
+    //     branch simply never fires). The residual risk is a genuinely
+    //     unexpected named graph whose content happens to equal the default
+    //     graph; no update-eval test has that shape, and the previous
+    //     name-filter had the analogous blind spot for a graph literally named
+    //     `w3c:test`.
+    //
+    // (b) This compares *non-empty* graphs only. Fluree does not track empty
+    //     named graphs, so CLEAR (graph remains, empty) vs DROP (graph removed)
+    //     and CREATE (empty graph exists) are not observable here. Those tests
+    //     are all currently registered; see tests/registers/mod.rs header for
+    //     why they must not be silently un-registered when the grammar lands.
     let expected_names: std::collections::HashSet<&str> = result_graph_data
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
-    let actual_names = list_named_graphs(&fluree, &ledger).await?;
-    for name in &actual_names {
-        if !expected_names.contains(name.as_str()) {
-            bail!(
-                "Unexpected non-empty named graph after update.\n\
-                 Test: {test_id}\n\
-                 Graph: <{name}>\n\
-                 Expected named graphs: {expected_names:?}"
-            );
+    for name in &list_named_graphs(&fluree, &ledger).await? {
+        if expected_names.contains(name.as_str()) {
+            continue;
         }
+        // Not an expected graph — but it may be the aliased default-graph leak.
+        let triples = read_graph_triples(&fluree, &ledger, Some(name)).await?;
+        if triples_eq(&triples, &actual_default) {
+            if name != TEST_LEDGER {
+                // The engine changed how it surfaces the default graph under
+                // `GRAPH ?g`; recognized by content, but flag it so the
+                // coupling stays visible rather than silently drifting.
+                eprintln!(
+                    "note: [{test_id}] default graph surfaced under GRAPH ?g as \
+                     <{name}> (expected ledger alias <{TEST_LEDGER}>) — recognized \
+                     by content; update the harness if the engine's default-graph \
+                     representation changed."
+                );
+            }
+            continue;
+        }
+        bail!(
+            "Unexpected non-empty named graph after update.\n\
+             Test: {test_id}\n\
+             Graph: <{name}>\n\
+             Expected named graphs: {expected_names:?}"
+        );
     }
 
     Ok(())

@@ -79,23 +79,30 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
             // `;`-separated sequence (including a legal trailing `;`) by
             // `parse_update_request`, so anything still unconsumed here is
             // genuinely trailing garbage for queries and updates alike.
+            let mut unconsumed_input = false;
             if !stream.is_eof() {
+                unconsumed_input = true;
                 stream.error_at_current("unexpected trailing tokens after the end of the query");
             }
 
             let diagnostics = stream.take_diagnostics();
             // Parse-time *semantic* rejections (currently the V5 BIND-scope
-            // check) must prevent AST production: unlike recovered syntax
-            // errors — where returning a best-effort AST keeps diagnostics
-            // flowing for IDE/LSP use — these describe a query that parsed
-            // completely but is spec-invalid, and callers that only check
-            // for an AST (e.g. the API's parse-then-validate path) would
-            // otherwise execute it (roadmap D-4: hard errors, no
-            // diagnostic-swallowing).
+            // check) and unconsumed trailing input must prevent AST
+            // production: unlike recovered syntax errors — where returning a
+            // best-effort AST keeps diagnostics flowing for IDE/LSP use —
+            // these produce an AST that does not faithfully represent the
+            // request (V5: parsed completely but spec-invalid; trailing
+            // input: the AST covers only a prefix of the input). Callers
+            // that only check for an AST — most dangerously external users
+            // of the public `lower_sparql_update_ast` entry, which takes the
+            // AST without seeing these diagnostics — would otherwise execute
+            // it; for a multi-operation UPDATE that re-opens exactly the
+            // #1438 silent-data-loss window the guard above closes (roadmap
+            // D-4: hard errors, no diagnostic-swallowing).
             let semantic_reject = diagnostics
                 .iter()
                 .any(|d| d.code == DiagCode::BindTargetAlreadyInScope && d.is_error());
-            if semantic_reject {
+            if semantic_reject || unconsumed_input {
                 ParseOutput::with_diagnostics(None, diagnostics)
             } else {
                 ParseOutput::with_diagnostics(Some(ast), diagnostics)
