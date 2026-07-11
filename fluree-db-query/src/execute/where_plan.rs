@@ -341,6 +341,18 @@ pub(crate) enum ExistsFallbackReason {
 /// True when any pattern (recursing through pattern containers) is a
 /// `GRAPH ?g { … }` whose graph variable appears in `outer`.
 fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) -> bool {
+    // Expression-embedded pattern lists (`FILTER(EXISTS { … } && …)`,
+    // `BIND(EXISTS { … } AS ?x)`, pattern comprehensions) hide the same
+    // correlated-GRAPH shape one level down.
+    fn expr_embeds(expr: &Expression, outer: &HashSet<VarId>) -> bool {
+        let mut found = false;
+        expr.for_each_embedded_patterns(&mut |ps| {
+            if !found && has_outer_correlated_graph_var(ps, outer) {
+                found = true;
+            }
+        });
+        found
+    }
     patterns.iter().any(|p| match p {
         Pattern::Graph { name, patterns } => {
             matches!(name, crate::ir::GraphName::Var(v) if outer.contains(v))
@@ -357,6 +369,18 @@ fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) 
             .iter()
             .any(|b| has_outer_correlated_graph_var(b, outer)),
         Pattern::Subquery(sq) => has_outer_correlated_graph_var(&sq.patterns, outer),
+        // PR-1454 review (bplatz + local): these bodies are walked
+        // transparently by `produced_vars`, so without matching arms here a
+        // correlated `GRAPH ?g` inside them still selected Semijoin and
+        // re-opened the #1443 cross-encoding hash mismatch this fallback
+        // exists to close.
+        Pattern::Service(sp) => has_outer_correlated_graph_var(&sp.patterns, outer),
+        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+            has_outer_correlated_graph_var(body, outer)
+        }
+        Pattern::Filter(expr) => expr_embeds(expr, outer),
+        Pattern::Bind { expr, .. } => expr_embeds(expr, outer),
+        Pattern::Unwind { var: _, list } => expr_embeds(list, outer),
         _ => false,
     })
 }
@@ -4438,6 +4462,139 @@ mod tests {
             ExistsStrategy::Semijoin {
                 key_vars: vec![a, b],
             },
+        );
+    }
+
+    /// A correlated `GRAPH ?g` directly inside the EXISTS body must fall
+    /// back to per-row seeding (#1443) — the baseline shape the recursion
+    /// tests below extend.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_bare() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [Pattern::Graph {
+            name: crate::ir::GraphName::Var(g),
+            patterns: vec![Pattern::Triple(make_pattern(VarId(10), "q", VarId(11)))],
+        }];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// PR-1454 review (bplatz): `produced_vars` walks SERVICE bodies
+    /// transparently, so `EXISTS { SERVICE <…> { GRAPH ?g { … } } }` with
+    /// an outer-bound `?g` used to select Semijoin — re-opening the #1443
+    /// `Binding::Iri` vs `Sid`/`EncodedSid` hash mismatch.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_inside_service() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [Pattern::Service(crate::ir::ServicePattern {
+            silent: false,
+            endpoint: crate::ir::ServiceEndpoint::Iri(Arc::from("fluree:ledger:x:main")),
+            patterns: vec![Pattern::Graph {
+                name: crate::ir::GraphName::Var(g),
+                patterns: vec![Pattern::Triple(make_pattern(VarId(10), "q", VarId(11)))],
+            }],
+            source_body: None,
+        })];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// PR-1454 review (bplatz): annotation containers embed pattern bodies
+    /// the walker must recurse into.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_inside_edge_annotation() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [Pattern::EdgeAnnotation {
+            edge: make_pattern(VarId(10), "p", VarId(11)),
+            annotation: Ref::Var(VarId(12)),
+            body: vec![Pattern::Graph {
+                name: crate::ir::GraphName::Var(g),
+                patterns: vec![Pattern::Triple(make_pattern(VarId(13), "q", VarId(14)))],
+            }],
+        }];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// PR-1454 review (local): expression-embedded EXISTS —
+    /// `FILTER(EXISTS { GRAPH ?g { … } } && …)` — hides the correlated
+    /// GRAPH one level down inside an `Expression`, which the
+    /// pattern-level walker never saw.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_inside_filter_expression() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [
+            // Produces ?g so the semijoin key set is non-empty (the shape
+            // that used to mis-select Semijoin).
+            Pattern::Triple(make_pattern(VarId(10), "p", g)),
+            Pattern::Filter(Expression::Exists {
+                patterns: vec![Pattern::Graph {
+                    name: crate::ir::GraphName::Var(g),
+                    patterns: vec![Pattern::Triple(make_pattern(VarId(11), "q", VarId(12)))],
+                }],
+                negated: false,
+            }),
+        ];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// Negative control: a SERVICE-wrapped `GRAPH ?h` whose graph variable
+    /// is NOT outer-bound keeps the Semijoin fast path.
+    #[test]
+    fn choose_exists_strategy_service_graph_var_uncorrelated_keeps_semijoin() {
+        let a = VarId(0);
+        let outer_schema = [a];
+        let inner = [Pattern::Service(crate::ir::ServicePattern {
+            silent: false,
+            endpoint: crate::ir::ServiceEndpoint::Iri(Arc::from("fluree:ledger:x:main")),
+            patterns: vec![
+                Pattern::Triple(make_pattern(a, "p", VarId(10))),
+                Pattern::Graph {
+                    name: crate::ir::GraphName::Var(VarId(20)),
+                    patterns: vec![Pattern::Triple(make_pattern(VarId(21), "q", VarId(22)))],
+                },
+            ],
+            source_body: None,
+        })];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Semijoin { key_vars: vec![a] },
         );
     }
 }
