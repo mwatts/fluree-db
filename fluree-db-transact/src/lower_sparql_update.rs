@@ -550,9 +550,11 @@ fn reject_user_authored_reifies(
 /// Update §19.8 grammar note 8: no blank nodes in DELETE DATA nor in the
 /// DeleteClause template). A blank node here denotes a fresh node, so a
 /// retraction built from it skolemizes a brand-new SID and silently matches
-/// nothing. Mirrors the validator's `BlankNodeInDelete` rule so callers that
-/// lower without running `validate()` (the transact builders) get the same
-/// clear error, and matches [`AnnotationExpansionMode::rejects_blank_reifier`]
+/// nothing. Mirrors the validator's `BlankNodeInDelete` rule as
+/// defense-in-depth: the fluree-db-api seam now runs `validate()` before
+/// lowering, but callers of the public `lower_sparql_update_ast` entry reach
+/// lowering directly and still get the same clear error. Matches
+/// [`AnnotationExpansionMode::rejects_blank_reifier`]
 /// (DeleteData | DeleteTemplate).
 ///
 /// Two deliberate carve-outs:
@@ -561,7 +563,8 @@ fn reject_user_authored_reifies(
 /// - DELETE WHERE is NOT routed through this check at lowering: its blank
 ///   nodes keep Fluree's documented existential-variable semantics
 ///   ([`BlankNodeVarNamer`]); the strict SPARQL surface rejects them in
-///   `validate()`.
+///   `validate()`, and the api seam waives exactly that rejection via
+///   `Capabilities::with_delete_where_extensions`.
 fn reject_blank_nodes_in_delete_quad_pattern(
     pattern: &QuadPattern,
     context: &'static str,

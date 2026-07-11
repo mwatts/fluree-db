@@ -2386,3 +2386,157 @@ async fn multi_operation_sparql_update_rejected_loudly() {
         .expect("single-op update with a trailing ';' is valid SPARQL and should commit");
     assert_eq!(result.receipt.t, 1);
 }
+
+/// bplatz review feedback on #1453: validator-side UPDATE rules must apply
+/// on the production seam (`parse_and_lower_sparql_update`), not only inside
+/// the W3C harness's own `validate()` call. The message shapes asserted here
+/// are the VALIDATOR's ("Blank node _:b0 is not allowed…", "Variable ?s not
+/// allowed…") — the lowering mirror's blank-node message reads "blank nodes
+/// are not allowed in…", and lowering has no variable guard at all — so
+/// these assertions prove `validate()` ran at the seam.
+#[tokio::test]
+async fn sparql_update_validation_runs_at_the_production_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("updval:main")
+        .await
+        .expect("create ledger");
+
+    // Validator rule with a lowering mirror: the error text is now the
+    // validator's, produced before lowering runs.
+    let err = fluree
+        .graph("updval:main")
+        .transact()
+        .sparql_update("DELETE DATA { _:b0 <http://example.org/p> <urn:o> }")
+        .commit()
+        .await
+        .expect_err("blank node in DELETE DATA must be rejected");
+    assert!(
+        err.to_string()
+            .contains("Blank node _:b0 is not allowed in DELETE DATA"),
+        "expected the validator's message shape, got: {err}"
+    );
+
+    // Validator-only rule (no lowering mirror): variables in ground DATA
+    // previously lowered to never-bindable template variables whose flakes
+    // were silently skipped at staging — a silent no-op. Now loud (D-4).
+    let err = fluree
+        .graph("updval:main")
+        .transact()
+        .sparql_update("INSERT DATA { ?s <http://example.org/p> <urn:o> }")
+        .commit()
+        .await
+        .expect_err("variables in INSERT DATA must be rejected, not silently no-op");
+    assert!(
+        err.to_string()
+            .contains("Variable ?s not allowed in INSERT DATA"),
+        "expected the validator's VariableInGroundData message, got: {err}"
+    );
+
+    // Control (the #1438-test idiom): a valid insert afterwards lands at
+    // t=1, proving the rejected requests staged nothing.
+    let result = fluree
+        .graph("updval:main")
+        .transact()
+        .sparql_update("INSERT DATA { <urn:s> <http://example.org/p> <urn:o> }")
+        .commit()
+        .await
+        .expect("valid insert commits");
+    assert_eq!(result.receipt.t, 1);
+}
+
+/// The seam's `validate()` call runs with
+/// `Capabilities::with_delete_where_extensions()`: Fluree's documented
+/// DELETE WHERE surface — non-stable blank nodes as existential variables
+/// and anonymous annotation tails — keeps working end-to-end through the
+/// PRODUCTION path. The W3C suite cannot guard this wiring (its
+/// negative-syntax tests require the strict default to reject these very
+/// shapes), and the pre-existing existential-semantics tests drive
+/// `lower_sparql_update_ast` directly, bypassing the seam — so this test is
+/// the production pin for the capability.
+#[tokio::test]
+async fn sparql_delete_where_extensions_still_work_at_the_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("delwhere:main")
+        .await
+        .expect("create ledger");
+
+    let seed = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:a ex:p "one" . ex:b ex:p "two" . ex:b ex:q "keep" }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed)
+        .commit()
+        .await
+        .expect("seed");
+
+    // _:x is an existential variable: every subject with ex:p matches, so
+    // both ex:a's and ex:b's ex:p triples are retracted; ex:b's ex:q stays.
+    let del = r#"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { _:x ex:p ?o }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del)
+        .commit()
+        .await
+        .expect("existential DELETE WHERE stays supported on the transact surface");
+
+    let ledger = fluree.ledger("delwhere:main").await.expect("ledger");
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let p_rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"@context": ctx, "select": "?o", "where": {"ex:p": "?o"}}),
+    )
+    .await
+    .expect("query ex:p")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        p_rows,
+        json!([]),
+        "existential match must retract ex:p from every subject"
+    );
+    let q_rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"@context": ctx, "select": "?o", "where": {"ex:q": "?o"}}),
+    )
+    .await
+    .expect("query ex:q")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(q_rows, json!(["keep"]), "unmatched triples survive");
+
+    // Anonymous annotation tails in DELETE WHERE — the capability's second
+    // waiver — also survive the seam.
+    let seed_ann = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:s ex:r ex:o {| ex:note "n" |} }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed_ann)
+        .commit()
+        .await
+        .expect("seed annotated edge");
+    let del_ann = r#"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { ex:s ex:r ex:o {| ex:note ?v |} . }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del_ann)
+        .commit()
+        .await
+        .expect("anonymous annotation tail in DELETE WHERE stays supported");
+}
