@@ -2445,6 +2445,58 @@ async fn sparql_update_validation_runs_at_the_production_seam() {
     assert_eq!(result.receipt.t, 1);
 }
 
+/// The seam's `validate()` call applies the query surface's WHERE rules to
+/// update WHERE clauses. Sub-SELECT shapes that SPARQL forbids — `SELECT *`
+/// combined with GROUP BY, and projecting an ungrouped variable — were
+/// previously accepted AND executed by the staged lowering of an update
+/// WHERE; they now reject up front exactly like the query surface
+/// (helpers::parse_and_validate_sparql) has since PR-2. Migration-noted in
+/// the PR body as part of the reject-more wave.
+#[tokio::test]
+async fn sparql_update_where_now_validated_like_query_where() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("updwhere:main")
+        .await
+        .expect("create ledger");
+
+    let star_group_by = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE { ?s ex:p ?o }
+        WHERE { { SELECT * WHERE { ?s ex:p ?o } GROUP BY ?s } }
+    ";
+    let err = fluree
+        .graph("updwhere:main")
+        .transact()
+        .sparql_update(star_group_by)
+        .commit()
+        .await
+        .expect_err("SELECT * with GROUP BY in an update WHERE must reject");
+    assert!(
+        err.to_string()
+            .contains("SELECT * is not allowed with GROUP BY"),
+        "expected the V4 projection-scope message, got: {err}"
+    );
+
+    let ungrouped = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE { ?s ex:p ?o }
+        WHERE { { SELECT ?o WHERE { ?s ex:p ?o } GROUP BY ?s } }
+    ";
+    let err = fluree
+        .graph("updwhere:main")
+        .transact()
+        .sparql_update(ungrouped)
+        .commit()
+        .await
+        .expect_err("ungrouped projection in an update WHERE sub-SELECT must reject");
+    assert!(
+        err.to_string()
+            .contains("is projected but is neither a GROUP BY key nor aggregated"),
+        "expected the V4 ungrouped-projection message, got: {err}"
+    );
+}
+
 /// The seam's `validate()` call runs with
 /// `Capabilities::with_delete_where_extensions()`: Fluree's documented
 /// DELETE WHERE surface — non-stable blank nodes as existential variables
