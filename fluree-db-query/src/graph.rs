@@ -194,10 +194,16 @@ impl GraphOperator {
                 ..
             } => Some(Arc::from(s.as_str())),
             // Late-materialized bindings from the binary index: decode against
-            // the active graph view, then extract from the decoded form. This
-            // runs per parent row of a correlated GRAPH, only in the bound-var
-            // arm — never on a scan hot path. (Subject/string dictionaries are
-            // store-global, so decoding against the outer view is sound.)
+            // the active graph view, then extract from the decoded form.
+            // Defense-in-depth: as of PR-1454's audit, every upstream
+            // operator (hash join, filter/EXISTS seeding, merge) materializes
+            // batches before they reach either extraction call site, so no
+            // known plan shape delivers an encoded binding here — but that is
+            // a property of operator internals, not of this function's
+            // contract, and extraction must stay total across binding kinds.
+            // (Subject/string dictionaries are store-global, so decoding
+            // against the outer view is sound; when extraction DOES run in
+            // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
                 let gv = ctx.graph_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
