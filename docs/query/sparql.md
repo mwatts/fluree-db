@@ -546,10 +546,15 @@ required:
 # Returns the named graph's triples even with no FROM NAMED
 SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }
 
-# Discovers every user-registered named graph (plus the ledger alias,
-# which addresses the default graph)
+# Discovers every user-registered named graph
 SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
 ```
+
+An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
+binds `?g` to each user-registered named graph and never to the default
+graph. The default graph remains explicitly addressable by the ledger alias
+(`GRAPH <mydb:main> { ... }`) when named directly or bound from another
+pattern — it just isn't enumerated.
 
 Only user-registered named graphs are exposed this way; the reserved system
 graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
