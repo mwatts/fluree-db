@@ -16,6 +16,7 @@ use fluree_db_iceberg::{
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
     scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
+    stats::{aggregate_column_stats, send_read_snapshot_data_files},
     IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
@@ -678,21 +679,87 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .instrument(span)
             .await
     }
-}
 
-impl FlureeR2rmlProvider<'_> {
-    /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
-    /// trait method can wrap the setup in an `r2rml.scan_table` timing span via
-    /// `.instrument()` (the codebase's established pattern for timing an async body
-    /// without holding a span guard across an `.await`).
-    async fn scan_table_inner(
+    /// The table's exact live row count from the pinned Iceberg manifest — **only
+    /// when it provably equals a full-scan `COUNT(*)`** (see the trait contract).
+    ///
+    /// Resolves the SAME per-query pinned table context the scan uses (via
+    /// [`Self::load_table_context`], sharing `self.session`), so a `COUNT` and a
+    /// scan in one query read one Iceberg snapshot. It then reads that snapshot's
+    /// manifest-list + manifest Avro (never a Parquet/data file), and returns the
+    /// `record_count` sum only if [`sound_manifest_row_count`] proves it equals a
+    /// full scan: no delete manifests, and every `non_null_col` provably zero-null.
+    /// Otherwise `Ok(None)` and the caller falls back to the scan.
+    async fn table_row_count(
         &self,
         graph_source_id: &str,
         table_name: &str,
-        projection: &[String],
-        filters: &[ScanFilter],
+        non_null_cols: &[String],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<ColumnBatchStream> {
+    ) -> QueryResult<Option<u64>> {
+        // Same pinned context as the scan: one Iceberg snapshot per query (the
+        // shared `self.session` pin), so a count and a scan cannot disagree.
+        // `as_of_t` is ignored here exactly as `scan_table` ignores it today.
+        let (storage, metadata, _metadata_location) = self
+            .load_table_context(graph_source_id, table_name)
+            .await?;
+
+        // The count must equal a full scan of THIS snapshot — the one the scan
+        // planner reads from the same pinned metadata. No current snapshot (an
+        // empty table) or no current schema: decline and let the scan handle it (an
+        // empty scan folds to 0; a missing schema surfaces the scan's own error).
+        let (Some(snapshot), Some(schema)) =
+            (metadata.current_snapshot(), metadata.current_schema())
+        else {
+            return Ok(None);
+        };
+
+        // Manifest-only read (never a Parquet/data file): the live data files, and
+        // whether the snapshot carries merge-on-read delete manifests.
+        let (data_files, _manifests_read, has_delete_manifests) =
+            send_read_snapshot_data_files(storage.as_ref(), snapshot)
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to read manifests for row count of '{table_name}': {e}"
+                    ))
+                })?;
+
+        let count =
+            sound_manifest_row_count(schema, &data_files, has_delete_manifests, non_null_cols);
+        match count {
+            Some(n) => debug!(
+                table_name = %table_name,
+                count = n,
+                non_null_cols = non_null_cols.len(),
+                "COUNT(*) manifest shortcut: answered from manifest record_count sum"
+            ),
+            None => debug!(
+                table_name = %table_name,
+                has_delete_manifests,
+                "COUNT(*) manifest shortcut declined; falling back to scan"
+            ),
+        }
+        Ok(count)
+    }
+}
+
+impl FlureeR2rmlProvider<'_> {
+    /// Resolve a graph source down to its pinned Iceberg table context: the S3
+    /// storage, the (metadata-location-pinned) [`TableMetadata`], and that metadata
+    /// location. Shared by [`Self::scan_table_inner`] and
+    /// [`R2rmlTableProvider::table_row_count`] so a `COUNT` and a scan in the same
+    /// query read ONE Iceberg snapshot — the whole `loadTable` resolution (the
+    /// per-query snapshot pin in [`super::catalog_session::IcebergCatalogSession`]
+    /// plus the cross-query / metadata caches) runs here, through the shared
+    /// `self.session`, exactly as the scan did before this was extracted. It
+    /// excludes the scan-only concerns — the "Starting Iceberg table scan" log and
+    /// the Parquet disk cache — which stay in `scan_table_inner`.
+    async fn load_table_context(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<(Arc<S3IcebergStorage>, Arc<TableMetadata>, String)> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -717,13 +784,6 @@ impl FlureeR2rmlProvider<'_> {
                 "Invalid Iceberg graph source config for '{graph_source_id}': {e}"
             ))
         })?;
-
-        info!(
-            graph_source_id = %graph_source_id,
-            table_name = %table_name,
-            projection = ?projection,
-            "Starting Iceberg table scan"
-        );
 
         // Branch on catalog mode: REST vs Direct
         use fluree_db_iceberg::config::CatalogConfig;
@@ -981,12 +1041,6 @@ impl FlureeR2rmlProvider<'_> {
             }
         };
 
-        // Shared on-disk cache for data files (one global byte budget, deduped
-        // per directory). Threaded into the Parquet readers, which apply a
-        // whole-file-vs-range policy per file based on how much each query reads.
-        let cache_dir = self.fluree.binary_store_cache_dir();
-        let disk_cache = fluree_db_iceberg::DiskArtifactCache::for_dir(&cache_dir);
-
         // Check cache for table metadata
         let cache = self.fluree.r2rml_cache();
         let metadata_location = &load_response.metadata_location;
@@ -1020,6 +1074,45 @@ impl FlureeR2rmlProvider<'_> {
 
             metadata
         };
+        Ok((storage, metadata, load_response.metadata_location.clone()))
+    }
+
+    /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
+    /// trait method can wrap the setup in an `r2rml.scan_table` timing span via
+    /// `.instrument()` (the codebase's established pattern for timing an async body
+    /// without holding a span guard across an `.await`). The shared `loadTable`
+    /// resolution (and its per-query snapshot pin) lives in
+    /// [`Self::load_table_context`]; this adds the scan-only concerns — the
+    /// scan-start log and the Parquet disk cache — and the streaming scan plan.
+    async fn scan_table_inner(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        info!(
+            graph_source_id = %graph_source_id,
+            table_name = %table_name,
+            projection = ?projection,
+            "Starting Iceberg table scan"
+        );
+
+        // Resolve the pinned table context (S3 storage + the snapshot-pinned
+        // metadata) shared with the COUNT(*) manifest shortcut, so a count and a
+        // scan in one query read the same pinned Iceberg snapshot.
+        let (storage, metadata, metadata_location) =
+            self.load_table_context(graph_source_id, table_name).await?;
+
+        // Shared on-disk cache for data files (one global byte budget, deduped per
+        // directory). Threaded into the Parquet readers, which apply a
+        // whole-file-vs-range policy per file based on how much each query reads.
+        // Scan-only: the COUNT shortcut reads no data files, so it never builds it.
+        let cache_dir = self.fluree.binary_store_cache_dir();
+        let disk_cache = fluree_db_iceberg::DiskArtifactCache::for_dir(&cache_dir);
+
+        let cache = self.fluree.r2rml_cache();
 
         let schema = metadata
             .current_schema()
@@ -1082,7 +1175,7 @@ impl FlureeR2rmlProvider<'_> {
                     plan.files_pruned,
                     plan.estimated_row_count,
                 )
-            } else if let Some(cached) = cache.get_scan_files(metadata_location).await {
+            } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
                 debug!(
                     metadata_location = %metadata_location,
                     cached_files = cached.data_files.len(),
@@ -1227,6 +1320,45 @@ fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
 }
 
+/// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
+/// answer to a bare `COUNT(*)`, and if so return it. Pure over the manifest read
+/// result (no I/O), so the soundness gates are unit-tested directly against
+/// hand-built [`fluree_db_iceberg::DataFile`]s.
+///
+/// Returns `Some(n)` only when both hold:
+/// 1. the snapshot has **no delete manifests** — a merge-on-read position/equality
+///    delete would make the `record_count` sum an over-count; and
+/// 2. **every** `non_null_col` is provably zero-null from the manifest stats.
+///    `aggregate_column_stats`' coverage gate makes `null_count` `Some(0)` only
+///    when EVERY data file reported a null count for the column and they sum to
+///    zero; an absent or partially-covered stat is `None` (unknown) and a positive
+///    count is `Some(n>0)` — both decline. An unknown null count is **never**
+///    treated as zero. A column absent from the schema is likewise unproven.
+///
+/// An empty `non_null_cols` is a constant-subject mapping (a row is produced for
+/// every table row), so the count is sound with no null proof required.
+fn sound_manifest_row_count(
+    schema: &fluree_db_iceberg::metadata::Schema,
+    data_files: &[fluree_db_iceberg::DataFile],
+    has_delete_manifests: bool,
+    non_null_cols: &[String],
+) -> Option<u64> {
+    if has_delete_manifests {
+        return None;
+    }
+    let agg = aggregate_column_stats(data_files, schema);
+    for col in non_null_cols {
+        let field = schema.field_by_name(col)?;
+        match agg.columns.get(&field.id).and_then(|c| c.null_count) {
+            Some(0) => {}
+            _ => return None,
+        }
+    }
+    // `record_count` is non-negative in real Iceberg metadata; a would-be negative
+    // total (corrupt manifest) declines rather than reporting a bogus count.
+    u64::try_from(agg.row_count).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,5 +1459,134 @@ mod tests {
         assert!(build_iceberg_filter(&[key_filter("dec_key", "5.5")], &s).is_none());
         // Unknown column → skip.
         assert!(build_iceberg_filter(&[key_filter("nope", "5")], &s).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // COUNT(*) manifest shortcut soundness (`sound_manifest_row_count`).
+    // The decision core is pure over the manifest read result, so the gates
+    // are exercised directly against hand-built DataFiles (the same fixture
+    // style as `fluree_db_iceberg::stats` tests).
+    // ------------------------------------------------------------------
+
+    use fluree_db_iceberg::manifest::{DataFile, FileFormat, PartitionData};
+    use std::collections::HashMap;
+
+    fn count_schema() -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![1],
+            fields: vec![
+                field(1, "SALE_KEY", json!("long")),
+                field(2, "AMOUNT", json!("decimal(18,2)")),
+            ],
+        }
+    }
+
+    /// A data file with `record_count` rows. `null_value_counts` = `Some(pairs)`
+    /// makes the file report those per-field null counts; `None` makes it report
+    /// no null counts at all (to simulate absent/partial coverage).
+    fn count_data_file(record_count: i64, null_value_counts: Option<&[(i32, i64)]>) -> DataFile {
+        DataFile {
+            file_path: "s3://b/t/data/f.parquet".to_string(),
+            file_format: FileFormat::Parquet,
+            record_count,
+            file_size_in_bytes: 1000,
+            partition: PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: null_value_counts
+                .map(|pairs| pairs.iter().copied().collect::<HashMap<i32, i64>>()),
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        }
+    }
+
+    #[test]
+    fn count_shortcut_clean_table_returns_exact_count() {
+        let schema = count_schema();
+        // Two files; every required column reports zero nulls in EVERY file (full
+        // coverage), so the record_count sum equals a full-scan COUNT.
+        let files = vec![
+            count_data_file(100, Some(&[(1, 0), (2, 0)])),
+            count_data_file(200, Some(&[(1, 0), (2, 0)])),
+        ];
+        let cols = vec!["SALE_KEY".to_string(), "AMOUNT".to_string()];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &cols),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn count_shortcut_declines_with_delete_manifests() {
+        let schema = count_schema();
+        let files = vec![count_data_file(300, Some(&[(1, 0), (2, 0)]))];
+        // A merge-on-read delete manifest makes record_count an over-count.
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, true, &["SALE_KEY".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn count_shortcut_declines_nullable_column() {
+        let schema = count_schema();
+        // AMOUNT carries 5 nulls; a COUNT requiring AMOUNT non-null must not adopt
+        // the manifest total (which counts those rows).
+        let files = vec![count_data_file(300, Some(&[(1, 0), (2, 5)]))];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["AMOUNT".to_string()]),
+            None
+        );
+        // Same table, but only the provably zero-null key is required → sound.
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["SALE_KEY".to_string()]),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn count_shortcut_declines_when_null_stats_absent() {
+        let schema = count_schema();
+        // Two files, but only one reports a null count for the key: partial
+        // coverage → aggregate_column_stats yields null_count None (unknown),
+        // which must NOT be read as zero.
+        let files = vec![
+            count_data_file(100, Some(&[(1, 0)])),
+            count_data_file(200, None),
+        ];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["SALE_KEY".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn count_shortcut_constant_subject_needs_no_null_proof() {
+        // Empty non_null_cols = constant-subject mapping: a row exists for every
+        // table row, so the count is sound with no per-column null proof — even
+        // when NO file reports any null stats.
+        let schema = count_schema();
+        let files = vec![count_data_file(100, None), count_data_file(200, None)];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &[]),
+            Some(300)
+        );
+        // A delete manifest still declines, even for a constant subject.
+        assert_eq!(sound_manifest_row_count(&schema, &files, true, &[]), None);
+    }
+
+    #[test]
+    fn count_shortcut_declines_unknown_column() {
+        let schema = count_schema();
+        let files = vec![count_data_file(300, Some(&[(1, 0), (2, 0)]))];
+        // A required column absent from the schema cannot be proven non-null.
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["NOPE".to_string()]),
+            None
+        );
     }
 }
