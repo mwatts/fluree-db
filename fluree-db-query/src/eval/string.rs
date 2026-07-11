@@ -334,8 +334,16 @@ pub fn eval_concat<R: RowAccess>(
         let Some(val) = arg.eval_to_comparable(row, ctx)? else {
             return Ok(None);
         };
-        let Some(s) = val.as_str() else {
-            return Ok(None);
+        // §17.4.3.5: CONCAT accepts only strings — plain, xsd:string, or
+        // language-tagged. An IRI or a foreign-datatype literal (both of which
+        // `as_str()` would expose) is a type error → the whole result is unbound.
+        let s = match &val {
+            ComparableValue::String(s) => s.as_ref(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s),
+                dtc,
+            } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => s.as_str(),
+            _ => return Ok(None),
         };
         let lang = extract_lang_tag(arg, row, ctx);
         match &common_lang {
