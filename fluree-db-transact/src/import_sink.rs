@@ -751,8 +751,13 @@ mod inner {
                     id
                 }
                 None => {
+                    // Anonymous mint: leading '-' keeps the namespace
+                    // disjoint from every lexable user label (labels cannot
+                    // start with '-'), while the full skolemized
+                    // `fdb-{txn}--b{N}` stays serializable — see
+                    // `FlakeSink::term_blank` for the full rationale.
                     self.blank_counter += 1;
-                    let label = format!("b{}", self.blank_counter);
+                    let label = format!("-b{}", self.blank_counter);
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }

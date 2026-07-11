@@ -212,9 +212,17 @@ impl GraphSink for FlakeSink<'_> {
                 id
             }
             None => {
-                // Anonymous blank node — unique counter-based label
+                // Anonymous blank node (`[]`, bare `~` reifiers, `{| … |}`
+                // blocks) — unique counter-based label. The leading '-'
+                // keeps the minted namespace disjoint from every
+                // user-written label: BLANK_NODE_LABEL must start with
+                // PN_CHARS_U | [0-9], so `_:-b1` can never lex (`_:b1` +
+                // an anonymous mint used to skolemize identically and
+                // silently merge). '-' stays legal medially, so the full
+                // skolemized `fdb-{txn}--b{N}` label still serializes and
+                // re-imports as the same stored node.
                 self.blank_counter += 1;
-                let label = format!("b{}", self.blank_counter);
+                let label = format!("-b{}", self.blank_counter);
                 let sid = self.skolemize(&label);
                 self.add_term(ResolvedTerm::Sid(sid))
             }
@@ -443,6 +451,25 @@ mod tests {
         assert_ne!(b1, b3);
         // Anonymous → always unique
         assert_ne!(b3, b4);
+    }
+
+    #[test]
+    fn test_anonymous_mints_disjoint_from_user_label_namespace() {
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        // A user-written `_:b1` and the first anonymous mint used to
+        // skolemize to the SAME Sid (`{txn}-b1`), silently merging user
+        // data into system-minted `[]`/reifier nodes. TermId inequality
+        // (above) never caught it — the collision was at the Sid level.
+        let user = sink.term_blank(Some("b1"));
+        let anon = sink.term_blank(None);
+        let user_sid = sink.resolve_sid(user).expect("user blank is a Sid");
+        let anon_sid = sink.resolve_sid(anon).expect("anon blank is a Sid");
+        assert_ne!(
+            user_sid, anon_sid,
+            "anonymous mint must never share a Sid with a user `_:b1`"
+        );
     }
 
     #[test]
