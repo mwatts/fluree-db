@@ -346,22 +346,28 @@ mod tests {
         assert!(corpus.select_by_ids(&["q019".to_string(), "q999".to_string()]).is_err());
     }
 
-    /// The error-boundary queries declare `expected_status.virtual = error`
-    /// (they succeed with 0 rows on native, error on a virtual R2RML target).
+    /// The error-boundary probes (q043 lang-tag, q044 custom-datatype) carry
+    /// NO expected_status override: the audit predicted a whole-GRAPH error on
+    /// virtual, but observed behavior (2026-07-11 baseline) is q043 ok/0-rows
+    /// and q044 dnf — neither errors. Both must still admit 0 rows on native.
     #[test]
-    fn error_boundary_queries_declare_virtual_error() {
+    fn error_boundary_queries_match_observed_behavior() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
         let corpus = Corpus::load(&dir).expect("corpus loads");
-        let boundary: Vec<&QueryDef> = corpus
+        let declared_error: Vec<&QueryDef> = corpus
             .queries
             .iter()
             .filter(|q| q.expected_status.for_target(true) == ExpectedOutcome::Error)
             .collect();
-        assert_eq!(boundary.len(), 2, "exactly the two lang-tag/custom-datatype probes");
-        for q in boundary {
-            // Native still expects success (0 rows), so its bound must admit 0.
+        assert!(
+            declared_error.is_empty(),
+            "no query declares virtual=error (empirically corrected); found {:?}",
+            declared_error.iter().map(|q| &q.id).collect::<Vec<_>>()
+        );
+        for id in ["q043", "q044"] {
+            let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
             assert_eq!(q.expected_status.for_target(false), ExpectedOutcome::Ok);
-            assert!(q.expected_rows.contains(0), "{} native-expects 0 rows", q.id);
+            assert!(q.expected_rows.contains(0), "{id} native-expects 0 rows");
         }
     }
 
