@@ -746,7 +746,11 @@
       "timeout_s": 180,
       "subsets": [
         "smoke"
-      ]
+      ],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
     },
     {
       "id": "q035",
@@ -1089,7 +1093,11 @@
       "timeout_s": 180,
       "subsets": [
         "smoke"
-      ]
+      ],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
     },
     {
       "id": "q052",

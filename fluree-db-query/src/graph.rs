@@ -251,6 +251,19 @@ impl GraphOperator {
                     graph_iri, rewrite_result.unconverted_count
                 )));
             }
+            // Non-lowered sub-scope patterns (property/shortest paths,
+            // subqueries) whose bodies would evaluate against the R2RML source's
+            // empty native index and silently return no rows — fail loudly.
+            if !rewrite_result.unsupported.is_empty() {
+                return Err(crate::error::QueryError::InvalidQuery(format!(
+                    "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
+                     virtual dataset (an R2RML source has no native index, so these would \
+                     silently return no rows): {}. Rewrite them as basic triple patterns or move \
+                     them outside the GRAPH block.",
+                    graph_iri,
+                    rewrite_result.unsupported.join(", ")
+                )));
+            }
 
             std::borrow::Cow::Owned(rewrite_result.patterns)
         } else {
@@ -393,6 +406,19 @@ impl GraphOperator {
                 "R2RML graph source '{}' contains {} pattern(s) that cannot be converted \
                  to R2RML scans.",
                 graph_iri, rewrite_result.unconverted_count
+            )));
+        }
+        // Non-lowered sub-scope patterns (property/shortest paths, subqueries)
+        // that would silently evaluate against the R2RML source's empty native
+        // index — fail loudly rather than return a wrong empty result.
+        if !rewrite_result.unsupported.is_empty() {
+            return Err(crate::error::QueryError::InvalidQuery(format!(
+                "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
+                 virtual dataset (an R2RML source has no native index, so these would silently \
+                 return no rows): {}. Rewrite them as basic triple patterns or move them outside \
+                 the GRAPH block.",
+                graph_iri,
+                rewrite_result.unsupported.join(", ")
             )));
         }
 

@@ -43,6 +43,15 @@ pub struct R2rmlRewriteResult {
     pub converted_count: usize,
     /// Number of patterns that couldn't be converted (preserved as-is)
     pub unconverted_count: usize,
+    /// Non-lowered sub-scope patterns that would evaluate against the R2RML
+    /// graph source's (empty) native index and **silently return no rows** —
+    /// property paths, shortest paths, and subqueries, whose bodies traverse or
+    /// scan the enclosing graph. The caller MUST error when this is non-empty
+    /// rather than hand back a silently-wrong empty result. Holds each SPARQL
+    /// kind name for the error message. Deliberately excludes the search
+    /// patterns (index/vector/geo/s2): they carry their own `graph_source_id`
+    /// and route independently of this scope.
+    pub unsupported: Vec<&'static str>,
 }
 
 /// Rewrite patterns for an R2RML graph source.
@@ -91,6 +100,7 @@ pub fn rewrite_patterns_for_r2rml(
     let mut result_patterns = Vec::with_capacity(patterns.len());
     let mut converted = 0;
     let mut unconverted = 0;
+    let mut unsupported: Vec<&'static str> = Vec::new();
 
     // Same-subject star grouping: accumulate regular-predicate R2RML patterns
     // (const predicate + fresh object var) by subject so they can be merged into
@@ -154,18 +164,46 @@ pub fn rewrite_patterns_for_r2rml(
                     );
                     converted += r.converted_count;
                     unconverted += r.unconverted_count;
+                    unsupported.extend(r.unsupported);
                     r.patterns
                 });
                 result_patterns.push(rewritten);
             }
-            // Preserve other patterns as-is
+            // Non-lowered patterns whose bodies evaluate against THIS R2RML
+            // graph source's (empty) native index, so if left unconverted they
+            // return no rows *silently* (fluree/db virtual-dataset findings
+            // F1/F2). Record them so the caller errors loudly instead. A
+            // property/shortest path traverses the graph; a subquery's WHERE
+            // scans it. Sequence paths (`a/b`) never reach here — SPARQL
+            // lowering decomposes them into triples upstream — so a residual
+            // `PropertyPath` is a transitive/complex path. We do NOT attempt to
+            // lower these (out of scope); we only convert silent-wrong into a
+            // loud error.
+            Pattern::PropertyPath(_) => {
+                unsupported.push("property path");
+                result_patterns.push(pattern.clone());
+            }
+            Pattern::ShortestPath(_) => {
+                unsupported.push("shortest path");
+                result_patterns.push(pattern.clone());
+            }
+            Pattern::Subquery(_) => {
+                unsupported.push("subquery");
+                result_patterns.push(pattern.clone());
+            }
+            // Preserve the rest as-is. These do NOT hydrate this graph's index:
+            // Filter/Bind/Unwind/Values transform already-bound solutions;
+            // IndexSearch/VectorSearch/GeoSearch/S2Search carry their own
+            // `graph_source_id` and route independently; `R2rml` is already
+            // converted; nested `Graph`/`DefaultGraphSource` re-enter routing
+            // for their own target; the RDF-star `EdgeAnnotation`/
+            // `AnnotationTarget` are expanded during planning (RDF-star over
+            // R2RML is undefined — left untouched here, not silently-empty in
+            // the confirmed sense).
             Pattern::Filter(_)
             | Pattern::Bind { .. }
             | Pattern::Unwind { .. }
             | Pattern::Values { .. }
-            | Pattern::Subquery(_)
-            | Pattern::PropertyPath(_)
-            | Pattern::ShortestPath(_)
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
             | Pattern::R2rml(_)
@@ -305,6 +343,7 @@ pub fn rewrite_patterns_for_r2rml(
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
+        unsupported,
     }
 }
 
@@ -1572,5 +1611,67 @@ mod tests {
             type_var_scans, 2,
             "two type-vars must NOT be merged (would drop a binding): {pats:?}"
         );
+    }
+
+    /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML
+    /// source's empty native index (property/shortest path, subquery) is
+    /// recorded in `unsupported` so the caller errors loudly instead of
+    /// returning a silently-empty result (fluree/db virtual-dataset F1/F2).
+    #[test]
+    fn non_lowered_subscopes_are_flagged_unsupported() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::pattern::SubqueryPattern;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+
+        // Transitive property path.
+        let path = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "knows"),
+            PathModifier::OneOrMore,
+            Ref::Var(VarId(1)),
+        ));
+        let r = rewrite_patterns_for_r2rml(&[path], "gs:main", &snapshot, None, false, false);
+        assert_eq!(r.unsupported, vec!["property path"]);
+
+        // Subquery.
+        let sub = Pattern::Subquery(SubqueryPattern::new(vec![VarId(0)], vec![]));
+        let r = rewrite_patterns_for_r2rml(&[sub], "gs:main", &snapshot, None, false, false);
+        assert_eq!(r.unsupported, vec!["subquery"]);
+
+        // A property path nested inside an OPTIONAL is caught via recursion.
+        let opt = Pattern::Optional(vec![Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(0)),
+            Sid::new(100, "knows"),
+            PathModifier::ZeroOrMore,
+            Ref::Var(VarId(1)),
+        ))]);
+        let r = rewrite_patterns_for_r2rml(&[opt], "gs:main", &snapshot, None, false, false);
+        assert_eq!(
+            r.unsupported,
+            vec!["property path"],
+            "recursion into OPTIONAL must catch a nested path"
+        );
+    }
+
+    /// PR-0/0a negative case: patterns that only transform already-bound
+    /// solutions (VALUES here) do NOT hydrate this graph's index, so they are
+    /// NOT flagged — a VALUES-bearing R2RML query must still rewrite cleanly.
+    #[test]
+    fn values_is_not_flagged_unsupported() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![crate::binding::Binding::Unbound]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+        ];
+        let r = rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, None, false, false);
+        assert!(r.unsupported.is_empty(), "VALUES must not be flagged unsupported");
+        assert_eq!(r.converted_count, 1, "the wildcard triple still converts");
     }
 }
