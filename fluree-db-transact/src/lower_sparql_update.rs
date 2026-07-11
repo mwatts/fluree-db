@@ -1852,15 +1852,41 @@ fn literal_to_template(
 // IRI expansion
 // =============================================================================
 
-/// Expand an IRI using prologue PREFIX declarations.
+/// Expand a constant IRI using the operation's prologue: prefixed names
+/// expand against PREFIX declarations, and relative references resolve
+/// against `BASE` — the same `fluree_vocab::iri`-backed semantics as the
+/// query path's `expand_iri_with` (RFC 3986 §5; SPARQL 1.1 §4.1.1) — so one
+/// document's constant IRIs denote the same absolute IRI on the update and
+/// query surfaces. `BASE <http://x/> INSERT DATA { <s1> <p1> "v" }` used to
+/// commit literal `s1`/`p1` that a query for `<http://x/s1>` could never
+/// find. Without a BASE, relative references stay as written (Fluree
+/// accepts them as ledger-local names).
 fn expand_iri(iri: &Iri, prologue: &Prologue) -> Result<String, LowerError> {
+    let base: Option<&str> = prologue.base.as_ref().map(|b| b.iri.as_ref());
     match &iri.value {
-        IriValue::Full(full) => Ok(full.to_string()),
+        IriValue::Full(full) => {
+            if let Some(base) = base {
+                if !fluree_vocab::iri::is_absolute_iri(full) {
+                    return Ok(fluree_vocab::iri::resolve_iri(base, full));
+                }
+            }
+            Ok(full.to_string())
+        }
         IriValue::Prefixed { prefix, local } => {
-            // Look up prefix in prologue
+            // Look up prefix in prologue (first declaration wins, matching
+            // `Prologue::get_prefix`)
             for decl in &prologue.prefixes {
                 if decl.prefix.as_ref() == prefix.as_ref() {
-                    return Ok(format!("{}{}", decl.iri, local));
+                    // A PREFIX namespace may itself be a relative reference
+                    // (`PREFIX : <#>`); per SPARQL 1.1 §4.1.1 it resolves
+                    // against BASE too.
+                    let expanded = match base {
+                        Some(base) if !fluree_vocab::iri::is_absolute_iri(&decl.iri) => {
+                            format!("{}{}", fluree_vocab::iri::resolve_iri(base, &decl.iri), local)
+                        }
+                        _ => format!("{}{}", decl.iri, local),
+                    };
+                    return Ok(expanded);
                 }
             }
             // Undefined prefix is an error
@@ -2019,6 +2045,80 @@ mod tests {
             result,
             Err(LowerError::UndefinedPrefix { prefix, .. }) if prefix == "unknown"
         ));
+    }
+
+    fn test_prologue_with_base(base: &str) -> Prologue {
+        Prologue {
+            base: Some(fluree_db_sparql::ast::BaseDecl::new(base, test_span())),
+            prefixes: vec![
+                PrefixDecl {
+                    prefix: Arc::from("ex"),
+                    iri: Arc::from("http://example.org/"),
+                    span: test_span(),
+                },
+                PrefixDecl {
+                    prefix: Arc::from("rel"),
+                    iri: Arc::from("#"),
+                    span: test_span(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_expand_relative_iri_against_base() {
+        // PR-1454 review: the update surface must resolve constant IRIs
+        // against BASE with the same RFC 3986 §5 semantics as the query
+        // surface — `BASE <…> INSERT DATA { <s1> … }` used to store the
+        // literal `s1` that a query for the resolved IRI could never find.
+        let prologue = test_prologue_with_base("http://x.example/dir/doc");
+        for (input, expected) in [
+            ("s1", "http://x.example/dir/s1"),
+            ("", "http://x.example/dir/doc"),
+            ("#frag", "http://x.example/dir/doc#frag"),
+            ("/rooted", "http://x.example/rooted"),
+            ("../up", "http://x.example/up"),
+        ] {
+            let iri = Iri::full(input, test_span());
+            assert_eq!(
+                expand_iri(&iri, &prologue).unwrap(),
+                expected,
+                "for <{input}>"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_absolute_iri_ignores_base() {
+        // Any valid scheme passes through verbatim — including non-`://`
+        // forms like `urn:` / `did:`.
+        let prologue = test_prologue_with_base("http://x.example/");
+        for absolute in ["http://other.example/a", "urn:uuid:abc", "did:key:xyz"] {
+            let iri = Iri::full(absolute, test_span());
+            assert_eq!(expand_iri(&iri, &prologue).unwrap(), absolute);
+        }
+    }
+
+    #[test]
+    fn test_expand_relative_prefix_namespace_against_base() {
+        // A PREFIX namespace that is itself a relative reference resolves
+        // against BASE (SPARQL 1.1 §4.1.1) before local-name concatenation
+        // — same as the query path's `prologue_environment`.
+        let prologue = test_prologue_with_base("http://x.example/doc");
+        let iri = Iri::prefixed("rel", "x", test_span());
+        assert_eq!(
+            expand_iri(&iri, &prologue).unwrap(),
+            "http://x.example/doc#x"
+        );
+    }
+
+    #[test]
+    fn test_expand_relative_iri_without_base_stays_as_written() {
+        // Fluree accepts relative references as ledger-local names when no
+        // BASE is declared.
+        let iri = Iri::full("ledger-local", test_span());
+        let prologue = test_prologue();
+        assert_eq!(expand_iri(&iri, &prologue).unwrap(), "ledger-local");
     }
 
     #[test]
