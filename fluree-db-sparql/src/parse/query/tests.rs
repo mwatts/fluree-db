@@ -3389,3 +3389,33 @@ fn test_cross_operation_bnode_label_reuse_rejected() {
     );
     assert_eq!(update_request(&ast).operations.len(), 2);
 }
+
+#[test]
+fn test_cross_operation_delete_side_bnode_labels_are_independent() {
+    // PR-1454 review (bplatz): §19.6's cross-operation label ban protects
+    // blank-node *minting* positions only. DELETE WHERE blank nodes are
+    // locally-scoped existential matching variables under Fluree's
+    // documented extension — reusing `_:b1` across two DELETE WHERE
+    // operations is two independent matches and must parse.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         DELETE WHERE { _:b1 :flag \"a\" } ; DELETE WHERE { _:b1 :flag \"b\" }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+    // DELETE-template labels likewise stay out of the reuse check: the
+    // strict validator rejects DELETE-side blank nodes outright with the
+    // real error, which a cross-operation-label complaint would mask.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         DELETE { _:b1 :p ?o } WHERE { ?s :q ?o } ; \
+         DELETE { _:b1 :p ?o } WHERE { ?s :q ?o }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+    // A minted label followed by a DELETE WHERE reuse is fine too — only
+    // minting positions participate in the §19.6 scope rule.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         INSERT DATA { _:b1 :p :o } ; DELETE WHERE { _:b1 :flag \"a\" }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+}

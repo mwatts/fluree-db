@@ -10,14 +10,19 @@ use crate::lex::TokenKind;
 use crate::span::SourceSpan;
 
 /// Collect the labeled blank nodes appearing in an update operation's
-/// template/data positions (INSERT DATA / DELETE DATA quad data, DELETE
-/// WHERE quad pattern, and Modify DELETE/INSERT templates).
+/// blank-node-MINTING template positions: INSERT DATA quad data and Modify
+/// INSERT templates.
 ///
 /// Used by the request-level parser to enforce SPARQL 1.1 Update §19.6's
 /// blank-node label scoping: a label may not be reused across operations of
-/// one request. WHERE-clause blank nodes are excluded — there they act as
-/// non-distinguished variables governed by the query-side BGP scoping rules,
-/// not by the template-scope rule.
+/// one request. WHERE-clause and DELETE-side blank nodes are excluded — in
+/// WHERE clauses (including DELETE WHERE, per Fluree's documented
+/// extension) they act as non-distinguished matching variables governed by
+/// the query-side BGP scoping rules, and strict-mode DELETE templates/data
+/// reject blank nodes outright downstream (validator + lowering) — in
+/// neither case is there a minted node the label-scope rule could protect,
+/// and walking them over-rejected `DELETE WHERE { _:b1 … } ; DELETE WHERE
+/// { _:b1 … }`, whose two labels are independently-scoped matches.
 ///
 /// Parser-synthesized labels (`#bnpl<N>` from blank-node property lists) are
 /// minted from a counter that is monotonic across the whole request, so they
@@ -95,16 +100,14 @@ pub(super) fn collect_template_bnode_labels(
 
     match op {
         UpdateOperation::InsertData(insert) => from_elements(&insert.data.quads, out),
-        UpdateOperation::DeleteData(delete) => from_elements(&delete.data.quads, out),
-        UpdateOperation::DeleteWhere(dw) => from_elements(&dw.pattern.patterns, out),
         UpdateOperation::Modify(modify) => {
-            if let Some(delete_clause) = &modify.delete_clause {
-                from_elements(&delete_clause.patterns, out);
-            }
             if let Some(insert_clause) = &modify.insert_clause {
                 from_elements(&insert_clause.patterns, out);
             }
         }
+        // DELETE-side blank nodes never mint nodes (see the doc comment),
+        // so they carry no cross-operation label identity to protect.
+        UpdateOperation::DeleteData(_) | UpdateOperation::DeleteWhere(_) => {}
     }
 }
 
