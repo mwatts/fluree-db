@@ -2278,6 +2278,40 @@ mod tests {
     }
 
     #[test]
+    fn test_stable_id_exemption_predicate_matches_validator() {
+        // pr-1453 review follow-up: the validator's stable-id exemption
+        // (validate/mod.rs, a `starts_with("fdb-")` on a duplicated const)
+        // and this crate's `stable_blank_node_sid_from_label` must classify
+        // the SAME labels as stable — today both are prefix-only, so
+        // `_:fdb-zzz` is exempt on both sides (a constant addressing a —
+        // possibly nonexistent — stored node; deleting it is a no-op, not
+        // an error). The lowering-feature sync test in fluree-db-sparql
+        // pins only the prefix CONSTANT; this pins the PREDICATE, so if the
+        // helper ever grows stricter parsing without the validator
+        // following, the drift fails here instead of shipping a
+        // passes-validate-then-fails-at-lowering flow.
+        for label in ["fdb-zzz", "fdb-1234-0-b0", "fdb-", "fdbx", "b0", "x0"] {
+            let lowering_exempts =
+                crate::namespace::stable_blank_node_sid_from_label(label).is_some();
+            let sparql = format!("DELETE DATA {{ _:{label} <http://example.org/p> <urn:o> }}");
+            let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            let ast = parsed
+                .ast
+                .unwrap_or_else(|| panic!("label {label} must parse: {:?}", parsed.diagnostics));
+            let diags =
+                fluree_db_sparql::validate(&ast, &fluree_db_sparql::Capabilities::default());
+            let validator_exempts = !diags
+                .iter()
+                .any(|d| d.code == fluree_db_sparql::DiagCode::BlankNodeInDelete && d.is_error());
+            assert_eq!(
+                lowering_exempts, validator_exempts,
+                "stable-id classification diverged for label {label:?} \
+                 (lowering: {lowering_exempts}, validator: {validator_exempts})"
+            );
+        }
+    }
+
+    #[test]
     fn test_lower_insert_data_blank_node_still_allowed() {
         // INSERT DATA keeps CONSTRUCT-style fresh-mint blank nodes.
         let parsed =
