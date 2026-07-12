@@ -84,18 +84,14 @@ pub(crate) fn is_reserved_edge_predicate(p: &Sid) -> bool {
     fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
 }
 
-/// Re-encode a pattern-constant predicate `Sid` into the active graph's dict.
-///
-/// Path predicates are encoded against the primary/lowering snapshot at plan
-/// time, but a path runs against a per-`GRAPH` snapshot that may code the same
-/// IRI differently; without this the traversal reads the wrong SID and finds no
-/// edges. Single-graph round-trips to the same SID.
+/// Re-encode a pattern-constant predicate `Sid` into the active graph's dict,
+/// falling back to the raw SID. A path runs against a per-`GRAPH` snapshot that
+/// may code the same IRI differently than the primary snapshot the predicate
+/// was encoded against; without this the traversal reads the wrong SID and finds
+/// no edges. Thin wrapper over [`crate::context::reencode_sid`].
 #[inline]
 fn reencode_pred(ctx: &ExecutionContext<'_>, db: &fluree_db_core::LedgerSnapshot, p: &Sid) -> Sid {
-    ctx.original_snapshot
-        .decode_sid(p)
-        .and_then(|iri| db.encode_iri(&iri))
-        .unwrap_or_else(|| p.clone())
+    crate::context::reencode_sid(ctx, db, p).unwrap_or_else(|| p.clone())
 }
 
 /// Property path operator - transitive graph traversal
@@ -1488,11 +1484,9 @@ impl PropertyPathOperator {
                 // Re-encode a pattern-constant endpoint into the active graph
                 // (like the `Ref::Iri` arm) so a divergent-namespace endpoint
                 // matches; falls back to the raw SID when undecodable.
-                Ref::Sid(s) => ctx
-                    .original_snapshot
-                    .decode_sid(s)
-                    .and_then(|iri| db_for_encode.encode_iri(&iri))
-                    .or_else(|| Some(s.clone())),
+                Ref::Sid(s) => {
+                    crate::context::reencode_sid(ctx, db_for_encode, s).or_else(|| Some(s.clone()))
+                }
                 Ref::Iri(iri) => db_for_encode.encode_iri(iri),
                 Ref::Var(_) => binding.and_then(|b| match b {
                     Binding::Sid { sid: s, .. } => Some(s.clone()),

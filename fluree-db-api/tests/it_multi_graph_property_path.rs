@@ -754,3 +754,64 @@ WHERE { GRAPH <taxonomy:main> { ?s subj:broader+ ?o } }";
         })
         .await;
 }
+
+/// A9 (JSON-LD regression guard) — the JSON-LD analog of Q3a: a default-graph
+/// pattern (`catalog`) joined to a `["graph", …]`-scoped pattern in `taxonomy`,
+/// over divergent, indexed ledgers. Expected: `lib:book1`.
+///
+/// NOTE: unlike the SPARQL cases, this passes with *or* without the
+/// `DatasetOperator` materialization fix — the JSON-LD `query_connection` path
+/// does not late-materialize these bindings to `EncodedSid`, so it never hit the
+/// bug the SPARQL path did (q3a/q3c). Kept as a guard that JSON-LD cross-ledger
+/// cross-graph joins keep working; it is NOT a red→green demonstration of the
+/// fix.
+#[tokio::test]
+async fn a9_jsonld_cross_graph_join_divergent_ns() {
+    let (fluree, local, handle) = fluree_with_indexer();
+    local
+        .run_until(async move {
+            insert_indexed(
+                &fluree,
+                &handle,
+                "taxonomy:main",
+                &json!({"@context": {"subj": "http://subject.example/"},
+                        "@graph": [
+                            {"@id": "subj:jazz",  "subj:broader": {"@id": "subj:music"}},
+                            {"@id": "subj:music", "subj:broader": {"@id": "subj:arts"}}
+                        ]}),
+            )
+            .await;
+            insert_indexed(
+                &fluree,
+                &handle,
+                "catalog:main",
+                &json!({"@context": {"lib": "http://library.example/", "subj": "http://subject.example/"},
+                        "@graph": [ {"@id": "lib:book1", "lib:subject": {"@id": "subj:jazz"}} ]}),
+            )
+            .await;
+
+            let query = json!({
+                "@context": {"subj": "http://subject.example/", "lib": "http://library.example/"},
+                "from": "catalog:main",
+                "fromNamed": ["taxonomy:main"],
+                "select": ["?book"],
+                "where": [
+                    {"@id": "?book", "lib:subject": "?c"},
+                    ["graph", "taxonomy:main", {"@id": "?c", "subj:broader": {"@id": "subj:music"}}]
+                ]
+            });
+            let result = fluree.query_connection(&query).await;
+            assert!(result.is_ok(), "JSON-LD cross-graph join should execute, got: {:?}", result.err());
+            let cat = fluree.ledger("catalog:main").await.expect("load");
+            let s = result
+                .unwrap()
+                .to_jsonld(&cat.snapshot)
+                .expect("to_jsonld")
+                .to_string();
+            assert!(
+                s.contains("lib:book1"),
+                "JSON-LD divergent-ns cross-graph join returned no rows: {s}"
+            );
+        })
+        .await;
+}
