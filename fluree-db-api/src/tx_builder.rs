@@ -26,12 +26,14 @@ use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_transact::{
-    lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
+    lower_sparql_update_request, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
 
-/// Parse, validate, and lower a SPARQL UPDATE string to the transaction IR
-/// against a snapshot's namespace registry. Parse/lowering errors map to
+/// Parse, validate, and lower a SPARQL UPDATE request to a sequence of
+/// transaction IRs (one per `;`-separated operation, in request order)
+/// against a snapshot's namespace registry. An empty vector is a valid
+/// no-op request (empty or prologue-only). Parse/lowering errors map to
 /// HTTP 400 with the same shape the two builder paths previously emitted;
 /// validation errors use the query seam's structured [`ApiError::sparql`]
 /// shape (the server maps both to 400).
@@ -40,11 +42,15 @@ use fluree_db_transact::{
 /// builders, and through them the HTTP route, consensus appliers, and CLI),
 /// so running `validate()` here means validator-side UPDATE rules apply to
 /// real updates — not only inside the W3C harness's own `validate()` call.
+///
+/// All operations share one namespace registry, so each `Txn`'s
+/// `namespace_delta` is a cumulative superset of its predecessors' — the
+/// last operation's delta carries the whole request's allocations.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
-) -> Result<Txn> {
+) -> Result<Vec<Txn>> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
     if parsed.has_errors() {
         let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
@@ -81,7 +87,7 @@ pub(crate) fn parse_and_lower_sparql_update(
     }
 
     let mut ns = NamespaceRegistry::from_db(snapshot);
-    lower_sparql_update_ast(&ast, &mut ns, txn_opts)
+    lower_sparql_update_request(&ast, &mut ns, txn_opts)
         .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
 }
 
@@ -1086,12 +1092,18 @@ impl Fluree {
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let txn = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
-            let txn_type = txn.txn_type;
+            let txns =
+                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
+            // A single-op request reports its own type; a multi-op (or
+            // empty no-op) request is reported as a generic update.
+            let txn_type = match txns.as_slice() {
+                [only] => only.txn_type,
+                _ => TxnType::Update,
+            };
             let stage_result = self
-                .stage_transaction_from_txn(
+                .stage_transaction_from_txns(
                     ledger_state,
-                    txn,
+                    txns,
                     Some(index_config),
                     core.policy.as_ref(),
                     Some(tracker),

@@ -144,7 +144,11 @@ impl<'a> Validator<'a> {
             QueryBody::Construct(query) => self.validate_construct(query),
             QueryBody::Ask(query) => self.validate_ask(query),
             QueryBody::Describe(query) => self.validate_describe(query),
-            QueryBody::Update(op) => self.validate_update(op),
+            QueryBody::Update(request) => {
+                for op in &request.operations {
+                    self.validate_update(&op.operation);
+                }
+            }
         }
     }
 
