@@ -192,6 +192,10 @@ name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
 [[test]]
+name = "it_multi_graph_property_path"
+path = "tests/it_multi_graph_property_path.rs"
+
+[[test]]
 name = "it_query_cypher"
 path = "tests/it_query_cypher.rs"
 
