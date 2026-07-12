@@ -561,9 +561,8 @@ pub const SPARQL12_VERSION: &[&str] = &[
 // Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
 // already produces the expected `[a,b,b]` bag once the GRAPH block matches
 // (residual-eval.md §2.2).
-pub const SPARQL11_PROPERTY_PATH: &[&str] = &[
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35",
-];
+pub const SPARQL11_PROPERTY_PATH: &[&str] =
+    &["http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35"];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
 // test environment cannot provide. Revisit with an in-process mock endpoint

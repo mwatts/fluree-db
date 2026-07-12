@@ -2552,7 +2552,7 @@ async fn sparql_update_constant_iris_resolve_against_base_at_the_seam() {
     let rows = support::query_sparql(
         &fluree,
         &ledger,
-        r#"BASE <http://x.example/> SELECT ?o WHERE { <s1> <p1> ?o }"#,
+        r"BASE <http://x.example/> SELECT ?o WHERE { <s1> <p1> ?o }",
     )
     .await
     .expect("BASE query");

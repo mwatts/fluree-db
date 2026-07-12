@@ -107,7 +107,7 @@ async fn multi_op_dangling_retract_and_ns_delta_survive_index_merge_and_reload()
     let json = query_sparql(
         &fluree2,
         &ledger,
-        r#"SELECT ?o WHERE { <http://example.org/ns/gone> <http://example.org/ns/p> ?o }"#,
+        r"SELECT ?o WHERE { <http://example.org/ns/gone> <http://example.org/ns/p> ?o }",
     )
     .await
     .expect("query dangling")
@@ -124,7 +124,7 @@ async fn multi_op_dangling_retract_and_ns_delta_survive_index_merge_and_reload()
     let json = query_sparql(
         &fluree2,
         &ledger,
-        r#"SELECT ?o WHERE { <http://fresh.example/only-in-op-3/kept> <http://fresh.example/only-in-op-3/q> ?o }"#,
+        r"SELECT ?o WHERE { <http://fresh.example/only-in-op-3/kept> <http://fresh.example/only-in-op-3/q> ?o }",
     )
     .await
     .expect("query fresh ns")
@@ -142,7 +142,7 @@ async fn multi_op_dangling_retract_and_ns_delta_survive_index_merge_and_reload()
     let json = query_sparql(
         &fluree2,
         &ledger,
-        r#"SELECT ?o WHERE { <http://example.org/ns/base> <http://example.org/ns/p> ?o }"#,
+        r"SELECT ?o WHERE { <http://example.org/ns/base> <http://example.org/ns/p> ?o }",
     )
     .await
     .expect("query base")

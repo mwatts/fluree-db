@@ -9277,9 +9277,7 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
                 .query(&view, QueryInput::Sparql(q))
                 .await
                 .expect("EncodedSid graph-var query");
-            let json = result
-                .to_sparql_json(&view.snapshot)
-                .expect("sparql json");
+            let json = result.to_sparql_json(&view.snapshot).expect("sparql json");
             let bindings = json["results"]["bindings"]
                 .as_array()
                 .expect("bindings array");
@@ -9308,9 +9306,7 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
                 .query(&view, QueryInput::Sparql(q))
                 .await
                 .expect("EncodedLit graph-var query");
-            let json = result
-                .to_sparql_json(&view.snapshot)
-                .expect("sparql json");
+            let json = result.to_sparql_json(&view.snapshot).expect("sparql json");
             assert_eq!(
                 json["results"]["bindings"]
                     .as_array()
@@ -9322,4 +9318,3 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
         })
         .await;
 }
-

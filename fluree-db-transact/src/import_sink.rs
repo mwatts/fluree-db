@@ -844,8 +844,7 @@ mod inner {
             };
 
             let bundle =
-                match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t)
-                {
+                match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
                     Ok(bundle) => bundle,
                     Err(e) => {
                         if self.encode_error.is_none() {

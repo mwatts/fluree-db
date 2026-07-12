@@ -4265,7 +4265,7 @@ async fn turtle_star_anonymous_mints_never_collide_with_user_bnode_labels() {
     // The annotation bundle exists, on its own fresh reifier node.
     let bundles = reifies_bundles_for_subject(ledger, "http://example.org/a").await;
     assert_eq!(bundles.len(), 1, "one anonymous reifier bundle for ex:a");
-    let ((ann_sid, _), _) = bundles.iter().next().map(|(k, v)| (k.clone(), v)).unwrap();
+    let ((ann_sid, _), _) = bundles.first().map(|(k, v)| (k.clone(), v)).unwrap();
     assert_ne!(ann_sid, bob_sid, "reifier node distinct from user `_:b1`");
 
     // The `[]` node is likewise its own node (the pre-existing collision

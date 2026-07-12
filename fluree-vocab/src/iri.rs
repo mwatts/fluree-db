@@ -204,7 +204,7 @@ fn remove_dot_segments(path: &str) -> String {
     // `/` — which the segment loop above drops (PR-1454 review; W3C
     // IRI-resolution-08 fixtures). Bare `.` / `..` (no leading slash, empty
     // output) stay empty per the algorithm's rule 2D.
-    if matches!(path.rsplit('/').next(), Some(".") | Some(".."))
+    if matches!(path.rsplit('/').next(), Some("." | ".."))
         && (!result.is_empty() || path.starts_with('/'))
         && !result.ends_with('/')
     {

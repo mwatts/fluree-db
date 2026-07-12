@@ -4592,9 +4592,6 @@ mod tests {
 
         let strategy = choose_exists_strategy(&outer_schema, &inner);
 
-        assert_eq!(
-            strategy,
-            ExistsStrategy::Semijoin { key_vars: vec![a] },
-        );
+        assert_eq!(strategy, ExistsStrategy::Semijoin { key_vars: vec![a] },);
     }
 }

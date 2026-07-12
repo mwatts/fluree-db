@@ -1882,7 +1882,11 @@ fn expand_iri(iri: &Iri, prologue: &Prologue) -> Result<String, LowerError> {
                     // against BASE too.
                     let expanded = match base {
                         Some(base) if !fluree_vocab::iri::is_absolute_iri(&decl.iri) => {
-                            format!("{}{}", fluree_vocab::iri::resolve_iri(base, &decl.iri), local)
+                            format!(
+                                "{}{}",
+                                fluree_vocab::iri::resolve_iri(base, &decl.iri),
+                                local
+                            )
                         }
                         _ => format!("{}{}", decl.iri, local),
                     };
