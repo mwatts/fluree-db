@@ -30,10 +30,21 @@ use std::sync::Arc;
 use tracing::{debug, info, warn, Instrument};
 
 /// How many data files to read concurrently. Defaults to
-/// `min(available_parallelism, files, 8)`; override with
+/// `min(available_parallelism, files, 32)`; override with
 /// `FLUREE_ICEBERG_SCAN_CONCURRENCY` (a positive integer; not capped, so callers
-/// can raise it for high-latency remote object stores). Bounded to keep memory
-/// and S3 request fan-out in check.
+/// can raise it further for high-latency remote object stores).
+///
+/// PR-2 Lever B raised the ceiling from 8 to 32. The per-file decode cost is
+/// fixed S3 round-trip latency, not CPU (see
+/// `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`), so more
+/// in-flight reads is close to pure win on the thousands-of-tiny-files fact-table
+/// shape; the sweep showed wall still improving to c=32 with only mild per-file
+/// contention creep past ~c=16, hence 32 as the ceiling. The default stays
+/// bounded by `available_parallelism`, so per-host resident memory
+/// (`O(concurrency)` file decodes) never exceeds today's core-bound footprint,
+/// and raising the ceiling never lowers the previous default on any core count
+/// (`clamp(1, 32) >= clamp(1, 8)` pointwise). Env override remains the escape
+/// hatch to reach the ceiling on a low-core host.
 fn iceberg_scan_concurrency(num_files: usize) -> usize {
     if let Some(n) = std::env::var("FLUREE_ICEBERG_SCAN_CONCURRENCY")
         .ok()
@@ -45,7 +56,7 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4);
-    cpus.min(num_files.max(1)).clamp(1, 8)
+    cpus.min(num_files.max(1)).clamp(1, 32)
 }
 
 /// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
