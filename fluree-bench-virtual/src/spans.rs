@@ -30,6 +30,15 @@ pub const SPAN_ALLOWLIST: &[&str] = &[
     "iceberg.parquet_read",
     "iceberg.scan_plan",
     "iceberg.oauth_token",
+    // PR-2 phase-1 (measurement-only): per-file cost decomposition sub-spans
+    // nested inside `iceberg.parquet_read` (small-file path,
+    // `send_parquet.rs::read_task_small_file`). `mean = total_us / n` per name
+    // splits the ~200ms per-file wall into footer / plan / fetch / decode; the
+    // residual `parquet_read - sum(children)` is spawn+channel scheduling.
+    "iceberg.read_footer",
+    "iceberg.plan_columns",
+    "iceberg.fetch_bytes",
+    "iceberg.decode",
 ];
 
 /// Spans that MUST fire on any non-trivial virtual scan. A virtual execution

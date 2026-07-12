@@ -22,6 +22,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::disk_cache::DiskArtifactCache;
 use tokio::runtime::Handle;
+// PR-2 phase-1 (measurement-only): `.instrument()` for the per-file cost
+// decomposition sub-spans in `read_task_small_file`. Additive/debug-level;
+// no behavior change.
+use tracing::Instrument as _;
 
 use crate::error::{IcebergError, Result};
 use crate::io::batch::ColumnBatch;
@@ -369,16 +373,33 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     }
 
     /// Read a small file using sparse buffer approach.
+    //
+    // PR-2 phase-1 (measurement-only): the four inner `iceberg.*` sub-spans below
+    // decompose the per-file wall captured by the outer `iceberg.parquet_read`
+    // span into footer read, column-index planning, byte fetch, and Arrow decode.
+    // They are additive debug-level spans (no behavior change); the harness sums
+    // their wall per name so `mean = total_us / n` isolates fixed overhead from
+    // I/O across a cold vs warm run.
     async fn read_task_small_file(&self, task: &FileScanTask) -> Result<Vec<ColumnBatch>> {
         let path = &task.data_file.file_path;
-        let metadata = self.read_metadata(path).await?;
+        let metadata = self
+            .read_metadata(path)
+            .instrument(tracing::debug_span!("iceberg.read_footer"))
+            .await?;
 
         // Resolve the projected Parquet column indices so the sparse-range read
         // fetches exactly the column chunks the Arrow reader will decode.
-        let (_, column_indices) = if let Some(ref iceberg_schema) = task.iceberg_schema {
-            build_batch_schema_with_iceberg(&metadata, iceberg_schema, &task.projected_field_ids)?
-        } else {
-            build_batch_schema(&metadata, &task.projected_field_ids)?
+        let (_, column_indices) = {
+            let _plan_guard = tracing::debug_span!("iceberg.plan_columns").entered();
+            if let Some(ref iceberg_schema) = task.iceberg_schema {
+                build_batch_schema_with_iceberg(
+                    &metadata,
+                    iceberg_schema,
+                    &task.projected_field_ids,
+                )?
+            } else {
+                build_batch_schema(&metadata, &task.projected_field_ids)?
+            }
         };
 
         let real_column_indices: Vec<usize> = column_indices
@@ -390,11 +411,13 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         // Read the file bytes via range reads for the needed column chunks.
         let file_bytes = self
             .read_file_for_task(path, task, &real_column_indices, &metadata)
+            .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
             .await?;
 
         // Decode the range-read bytes with native projection + row-group pruning
         // + exact row filtering. `Bytes` is a `ChunkReader`, so the Arrow reader
         // reuses the exact bytes fetched above.
+        let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
         crate::io::arrow_reader::decode_batches_arrow(
             file_bytes,
             &task.projected_field_ids,
