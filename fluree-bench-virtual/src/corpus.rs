@@ -357,20 +357,34 @@ mod tests {
     /// NO expected_status override: the audit predicted a whole-GRAPH error on
     /// virtual, but observed behavior (2026-07-11 baseline) is q043 ok/0-rows
     /// and q044 dnf — neither errors. Both must still admit 0 rows on native.
+    ///
+    /// PR-0 (findings F1/F2) then flipped the non-lowered sub-scope queries to
+    /// loud-refuse on virtual: exactly q034 (transitive property path) and
+    /// q051 (subquery) declare `virtual = error`, and both must stay `ok` on
+    /// native, where the same shapes evaluate fine against the ledger index.
     #[test]
     fn error_boundary_queries_match_observed_behavior() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
         let corpus = Corpus::load(&dir).expect("corpus loads");
-        let declared_error: Vec<&QueryDef> = corpus
+        let declared_error: Vec<&str> = corpus
             .queries
             .iter()
             .filter(|q| q.expected_status.for_target(true) == ExpectedOutcome::Error)
+            .map(|q| q.id.as_str())
             .collect();
-        assert!(
-            declared_error.is_empty(),
-            "no query declares virtual=error (empirically corrected); found {:?}",
-            declared_error.iter().map(|q| &q.id).collect::<Vec<_>>()
+        assert_eq!(
+            declared_error,
+            vec!["q034", "q051"],
+            "exactly the PR-0 loud-refuse queries declare virtual=error"
         );
+        for id in ["q034", "q051"] {
+            let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
+            assert_eq!(
+                q.expected_status.for_target(false),
+                ExpectedOutcome::Ok,
+                "{id} must stay ok on native"
+            );
+        }
         for id in ["q043", "q044"] {
             let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
             assert_eq!(q.expected_status.for_target(false), ExpectedOutcome::Ok);
