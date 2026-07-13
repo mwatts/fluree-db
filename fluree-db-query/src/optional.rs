@@ -1415,11 +1415,59 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
 /// property paths from a (possibly seeded) endpoint qualify; subqueries,
 /// nested OPTIONAL/UNION/MINUS, BIND/UNWIND/VALUES, and search patterns do
 /// not (they can carry internal limits or independent correlation).
+///
+/// PR-4b: a subject-driven R2RML LEAF scan (a scalar POM or a RefObjectMap that
+/// binds one object from the correlation subject) is a pure restriction by that
+/// subject — exactly a `Pattern::Triple` in R2RML clothing — so it is admitted
+/// too, behind `FLUREE_R2RML_BATCHED_OPTIONAL`. This lets a correlated OPTIONAL
+/// over an R2RML source take the batched hash-left-join instead of the per-row
+/// operator rebuild (`optional.rs::build_correlated_optional_op`), which no
+/// operator-scoped cache can span (design: `07-pr4b-batched-optional.md`).
+/// Star / type-var / wildcard / bound-subject R2RML shapes stay EXCLUDED pending
+/// differential evidence (`r2rml_leaf_is_hash_join_safe`).
 fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
-    matches!(
-        p,
-        Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_)
-    )
+    match p {
+        Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_) => true,
+        Pattern::R2rml(rp) => batched_optional_r2rml_enabled() && r2rml_leaf_is_hash_join_safe(rp),
+        _ => false,
+    }
+}
+
+/// PR-4b kill switch: `FLUREE_R2RML_BATCHED_OPTIONAL` (default ON; `0`/`false`/
+/// `off` disable it). Off ⇒ R2RML inners are never admitted to the batched
+/// path, so a correlated OPTIONAL over R2RML falls to the per-row rebuild — the
+/// exact pre-PR-4b behavior.
+fn batched_optional_r2rml_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_BATCHED_OPTIONAL") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Err(_) => true,
+    })
+}
+
+/// Whether an R2RML pattern is a subject-driven single-object LEAF scan — the
+/// narrow shape PR-4b admits to the batched OPTIONAL. Its solutions depend on
+/// the required row ONLY through its subject variable (the correlation), so
+/// executing it once over the distinct subjects and hash-partitioning by the
+/// correlation key reproduces the per-row results exactly. Covers a scalar POM
+/// (`?s :p ?o`) and a single-valued subject-driven RefObjectMap (`?s :ref ?o`);
+/// both bind exactly `object_var` from `subject_var`. EXCLUDES:
+/// - stars (`star_bindings`/`star_constraints`) — multi-predicate cartesian;
+/// - `type_var` — multi-class cartesian;
+/// - a wildcard `predicate_var` and bound/constant subjects — not subject-driven
+///   restrictions.
+/// (An object-only correlation is still sound via the seed-bound fallback — the
+/// var is simply seeded rather than subject-probed — so it needs no gate here.)
+fn r2rml_leaf_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool {
+    rp.subject_var.is_some()
+        && rp.object_var.is_some()
+        && rp.predicate_filter.is_some()
+        && rp.subject_constant.is_none()
+        && rp.predicate_var.is_none()
+        && rp.type_var.is_none()
+        && rp.star_bindings.is_empty()
+        && rp.star_constraints.is_empty()
 }
 
 /// True iff `v` occurs in the inner patterns ONLY as the object of one or more
@@ -2199,6 +2247,238 @@ mod tests {
         // Check unify instructions (for ?s)
         assert_eq!(builder.unify_instructions().len(), 1);
         assert_eq!(builder.unify_instructions()[0].left_col, 0); // ?s in required
+    }
+
+    // PR-4b: the batched-OPTIONAL admission for R2RML inners is NARROW — only a
+    // subject-driven single-object leaf (scalar POM / single-valued ref). Every
+    // richer shape stays on the per-row path pending differential evidence.
+    #[test]
+    fn r2rml_leaf_admission_is_narrow() {
+        use crate::ir::adapters::R2rmlPattern;
+
+        let mut leaf = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        leaf.predicate_filter = Some("http://ex/rating".to_string());
+        assert!(
+            r2rml_leaf_is_hash_join_safe(&leaf),
+            "subject-driven scalar/ref leaf is admitted"
+        );
+        // Full gate honors the shape (FLUREE_R2RML_BATCHED_OPTIONAL defaults on).
+        assert!(inner_pattern_is_hash_join_safe(&Pattern::R2rml(leaf.clone())));
+
+        let mut star = leaf.clone();
+        star.star_bindings = vec![("http://ex/p2".to_string(), VarId(2))];
+        assert!(!r2rml_leaf_is_hash_join_safe(&star), "star excluded");
+
+        let mut star_c = leaf.clone();
+        star_c.star_constraints = vec![(
+            "http://ex/p3".to_string(),
+            crate::r2rml::ObjectConstant::Iri("http://ex/c".to_string()),
+        )];
+        assert!(!r2rml_leaf_is_hash_join_safe(&star_c), "star-constraint excluded");
+
+        let mut tv = leaf.clone();
+        tv.type_var = Some(VarId(3));
+        assert!(!r2rml_leaf_is_hash_join_safe(&tv), "type-var excluded");
+
+        let mut wild = leaf.clone();
+        wild.predicate_var = Some(VarId(4));
+        assert!(!r2rml_leaf_is_hash_join_safe(&wild), "wildcard predicate excluded");
+
+        let mut bound = leaf.clone();
+        bound.subject_var = None;
+        bound.subject_constant = Some("http://ex/s/1".to_string());
+        assert!(!r2rml_leaf_is_hash_join_safe(&bound), "bound subject excluded");
+
+        let mut no_obj = leaf.clone();
+        no_obj.object_var = None;
+        assert!(!r2rml_leaf_is_hash_join_safe(&no_obj), "no object var excluded");
+    }
+
+    // PR-4b (B): the hermetic differential — the batched hash-left-join and the
+    // per-row rebuild must produce IDENTICAL optional-side bindings on a GENUINE
+    // R2RML dangling FK (empty bucket) and a matched FK, driving both OptionalBuilder
+    // methods directly on one PlanTreeOptionalBuilder with a mock mapping + table
+    // provider (no live Snowflake, no switch — the two code paths are compared
+    // head-to-head). This mechanically pins batched≡per-row on the R2RML-specific
+    // miss edge that q050's live oracle run covers only by code-path identity.
+    #[test]
+    fn batched_equals_per_row_on_dangling_fk() {
+        use crate::context::ExecutionContext;
+        use crate::ir::adapters::R2rmlPattern;
+        use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
+        use std::sync::Arc;
+
+        // ---- synthetic mapping: Product --edw:supplier(RefObjectMap)--> Supplier
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Product", "products")
+                .with_subject_template("http://ex/product/{PID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/supplier"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Supplier", "SUP_FK", "SID",
+                    )),
+                }),
+            TriplesMap::new("#Supplier", "suppliers")
+                .with_subject_template("http://ex/supplier/{SID}"),
+        ]));
+
+        #[derive(Debug)]
+        struct MapProvider(Arc<CompiledR2rmlMapping>);
+        #[async_trait]
+        impl R2rmlProvider for MapProvider {
+            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+                true
+            }
+            async fn compiled_mapping(
+                &self,
+                _gs: &str,
+                _t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        fn ints(name: &str, id: i32, vals: Vec<Option<i64>>) -> Column {
+            let _ = (name, id);
+            Column::Int64(vals)
+        }
+        fn batch(fields: Vec<(&str, i32)>, cols: Vec<Column>) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(
+                fields
+                    .into_iter()
+                    .map(|(n, id)| FieldInfo {
+                        name: n.to_string(),
+                        field_type: FieldType::Int64,
+                        nullable: true,
+                        field_id: id,
+                    })
+                    .collect(),
+            ));
+            ColumnBatch::new(schema, cols).unwrap()
+        }
+
+        #[derive(Debug)]
+        struct TableProvider;
+        #[async_trait]
+        impl R2rmlTableProvider for TableProvider {
+            async fn scan_table(
+                &self,
+                _gs: &str,
+                table: &str,
+                _proj: &[String],
+                _filters: &[ScanFilter],
+                _t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                // products: PID 1 (FK 10 -> exists) and PID 2 (FK 99 -> DANGLING).
+                // suppliers: only SID 10 exists, so product 2's FK is dangling.
+                let b = if table == "products" {
+                    batch(
+                        vec![("PID", 1), ("SUP_FK", 2)],
+                        vec![
+                            ints("PID", 1, vec![Some(1), Some(2)]),
+                            ints("SUP_FK", 2, vec![Some(10), Some(99)]),
+                        ],
+                    )
+                } else {
+                    batch(vec![("SID", 1)], vec![ints("SID", 1, vec![Some(10)])])
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+            }
+        }
+
+        // ---- OPTIONAL { ?p edw:supplier ?s }, correlated on ?p (VarId 0).
+        let mut inner = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        inner.predicate_filter = Some("http://ex/supplier".to_string());
+        assert!(
+            r2rml_leaf_is_hash_join_safe(&inner),
+            "the ref leaf must be admitted, else this test is vacuous"
+        );
+        let inner_patterns = vec![Pattern::R2rml(inner)];
+        let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let builder = PlanTreeOptionalBuilder::new(
+            required_schema.clone(),
+            inner_patterns,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+
+        // Required rows: the two products, as subject IRIs (?p bound).
+        let required = Batch::new(
+            required_schema.clone(),
+            vec![vec![
+                Binding::iri("http://ex/product/1"),
+                Binding::iri("http://ex/product/2"),
+            ]],
+        )
+        .unwrap();
+
+        let map_provider = MapProvider(Arc::clone(&mapping));
+        let table_provider = TableProvider;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let mut ctx = ExecutionContext::new(&snapshot, &vars);
+        ctx = ctx.with_r2rml_providers(&map_provider, &table_provider);
+
+        // ---- batched path.
+        let batched = futures::executor::block_on(builder.build_batch(&required, 0, &ctx))
+            .expect("build_batch")
+            .expect("batched path admitted");
+
+        // ---- per-row path: build + drain the inner operator for each row.
+        let per_row: Vec<Vec<Vec<Binding>>> = (0..required.len())
+            .map(|row| {
+                let op = futures::executor::block_on(async {
+                    let mut op = builder
+                        .build(&required, row, &ctx)?
+                        .expect("per-row op");
+                    op.open(&ctx).await?;
+                    let mut rows = Vec::new();
+                    while let Some(b) = op.next_batch(&ctx).await? {
+                        for r in 0..b.len() {
+                            rows.push(
+                                (0..b.schema().len())
+                                    .map(|c| b.get_by_col(r, c).clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                    }
+                    op.close();
+                    Ok::<_, crate::error::QueryError>(rows)
+                })
+                .expect("per-row drain");
+                op
+            })
+            .collect();
+
+        // Product 1 matches (supplier/10); product 2's FK is dangling → OPTIONAL miss.
+        // Assert the per-row path produced exactly one binding for row 0 and none
+        // for row 1, and that the batched path agrees row-for-row.
+        assert_eq!(per_row[0].len(), 1, "matched FK binds ?s: {:?}", per_row[0]);
+        assert_eq!(per_row[1].len(), 0, "dangling FK is a miss: {:?}", per_row[1]);
+
+        for (row, batches) in &batched {
+            let batched_rows: usize = batches.iter().map(|b| b.len()).sum();
+            assert_eq!(
+                batched_rows,
+                per_row[*row].len(),
+                "batched != per-row optional-row count for required row {row}"
+            );
+        }
+        // Rows with no batched entry must be per-row misses too.
+        let batched_rows: std::collections::HashSet<usize> =
+            batched.iter().map(|(r, _)| *r).collect();
+        for (row, pr) in per_row.iter().enumerate() {
+            if !batched_rows.contains(&row) {
+                assert!(pr.is_empty(), "batched dropped row {row} that per-row kept");
+            }
+        }
     }
 
     #[test]
