@@ -1055,6 +1055,13 @@ fn flake_content(f: &Flake) -> FlakeContent {
 /// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
 /// novelty view as of the ledger's current `t`).
 ///
+/// Scale note: a whole-graph operation (`CLEAR ALL`, a large COPY/MOVE)
+/// materializes every scanned flake into a `Vec` and re-stages it, and
+/// backpressure (`at_max_novelty`) is only checked at commit entry — so one
+/// graph-management op can roughly double novelty in a single commit. That is
+/// exactly the op class most likely to touch the whole store; chunked staging
+/// for whole-graph ops is a known follow-up if this cliff is hit in practice.
+///
 /// O4 (by design): this scan is NOT view-policy filtered — unlike the
 /// DELETE-WHERE path, which reads through a `QueryPolicyEnforcer`. So the set a
 /// graph-management op (CLEAR/DROP/COPY/MOVE/ADD) acts on is the *modifiable*
