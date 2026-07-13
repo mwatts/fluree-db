@@ -2523,13 +2523,9 @@ async fn test_using_named_only_where_default_graph_is_empty() {
 
     // Control: the no-USING ambient path is untouched — a plain DELETE WHERE
     // over the default graph still matches it.
-    let ledger = run_sparql_update(
-        &fluree,
-        ledger,
-        "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
-    )
-    .await
-    .ledger;
+    let ledger = run_sparql_update(&fluree, ledger, "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }")
+        .await
+        .ledger;
     assert_eq!(count_in_default(&fluree, &ledger).await, 0);
 }
 
@@ -2560,8 +2556,16 @@ async fn test_graph_mgmt_builder_move_add_parity() {
         .await
         .expect("Txn::add_graph")
         .ledger;
-    assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 1, "ADD keeps source");
-    assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 2, "ADD merges into dest");
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g1).await,
+        1,
+        "ADD keeps source"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        2,
+        "ADD merges into dest"
+    );
 
     // move_graph(g1 -> g2): dest replaced by source; source gone.
     let ledger = fluree
@@ -2571,8 +2575,16 @@ async fn test_graph_mgmt_builder_move_add_parity() {
         .await
         .expect("Txn::move_graph")
         .ledger;
-    assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 0, "MOVE retracts source");
-    assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 1, "MOVE replaces dest");
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g1).await,
+        0,
+        "MOVE retracts source"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        1,
+        "MOVE replaces dest"
+    );
 
     // --- SPARQL path: identical outcomes ---
     let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-sparql:main");
@@ -2620,7 +2632,11 @@ async fn test_graph_mgmt_same_graph_transfer_is_noop() {
     }
 
     // Builder surface too (same Txn IR, same guard).
-    for txn in [Txn::copy_graph(g, g), Txn::move_graph(g, g), Txn::add_graph(g, g)] {
+    for txn in [
+        Txn::copy_graph(g, g),
+        Txn::move_graph(g, g),
+        Txn::add_graph(g, g),
+    ] {
         ledger = fluree
             .stage_owned(ledger.clone())
             .txn(txn)
@@ -2644,5 +2660,108 @@ async fn test_graph_mgmt_same_graph_transfer_is_noop() {
     assert!(
         err.contains("reserved system graph"),
         "expected the reserved-graph rejection, got: {err}"
+    );
+}
+
+/// A multi-operation request mixing a DATA op with a graph-management op:
+/// each op stages sequentially in ONE atomic commit (§3.1 / D-10), so the
+/// COPY/CLEAR must observe the graph its predecessor just created — including
+/// the g_id registered earlier in the SAME request (the sequential-staging
+/// novelty view + provisional graph registration working together).
+#[tokio::test]
+async fn test_multi_op_update_mixes_data_and_graph_mgmt() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("it/multiop-graph-mgmt:main")
+        .await
+        .expect("create ledger");
+    let g = "http://example.org/g";
+    let h = "http://example.org/h";
+
+    // Op 1 creates <g>; op 2 copies the just-created graph into <h>.
+    let insert_then_copy = format!(
+        r#"INSERT DATA {{ GRAPH <{g}> {{ <http://example.org/s> <http://example.org/p> "v" }} }} ;
+           COPY <{g}> TO <{h}>"#
+    );
+    fluree
+        .graph("it/multiop-graph-mgmt:main")
+        .transact()
+        .sparql_update(&insert_then_copy)
+        .commit()
+        .await
+        .expect("INSERT DATA ; COPY executes as one atomic commit");
+    let ledger = fluree
+        .ledger("it/multiop-graph-mgmt:main")
+        .await
+        .expect("ledger");
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g).await,
+        1,
+        "op 1's graph survives (COPY keeps its source)"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, h).await,
+        1,
+        "COPY must see the graph op 1 created in the same request"
+    );
+
+    // Insert-then-CLEAR of the same graph in one request nets to empty —
+    // CLEAR sees the same-request insert through the sequential novelty view.
+    let g2 = "http://example.org/g2";
+    let insert_then_clear = format!(
+        r#"INSERT DATA {{ GRAPH <{g2}> {{ <http://example.org/s2> <http://example.org/p> "w" }} }} ;
+           CLEAR GRAPH <{g2}>"#
+    );
+    fluree
+        .graph("it/multiop-graph-mgmt:main")
+        .transact()
+        .sparql_update(&insert_then_clear)
+        .commit()
+        .await
+        .expect("INSERT DATA ; CLEAR executes as one atomic commit");
+    let ledger = fluree
+        .ledger("it/multiop-graph-mgmt:main")
+        .await
+        .expect("ledger");
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        0,
+        "CLEAR must retract the same-request insert"
+    );
+}
+
+/// CLEAR of an annotation-bearing graph retracts the whole reification bundle
+/// (base edge + f:reifies* anchors) cleanly: the graph reads empty, and
+/// re-inserting the SAME annotated edge afterwards succeeds — a leftover
+/// (orphaned) anchor would collide with the re-insert's bundle instead.
+#[tokio::test]
+async fn test_clear_of_annotation_bearing_graph_is_clean() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/clear-annotations:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = r#"PREFIX ex: <http://example.org/>
+INSERT DATA { ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} . }"#;
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+    assert!(
+        count_in_default(&fluree, &ledger).await >= 1,
+        "annotated edge seeded"
+    );
+
+    // CLEAR DEFAULT retracts base edge AND annotation bundle.
+    let ledger = run_sparql_update(&fluree, ledger, "CLEAR DEFAULT")
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_default(&fluree, &ledger).await,
+        0,
+        "CLEAR DEFAULT must leave nothing behind (no orphaned anchors)"
+    );
+
+    // Re-inserting the identical annotated edge succeeds cleanly — a leftover
+    // anchor from an incomplete retraction would corrupt this bundle.
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+    assert!(
+        count_in_default(&fluree, &ledger).await >= 1,
+        "re-insert after CLEAR must succeed with a clean bundle"
     );
 }

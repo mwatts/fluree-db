@@ -728,3 +728,45 @@ async fn sparql_construct_aggregate_order_by_is_rejected() {
         "CONSTRUCT + inline-aggregate ORDER BY must be rejected, got: {result:#?}"
     );
 }
+
+/// §16.2: the template is instantiated once per SOLUTION (the sequence, not
+/// the distinct set), and each row mints fresh template blanks. Two rows with
+/// IDENTICAL variable bindings (two subjects sharing the same handle value,
+/// template using only `?h`) must therefore yield TWO distinct blank nodes —
+/// per-row minting, not per-distinct-binding. (Jena/oxigraph agree.)
+#[tokio::test]
+async fn sparql_construct_duplicate_rows_mint_distinct_blanks() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/construct:duprows");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let tx = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:v": "same"},
+            {"@id": "ex:b", "ex:v": "same"}
+        ]
+    });
+    let committed = fluree.insert(ledger0, &tx).await.expect("insert");
+    let ledger = committed.ledger;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    // Template projects only ?h — both WHERE rows carry the identical binding.
+    let sparql = "PREFIX ex: <http://example.org/> \
+         CONSTRUCT { [ ex:tag ?h ] } WHERE { ?s ex:v ?h }";
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    let graph = out
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("@graph array");
+    assert_eq!(
+        graph.len(),
+        2,
+        "two solution rows (even with identical bindings) mint two distinct \
+         template blanks — per-row, not per-distinct-binding: {out:#}"
+    );
+}

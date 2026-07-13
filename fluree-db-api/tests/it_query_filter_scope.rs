@@ -191,3 +191,113 @@ async fn subselect_optional_bound_correlation_var_reconciles_to_empty() {
          reconcile against the parent ?x = ex:paul and drop every row; got {rows}"
     );
 }
+
+/// Family B, TWO levels deep: the reconcile must compose through nested
+/// sub-SELECTs. The innermost sub-SELECT binds the correlation var `?x` only
+/// via OPTIONAL (email subjects — john/ringo); the middle sub-SELECT passes it
+/// through; the parent binds `?x = ex:paul`. §18.4 compatible-mapping joins at
+/// EACH level must drop the incompatible rows → 0 rows total. A regression
+/// that seeds (pins) the var at either nesting level would leak `ex:paul`
+/// through and return a row.
+#[tokio::test]
+async fn nested_subselects_reconcile_optional_bound_correlation_var() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:b-nested");
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:paul", "ex:name": "paul"},
+            {"@id": "ex:george", "ex:name": "george"},
+            {"@id": "ex:john", "ex:email": "john@example.org"},
+            {"@id": "ex:ringo", "ex:email": "ringo@example.org"}
+        ]
+    });
+    let db = graphdb_from_ledger(&fluree.insert(ledger0, &txn).await.expect("seed").ledger);
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?x", "?y", "?z"],
+        "where": [
+            {"@id": "?x", "ex:name": "paul"},
+            ["query", {
+                "@context": ctx(),
+                "select": ["?x", "?y", "?z"],
+                "where": [
+                    {"@id": "?y", "ex:name": "george"},
+                    ["query", {
+                        "@context": ctx(),
+                        "select": ["?x", "?z"],
+                        "where": [
+                            {"@id": "?mid", "ex:name": "george"},
+                            ["optional", {"@id": "?x", "ex:email": "?z"}]
+                        ]
+                    }]
+                ]
+            }]
+        ]
+    });
+
+    let rows = fluree
+        .query(&db, &q)
+        .await
+        .expect("query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+
+    assert_eq!(
+        rows,
+        json!([]),
+        "the OPTIONAL-bound ?x must reconcile against the parent through BOTH \
+         nesting levels (john/ringo vs ex:paul → incompatible); got {rows}"
+    );
+}
+
+/// Family B + aggregation: a correlation var used as the GROUP BY key of a
+/// correlated sub-SELECT. The sub-SELECT groups emails per subject `?x`
+/// independently; joining with the parent's `?x = ex:john` must keep exactly
+/// john's group (count 2), not pin the grouping to the parent binding or leak
+/// other groups.
+#[tokio::test]
+async fn subselect_group_by_correlation_var_joins_per_group() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "w1/parity:b-groupby");
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:john", "ex:name": "john",
+             "ex:email": ["john@a.org", "john@b.org"]},
+            {"@id": "ex:ringo", "ex:name": "ringo", "ex:email": "ringo@a.org"}
+        ]
+    });
+    let db = graphdb_from_ledger(&fluree.insert(ledger0, &txn).await.expect("seed").ledger);
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?x", "?n"],
+        "where": [
+            {"@id": "?x", "ex:name": "john"},
+            ["query", {
+                "@context": ctx(),
+                "select": ["?x", "(as (count ?e) ?n)"],
+                "where": [{"@id": "?x", "ex:email": "?e"}],
+                "groupBy": ["?x"]
+            }]
+        ]
+    });
+
+    let rows = fluree
+        .query(&db, &q)
+        .await
+        .expect("query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+
+    assert_eq!(
+        rows,
+        json!([["ex:john", 2]]),
+        "the grouped sub-SELECT must join on ?x per §18.2 (john's group only, \
+         count of BOTH emails); got {rows}"
+    );
+}
