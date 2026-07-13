@@ -8,6 +8,28 @@
 //! - a test that passes but IS listed here fails the suite (stale entry —
 //!   remove it in the same change that fixes the feature).
 //!
+//! LIMITATION — what this register CANNOT catch: an *unregistered* test that
+//! PASSES for the wrong reason. The check polices registered-pass (stale) and
+//! unregistered-fail (regression); a false-pass is invisible to it by
+//! construction. Two harness leniencies open that blind spot and need manual
+//! vigilance, not register enforcement:
+//!
+//! - Empty named graphs are not tracked, so CLEAR (graph stays, empty), DROP
+//!   (graph removed) and CREATE (empty graph exists) end-states are partially
+//!   unobservable (see query_handler.rs `run_update_eval_test` step 5). Every
+//!   such test is currently registered below (the grammar does not parse the
+//!   graph-management ops yet). When that grammar lands, they must gain
+//!   explicit end-state assertions or STAY registered — do NOT un-register them
+//!   just because `check_testsuite` reports an "unexpected pass".
+//!
+//! - Net-zero updates (expected end-state == initial state) pass whether or not
+//!   the engine actually ran the update; on their own they confirm end-state
+//!   invariance, not execution. 12 currently-passing update-eval tests are
+//!   net-zero (enumerated in docs/audit/2026-07-sparql-testsuite-audit.md
+//!   §"Net-zero vacuous passes"); the WITH/USING no-op cases
+//!   (dawg-delete-with-03/04, dawg-delete-using-03/04) warrant a manual check,
+//!   since sibling tests in those families are known-broken and registered.
+//!
 //! Grouping comments name the root cause. The full failure taxonomy, root
 //! causes, and burn-down plan live in
 //! `docs/audit/2026-07-sparql-testsuite-audit.md`; policy for adding entries
@@ -304,44 +326,43 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 // ingest (PR-W15) lands: the residual blockers are wave-2 query syntax /
 // triple-term functions / CONSTRUCT projection / result serialization,
 // scoped by the Option-1 first-class-triple-term epic (ROADMAP §2).
+// Each test appears in EXACTLY ONE reason cluster (PR-1454 review found 10
+// entries double-counted across clusters); attribution below re-verified
+// empirically by unregistering and reading the harness's failure reasons.
 pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: Turtle-star data won't parse (13)
+    // data load: Turtle-star data won't parse (11)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-4",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
-    // data load: additionally blocked on TriG GRAPH-block parsing,
-    // orthogonal to star (D-8) (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
-    // data load: Turtle-star data won't parse (22)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-7",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-9",
+    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
+    // (D-8) — 'expected subject, found KwGraph' on data-4.trig (3)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
+    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
+    // (D-8) (2)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
     // D-1 triple-terms-as-values: qt:data uses `<<( … )>>`, rejected by
-    // ingest with the specific deferred error — Option-1 epic. (op-1/op-2/
-    // order-1/order-2 are D-1-blocked too, but each is registered once, above.)
+    // ingest with the specific deferred error — Option-1 epic (10)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-9",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-10",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
-    // data load: additionally blocked on TriG GRAPH-block parsing,
-    // orthogonal to star (D-8) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
     // harness: the expected-result TriG-star graph fails to parse — the
     // `{| |}` INSERT DATA itself already executes (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
@@ -352,13 +373,14 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
-    // Secondary blockers for tests already registered once above (kept as
-    // intel, not re-listed): construct-4 also hits D-4 CONSTRUCT
-    // annotation-projection lowering ("CONSTRUCT projection of edge-annotation
-    // metadata"); construct-5 and update-3 also fail harness EXPECTED-graph
-    // parsing (star constructs — `<<( )>>` / TriG-star `{| |}` — in the
-    // expected .ttl/.trig the collector sink can't parse). Option-1 epic
-    // scoping intel, roadmap §1.1-11.
+    // D-4 CONSTRUCT annotation projection: lowering returns "CONSTRUCT
+    // projection of edge-annotation metadata is not supported in v1" (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
+    // harness EXPECTED-graph parsing: the expected .ttl embeds `<<( … )>>`
+    // triple-term values the collector sink can't parse (secondary blockers
+    // for update-3 above are the same class). Option-1 epic scoping intel,
+    // roadmap §1.1-11. (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
 ];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[

@@ -4199,6 +4199,99 @@ async fn turtle_star_repeated_anonymous_occurrences_mint_fresh_reifiers() {
     assert_eq!(jl, tt, "bundle bodies must match across surfaces");
 }
 
+#[tokio::test]
+async fn turtle_star_anonymous_mints_never_collide_with_user_bnode_labels() {
+    // PR-1454 review regression: anonymous mints (bare `{| … |}` reifiers
+    // and `[]` nodes) used the generic `b{N}` label scheme, whose
+    // skolemized Sid is identical to a user-written `_:b{N}` in the same
+    // transaction — `_:b1` here silently absorbed the reifier bundle, the
+    // annotation body, and the `[]` node's properties. Anonymous mints now
+    // use the `-b{N}` namespace, which no user label can lex into.
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:anon-user-label-collision");
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         _:b1 ex:name \"Bob\" .\n\
+         ex:a ex:b ex:c {| ex:source \"hr-system\" |} .\n\
+         ex:s2 ex:q [ ex:r \"y\" ] .\n";
+    let committed = fluree
+        .insert_turtle(ledger0, turtle)
+        .await
+        .expect("Turtle-star insert mixing user label with anonymous mints");
+    let ledger = &committed.ledger;
+
+    let name_pid = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("encode ex:name");
+    let bob_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(name_pid.clone(), FlakeValue::String("Bob".to_string())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan for Bob's node");
+    assert_eq!(bob_pointers.len(), 1, "exactly one ex:name \"Bob\" fact");
+    let bob_sid = bob_pointers[0].s.clone();
+
+    // Bob's node carries ex:name and NOTHING else — no ex:source, no
+    // f:reifies* bundle, no `[]` properties.
+    let bob_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject(bob_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan Bob's subject");
+    assert_eq!(
+        bob_flakes.len(),
+        1,
+        "user `_:b1` must not absorb system-minted facts; got {bob_flakes:?}"
+    );
+    assert_eq!(bob_flakes[0].p, name_pid, "Bob's only fact is ex:name");
+
+    // The annotation bundle exists, on its own fresh reifier node.
+    let bundles = reifies_bundles_for_subject(ledger, "http://example.org/a").await;
+    assert_eq!(bundles.len(), 1, "one anonymous reifier bundle for ex:a");
+    let ((ann_sid, _), _) = bundles.first().map(|(k, v)| (k.clone(), v)).unwrap();
+    assert_ne!(ann_sid, bob_sid, "reifier node distinct from user `_:b1`");
+
+    // The `[]` node is likewise its own node (the pre-existing collision
+    // this fix closes for free).
+    let r_pid = ledger
+        .snapshot
+        .encode_iri("http://example.org/r")
+        .expect("encode ex:r");
+    let anon_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(r_pid, FlakeValue::String("y".to_string())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan for the `[]` node");
+    assert_eq!(anon_pointers.len(), 1, "exactly one ex:r \"y\" fact");
+    assert_ne!(
+        anon_pointers[0].s, bob_sid,
+        "`[]` node distinct from user `_:b1`"
+    );
+}
+
 // =====================================================================
 // Delete-path end-to-end coverage for literal-object annotations
 // =====================================================================

@@ -150,6 +150,13 @@ type PrefixMap = HashMap<Arc<str>, Arc<str>>;
 /// Resolution happens once here (prepare-time) so every prefixed-name
 /// expansion sees an absolute namespace. Without a BASE, relative namespaces
 /// stay as written.
+///
+/// Deliberate simplifications in loosely-specified territory (PR-1454
+/// review): `prologue.base` is the single FINAL base (last declaration
+/// wins), so a relative PREFIX namespace declared textually BEFORE the
+/// BASE still resolves against it, and a second relative BASE is not
+/// chained against the first. Redeclared prefixes resolve last-wins via
+/// the map insert below.
 fn prologue_environment(prologue: &crate::ast::Prologue) -> (PrefixMap, Option<Arc<str>>) {
     let base = prologue.base.as_ref().map(|b| b.iri.clone());
 
@@ -311,9 +318,13 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 }
                 // ShortestPath also carries a predicate Sid; apply the same
                 // firewall (no SPARQL surface produces it today, but stay safe).
+                // The wildcard form (`predicate: None`) excludes `f:reifies*`
+                // in the operator's edge-set.
                 Pattern::ShortestPath(sp) => {
-                    if fluree_db_core::is_reserved_reifies_predicate(&sp.predicate) {
-                        return Err(reject_predicate_string(format!("{}", sp.predicate)));
+                    if let Some(pred) = &sp.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(pred) {
+                            return Err(reject_predicate_string(format!("{pred}")));
+                        }
                     }
                 }
                 Pattern::Optional(inner)
@@ -389,11 +400,6 @@ struct LoweringContext<'a, E> {
     pp_counter: u32,
     /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
     order_counter: u32,
-    /// Monotonic counter for anonymous blank-node (`[]`) variables (`_:#anon0`,
-    /// `_:#anon1`, …). The `#` is outside PN_CHARS, so a user-written `_:label`
-    /// can never collide with (and be silently merged into) one of these —
-    /// unlike a `_:b{len}` scheme, which a user's `_:bN` can forge.
-    anon_counter: u32,
     /// Original SPARQL source text (for extracting SERVICE body text).
     source_text: Option<&'a str>,
 }
@@ -418,7 +424,6 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             agg_counter: 0,
             pp_counter: 0,
             order_counter: 0,
-            anon_counter: 0,
             source_text,
         }
     }
@@ -686,6 +691,32 @@ mod tests {
         encoder.add_namespace("http://schema.org/", 101);
         encoder.add_namespace("http://xmlns.com/foaf/0.1/", 102);
         encoder
+    }
+
+    #[test]
+    fn anonymous_bnode_vars_stay_disjoint_from_user_labels() {
+        // pr-1453 follow-up (same class as the transact-side fix):
+        // anonymous blank nodes minted `_:b{N}` variable names, which live
+        // inside the user label namespace — here the anon mints at
+        // vars.len() == 2, so a user-written _:b2 in the same scope
+        // silently unified with it, joining two independent existentials.
+        // The `_:[]{N}` namespace cannot be written as a BLANK_NODE_LABEL.
+        let (query, _vars) = lower_query_with_vars(
+            "SELECT * WHERE { _:b2 <http://example.org/p> ?o . [] <http://example.org/p> ?o }",
+        )
+        .expect("lowers");
+        let subject_var = |p: &Pattern| match p {
+            Pattern::Triple(t) => match &t.s {
+                Ref::Var(v) => *v,
+                other => panic!("expected var subject, got {other:?}"),
+            },
+            other => panic!("expected triple, got {other:?}"),
+        };
+        assert_ne!(
+            subject_var(&query.patterns[0]),
+            subject_var(&query.patterns[1]),
+            "a user label _:b2 must not unify with an anonymous [] blank node"
+        );
     }
 
     fn lower_query(sparql: &str) -> Result<Query> {

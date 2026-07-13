@@ -28,7 +28,7 @@ use crate::operator::BoxedOperator;
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
 use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
-use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
+use crate::property_path::PropertyPathOperator;
 use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
@@ -341,6 +341,18 @@ pub(crate) enum ExistsFallbackReason {
 /// True when any pattern (recursing through pattern containers) is a
 /// `GRAPH ?g { … }` whose graph variable appears in `outer`.
 fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) -> bool {
+    // Expression-embedded pattern lists (`FILTER(EXISTS { … } && …)`,
+    // `BIND(EXISTS { … } AS ?x)`, pattern comprehensions) hide the same
+    // correlated-GRAPH shape one level down.
+    fn expr_embeds(expr: &Expression, outer: &HashSet<VarId>) -> bool {
+        let mut found = false;
+        expr.for_each_embedded_patterns(&mut |ps| {
+            if !found && has_outer_correlated_graph_var(ps, outer) {
+                found = true;
+            }
+        });
+        found
+    }
     patterns.iter().any(|p| match p {
         Pattern::Graph { name, patterns } => {
             matches!(name, crate::ir::GraphName::Var(v) if outer.contains(v))
@@ -357,6 +369,18 @@ fn has_outer_correlated_graph_var(patterns: &[Pattern], outer: &HashSet<VarId>) 
             .iter()
             .any(|b| has_outer_correlated_graph_var(b, outer)),
         Pattern::Subquery(sq) => has_outer_correlated_graph_var(&sq.patterns, outer),
+        // PR-1454 review (bplatz + local): these bodies are walked
+        // transparently by `produced_vars`, so without matching arms here a
+        // correlated `GRAPH ?g` inside them still selected Semijoin and
+        // re-opened the #1443 cross-encoding hash mismatch this fallback
+        // exists to close.
+        Pattern::Service(sp) => has_outer_correlated_graph_var(&sp.patterns, outer),
+        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+            has_outer_correlated_graph_var(body, outer)
+        }
+        Pattern::Filter(expr) => expr_embeds(expr, outer),
+        Pattern::Bind { expr, .. } => expr_embeds(expr, outer),
+        Pattern::Unwind { var: _, list } => expr_embeds(list, outer),
         _ => false,
     })
 }
@@ -732,6 +756,12 @@ impl BindPattern {
         expr: &Expression,
         bound_vars: &HashSet<VarId>,
     ) -> Option<Self> {
+        // EXISTS / pattern comprehensions are async subqueries resolved
+        // per-row by the standalone BindOperator; the fused join block's
+        // synchronous eval would silently collapse them to false/unbound.
+        if crate::filter::contains_exists(expr) {
+            return None;
+        }
         let mut required_vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
         if !required_vars.is_subset(bound_vars) {
             return None;
@@ -1992,17 +2022,45 @@ pub fn build_where_operators_seeded_with_needed(
                         let mut best_idx: Option<usize> = None;
                         let mut best_est: f64 = f64::INFINITY;
                         for (idx, tp) in triples_for_exec.iter().enumerate().skip(1) {
-                            let has_bounds =
-                                tp.o.as_var()
-                                    .is_some_and(|v| pushdown.object_bounds.contains_key(&v));
-                            if !has_bounds {
+                            let bounds = tp.o.as_var().and_then(|v| pushdown.object_bounds.get(&v));
+                            let Some(bounds) = bounds else {
                                 continue;
-                            }
-                            let est = crate::planner::estimate_triple_row_count(
-                                tp,
-                                &bound_vars,
-                                stats_ref,
-                            );
+                            };
+                            // An EQUALITY bound pins the object to one value, so
+                            // the triple's effective cardinality is the per-value
+                            // row count (count/ndv) — the same estimate a
+                            // bound-object pattern gets — not the full property
+                            // scan the bare triple estimate assumes. Without
+                            // this, a handful of novelty rows on the bounded
+                            // predicate nudge its scan estimate past the class
+                            // anchor's and flip a point lookup (`WHERE n.id =
+                            // $id`) into a full-class probe join.
+                            let equality_value = match (&bounds.lower, &bounds.upper) {
+                                (Some((lo, true)), Some((hi, true))) if lo == hi => {
+                                    Some(lo.clone())
+                                }
+                                _ => None,
+                            };
+                            let est = match equality_value {
+                                Some(v) => {
+                                    let bound_tp = TriplePattern {
+                                        s: tp.s.clone(),
+                                        p: tp.p.clone(),
+                                        o: Term::Value(v),
+                                        dtc: tp.dtc.clone(),
+                                    };
+                                    crate::planner::estimate_triple_row_count(
+                                        &bound_tp,
+                                        &bound_vars,
+                                        stats_ref,
+                                    )
+                                }
+                                None => crate::planner::estimate_triple_row_count(
+                                    tp,
+                                    &bound_vars,
+                                    stats_ref,
+                                ),
+                            };
                             if est < best_est {
                                 best_est = est;
                                 best_idx = Some(idx);
@@ -2275,8 +2333,12 @@ pub fn build_where_operators_seeded_with_needed(
                 let augmented_ref = augmented_rwv.as_deref();
 
                 operator = Some(Box::new(
-                    PropertyPathOperator::new(operator, pp.clone(), DEFAULT_MAX_VISITED)
-                        .with_out_schema(augmented_ref),
+                    PropertyPathOperator::new(
+                        operator,
+                        pp.clone(),
+                        crate::property_path::path_max_visited(),
+                    )
+                    .with_out_schema(augmented_ref),
                 ));
                 i += 1;
             }
@@ -4401,5 +4463,135 @@ mod tests {
                 key_vars: vec![a, b],
             },
         );
+    }
+
+    /// A correlated `GRAPH ?g` directly inside the EXISTS body must fall
+    /// back to per-row seeding (#1443) — the baseline shape the recursion
+    /// tests below extend.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_bare() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [Pattern::Graph {
+            name: crate::ir::GraphName::Var(g),
+            patterns: vec![Pattern::Triple(make_pattern(VarId(10), "q", VarId(11)))],
+        }];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// PR-1454 review (bplatz): `produced_vars` walks SERVICE bodies
+    /// transparently, so `EXISTS { SERVICE <…> { GRAPH ?g { … } } }` with
+    /// an outer-bound `?g` used to select Semijoin — re-opening the #1443
+    /// `Binding::Iri` vs `Sid`/`EncodedSid` hash mismatch.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_inside_service() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [Pattern::Service(crate::ir::ServicePattern {
+            silent: false,
+            endpoint: crate::ir::ServiceEndpoint::Iri(Arc::from("fluree:ledger:x:main")),
+            patterns: vec![Pattern::Graph {
+                name: crate::ir::GraphName::Var(g),
+                patterns: vec![Pattern::Triple(make_pattern(VarId(10), "q", VarId(11)))],
+            }],
+            source_body: None,
+        })];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// PR-1454 review (bplatz): annotation containers embed pattern bodies
+    /// the walker must recurse into.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_inside_edge_annotation() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [Pattern::EdgeAnnotation {
+            edge: make_pattern(VarId(10), "p", VarId(11)),
+            annotation: Ref::Var(VarId(12)),
+            body: vec![Pattern::Graph {
+                name: crate::ir::GraphName::Var(g),
+                patterns: vec![Pattern::Triple(make_pattern(VarId(13), "q", VarId(14)))],
+            }],
+        }];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// PR-1454 review (local): expression-embedded EXISTS —
+    /// `FILTER(EXISTS { GRAPH ?g { … } } && …)` — hides the correlated
+    /// GRAPH one level down inside an `Expression`, which the
+    /// pattern-level walker never saw.
+    #[test]
+    fn choose_exists_strategy_graph_var_correlated_inside_filter_expression() {
+        let g = VarId(1);
+        let outer_schema = [VarId(0), g];
+        let inner = [
+            // Produces ?g so the semijoin key set is non-empty (the shape
+            // that used to mis-select Semijoin).
+            Pattern::Triple(make_pattern(VarId(10), "p", g)),
+            Pattern::Filter(Expression::Exists {
+                patterns: vec![Pattern::Graph {
+                    name: crate::ir::GraphName::Var(g),
+                    patterns: vec![Pattern::Triple(make_pattern(VarId(11), "q", VarId(12)))],
+                }],
+                negated: false,
+            }),
+        ];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::GraphVarCorrelated,
+            },
+        );
+    }
+
+    /// Negative control: a SERVICE-wrapped `GRAPH ?h` whose graph variable
+    /// is NOT outer-bound keeps the Semijoin fast path.
+    #[test]
+    fn choose_exists_strategy_service_graph_var_uncorrelated_keeps_semijoin() {
+        let a = VarId(0);
+        let outer_schema = [a];
+        let inner = [Pattern::Service(crate::ir::ServicePattern {
+            silent: false,
+            endpoint: crate::ir::ServiceEndpoint::Iri(Arc::from("fluree:ledger:x:main")),
+            patterns: vec![
+                Pattern::Triple(make_pattern(a, "p", VarId(10))),
+                Pattern::Graph {
+                    name: crate::ir::GraphName::Var(VarId(20)),
+                    patterns: vec![Pattern::Triple(make_pattern(VarId(21), "q", VarId(22)))],
+                },
+            ],
+            source_body: None,
+        })];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(strategy, ExistsStrategy::Semijoin { key_vars: vec![a] },);
     }
 }

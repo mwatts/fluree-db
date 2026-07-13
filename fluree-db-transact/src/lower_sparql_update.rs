@@ -569,9 +569,11 @@ fn reject_user_authored_reifies(
 /// Update §19.8 grammar note 8: no blank nodes in DELETE DATA nor in the
 /// DeleteClause template). A blank node here denotes a fresh node, so a
 /// retraction built from it skolemizes a brand-new SID and silently matches
-/// nothing. Mirrors the validator's `BlankNodeInDelete` rule so callers that
-/// lower without running `validate()` (the transact builders) get the same
-/// clear error, and matches [`AnnotationExpansionMode::rejects_blank_reifier`]
+/// nothing. Mirrors the validator's `BlankNodeInDelete` rule as
+/// defense-in-depth: the fluree-db-api seam now runs `validate()` before
+/// lowering, but callers of the public `lower_sparql_update_ast` entry reach
+/// lowering directly and still get the same clear error. Matches
+/// [`AnnotationExpansionMode::rejects_blank_reifier`]
 /// (DeleteData | DeleteTemplate).
 ///
 /// Two deliberate carve-outs:
@@ -580,7 +582,8 @@ fn reject_user_authored_reifies(
 /// - DELETE WHERE is NOT routed through this check at lowering: its blank
 ///   nodes keep Fluree's documented existential-variable semantics
 ///   ([`BlankNodeVarNamer`]); the strict SPARQL surface rejects them in
-///   `validate()`.
+///   `validate()`, and the api seam waives exactly that rejection via
+///   `Capabilities::with_delete_where_extensions`.
 fn reject_blank_nodes_in_delete_quad_pattern(
     pattern: &QuadPattern,
     context: &'static str,
@@ -666,11 +669,26 @@ fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerErro
 }
 
 /// Assign stable variable names for SPARQL blank nodes when lowering
-/// triple-template forms like `DELETE WHERE { ... }`.
+/// DELETE WHERE forms — the triple-only fast path directly, and the
+/// GRAPH-bearing path via [`rewrite_blank_nodes_to_vars`].
 ///
 /// In SPARQL graph patterns, blank node labels behave like locally-scoped
 /// existential variables; lowering rewrites them to query variables with
-/// special names (e.g., `_:b1`).
+/// reserved names. Two invariants keep the reserved namespace airtight:
+///
+/// - Every name starts with `_:`, which can never be lexed as a SPARQL
+///   variable (`?`/`$` names cannot contain `:`), so no user-written
+///   variable can unify with a rewritten existential. The names live only
+///   as opaque registry keys; nothing re-lexes them.
+/// - The anonymous arm mints `_:[]{N}`: `[` is illegal in a
+///   BLANK_NODE_LABEL, so anonymous names are disjoint from the labeled
+///   arm's `_:{label}` for every possible label. (Plain `_:b{N}` collided
+///   with a user-written `_:b0`, silently unifying two distinct
+///   existentials — the same label-space hazard the annotation expansion
+///   avoids with its `__fluree_ann_` prefix.)
+///
+/// Same label ⇒ same name, per SPARQL's blank-node label scoping within a
+/// request.
 struct BlankNodeVarNamer {
     anon_counter: u32,
 }
@@ -719,7 +737,7 @@ impl BlankNodeVarNamer {
         match bn {
             BlankNodeValue::Labeled(label) => Arc::from(format!("_:{label}")),
             BlankNodeValue::Anon => {
-                let name: Arc<str> = Arc::from(format!("_:b{}", self.anon_counter));
+                let name: Arc<str> = Arc::from(format!("_:[]{}", self.anon_counter));
                 self.anon_counter += 1;
                 name
             }
@@ -1269,31 +1287,27 @@ fn lower_delete_where_with_graphs(
 /// SPARQL blank nodes in a graph pattern are locally-scoped existential
 /// variables. Because a DELETE WHERE pattern is used as both the WHERE clause
 /// and the DELETE template, the same variable must appear on both sides, so
-/// the rewrite happens once on the shared AST. Labeled blank nodes map to one
-/// variable per label; each anonymous blank node gets a fresh variable. The
-/// `_fluree_bn_` prefix keeps the synthesized names out of the user's
-/// variable namespace (`?` + `_fluree_` is already reserved by the annotation
-/// machinery). Stable `_:fdb-` ids are left untouched: they denote the stored
-/// node as a constant in both the WHERE lowering and the template lowering.
+/// the rewrite happens once on the shared AST. Naming comes from the shared
+/// [`BlankNodeVarNamer`] — the same scheme the triple-only DELETE WHERE path
+/// ships — whose `_:`-prefixed names cannot be lexed as user variables (the
+/// previous lexable `_fluree_bn_{label}` names let a user-written
+/// `?_fluree_bn_x` in the same request unify with the rewritten existential,
+/// changing which triples get deleted). Both the template lowering and the
+/// staging-time SPARQL WHERE lowering intern the name as an opaque
+/// `"?" + name` registry key; nothing re-lexes it. Stable `_:fdb-` ids are
+/// left untouched: they denote the stored node as a constant in both the
+/// WHERE lowering and the template lowering.
 fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
     use fluree_db_sparql::ast::Var;
 
-    let mut anon_counter: u32 = 0;
+    let mut namer = BlankNodeVarNamer::new();
     let mut rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
-        match &bn.value {
-            BlankNodeValue::Labeled(l) => {
-                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                    None
-                } else {
-                    Some(Var::new(format!("_fluree_bn_{l}"), bn.span))
-                }
-            }
-            BlankNodeValue::Anon => {
-                let v = Var::new(format!("_fluree_bn_anon{anon_counter}"), bn.span);
-                anon_counter += 1;
-                Some(v)
+        if let BlankNodeValue::Labeled(l) = &bn.value {
+            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
+                return None;
             }
         }
+        Some(Var::new(namer.var_name(&bn.value), bn.span))
     };
 
     let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
@@ -2021,15 +2035,45 @@ fn literal_to_template(
 // IRI expansion
 // =============================================================================
 
-/// Expand an IRI using prologue PREFIX declarations.
+/// Expand a constant IRI using the operation's prologue: prefixed names
+/// expand against PREFIX declarations, and relative references resolve
+/// against `BASE` — the same `fluree_vocab::iri`-backed semantics as the
+/// query path's `expand_iri_with` (RFC 3986 §5; SPARQL 1.1 §4.1.1) — so one
+/// document's constant IRIs denote the same absolute IRI on the update and
+/// query surfaces. `BASE <http://x/> INSERT DATA { <s1> <p1> "v" }` used to
+/// commit literal `s1`/`p1` that a query for `<http://x/s1>` could never
+/// find. Without a BASE, relative references stay as written (Fluree
+/// accepts them as ledger-local names).
 fn expand_iri(iri: &Iri, prologue: &Prologue) -> Result<String, LowerError> {
+    let base: Option<&str> = prologue.base.as_ref().map(|b| b.iri.as_ref());
     match &iri.value {
-        IriValue::Full(full) => Ok(full.to_string()),
+        IriValue::Full(full) => {
+            if let Some(base) = base {
+                if !fluree_vocab::iri::is_absolute_iri(full) {
+                    return Ok(fluree_vocab::iri::resolve_iri(base, full));
+                }
+            }
+            Ok(full.to_string())
+        }
         IriValue::Prefixed { prefix, local } => {
-            // Look up prefix in prologue
+            // Look up prefix in prologue (first declaration wins, matching
+            // `Prologue::get_prefix`)
             for decl in &prologue.prefixes {
                 if decl.prefix.as_ref() == prefix.as_ref() {
-                    return Ok(format!("{}{}", decl.iri, local));
+                    // A PREFIX namespace may itself be a relative reference
+                    // (`PREFIX : <#>`); per SPARQL 1.1 §4.1.1 it resolves
+                    // against BASE too.
+                    let expanded = match base {
+                        Some(base) if !fluree_vocab::iri::is_absolute_iri(&decl.iri) => {
+                            format!(
+                                "{}{}",
+                                fluree_vocab::iri::resolve_iri(base, &decl.iri),
+                                local
+                            )
+                        }
+                        _ => format!("{}{}", decl.iri, local),
+                    };
+                    return Ok(expanded);
                 }
             }
             // Undefined prefix is an error
@@ -2188,6 +2232,80 @@ mod tests {
             result,
             Err(LowerError::UndefinedPrefix { prefix, .. }) if prefix == "unknown"
         ));
+    }
+
+    fn test_prologue_with_base(base: &str) -> Prologue {
+        Prologue {
+            base: Some(fluree_db_sparql::ast::BaseDecl::new(base, test_span())),
+            prefixes: vec![
+                PrefixDecl {
+                    prefix: Arc::from("ex"),
+                    iri: Arc::from("http://example.org/"),
+                    span: test_span(),
+                },
+                PrefixDecl {
+                    prefix: Arc::from("rel"),
+                    iri: Arc::from("#"),
+                    span: test_span(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_expand_relative_iri_against_base() {
+        // PR-1454 review: the update surface must resolve constant IRIs
+        // against BASE with the same RFC 3986 §5 semantics as the query
+        // surface — `BASE <…> INSERT DATA { <s1> … }` used to store the
+        // literal `s1` that a query for the resolved IRI could never find.
+        let prologue = test_prologue_with_base("http://x.example/dir/doc");
+        for (input, expected) in [
+            ("s1", "http://x.example/dir/s1"),
+            ("", "http://x.example/dir/doc"),
+            ("#frag", "http://x.example/dir/doc#frag"),
+            ("/rooted", "http://x.example/rooted"),
+            ("../up", "http://x.example/up"),
+        ] {
+            let iri = Iri::full(input, test_span());
+            assert_eq!(
+                expand_iri(&iri, &prologue).unwrap(),
+                expected,
+                "for <{input}>"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_absolute_iri_ignores_base() {
+        // Any valid scheme passes through verbatim — including non-`://`
+        // forms like `urn:` / `did:`.
+        let prologue = test_prologue_with_base("http://x.example/");
+        for absolute in ["http://other.example/a", "urn:uuid:abc", "did:key:xyz"] {
+            let iri = Iri::full(absolute, test_span());
+            assert_eq!(expand_iri(&iri, &prologue).unwrap(), absolute);
+        }
+    }
+
+    #[test]
+    fn test_expand_relative_prefix_namespace_against_base() {
+        // A PREFIX namespace that is itself a relative reference resolves
+        // against BASE (SPARQL 1.1 §4.1.1) before local-name concatenation
+        // — same as the query path's `prologue_environment`.
+        let prologue = test_prologue_with_base("http://x.example/doc");
+        let iri = Iri::prefixed("rel", "x", test_span());
+        assert_eq!(
+            expand_iri(&iri, &prologue).unwrap(),
+            "http://x.example/doc#x"
+        );
+    }
+
+    #[test]
+    fn test_expand_relative_iri_without_base_stays_as_written() {
+        // Fluree accepts relative references as ledger-local names when no
+        // BASE is declared.
+        let iri = Iri::full("ledger-local", test_span());
+        let prologue = test_prologue();
+        assert_eq!(expand_iri(&iri, &prologue).unwrap(), "ledger-local");
     }
 
     #[test]
@@ -2361,16 +2479,84 @@ mod tests {
         let sparql_where = txn.sparql_where.as_ref().expect("sparql where");
         let rendered = format!("{:?}", sparql_where.pattern);
         assert!(
-            rendered.contains("_fluree_bn_x"),
+            rendered.contains("_:x"),
             "WHERE pattern must reference the shared existential var: {rendered}"
         );
     }
 
     #[test]
+    fn test_delete_where_bnode_vars_cannot_collide_with_user_vars() {
+        // pr-1453 review: the GRAPH path used to mint LEXABLE reserved names
+        // (`_fluree_bn_x`), so a user-written ?_fluree_bn_x in the same
+        // request silently unified with the rewritten existential, changing
+        // which triples get deleted. The shared `_:`-scheme names cannot be
+        // written as SPARQL variables.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE WHERE { GRAPH <urn:g1> { _:x <http://example.org/p> ?_fluree_bn_x } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        let template = &txn.delete_templates[0];
+        let (TemplateTerm::Var(subject), TemplateTerm::Var(object)) =
+            (&template.subject, &template.object)
+        else {
+            panic!("both positions must lower to variables: {template:?}");
+        };
+        assert_ne!(
+            subject, object,
+            "the rewritten existential must not unify with the user's variable"
+        );
+    }
+
+    #[test]
+    fn test_delete_where_anon_bnode_vars_disjoint_from_labels() {
+        // A user-written label `_:b0` and an anonymous `[]` are distinct
+        // existentials. The old `_:b{N}` anonymous names lived inside the
+        // label namespace, so `[]` unified with a user's `_:b0` — deleting
+        // by the JOIN of two patterns that the spec treats independently.
+        // The `_:[]{N}` anonymous namespace cannot be produced by any
+        // BLANK_NODE_LABEL. Pin both DELETE WHERE paths.
+        for input in [
+            // Triple-only fast path (BlankNodeVarNamer used directly).
+            "DELETE WHERE { _:b0 <http://example.org/p> ?o . [] <http://example.org/q> ?r }",
+            // GRAPH path (rewrite_blank_nodes_to_vars, shared namer).
+            "DELETE WHERE { GRAPH <urn:g1> { _:b0 <http://example.org/p> ?o . \
+             [] <http://example.org/q> ?r } }",
+        ] {
+            let parsed = fluree_db_sparql::parse_sparql(input);
+            assert!(
+                !parsed.has_errors(),
+                "parse errors for {input}: {:?}",
+                parsed.diagnostics
+            );
+            let ast = parsed.ast.expect("AST");
+            let mut ns = NamespaceRegistry::new();
+            let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+            let TemplateTerm::Var(labeled) = &txn.delete_templates[0].subject else {
+                panic!("labeled bnode must lower to a variable ({input})");
+            };
+            let TemplateTerm::Var(anon) = &txn.delete_templates[1].subject else {
+                panic!("anonymous bnode must lower to a variable ({input})");
+            };
+            assert_ne!(
+                labeled, anon,
+                "a user label _:b0 must not unify with an anonymous [] existential ({input})"
+            );
+        }
+    }
+
+    #[test]
     fn test_lower_delete_data_blank_node_rejected() {
         // SPARQL 1.1 Update §19.8 note 8: no blank nodes in DELETE DATA.
-        // Enforced at lowering too, since the transact builders lower
-        // without running validate().
+        // Enforced at lowering too, as defense-in-depth for direct
+        // lower_sparql_update_ast callers (the api seam also rejects this
+        // via validate() before lowering).
         let parsed =
             fluree_db_sparql::parse_sparql("DELETE DATA { _:a <http://example.org/p> <urn:o> }");
         let ast = parsed.ast.expect("AST");
@@ -2422,6 +2608,40 @@ mod tests {
         let mut ns = NamespaceRegistry::new();
         lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
             .expect("stable blank-node id in DELETE DATA must lower");
+    }
+
+    #[test]
+    fn test_stable_id_exemption_predicate_matches_validator() {
+        // pr-1453 review follow-up: the validator's stable-id exemption
+        // (validate/mod.rs, a `starts_with("fdb-")` on a duplicated const)
+        // and this crate's `stable_blank_node_sid_from_label` must classify
+        // the SAME labels as stable — today both are prefix-only, so
+        // `_:fdb-zzz` is exempt on both sides (a constant addressing a —
+        // possibly nonexistent — stored node; deleting it is a no-op, not
+        // an error). The lowering-feature sync test in fluree-db-sparql
+        // pins only the prefix CONSTANT; this pins the PREDICATE, so if the
+        // helper ever grows stricter parsing without the validator
+        // following, the drift fails here instead of shipping a
+        // passes-validate-then-fails-at-lowering flow.
+        for label in ["fdb-zzz", "fdb-1234-0-b0", "fdb-", "fdbx", "b0", "x0"] {
+            let lowering_exempts =
+                crate::namespace::stable_blank_node_sid_from_label(label).is_some();
+            let sparql = format!("DELETE DATA {{ _:{label} <http://example.org/p> <urn:o> }}");
+            let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            let ast = parsed
+                .ast
+                .unwrap_or_else(|| panic!("label {label} must parse: {:?}", parsed.diagnostics));
+            let diags =
+                fluree_db_sparql::validate(&ast, &fluree_db_sparql::Capabilities::default());
+            let validator_exempts = !diags
+                .iter()
+                .any(|d| d.code == fluree_db_sparql::DiagCode::BlankNodeInDelete && d.is_error());
+            assert_eq!(
+                lowering_exempts, validator_exempts,
+                "stable-id classification diverged for label {label:?} \
+                 (lowering: {lowering_exempts}, validator: {validator_exempts})"
+            );
+        }
     }
 
     #[test]

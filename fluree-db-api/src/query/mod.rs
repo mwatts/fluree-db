@@ -27,6 +27,18 @@ use fluree_db_query::ir::QueryOutput;
 pub struct QueryExecutionOptions {
     /// Cooperative cancellation handle passed through to query operators.
     pub cancellation: Option<fluree_db_core::QueryCancellation>,
+    /// Render R2RML `RefObjectMap` objects by templating the parent IRI from the
+    /// child row's own FK columns, skipping the parent-table scan and its
+    /// referential (dangling-FK) existence check. Default `false` — R2RML-faithful
+    /// semantics, where a dangling FK yields no triple. Enabled ONLY by the
+    /// graph-source subgraph-crawl ("View Instances"/browse) path, where scanning
+    /// every FK-parent table just to render ref IRIs is the dominant cost and
+    /// referential integrity is assumed. A matched (non-dangling) row renders a
+    /// byte-identical IRI either way; the relaxation only affects a present-but-
+    /// dangling FK (templated instead of omitted). A type-mismatched FK/PK — whose
+    /// stringified child value never equals the parent key — is treated as
+    /// dangling, so the templated IRI may not resolve to a real parent subject.
+    pub trust_fk_refs: bool,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
 }
 
@@ -48,6 +60,14 @@ impl QueryExecutionOptions {
     /// Attach a cooperative cancellation handle.
     pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Enable child-templated `RefObjectMap` rendering (skip FK-parent scans).
+    /// See [`QueryExecutionOptions::trust_fk_refs`]. Set only by the graph-source
+    /// crawl/browse path.
+    pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
+        self.trust_fk_refs = trust;
         self
     }
 
@@ -245,6 +265,28 @@ impl QueryResult {
     pub fn to_cypher_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
         let config = FormatterConfig::cypher_json();
         format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// The Cypher tabular result (columns + rows) with RDF-faithful cell
+    /// values — the pre-flattening form of [`Self::to_cypher_json`]. Value-
+    /// typed transports (Bolt) map datatypes from these cells directly.
+    pub fn to_cypher_table(
+        &self,
+        snapshot: &LedgerSnapshot,
+    ) -> format::Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
+        format::format_cypher_table(self, &self.context, snapshot)
+    }
+
+    /// The typed Cypher tabular result: node refs hydrate into
+    /// [`format::cypher_typed::CypherNode`] (labels + properties fetched
+    /// from `view` at format time), relationship/path/temporal values stay
+    /// typed. Under a view policy, hydration filters each subject's raw
+    /// SPOT fetch through the view's enforcer before rendering.
+    pub async fn to_cypher_typed_table(
+        &self,
+        view: &crate::view::GraphDb,
+    ) -> format::Result<(Vec<String>, Vec<Vec<format::cypher_typed::CypherCell>>)> {
+        format::format_cypher_typed_table(self, &self.context, view).await
     }
 
     /// Format as AgentJson (LLM/agent-optimized envelope)

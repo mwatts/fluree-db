@@ -198,7 +198,18 @@ fn remove_dot_segments(path: &str) -> String {
         }
     }
 
-    let result = output.join("/");
+    let mut result = output.join("/");
+    // RFC 3986 §5.2.4: a FINAL `.` / `..` segment resolves to the directory
+    // itself, leaving a trailing slash — `/def/.` → `/def/`, `/def/..` →
+    // `/` — which the segment loop above drops (PR-1454 review; W3C
+    // IRI-resolution-08 fixtures). Bare `.` / `..` (no leading slash, empty
+    // output) stay empty per the algorithm's rule 2D.
+    if matches!(path.rsplit('/').next(), Some("." | ".."))
+        && (!result.is_empty() || path.starts_with('/'))
+        && !result.ends_with('/')
+    {
+        result.push('/');
+    }
     if path.starts_with('/') && !result.starts_with('/') {
         format!("/{result}")
     } else {
@@ -244,6 +255,50 @@ mod tests {
             ),
             "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/data-g1.ttl"
         );
+    }
+
+    #[test]
+    fn final_dot_segments_keep_the_trailing_slash() {
+        // RFC 3986 §5.2.4 / W3C rdf-tests IRI-resolution-08 (s295–s300): a
+        // final `.` / `..` segment resolves to the DIRECTORY — the output
+        // ends in `/`. The old segment loop dropped it (PR-1454 review).
+        let base = "http://abc/def/ghi";
+        for (reference, expected) in [
+            (".", "http://abc/def/"),
+            (".?a=b", "http://abc/def/?a=b"),
+            (".#a=b", "http://abc/def/#a=b"),
+            ("..", "http://abc/"),
+            ("..?a=b", "http://abc/?a=b"),
+            ("..#a=b", "http://abc/#a=b"),
+        ] {
+            assert_eq!(
+                resolve_iri(base, reference),
+                expected,
+                "resolve_iri({base:?}, {reference:?})"
+            );
+        }
+        // Mid-path dot-segments keep collapsing without a trailing slash.
+        assert_eq!(resolve_iri(base, "../x"), "http://abc/x");
+        assert_eq!(resolve_iri(base, "./x"), "http://abc/def/x");
+        // A root-consuming `..` still yields the root.
+        assert_eq!(resolve_iri("http://abc/def", ".."), "http://abc/");
+    }
+
+    #[test]
+    fn empty_and_colon_path_segments_survive_resolution() {
+        // W3C rdf-tests IRI-resolution-08 (s301–s306): empty path segments
+        // (`//de//ghi`) and colon-in-path segments (`d:f`) are ordinary
+        // segments — merging and dot-segment removal must not collapse or
+        // misparse them.
+        let double = "http://ab//de//ghi";
+        assert_eq!(resolve_iri(double, "xyz"), "http://ab//de//xyz");
+        assert_eq!(resolve_iri(double, "./xyz"), "http://ab//de//xyz");
+        assert_eq!(resolve_iri(double, "../xyz"), "http://ab//de/xyz");
+
+        let colon = "http://abc/d:f/ghi";
+        assert_eq!(resolve_iri(colon, "xyz"), "http://abc/d:f/xyz");
+        assert_eq!(resolve_iri(colon, "./xyz"), "http://abc/d:f/xyz");
+        assert_eq!(resolve_iri(colon, "../xyz"), "http://abc/xyz");
     }
 
     #[test]

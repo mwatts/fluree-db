@@ -88,17 +88,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Ref::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    // A bare `[]` is a fresh non-distinguished variable. Mint an
-                    // unforgeable registry name from a dedicated monotonic
-                    // counter: `#` is outside PN_CHARS, so no user-written
-                    // `_:label` can ever collide with it. (The old `_:b{len}`
-                    // scheme was forgeable — a user `_:bN` with N == vars.len()
-                    // here mapped to the same var, merging two intended-distinct
-                    // template blanks; matches the `#bnpl…`/`#coll…` labeling the
-                    // parser already uses for property lists / collections.)
-                    let label = format!("_:#anon{}", self.anon_counter);
-                    self.anon_counter += 1;
-                    let var_id = self.vars.get_or_insert(&label);
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Ref::Var(var_id))
                 }
             },
@@ -160,11 +150,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Term::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    // Fresh non-distinguished var with an unforgeable label; see
-                    // the `Anon` arm of `lower_subject` for why `#anon…`.
-                    let label = format!("_:#anon{}", self.anon_counter);
-                    self.anon_counter += 1;
-                    let var_id = self.vars.get_or_insert(&label);
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Term::Var(var_id))
                 }
             },

@@ -7,6 +7,7 @@ use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
+#[cfg(test)]
 use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
@@ -212,9 +213,17 @@ impl GraphSink for FlakeSink<'_> {
                 id
             }
             None => {
-                // Anonymous blank node — unique counter-based label
+                // Anonymous blank node (`[]`, bare `~` reifiers, `{| … |}`
+                // blocks) — unique counter-based label. The leading '-'
+                // keeps the minted namespace disjoint from every
+                // user-written label: BLANK_NODE_LABEL must start with
+                // PN_CHARS_U | [0-9], so `_:-b1` can never lex (`_:b1` +
+                // an anonymous mint used to skolemize identically and
+                // silently merge). '-' stays legal medially, so the full
+                // skolemized `fdb-{txn}--b{N}` label still serializes and
+                // re-imports as the same stored node.
                 self.blank_counter += 1;
-                let label = format!("b{}", self.blank_counter);
+                let label = format!("-b{}", self.blank_counter);
                 let sid = self.skolemize(&label);
                 self.add_term(ResolvedTerm::Sid(sid))
             }
@@ -267,14 +276,11 @@ impl GraphSink for FlakeSink<'_> {
         true
     }
 
-    /// Turtle-star reifier attachment → the durable `f:reifies*` bundle.
-    ///
-    /// Emits via [`EdgeKey::to_reifies_facts_jsonld_compatible`] — the SAME
-    /// shape the JSON-LD `@annotation` lowering produces (no
-    /// `f:reifiesDatatype` flake) — so Turtle-star and JSON-LD annotations
-    /// are bit-identical at the flake level and cascade retracts built from
-    /// `AttachmentNovelty` cancel either surface's assertions. The base
-    /// triple has already been emitted by the parser via `emit_triple`.
+    /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
+    /// built by the shared [`crate::generate::flakes::reified_triple_bundle`]
+    /// (bit-identical with the JSON-LD `@annotation` lowering and with
+    /// `ImportSink`'s bulk path). The base triple has already been emitted
+    /// by the parser via `emit_triple`.
     fn emit_reified_triple(
         &mut self,
         subject: TermId,
@@ -295,35 +301,15 @@ impl GraphSink for FlakeSink<'_> {
             return;
         };
 
-        let dt = dtc.datatype().clone();
-        let lang = dtc.lang_tag().map(std::string::ToString::to_string);
-
-        // Same late hard guard as `build_flake`: a bad (value, dt) pair must
-        // fail the whole transaction, not silently drop the bundle. The base
-        // triple hit the same guard already, so this only fires on shapes
-        // the base emission also rejected.
-        if let Err(e) = validate_value_dt_pair(&o, &dt) {
-            tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
-            if self.invariant_error.is_none() {
-                self.invariant_error = Some(e);
+        match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
+            Ok(bundle) => self.flakes.extend(bundle),
+            Err(e) => {
+                tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
+                if self.invariant_error.is_none() {
+                    self.invariant_error = Some(e);
+                }
             }
-            return;
         }
-
-        // Plain Turtle is default-graph only (named graphs are TriG, which
-        // takes a different ingest path), so `g = None`; list-occurrence
-        // annotations are deferred in v1, so `list_i = None`.
-        let key = EdgeKey {
-            g: None,
-            s,
-            p,
-            o,
-            dt,
-            lang,
-            list_i: None,
-        };
-        self.flakes
-            .extend(key.to_reifies_facts_jsonld_compatible(&ann, self.t, true));
     }
 }
 
@@ -443,6 +429,25 @@ mod tests {
         assert_ne!(b1, b3);
         // Anonymous → always unique
         assert_ne!(b3, b4);
+    }
+
+    #[test]
+    fn test_anonymous_mints_disjoint_from_user_label_namespace() {
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        // A user-written `_:b1` and the first anonymous mint used to
+        // skolemize to the SAME Sid (`{txn}-b1`), silently merging user
+        // data into system-minted `[]`/reifier nodes. TermId inequality
+        // (above) never caught it — the collision was at the Sid level.
+        let user = sink.term_blank(Some("b1"));
+        let anon = sink.term_blank(None);
+        let user_sid = sink.resolve_sid(user).expect("user blank is a Sid");
+        let anon_sid = sink.resolve_sid(anon).expect("anon blank is a Sid");
+        assert_ne!(
+            user_sid, anon_sid,
+            "anonymous mint must never share a Sid with a user `_:b1`"
+        );
     }
 
     #[test]

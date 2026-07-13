@@ -194,10 +194,16 @@ impl GraphOperator {
                 ..
             } => Some(Arc::from(s.as_str())),
             // Late-materialized bindings from the binary index: decode against
-            // the active graph view, then extract from the decoded form. This
-            // runs per parent row of a correlated GRAPH, only in the bound-var
-            // arm — never on a scan hot path. (Subject/string dictionaries are
-            // store-global, so decoding against the outer view is sound.)
+            // the active graph view, then extract from the decoded form.
+            // Defense-in-depth: as of PR-1454's audit, every upstream
+            // operator (hash join, filter/EXISTS seeding, merge) materializes
+            // batches before they reach either extraction call site, so no
+            // known plan shape delivers an encoded binding here — but that is
+            // a property of operator internals, not of this function's
+            // contract, and extraction must stay total across binding kinds.
+            // (Subject/string dictionaries are store-global, so decoding
+            // against the outer view is sound; when extraction DOES run in
+            // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
                 let gv = ctx.graph_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
@@ -275,6 +281,8 @@ impl GraphOperator {
                 &graph_iri,
                 ctx.active_snapshot,
                 mapping.as_deref(),
+                ctx.reasoning_active,
+                ctx.trust_fk_refs,
             );
 
             // If there are unconverted patterns in an R2RML graph source, return an error.
@@ -366,6 +374,16 @@ impl GraphOperator {
                 // graph var the inner body actually carries; when the value
                 // was seeded (`seed_graph_var`) it short-circuits on the
                 // `Binding::Iri` fast path.
+                //
+                // Two deliberate edges (PR-1454 review): (1) an inner `?g`
+                // whose binding fails extraction (`extract → None`: a
+                // non-string literal, or an encoded form with no graph view)
+                // compares unequal and the row drops — lossy-but-safe over
+                // erroring mid-merge; (2) extraction honors the documented
+                // string-literal back-compat, so a plain-string graph name
+                // joins the IRI-valued enumeration by VALUE across term
+                // kinds where strict SPARQL term-equality would drop it
+                // (kept for pre-IRI-migration data).
                 if let Some(gvar) = bind_graph_var {
                     if let Some(b) = batch.get(inner_row_idx, gvar) {
                         if !matches!(b, Binding::Unbound | Binding::Poisoned)
@@ -461,6 +479,8 @@ impl GraphOperator {
             &graph_iri,
             ctx.active_snapshot,
             mapping.as_deref(),
+            ctx.reasoning_active,
+            ctx.trust_fk_refs,
         );
         if rewrite_result.unconverted_count > 0 {
             return Err(crate::error::QueryError::InvalidQuery(format!(

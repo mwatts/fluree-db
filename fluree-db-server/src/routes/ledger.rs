@@ -492,35 +492,6 @@ fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
     }
 }
 
-/// Build a JSON representation of a graph source record for the info endpoint.
-fn graph_source_info_json(gs: &fluree_db_nameservice::GraphSourceRecord) -> JsonValue {
-    let mut obj = serde_json::json!({
-        "name": gs.name,
-        "branch": gs.branch,
-        "type": format_source_type(&gs.source_type),
-        "graph_source_id": gs.graph_source_id,
-        "retracted": gs.retracted,
-        "index_t": gs.index_t,
-    });
-
-    if let Some(ref id) = gs.index_id {
-        obj["index_id"] = serde_json::Value::String(id.to_string());
-    }
-
-    if !gs.dependencies.is_empty() {
-        obj["dependencies"] = serde_json::json!(gs.dependencies);
-    }
-
-    // Include parsed config if non-empty
-    if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<JsonValue>(&gs.config) {
-            obj["config"] = parsed;
-        }
-    }
-
-    obj
-}
-
 // =============================================================================
 // Info
 // =============================================================================
@@ -617,10 +588,16 @@ pub async fn info(
         let ledger_state = match super::query::load_ledger_for_query(&state, alias, &span).await {
             Ok(ls) => ls,
             Err(ServerError::Api(ref e)) if e.is_not_found() => {
-                // Try graph source lookup
+                // Try graph source lookup. A virtual (R2RML/Iceberg) dataset is
+                // routed through the SHARED api builder so its `/info` returns
+                // real classes/properties/counts (metadata-only) with NO secrets.
                 if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
+                    let info =
+                        fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
+                            .await
+                            .map_err(ServerError::Api)?;
                     tracing::info!(status = "success", "graph source info retrieved");
-                    return Ok(Json(graph_source_info_json(&gs)).into_response());
+                    return Ok(Json(info).into_response());
                 }
                 set_span_error_code(&span, "error:NotFound");
                 return Err(ServerError::Api(ApiError::NotFound(alias.to_string())));
@@ -729,10 +706,13 @@ async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) ->
         }
     }
 
-    // Try graph source lookup
+    // Try graph source lookup (shared builder: redacted, virtual-aware).
     if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
+        let info = fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
+            .await
+            .map_err(ServerError::Api)?;
         tracing::info!(status = "success", "graph source info retrieved");
-        return Ok(Json(graph_source_info_json(&gs)).into_response());
+        return Ok(Json(info).into_response());
     }
 
     let server_error = ServerError::Api(ApiError::NotFound(alias.to_string()));
@@ -1822,6 +1802,18 @@ const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 /// should pass `include_conflicts=false`.
 const PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
 
+/// Hard cap on `max_changes`. 10x the recommended default.
+///
+/// **What this protects:** the size of `changes.entries` in the response
+/// (counted in flakes; cut at subject boundaries, so a single huge subject
+/// may overshoot by its own size).
+///
+/// **What this does NOT protect:** the change computation. When
+/// `include_changes=true`, the source-side commit chain since the ancestor
+/// is fully replayed (one commit blob load per commit) regardless of cap —
+/// the same cost the merge itself pays. Each pagination page re-pays it.
+const PREVIEW_HARD_MAX_CHANGES: usize = 5_000;
+
 /// Query parameters for [`merge_preview`].
 #[derive(Deserialize)]
 pub struct MergePreviewQuery {
@@ -1845,6 +1837,17 @@ pub struct MergePreviewQuery {
     /// Strategy used for conflict resolution labels. Defaults to take-both.
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Include the aggregate netted change set the merge would apply.
+    #[serde(default)]
+    pub include_changes: Option<bool>,
+    /// Cap on change entries returned, counted in flakes and cut at subject
+    /// boundaries. `0` = stats-only (exact counts, no payload). Defaults to 500.
+    #[serde(default)]
+    pub max_changes: Option<usize>,
+    /// Pagination cursor: return only subjects sorting strictly after this
+    /// full IRI. Pass the previous response's `changes.next_cursor`.
+    #[serde(default)]
+    pub changes_after_subject: Option<String>,
 }
 
 /// Read-only branch merge preview.
@@ -1933,6 +1936,18 @@ pub async fn merge_preview(
                 "strategy=abort requires include_conflicts=true for mergeable preview",
             ));
         }
+        if let Some(b) = params.include_changes {
+            opts.include_changes = b;
+        }
+        if let Some(n) = params.max_changes {
+            opts.max_changes = Some(n.min(PREVIEW_HARD_MAX_CHANGES));
+        }
+        if params.changes_after_subject.is_some() && !opts.include_changes {
+            return Err(ServerError::bad_request(
+                "changes_after_subject requires include_changes=true",
+            ));
+        }
+        opts.changes_after_subject = params.changes_after_subject.clone();
 
         let preview = state
             .fluree

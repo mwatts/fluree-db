@@ -751,8 +751,13 @@ mod inner {
                     id
                 }
                 None => {
+                    // Anonymous mint: leading '-' keeps the namespace
+                    // disjoint from every lexable user label (labels cannot
+                    // start with '-'), while the full skolemized
+                    // `fdb-{txn}--b{N}` stays serializable — see
+                    // `FlakeSink::term_blank` for the full rationale.
                     self.blank_counter += 1;
-                    let label = format!("b{}", self.blank_counter);
+                    let label = format!("-b{}", self.blank_counter);
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
@@ -812,13 +817,12 @@ mod inner {
         }
 
         /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
-        /// streamed through the commit writer (and spool, when attached)
-        /// exactly like ordinary triples.
-        ///
-        /// Uses [`fluree_db_core::edge::EdgeKey::to_reifies_facts_jsonld_compatible`]
-        /// — the same shape the JSON-LD `@annotation` lowering produces — so
-        /// bulk-import and transactional ingest write identical bundles. The
-        /// base triple has already been emitted by the parser via `emit_triple`.
+        /// built by the shared
+        /// [`crate::generate::flakes::reified_triple_bundle`] (bit-identical
+        /// with the JSON-LD `@annotation` lowering and with `FlakeSink`'s
+        /// transactional path) and streamed through the commit writer (and
+        /// spool, when attached) exactly like ordinary triples. The base
+        /// triple has already been emitted by the parser via `emit_triple`.
         fn emit_reified_triple(
             &mut self,
             subject: TermId,
@@ -826,8 +830,6 @@ mod inner {
             object: TermId,
             reifier: TermId,
         ) {
-            use fluree_db_core::edge::EdgeKey;
-
             let Some(s) = self.resolve_sid(subject) else {
                 return;
             };
@@ -841,33 +843,19 @@ mod inner {
                 return;
             };
 
-            let dt = dtc.datatype().clone();
-            let lang = dtc.lang_tag().map(std::string::ToString::to_string);
-
-            // Same hard guard as `push_triple`: fail the import loudly on a
-            // bad (value, dt) pair instead of writing a corrupt bundle.
-            if let Err(e) = crate::generate::flakes::validate_value_dt_pair(&o, &dt) {
-                if self.encode_error.is_none() {
-                    let msg = format!("invariant violation in reifier bundle: {e}");
-                    tracing::error!("ImportSink: {msg}");
-                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
-                }
-                return;
-            }
-
-            // The streaming import parser only handles the default graph
-            // (named graphs are TriG blocks on a separate path), so `g = None`;
-            // list-occurrence annotations are deferred in v1.
-            let key = EdgeKey {
-                g: None,
-                s,
-                p,
-                o,
-                dt,
-                lang,
-                list_i: None,
-            };
-            for flake in key.to_reifies_facts_jsonld_compatible(&ann, self.t, true) {
+            let bundle =
+                match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
+                    Ok(bundle) => bundle,
+                    Err(e) => {
+                        if self.encode_error.is_none() {
+                            let msg = format!("invariant violation in reifier bundle: {e}");
+                            tracing::error!("ImportSink: {msg}");
+                            self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                        }
+                        return;
+                    }
+                };
+            for flake in bundle {
                 if let Err(e) = self.writer.push_flake(&flake) {
                     if self.encode_error.is_none() {
                         tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);

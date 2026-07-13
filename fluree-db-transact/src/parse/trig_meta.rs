@@ -613,14 +613,23 @@ impl<'a> TrigMetaParser<'a> {
         }
     }
 
+    /// Resolve a potentially relative IRI reference against `@base` per
+    /// RFC 3986 §5, via the shared `fluree_vocab::iri` resolver — the same
+    /// semantics as the Turtle parser and SPARQL prologue handling. The old
+    /// `!iri.contains(':')` + concat heuristic mis-resolved sibling
+    /// references (`<sibling.ttl>` was appended, not merged), `<//host/x>`,
+    /// `</rooted>`, and dot-segments, and mis-classified colon-in-path
+    /// relatives (`<a/b:c>`) as absolute. Without a `@base`, relative
+    /// references stay as written (ledger-local names) — this import path's
+    /// historical behavior, which also keeps the relative `<#txn-meta>`
+    /// sentinel matching `TXN_META_GRAPH_IRI` exactly.
     fn resolve_iri(&self, iri: &str) -> String {
-        // Simple resolution - if relative and base is set, resolve against base
-        if let Some(base) = &self.base {
-            if !iri.contains(':') {
-                return format!("{base}{iri}");
+        match &self.base {
+            Some(base) if !fluree_vocab::iri::is_absolute_iri(iri) => {
+                fluree_vocab::iri::resolve_iri(base, iri)
             }
+            _ => iri.to_string(),
         }
-        iri.to_string()
     }
 
     fn expand_prefixed_name(&self, prefix: &str, local: &str) -> Result<String> {
@@ -1492,6 +1501,66 @@ GRAPH <http://example.org/my-graph> {
         // Subject should be included for named graphs
         let triple = &result.named_graphs[0].triples[0];
         assert!(triple.subject.is_some());
+    }
+
+    #[test]
+    fn test_base_resolves_relative_references_rfc3986() {
+        // bplatz's PR-1454 case: this is the production TriG import path,
+        // and a document-IRI @base with a sibling relative reference must
+        // MERGE paths per RFC 3986 §5 — the old concat heuristic produced
+        // "http://ex.org/data/doc.trigsibling.ttl".
+        let mut ns = test_registry();
+        let input = r#"
+@base <http://ex.org/data/doc.trig> .
+@prefix ex: <http://example.org/> .
+
+GRAPH <sibling.ttl> {
+    ex:alice ex:name "Alice" .
+}
+
+GRAPH <#annotations> {
+    ex:alice ex:note "fragment-named graph" .
+}
+
+GRAPH </rooted> {
+    ex:alice ex:note "root-relative graph" .
+}
+
+GRAPH <urn:absolute:g> {
+    ex:alice ex:note "absolute passthrough" .
+}
+"#;
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        let iris: Vec<&str> = result.named_graphs.iter().map(|g| g.iri.as_str()).collect();
+        assert_eq!(
+            iris,
+            vec![
+                "http://ex.org/data/sibling.ttl",
+                "http://ex.org/data/doc.trig#annotations",
+                "http://ex.org/rooted",
+                "urn:absolute:g",
+            ],
+            "RFC 3986 §5 resolution on the TriG import path"
+        );
+    }
+
+    #[test]
+    fn test_relative_references_without_base_stay_as_written() {
+        // Ledger-local names: without @base, relative references pass
+        // through verbatim (also keeps the `<#txn-meta>` sentinel intact —
+        // covered by the txn-meta tests above).
+        let mut ns = test_registry();
+        let input = r#"
+@prefix ex: <http://example.org/> .
+
+GRAPH <local-graph> {
+    ex:alice ex:name "Alice" .
+}
+"#;
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert_eq!(result.named_graphs.len(), 1);
+        assert_eq!(result.named_graphs[0].iri, "local-graph");
     }
 
     #[test]
