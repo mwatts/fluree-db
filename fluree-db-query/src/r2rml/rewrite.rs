@@ -1354,7 +1354,10 @@ mod tests {
         let mapping = CompiledR2rmlMapping::new(vec![store, customer]);
         let subject = VarId(1);
         let mut base = star_base(subject, PRED);
-        let mut class_groups = vec![(subject, vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)])];
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
+        )];
         fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
         // Not fused for materialization (class stays separate), but prune hint set.
         assert_eq!(base.class_filter, None);
@@ -1377,7 +1380,10 @@ mod tests {
         let mapping = CompiledR2rmlMapping::new(vec![store_attrs, store_class]);
         let subject = VarId(1);
         let mut base = star_base(subject, PRED);
-        let mut class_groups = vec![(subject, vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)])];
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
+        )];
         fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
         assert_eq!(base.class_filter, None, "must not fuse");
         assert_eq!(
@@ -1741,8 +1747,14 @@ mod tests {
                 Term::Var(VarId(3)),
             ))]),
         ];
-        let result =
-            rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, Some(&mapping), false, false);
+        let result = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            false,
+        );
         // The OPTIONAL stays a separate scope.
         assert!(
             result

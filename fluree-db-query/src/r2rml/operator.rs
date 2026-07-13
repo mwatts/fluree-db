@@ -2207,7 +2207,11 @@ mod tests {
             .with_predicate_object(pom("http://ex/name", "full_name"));
         let name = vec!["http://ex/name".to_string()];
         assert!(tm_passes_star_prune(&store, &name, Some("http://ex/Store")));
-        assert!(!tm_passes_star_prune(&customer, &name, Some("http://ex/Store")));
+        assert!(!tm_passes_star_prune(
+            &customer,
+            &name,
+            Some("http://ex/Store")
+        ));
     }
 
     // PR-3 fix (d): switch off (empty inputs) reproduces today's fan-out — every
