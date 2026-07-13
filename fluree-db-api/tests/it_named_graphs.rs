@@ -2765,3 +2765,62 @@ INSERT DATA { ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} . }"#;
         "re-insert after CLEAR must succeed with a clean bundle"
     );
 }
+
+/// CREATE registers the graph in the additive registry, so a subsequent
+/// non-SILENT COPY/MOVE/ADD from it is a legitimate EMPTY source — not the O3
+/// "source graph does not exist" error, which contradicted CREATE's reported
+/// success. Covers both the cross-request and the same-request (multi-op)
+/// flow; the never-CREATEd control still errors.
+#[tokio::test]
+async fn test_create_registers_graph_as_transfer_source() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/create-registers:main";
+    let dest = "http://example.org/dest";
+    let fresh = "http://example.org/fresh";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{dest}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // Cross-request: CREATE then COPY. The COPY must succeed (empty source
+    // overwrites dest → dest emptied), not raise SourceGraphNotFound.
+    let ledger = run_sparql_update(&fluree, ledger, &format!("CREATE GRAPH <{fresh}>"))
+        .await
+        .ledger;
+    let ledger = run_sparql_update(&fluree, ledger, &format!("COPY <{fresh}> TO <{dest}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, dest).await,
+        0,
+        "COPY from a CREATEd (registered, empty) source must proceed"
+    );
+
+    // Control: a never-CREATEd source still errors non-SILENTLY.
+    let err = try_run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY <http://example.org/never> TO <{dest}>"),
+    )
+    .await
+    .expect_err("COPY from a never-registered source must still error");
+    assert!(err.contains("does not exist"), "got: {err}");
+
+    // Same-request (multi-op): CREATE ; ADD in one atomic commit — the second
+    // op must see the first's provisional registration.
+    fluree
+        .create_ledger("it/create-registers-multi:main")
+        .await
+        .expect("create ledger");
+    fluree
+        .graph("it/create-registers-multi:main")
+        .transact()
+        .sparql_update(
+            "CREATE GRAPH <http://example.org/g1> ; \
+             ADD <http://example.org/g1> TO <http://example.org/g2>",
+        )
+        .commit()
+        .await
+        .expect("CREATE ; ADD must commit (registered empty source)");
+}

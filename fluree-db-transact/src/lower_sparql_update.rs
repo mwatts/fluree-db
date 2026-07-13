@@ -881,11 +881,24 @@ pub fn lower_sparql_update(
         UpdateOperation::Clear(gm) | UpdateOperation::Drop(gm) => {
             lower_clear_drop(gm, prologue, opts)?
         }
-        UpdateOperation::Create(_) => {
-            // Fluree cannot represent an empty named graph (roadmap D-6), and
-            // the harness cannot observe one, so CREATE — of a fresh graph
-            // (unobservable) or an existing one (a spec no-op) — is a no-op.
-            Txn::update().with_opts(opts)
+        UpdateOperation::Create(create) => {
+            // Fluree cannot represent an empty named graph (roadmap D-6), so
+            // CREATE stages no flakes — but it DOES register the graph IRI in
+            // the additive registry (same `graph_delta` mechanism as a
+            // transfer destination). Registration is what O3's source-existence
+            // check consults, so `CREATE GRAPH <g>` followed by a non-SILENT
+            // `COPY <g> TO <h>` is a legitimate empty source rather than the
+            // contradictory "source graph does not exist" error. CREATE of an
+            // ALREADY-registered graph stays a no-op rather than the spec's
+            // §3.2.2 error (D-6: the registry can't distinguish an
+            // intentionally-created empty graph from an emptied one), so
+            // `silent` has nothing to suppress; the graph remains
+            // non-enumerable until a flake lands in it.
+            let iri = expand_iri(&create.graph, prologue)?;
+            let mut txn = Txn::update().with_opts(opts);
+            txn.graph_delta
+                .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, iri);
+            txn
         }
         UpdateOperation::Add(t) => lower_transfer(t, prologue, TransferMode::Add, opts)?,
         UpdateOperation::Copy(t) => lower_transfer(t, prologue, TransferMode::Copy, opts)?,
@@ -943,6 +956,11 @@ fn graph_or_default_to_sel(
 ///
 /// `DROP ≡ CLEAR` in Fluree's model (roadmap D-6): the graph registry is
 /// additive-only and an emptied graph is indistinguishable from a dropped one.
+///
+/// The parsed `SILENT` flag is deliberately not consulted: in the D-6 model a
+/// CLEAR/DROP of an unregistered graph is a no-op rather than the spec's
+/// "graph does not exist" error, so there is no error for SILENT to suppress —
+/// a documented divergence, symmetric with CREATE-of-existing staying a no-op.
 fn lower_clear_drop(
     gm: &GraphMgmtRef,
     prologue: &Prologue,
