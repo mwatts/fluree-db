@@ -540,6 +540,79 @@ fn binding_effective_bool(
     }
 }
 
+/// Full XSD IRI when `dtc` names a numeric or boolean XSD datatype — the
+/// family whose string-backed lexical forms still have an EBV (§17.2.2) —
+/// `None` for everything else (string is handled separately; a lang-tagged or
+/// foreign-datatype literal has no EBV).
+fn numeric_or_boolean_xsd_iri(dtc: &DatatypeConstraint) -> Option<&'static str> {
+    use fluree_vocab::{namespaces::XSD, xsd, xsd_names as n};
+    let DatatypeConstraint::Explicit(sid) = dtc else {
+        return None;
+    };
+    if sid.namespace_code != XSD {
+        return None;
+    }
+    Some(match sid.name.as_ref() {
+        n::INTEGER => xsd::INTEGER,
+        n::LONG => xsd::LONG,
+        n::INT => xsd::INT,
+        n::SHORT => xsd::SHORT,
+        n::BYTE => xsd::BYTE,
+        n::UNSIGNED_LONG => xsd::UNSIGNED_LONG,
+        n::UNSIGNED_INT => xsd::UNSIGNED_INT,
+        n::UNSIGNED_SHORT => xsd::UNSIGNED_SHORT,
+        n::UNSIGNED_BYTE => xsd::UNSIGNED_BYTE,
+        n::NON_NEGATIVE_INTEGER => xsd::NON_NEGATIVE_INTEGER,
+        n::POSITIVE_INTEGER => xsd::POSITIVE_INTEGER,
+        n::NON_POSITIVE_INTEGER => xsd::NON_POSITIVE_INTEGER,
+        n::NEGATIVE_INTEGER => xsd::NEGATIVE_INTEGER,
+        n::DECIMAL => xsd::DECIMAL,
+        n::FLOAT => xsd::FLOAT,
+        n::DOUBLE => xsd::DOUBLE,
+        n::BOOLEAN => xsd::BOOLEAN,
+        _ => return None,
+    })
+}
+
+/// The IRI-keyed twin of [`numeric_or_boolean_xsd_iri`], for
+/// `UnresolvedDatatypeConstraint::Explicit` (which carries a full IRI string).
+fn iri_is_numeric_or_boolean_xsd(iri: &str) -> bool {
+    use fluree_vocab::xsd;
+    [
+        xsd::INTEGER,
+        xsd::LONG,
+        xsd::INT,
+        xsd::SHORT,
+        xsd::BYTE,
+        xsd::UNSIGNED_LONG,
+        xsd::UNSIGNED_INT,
+        xsd::UNSIGNED_SHORT,
+        xsd::UNSIGNED_BYTE,
+        xsd::NON_NEGATIVE_INTEGER,
+        xsd::POSITIVE_INTEGER,
+        xsd::NON_POSITIVE_INTEGER,
+        xsd::NEGATIVE_INTEGER,
+        xsd::DECIMAL,
+        xsd::FLOAT,
+        xsd::DOUBLE,
+        xsd::BOOLEAN,
+    ]
+    .contains(&iri)
+}
+
+/// EBV of a parsed (coerced) boolean/numeric value; `None` when the coercion
+/// produced something with no direct numeric/boolean EBV.
+fn coerced_effective_bool(v: &FlakeValue) -> Option<bool> {
+    match v {
+        FlakeValue::Boolean(b) => Some(*b),
+        FlakeValue::Long(n) => Some(*n != 0),
+        FlakeValue::Double(d) => Some(!d.is_nan() && *d != 0.0),
+        FlakeValue::BigInt(n) => Some(!n.is_zero()),
+        FlakeValue::Decimal(d) => Some(!d.is_zero()),
+        _ => None,
+    }
+}
+
 /// EBV of a literal value + its datatype constraint (the common, non-encoded
 /// path). Numeric → non-zero and non-NaN; xsd:string/plain → non-empty; a
 /// language-tagged or foreign-datatype literal has no EBV.
@@ -551,14 +624,31 @@ fn lit_effective_bool(val: &FlakeValue, dtc: &DatatypeConstraint) -> Result<bool
         FlakeValue::BigInt(n) => Ok(!n.is_zero()),
         FlakeValue::Decimal(d) => Ok(!d.is_zero()),
         FlakeValue::String(s) if is_xsd_string(dtc) => Ok(!s.is_empty()),
+        // §17.2.2: a numeric- or boolean-typed literal that arrives
+        // string-backed — a cast/computed value like `xsd:float("1.5")`
+        // (BIND stores it as a String tagged xsd:float), or a STRDT/stored
+        // lexical form — still has an EBV. Parse the lexical form: a
+        // well-formed value follows the numeric/boolean rule, and an
+        // ILL-FORMED boolean/numeric lexical form is EBV FALSE per the
+        // spec's rule 1, not a type error.
+        FlakeValue::String(s) => {
+            let Some(dt_iri) = numeric_or_boolean_xsd_iri(dtc) else {
+                return Err(ebv_type_error());
+            };
+            match fluree_db_core::coerce_value(FlakeValue::String(s.clone()), dt_iri) {
+                Ok(v) => Ok(coerced_effective_bool(&v).unwrap_or(false)),
+                Err(_) => Ok(false),
+            }
+        }
         _ => Err(ebv_type_error()),
     }
 }
 
 /// EBV of an already-materialized comparable value (the late-materialized
-/// encoded path). It cannot observe a language tag, so an encoded lang-string
-/// reads as a string here — an untested corner no register test exercises.
-fn comparable_effective_bool(cv: &ComparableValue) -> Result<bool> {
+/// encoded path and direct expression results). It cannot observe an encoded
+/// language tag, so an encoded lang-string reads as a string here — an
+/// untested corner no register test exercises.
+pub(crate) fn comparable_effective_bool(cv: &ComparableValue) -> Result<bool> {
     match cv {
         ComparableValue::Bool(b) => Ok(*b),
         ComparableValue::Long(n) => Ok(*n != 0),
@@ -567,6 +657,26 @@ fn comparable_effective_bool(cv: &ComparableValue) -> Result<bool> {
         ComparableValue::BigInt(n) => Ok(!n.is_zero()),
         ComparableValue::Decimal(d) => Ok(!d.is_zero()),
         ComparableValue::String(s) => Ok(!s.is_empty()),
+        // §17.2.2 for string-backed typed literals (cast/STRDT results that
+        // reach EBV directly, without a BIND round-trip): numeric/boolean
+        // datatypes parse to their value's EBV, ill-formed lexical forms are
+        // EBV false (rule 1); a plain-string TypedLiteral is string EBV; a
+        // lang-tagged or foreign-datatype literal has no EBV.
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            dtc,
+        } => match dtc {
+            Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(iri))
+                if iri_is_numeric_or_boolean_xsd(iri) =>
+            {
+                match fluree_db_core::coerce_value(FlakeValue::String(s.clone()), iri) {
+                    Ok(v) => Ok(coerced_effective_bool(&v).unwrap_or(false)),
+                    Err(_) => Ok(false),
+                }
+            }
+            None => Ok(!s.is_empty()),
+            _ => Err(ebv_type_error()),
+        },
         _ => Err(ebv_type_error()),
     }
 }

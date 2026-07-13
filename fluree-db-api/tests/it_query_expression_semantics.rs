@@ -1525,3 +1525,88 @@ async fn sparql_sum_avg_poison_on_indexed_ledger() {
         json!([["ex:g1", "2"], ["ex:g2", null]])
     );
 }
+
+// =============================================================================
+// §17.2.2 EBV of string-backed numeric/boolean literals (review follow-up):
+// a cast result (`xsd:float("1.5")` — a String tagged xsd:float) is truthy by
+// the numeric rule on BOTH the direct-expression and the BIND'd-binding path,
+// and an ILL-FORMED numeric/boolean lexical form is EBV FALSE (rule 1), not a
+// type error.
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_ebv_of_cast_numeric_literals() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/ebvcast:sparql").await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+    for (filter, expect) in [
+        // Direct expression path (comparable_effective_bool).
+        ("xsd:float(\"1.5\")", true),
+        ("xsd:float(\"0\")", false),
+        ("xsd:decimal(\"2.5\")", true),
+        // Ill-formed lexical forms via STRDT: EBV false — so the negation is
+        // TRUE (discriminates rule-1 false from a demoted type error, which
+        // would fail both directions).
+        ("!STRDT(\"abc\", xsd:integer)", true),
+        ("STRDT(\"abc\", xsd:integer)", false),
+        ("STRDT(\"true\", xsd:boolean)", true),
+        ("STRDT(\"nope\", xsd:boolean)", false),
+    ] {
+        let q = format!("{p} ASK {{ FILTER({filter}) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(expect),
+            "{filter}"
+        );
+    }
+    // BIND'd-binding path (lit_effective_bool): the cast lands as a
+    // String-backed Binding::Lit tagged xsd:float; FILTER(?f) must be truthy.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ BIND(xsd:float(\"1.5\") AS ?f) FILTER(?f) }}"),
+        )
+        .await,
+        JsonValue::Bool(true),
+        "BIND'd cast float must be truthy"
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ BIND(xsd:float(\"0\") AS ?f) FILTER(!?f) }}"),
+        )
+        .await,
+        JsonValue::Bool(true),
+        "BIND'd cast zero-float must be falsy (EBV false, not error)"
+    );
+}
+
+#[tokio::test]
+async fn jsonld_ebv_of_cast_numeric_literals() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/ebvcast:jsonld").await;
+    // Truthy cast float keeps the row; zero-float drops it (shared EBV).
+    let q_truthy = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["filter", ["xsd:float", "1.5"]]
+        ]
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_truthy).await,
+        json!([["Alice"]])
+    );
+    let q_falsy = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["filter", ["xsd:float", "0"]]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q_falsy).await, json!([]));
+}

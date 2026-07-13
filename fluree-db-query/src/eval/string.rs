@@ -654,11 +654,21 @@ pub fn eval_str_dt<R: RowAccess>(
     let dt = args[1].eval_to_comparable(row, ctx)?;
     match (val, dt) {
         (Some(ComparableValue::String(s)), Some(dt_val)) => {
+            // The datatype argument usually arrives as a Sid — a constant IRI
+            // in expression position lowers through the IRI encoder — which
+            // `as_str()` deliberately does not expose. Decode it back to the
+            // full IRI; without it the constructed literal silently lost its
+            // datatype (DATATYPE(STRDT(?x, xsd:integer)) came back unbound
+            // and the EBV/equality paths saw a plain string).
+            let dt_iri: Option<Arc<str>> = match &dt_val {
+                ComparableValue::Sid(sid) => ctx
+                    .and_then(|c| c.active_snapshot.decode_sid(sid))
+                    .map(Arc::from),
+                other => other.as_str().map(Arc::from),
+            };
             Ok(Some(ComparableValue::TypedLiteral {
                 val: FlakeValue::String(s.to_string()),
-                dtc: dt_val
-                    .as_str()
-                    .map(|s| UnresolvedDatatypeConstraint::Explicit(Arc::from(s))),
+                dtc: dt_iri.map(UnresolvedDatatypeConstraint::Explicit),
             }))
         }
         (Some(_), Some(_)) => Ok(None),
