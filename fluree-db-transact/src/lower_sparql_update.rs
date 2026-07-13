@@ -303,6 +303,18 @@ fn expand_annotated_triples(
             });
         }
 
+        // Same for an RDF 1.2 triple-term subject (`<<( s p o )>>`,
+        // accept-then-defer, D-1): this expansion pre-pass runs BEFORE the
+        // quad-pattern lowering whose TripleTerm arms defer cleanly, and
+        // `subject_to_object` below would hit its `unreachable!()` panic.
+        if let SubjectTerm::TripleTerm(tt) = &tp.subject {
+            return Err(LowerError::UnsupportedFeature {
+                feature: "SPARQL 1.2 triple-term subject combined with an RDF 1.2 \
+                          annotation tail (`{| ... |}`) in SPARQL UPDATE (deferred)",
+                span: tt.span,
+            });
+        }
+
         // Reify the base edge and emit base + per-unit bundle + body.
         // The base triple stripped of its annotation goes through
         // unchanged; each annotation unit (`~ r? {| … |}?`) contributes
@@ -2466,5 +2478,78 @@ mod tests {
             UnresolvedTerm::Literal(LiteralValue::Vector(v)) => assert_eq!(v.len(), 2),
             other => panic!("expected LiteralValue::Vector, got {other:?}"),
         }
+    }
+
+    /// Parse a SPARQL UPDATE string and lower it, asserting the parser
+    /// accepted it — for negative tests that pin a clean *lowering* error
+    /// (never a panic) on parse-accepted input.
+    fn parse_and_lower(sparql: &str) -> Result<Txn, LowerError> {
+        let parsed = fluree_db_sparql::parse_sparql(sparql);
+        assert!(
+            !parsed.has_errors(),
+            "input must be parse-accepted (accept-then-defer): {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("parse produced an AST");
+        let mut ns = NamespaceRegistry::new();
+        lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+    }
+
+    /// D-1 accept-then-defer: a triple-term SUBJECT carrying an annotation
+    /// tail parses, and must lower to a clean `UnsupportedFeature` — the
+    /// annotation-expansion pre-pass runs before the quad-pattern TripleTerm
+    /// defer arms, and without its own guard `subject_to_object` panics via
+    /// `unreachable!` (the pre-fix behavior this test locks out).
+    #[test]
+    fn test_triple_term_subject_with_annotation_tail_defers_in_insert_data() {
+        let result = parse_and_lower(
+            r"PREFIX ex: <http://example.org/>
+               INSERT DATA { <<( ex:s ex:p ex:o )>> ex:q ex:o2 {| ex:a ex:b |} }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(LowerError::UnsupportedFeature { feature, .. })
+                    if feature.contains("triple-term subject")
+            ),
+            "expected a clean triple-term-subject UnsupportedFeature, got {result:?}"
+        );
+    }
+
+    /// Same shape through the Modify (DELETE template) path, where variables
+    /// are allowed inside the triple term.
+    #[test]
+    fn test_triple_term_subject_with_annotation_tail_defers_in_delete_template() {
+        let result = parse_and_lower(
+            r"PREFIX ex: <http://example.org/>
+               DELETE { <<( ?s ex:p ?o )>> ex:q ex:o2 {| ex:a ex:b |} }
+               WHERE { ?s ex:p ?o }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(LowerError::UnsupportedFeature { feature, .. })
+                    if feature.contains("triple-term subject")
+            ),
+            "expected a clean triple-term-subject UnsupportedFeature, got {result:?}"
+        );
+    }
+
+    /// The pre-existing QuotedTriple twin of the guard: `<< s p o >>` subject
+    /// + annotation tail is likewise a clean error, not a panic.
+    #[test]
+    fn test_quoted_triple_subject_with_annotation_tail_is_rejected() {
+        let result = parse_and_lower(
+            r"PREFIX ex: <http://example.org/>
+               INSERT DATA { << ex:s ex:p ex:o >> ex:q ex:o2 {| ex:a ex:b |} }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(LowerError::UnsupportedFeature { feature, .. })
+                    if feature.contains("quoted-triple subject")
+            ),
+            "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
+        );
     }
 }
