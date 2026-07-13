@@ -528,8 +528,15 @@ fn triple_term_fn_arity(name: &FunctionName) -> usize {
         | FunctionName::Predicate
         | FunctionName::Object
         | FunctionName::IsTriple => 1,
-        // Not reachable: only the five triple-term builtins are passed here.
-        _ => 1,
+        // Only the five triple-term builtins may be routed here; a silent `1`
+        // for anything else would mis-validate a future caller's arity.
+        other => {
+            debug_assert!(
+                false,
+                "triple_term_fn_arity called with a non-triple-term builtin: {other:?}"
+            );
+            1
+        }
     }
 }
 

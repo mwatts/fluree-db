@@ -111,7 +111,9 @@ fn instantiate_row(
     // Fresh blank node per template blank-node variable for THIS solution row:
     // minted lazily on first use, shared by every template triple in the row,
     // and — via the row-global `bnode_counter` — distinct from every other
-    // row's blanks. Empty (and never touched) for templates with no blank nodes.
+    // row's blanks. `HashMap::new()` never allocates, and `has_bnodes` skips
+    // the per-term set probes entirely for the common blank-free template.
+    let has_bnodes = !template.bnode_vars.is_empty();
     let mut row_bnodes: HashMap<VarId, BlankId> = HashMap::new();
 
     for pattern in &template.patterns {
@@ -119,21 +121,19 @@ fn instantiate_row(
         // and object positions redirect template blank-node vars to this row's
         // freshly-minted blanks instead of the (absent) bindings; predicates can
         // never be blank nodes, so they always resolve normally.
-        let subject =
-            match &pattern.s {
-                Ref::Var(v) if template.bnode_vars.contains(v) => Some(IrTerm::BlankNode(
-                    row_blank(*v, &mut row_bnodes, bnode_counter),
-                )),
-                s => resolve_subject_term(result, s, batch, row_idx, compactor)?,
-            };
+        let subject = match &pattern.s {
+            Ref::Var(v) if has_bnodes && template.bnode_vars.contains(v) => Some(
+                IrTerm::BlankNode(row_blank(*v, &mut row_bnodes, bnode_counter)),
+            ),
+            s => resolve_subject_term(result, s, batch, row_idx, compactor)?,
+        };
         let predicate = resolve_predicate_term(result, &pattern.p, batch, row_idx, compactor)?;
-        let object =
-            match &pattern.o {
-                Term::Var(v) if template.bnode_vars.contains(v) => Some(IrTerm::BlankNode(
-                    row_blank(*v, &mut row_bnodes, bnode_counter),
-                )),
-                o => resolve_object_term(result, o, batch, row_idx, compactor)?,
-            };
+        let object = match &pattern.o {
+            Term::Var(v) if has_bnodes && template.bnode_vars.contains(v) => Some(
+                IrTerm::BlankNode(row_blank(*v, &mut row_bnodes, bnode_counter)),
+            ),
+            o => resolve_object_term(result, o, batch, row_idx, compactor)?,
+        };
 
         // Skip if any term is unbound (incomplete triple)
         let (Some(s), Some(p), Some(o)) = (subject, predicate, object) else {
@@ -152,6 +152,12 @@ fn instantiate_row(
 /// The first time a given variable is seen in a row it takes the next global
 /// counter value (so blanks are distinct across rows); later uses in the same
 /// row reuse it (so `[ :p ?a ; :q ?b ]` links both triples to a single node).
+///
+/// The counter is scoped to ONE CONSTRUCT execution: two separate CONSTRUCT
+/// queries both start at `cst0`, so a caller merging multiple `@graph` outputs
+/// into one graph must standardize their blanks apart first — the standard RDF
+/// blank-node scoping rule (labels are document/result-scoped), not a Fluree
+/// quirk; it applies equally to `fdb-`/`b{n}` labels.
 fn row_blank(
     var_id: VarId,
     row_bnodes: &mut HashMap<VarId, BlankId>,
