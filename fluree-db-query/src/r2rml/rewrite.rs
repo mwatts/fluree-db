@@ -898,10 +898,10 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(v) => (Some(*v), None),
         Ref::Iri(iri) => (None, Some(iri.to_string())),
         // A bound SID subject we cannot decode to an IRI is left unconverted.
-        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
-            Some(iri) => (None, Some(iri)),
-            None => return None,
-        },
+        Ref::Sid(sid) => {
+            let iri = snapshot.decode_sid(sid)?;
+            (None, Some(iri))
+        }
     };
 
     // Build a pattern for `object_var`, carrying either the subject variable or
