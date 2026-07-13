@@ -431,16 +431,16 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     ///
     /// A larger file with a narrow projection returns `None` — that is the
     /// range-read tier, whose footer path is intentionally unchanged.
-    async fn try_whole_bytes_no_footer(
-        &self,
-        path: &str,
-        file_size: u64,
-    ) -> Result<Option<Bytes>> {
+    async fn try_whole_bytes_no_footer(&self, path: &str, file_size: u64) -> Result<Option<Bytes>> {
         if let Some(dc) = self.disk_cache.filter(|dc| dc.cache.budget_bytes() > 0) {
             let local = dc.local_path(path, file_size);
             // A2: whole file already local — serve footer + data from disk.
             if let Some(bytes) = read_whole_local(&local, file_size).await {
-                tracing::debug!(path, file_size, "Lever A: footer+data from disk cache (whole file)");
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from disk cache (whole file)"
+                );
                 return Ok(Some(bytes));
             }
             // A1 (cheap tier): admitted whole unconditionally, so fetch whole
@@ -457,7 +457,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     })
                     .await
                     .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
-                tracing::debug!(path, file_size, "Lever A: footer+data from whole-file fetch (cheap, cached)");
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from whole-file fetch (cheap, cached)"
+                );
                 return Ok(Some(Bytes::from(data)));
             }
             // Larger file, narrow projection: range-read tier (unchanged).
@@ -466,7 +470,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         // No disk cache: only the sub-`MIN_SPARSE_FILE_BYTES` correctness-floor
         // files are read whole (matches `read_file_for_task`).
         if file_size < MIN_SPARSE_FILE_BYTES {
-            tracing::debug!(path, file_size, "Lever A: footer+data from whole small file (no disk cache)");
+            tracing::debug!(
+                path,
+                file_size,
+                "Lever A: footer+data from whole small file (no disk cache)"
+            );
             return Ok(Some(self.storage.read(path).await?));
         }
         Ok(None)
