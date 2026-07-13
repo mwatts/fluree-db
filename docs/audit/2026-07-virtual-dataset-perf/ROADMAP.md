@@ -147,9 +147,9 @@ The master bottleneck. Split into three tracks; ship 2a first because it is meas
 
 ## Harness follow-ups (not perf PRs, but gating)
 
-- **`scan_plan` span coverage (F7).** The span fires only on the pushdown branch (2/16 smoke queries); tune the `EXPECTED_FOR_VIRTUAL` set so it isn't false-flagged as missing, or emit it unconditionally with `files_pruned=0`. Feeds PR-2/PR-5/PR-7 measurement.
+- **`scan_plan` span coverage (F7).** The span fires only on the pushdown branch (2/16 smoke queries); tune the `EXPECTED_FOR_VIRTUAL` set so it isn't false-flagged as missing, or emit it unconditionally with `files_pruned=0`. Feeds PR-2/PR-5/PR-7 measurement. **Harness side DONE on this branch:** `EXPECTED_FOR_VIRTUAL` is now `scan_table` only, so `spans_missing` no longer false-flags; unconditional engine-side emission remains open.
 - **`files_pruned` / `rows_decoded` counters** (PR-7 pre-task, PR-2a) — the two counters flagged in `02-hypothesis-map` as H1/H4 confirm-gaps.
-- **`hash_gate` compare-side wiring** — `baseline::check` must skip the hash assertion on `RowsOnly` (described in `03 §5.1`; field is ready, gate not yet wired — WP6/baseline owner).
+- **`hash_gate` compare-side wiring** — ~~`baseline::check` must skip the hash assertion on `RowsOnly` (described in `03 §5.1`; field is ready, gate not yet wired — WP6/baseline owner).~~ **DONE on this branch:** `compare_one` gates `RowsOnly` on row count (dashboard applies the same rule), and `baseline --expected` re-bless tolerates hash drift on `RowsOnly` oracles.
 - **`ns@v2` store-state fingerprint TODO** — the run `TargetFingerprint` (`schema.rs:57-64`) keys on `fluree_home` only; add a native store-state / namespace-v2 fingerprint so a re-indexed or drifted native ledger is detected as incomparable across runs (prevents a stale-baseline false pass).
 
 ---

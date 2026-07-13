@@ -1,8 +1,10 @@
 //! The virtual-pathway span allowlist and its aggregation into [`Counters`].
 //!
 //! Every name here was verified against a `debug_span!`/`instrument` callsite in
-//! the engine (file:line cited below); they are stable string literals, so the
-//! allowlist is safe to pin as the schema of the pathway counters:
+//! the engine (file cited below, re-checked at test time by
+//! `allowlist_literals_exist_at_engine_callsites` so a silent rename can't zero
+//! a counter); they are stable string literals, so the allowlist is safe to pin
+//! as the schema of the pathway counters:
 //!
 //! | span | site | numeric fields |
 //! |---|---|---|
@@ -45,12 +47,17 @@ pub const SPAN_ALLOWLIST: &[&str] = &[
 /// where none of these appear either didn't hit the R2RML engine or ran with
 /// tracing mis-installed — that's what `spans_missing` flags.
 ///
-/// Deliberately excludes the data-/cache-dependent spans:
+/// Deliberately excludes the data-/cache-/plan-dependent spans:
+/// - `iceberg.scan_plan` — fires only when the planner takes the
+///   pruning/pushdown branch (2 of 16 smoke queries; finding F7 in
+///   `04-findings-register`), so treating it as must-fire false-flagged most
+///   virtual queries. Re-add if the engine ever emits it unconditionally
+///   (with `files_pruned=0`), per the ROADMAP harness follow-up.
 /// - `iceberg.parquet_read` — a metadata-only COUNT can answer from row-count
 ///   stats without reading any Parquet.
 /// - `r2rml.load_table` / `iceberg.oauth_token` — fire only on a cold catalog /
 ///   OAuth miss; a warm cross-query cache skips them.
-pub const EXPECTED_FOR_VIRTUAL: &[&str] = &["r2rml.scan_table", "iceberg.scan_plan"];
+pub const EXPECTED_FOR_VIRTUAL: &[&str] = &["r2rml.scan_table"];
 
 /// Fold a rep's captured spans into per-span timing aggregates plus the summed
 /// numeric fields the Iceberg planner/reader record.
@@ -93,7 +100,7 @@ pub fn spans_missing(counters: &Counters, is_virtual: bool) -> Vec<String> {
     }
     EXPECTED_FOR_VIRTUAL
         .iter()
-        .filter(|name| counters.spans.get(**name).map_or(true, |a| a.n == 0))
+        .filter(|name| counters.spans.get(**name).is_none_or(|a| a.n == 0))
         .map(|name| (*name).to_string())
         .collect()
 }
@@ -112,6 +119,8 @@ pub fn span_total_us(counters: &Counters, name: &str) -> u64 {
 /// capture, so it's a plain fixture test.
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use serde_json::{Map, Number, Value};
 
@@ -159,16 +168,68 @@ mod tests {
 
     #[test]
     fn spans_missing_flags_absent_expected_spans_for_virtual_only() {
-        // Only scan_table fired; scan_plan is missing.
-        let c = aggregate(&[rec("r2rml.scan_table", 10, &[])]);
-        assert_eq!(spans_missing(&c, true), vec!["iceberg.scan_plan".to_string()]);
+        // Nothing fired: the must-fire span (scan_table) is flagged.
+        let c = aggregate(&[]);
+        assert_eq!(
+            spans_missing(&c, true),
+            vec!["r2rml.scan_table".to_string()]
+        );
         // Native target: never flagged.
         assert!(spans_missing(&c, false).is_empty());
-        // Both expected spans present: nothing missing.
-        let full = aggregate(&[
-            rec("r2rml.scan_table", 10, &[]),
-            rec("iceberg.scan_plan", 10, &[]),
-        ]);
-        assert!(spans_missing(&full, true).is_empty());
+        // scan_table fired: nothing missing — in particular the conditional
+        // pruning-branch span (iceberg.scan_plan) must NOT be false-flagged on
+        // a query whose plan never takes the pushdown branch (finding F7).
+        let fired = aggregate(&[rec("r2rml.scan_table", 10, &[])]);
+        assert!(spans_missing(&fired, true).is_empty());
+    }
+
+    /// Rename guard: every allowlisted span literal must still exist at its
+    /// cited engine callsite. A renamed engine span would otherwise silently
+    /// zero its counter (the layer filter just stops matching). Reads the
+    /// workspace sources relative to this crate, so it runs anywhere the repo
+    /// checkout does.
+    #[test]
+    fn allowlist_literals_exist_at_engine_callsites() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let sites: &[(&str, &str)] = &[
+            (
+                "r2rml.scan_table",
+                "fluree-db-api/src/graph_source/r2rml.rs",
+            ),
+            (
+                "r2rml.load_table",
+                "fluree-db-api/src/graph_source/r2rml.rs",
+            ),
+            (
+                "iceberg.parquet_read",
+                "fluree-db-api/src/graph_source/r2rml.rs",
+            ),
+            (
+                "iceberg.scan_plan",
+                "fluree-db-iceberg/src/scan/send_planner.rs",
+            ),
+            (
+                "iceberg.oauth_token",
+                "fluree-db-iceberg/src/auth/oauth2.rs",
+            ),
+        ];
+        // The table above must stay in lockstep with SPAN_ALLOWLIST.
+        for name in SPAN_ALLOWLIST {
+            assert!(
+                sites.iter().any(|(n, _)| n == name),
+                "span '{name}' is allowlisted but has no cited callsite in this test"
+            );
+        }
+        for (name, file) in sites {
+            let path = workspace.join(file);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading engine source {}: {e}", path.display()));
+            assert!(
+                source.contains(&format!("\"{name}\"")),
+                "span literal \"{name}\" not found in {file} — if the engine span was \
+                 renamed or moved, update SPAN_ALLOWLIST and this table so the \
+                 pathway counters keep measuring what they claim to"
+            );
+        }
     }
 }
