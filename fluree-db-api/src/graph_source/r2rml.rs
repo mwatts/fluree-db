@@ -700,9 +700,8 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
         // `as_of_t` is ignored here exactly as `scan_table` ignores it today.
-        let (storage, metadata, _metadata_location) = self
-            .load_table_context(graph_source_id, table_name)
-            .await?;
+        let (storage, metadata, _metadata_location) =
+            self.load_table_context(graph_source_id, table_name).await?;
 
         // The count must equal a full scan of THIS snapshot — the one the scan
         // planner reads from the same pinned metadata. No current snapshot (an

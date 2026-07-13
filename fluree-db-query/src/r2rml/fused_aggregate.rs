@@ -40,7 +40,9 @@ use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
-use fluree_db_r2rml::mapping::{extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap};
+use fluree_db_r2rml::mapping::{
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap,
+};
 use fluree_db_r2rml::materialize::materialize_object_from_batch;
 use fluree_db_tabular::Column;
 use futures::StreamExt;
@@ -936,7 +938,10 @@ impl Operator for FusedR2rmlAggregateOperator {
                 self.done = true;
                 self.state = OperatorState::Exhausted;
                 let count = Acc::Count(n).finalize();
-                return Ok(Some(Batch::new(Arc::clone(&self.schema), vec![vec![count]])?));
+                return Ok(Some(Batch::new(
+                    Arc::clone(&self.schema),
+                    vec![vec![count]],
+                )?));
             }
         }
 
