@@ -182,9 +182,9 @@ pub fn load_expected(baselines: &Path, query_id: &str) -> Result<Option<Expected
     }
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Some(serde_json::from_str(&raw).with_context(|| {
-        format!("parsing {}", path.display())
-    })?))
+    Ok(Some(
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?,
+    ))
 }
 
 pub fn load_perf(baselines: &Path, target: &str) -> Result<Option<PerfBaseline>> {
@@ -194,9 +194,9 @@ pub fn load_perf(baselines: &Path, target: &str) -> Result<Option<PerfBaseline>>
     }
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Some(serde_json::from_str(&raw).with_context(|| {
-        format!("parsing {}", path.display())
-    })?))
+    Ok(Some(
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?,
+    ))
 }
 
 /// Correctness verdict for one record vs its expected oracle.
@@ -208,10 +208,16 @@ pub enum HashCheck {
     /// The record is a non-ok status, so there's no hash to compare.
     NotApplicable,
     /// A `Full`-gated query whose result hash changed.
-    Mismatch { expected: String, observed: String },
+    Mismatch {
+        expected: String,
+        observed: String,
+    },
     /// A `RowsOnly`-gated query (nondeterministic-selection LIMIT) whose row
     /// count changed — the hash is deliberately not compared for these.
-    RowsMismatch { expected: usize, observed: usize },
+    RowsMismatch {
+        expected: usize,
+        observed: usize,
+    },
 }
 
 impl HashCheck {
@@ -291,7 +297,13 @@ pub fn compare_one(
 
     // Perf: pick the baseline wall matching this record's cache state.
     let cold = record.cache_state == "cold";
-    let baseline_ms = perf.and_then(|p| if cold { p.cold_wall_ms } else { p.hot_wall_ms_median });
+    let baseline_ms = perf.and_then(|p| {
+        if cold {
+            p.cold_wall_ms
+        } else {
+            p.hot_wall_ms_median
+        }
+    });
     let perf_check = baseline_ms.map(|base| {
         let ratio = if base == 0 {
             1.0
@@ -384,7 +396,10 @@ mod tests {
         };
         let o = compare_one(&r, Some(&e), Some(&p), Some(20.0), HashGate::Full);
         assert!(o.hash.is_fail());
-        assert!(o.perf.unwrap().violated, "200 vs 100 is 100% over a 20% budget");
+        assert!(
+            o.perf.unwrap().violated,
+            "200 vs 100 is 100% over a 20% budget"
+        );
     }
 
     #[test]
@@ -395,7 +410,11 @@ mod tests {
         let mut e = expected("q029", "NATIVE_HASH");
         e.rows = 100;
         let o = compare_one(&r, Some(&e), None, Some(20.0), HashGate::RowsOnly);
-        assert_eq!(o.hash, HashCheck::Pass, "rows_only ignores the hash difference");
+        assert_eq!(
+            o.hash,
+            HashCheck::Pass,
+            "rows_only ignores the hash difference"
+        );
         // Same query, wrong row count → RowsMismatch (a fail).
         r.rows = 99;
         let o = compare_one(&r, Some(&e), None, Some(20.0), HashGate::RowsOnly);
@@ -415,7 +434,10 @@ mod tests {
         // budget None == advisory.
         let o = compare_one(&r, Some(&e), Some(&p), None, HashGate::Full);
         let perf = o.perf.unwrap();
-        assert_eq!(perf.baseline_ms, 1000, "cold compares against cold baseline");
+        assert_eq!(
+            perf.baseline_ms, 1000,
+            "cold compares against cold baseline"
+        );
         assert!(!perf.violated, "cold is advisory");
     }
 
@@ -435,6 +457,9 @@ mod tests {
         assert!(over_budget(100, 200, 20.0), "first pass is over budget");
         assert!(!over_budget(100, 105, 20.0), "rerun recovers within budget");
         // A genuine regression stays red on rerun too.
-        assert!(over_budget(100, 180, 20.0), "a real 80% regression stays red");
+        assert!(
+            over_budget(100, 180, 20.0),
+            "a real 80% regression stays red"
+        );
     }
 }

@@ -126,8 +126,7 @@ impl BenchSpanCapture {
     /// cost nothing.
     pub fn layer(&self, allowlist: Option<&[&str]>) -> BenchSpanLayer {
         BenchSpanLayer {
-            allowlist: allowlist
-                .map(|names| names.iter().map(|s| s.to_string()).collect()),
+            allowlist: allowlist.map(|names| names.iter().map(|s| s.to_string()).collect()),
             sink: Arc::clone(&self.records),
             file: None,
         }
@@ -235,17 +234,13 @@ where
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(&id) else { return };
-        let Some(mut in_flight) = span.extensions_mut().remove::<InFlight>()
-        else {
+        let Some(mut in_flight) = span.extensions_mut().remove::<InFlight>() else {
             return;
         };
         in_flight.record.elapsed_us =
-            u64::try_from(in_flight.start.elapsed().as_micros())
-                .unwrap_or(u64::MAX);
+            u64::try_from(in_flight.start.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Some(file) = &self.file {
-            if let (Ok(mut w), Ok(line)) =
-                (file.lock(), serde_json::to_string(&in_flight.record))
-            {
+            if let (Ok(mut w), Ok(line)) = (file.lock(), serde_json::to_string(&in_flight.record)) {
                 let _ = writeln!(w, "{line}");
                 let _ = w.flush();
             }
@@ -261,9 +256,7 @@ where
 /// `FLUREE_BENCH_TRACING=file:...` mode). Optional allowlist from
 /// `FLUREE_BENCH_SPAN_ALLOWLIST` (comma-separated span names; unset = all
 /// spans). Returns the capture handle so callers can also drain in-process.
-pub fn install_file_span_capture(
-    path: &str,
-) -> std::io::Result<BenchSpanCapture> {
+pub fn install_file_span_capture(path: &str) -> std::io::Result<BenchSpanCapture> {
     use tracing_subscriber::prelude::*;
     let capture = BenchSpanCapture::new();
     let allowlist_env = std::env::var("FLUREE_BENCH_SPAN_ALLOWLIST").ok();
@@ -316,10 +309,7 @@ mod tests {
             let outer = tracing::debug_span!("bench.outer", files = 3i64);
             let _og = outer.enter();
             {
-                let inner = tracing::debug_span!(
-                    "bench.inner",
-                    rows = tracing::field::Empty
-                );
+                let inner = tracing::debug_span!("bench.inner", rows = tracing::field::Empty);
                 let _ig = inner.enter();
                 inner.record("rows", 42i64);
                 std::thread::sleep(std::time::Duration::from_millis(2));

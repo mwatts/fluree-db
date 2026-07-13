@@ -43,7 +43,10 @@ const PROBE_CLASS: &str =
 const PROBE_TOTAL: &str = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
 
 #[derive(Parser)]
-#[command(name = "vbench", about = "Native-vs-virtual SPARQL corpus benchmark runner")]
+#[command(
+    name = "vbench",
+    about = "Native-vs-virtual SPARQL corpus benchmark runner"
+)]
 struct Cli {
     /// Corpus directory (default: <crate>/corpus).
     #[arg(long, global = true)]
@@ -205,7 +208,9 @@ fn main() -> Result<()> {
     let cache_dir = cli.cache_dir.clone();
 
     match cli.command {
-        Command::Setup { verify: _, targets } => cmd_setup(&targets_dir, &targets, cache_dir.as_deref()),
+        Command::Setup { verify: _, targets } => {
+            cmd_setup(&targets_dir, &targets, cache_dir.as_deref())
+        }
         Command::Run {
             targets,
             subset,
@@ -271,7 +276,14 @@ fn main() -> Result<()> {
             run,
             baseline_dir,
             gate,
-        } => cmd_compare(&corpus_dir, &targets_dir, cache_dir.as_deref(), &run, baseline_dir, gate),
+        } => cmd_compare(
+            &corpus_dir,
+            &targets_dir,
+            cache_dir.as_deref(),
+            &run,
+            baseline_dir,
+            gate,
+        ),
         Command::Dashboard { runs, out, title } => cmd_dashboard(&corpus_dir, &runs, out, &title),
     }
 }
@@ -421,7 +433,8 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         resolved.len()
     );
 
-    let exe = std::env::current_exe().context("resolving current executable for cold subprocess")?;
+    let exe =
+        std::env::current_exe().context("resolving current executable for cold subprocess")?;
 
     for target in &resolved {
         eprintln!("== target {} ({}) ==", target.id, target.kind_str());
@@ -442,7 +455,10 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         for q in &queries {
             if let Some(budget) = args.max_wall_budget_s {
                 if spent.as_secs() >= budget {
-                    eprintln!("  budget {budget}s exhausted for {} — skipping rest", target.id);
+                    eprintln!(
+                        "  budget {budget}s exhausted for {} — skipping rest",
+                        target.id
+                    );
                     break;
                 }
             }
@@ -453,14 +469,28 @@ fn cmd_run(args: RunArgs) -> Result<()> {
                 if !first {
                     std::thread::sleep(Duration::from_secs(2));
                 }
-                exec::cold_run_query(&exe, args.corpus_dir, args.targets_dir, target, &q.id, args.keep_heads)?
+                exec::cold_run_query(
+                    &exe,
+                    args.corpus_dir,
+                    args.targets_dir,
+                    target,
+                    &q.id,
+                    args.keep_heads,
+                )?
             } else {
                 let params = RunParams {
                     timeout: Duration::from_secs(args.timeout_s.unwrap_or(q.timeout_s)),
                     reps,
                     keep_heads: args.keep_heads,
                 };
-                engine.run_query(fluree.as_ref().unwrap(), target, &q.id, &sparql, &params, expected)
+                engine.run_query(
+                    fluree.as_ref().unwrap(),
+                    target,
+                    &q.id,
+                    &sparql,
+                    &params,
+                    expected,
+                )
             };
             first = false;
             spent += Duration::from_millis(record.all_walls_ms.iter().sum());
@@ -557,7 +587,10 @@ fn cmd_baseline(args: BaselineArgs) -> Result<()> {
     let (meta, records) = match &args.run {
         Some(path) => report::read_run(path)?,
         None => {
-            eprintln!("baseline: no --run given; executing a fresh run of {:?}", args.target_ids);
+            eprintln!(
+                "baseline: no --run given; executing a fresh run of {:?}",
+                args.target_ids
+            );
             run_corpus(
                 &corpus,
                 args.targets_dir,
@@ -683,11 +716,17 @@ fn cmd_compare(
         let pb = perf_cache
             .entry(r.target.clone())
             .or_insert_with(|| baseline::load_perf(&baselines, &r.target).ok().flatten());
-        let perf_entry = pb.as_ref().and_then(|b| b.entries.get(&r.query_id)).cloned();
+        let perf_entry = pb
+            .as_ref()
+            .and_then(|b| b.entries.get(&r.query_id))
+            .cloned();
         let virt = is_virtual.get(r.target.as_str()).copied().unwrap_or(false);
         let cold = r.cache_state == "cold";
         let budget = budgets.budget_pct(&r.query_id, virt, cold);
-        let hash_gate = corpus.get(&r.query_id).map(|q| q.hash_gate).unwrap_or_default();
+        let hash_gate = corpus
+            .get(&r.query_id)
+            .map(|q| q.hash_gate)
+            .unwrap_or_default();
         let mut outcome =
             baseline::compare_one(r, expected.as_ref(), perf_entry.as_ref(), budget, hash_gate);
 
@@ -876,14 +915,26 @@ fn provenance() -> Provenance {
 }
 
 fn git_short_commit() -> String {
-    run_capture("git", &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "--short", "HEAD"])
-        .unwrap_or_else(|| "unknown".to_string())
+    run_capture(
+        "git",
+        &[
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ],
+    )
+    .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn git_dirty() -> bool {
-    run_capture("git", &["-C", env!("CARGO_MANIFEST_DIR"), "status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+    run_capture(
+        "git",
+        &["-C", env!("CARGO_MANIFEST_DIR"), "status", "--porcelain"],
+    )
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
 }
 
 fn hostname() -> String {

@@ -19,8 +19,8 @@
 //! - everything else (string, date, dateTime, boolean, ...): the lexical form
 //!   verbatim.
 
-use sha2::{Digest, Sha256};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Unit separator between cells of a row (cannot appear in canonical cells).
 const CELL_SEP: char = '\u{1f}';
@@ -89,7 +89,11 @@ pub fn canonicalize_sparql_json(doc: &Value) -> Canonical {
         .get("head")
         .and_then(|h| h.get("vars"))
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     vars.sort();
 
@@ -152,13 +156,11 @@ fn canonical_literal(value: &str, datatype: Option<&str>) -> String {
     let local = dt.rsplit(['#', '/']).next().unwrap_or(dt);
     match local {
         "integer" | "int" | "long" | "short" | "byte" | "nonNegativeInteger"
-        | "nonPositiveInteger" | "negativeInteger" | "positiveInteger"
-        | "unsignedLong" | "unsignedInt" | "unsignedShort" | "unsignedByte" => {
-            match value.trim().parse::<i128>() {
-                Ok(n) => n.to_string(),
-                Err(_) => value.to_string(),
-            }
-        }
+        | "nonPositiveInteger" | "negativeInteger" | "positiveInteger" | "unsignedLong"
+        | "unsignedInt" | "unsignedShort" | "unsignedByte" => match value.trim().parse::<i128>() {
+            Ok(n) => n.to_string(),
+            Err(_) => value.to_string(),
+        },
         "decimal" => match value.trim().parse::<f64>() {
             // Shortest round-trip collapses `100` / `100.0` / `100.00`.
             Ok(f) => format!("{f}"),
@@ -223,11 +225,15 @@ mod tests {
         // `100` (integer) rendered by one engine, `100.0` (decimal) by another.
         let a = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"0100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"0100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}}),
+            ],
         );
         let b = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}}),
+            ],
         );
         assert_eq!(
             canonicalize_sparql_json(&a).hash,
@@ -236,11 +242,15 @@ mod tests {
 
         let d1 = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"100.0","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"100.0","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}}),
+            ],
         );
         let d2 = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"100.00","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"100.00","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}}),
+            ],
         );
         assert_eq!(
             canonicalize_sparql_json(&d1).hash,
@@ -252,12 +262,16 @@ mod tests {
     fn floats_within_12_sig_digits_hash_equal() {
         let a = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"3.14159265358979","datatype":"http://www.w3.org/2001/XMLSchema#double"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"3.14159265358979","datatype":"http://www.w3.org/2001/XMLSchema#double"}}),
+            ],
         );
         // Differs only past the 12th significant digit.
         let b = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"3.141592653589792","datatype":"http://www.w3.org/2001/XMLSchema#double"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"3.141592653589792","datatype":"http://www.w3.org/2001/XMLSchema#double"}}),
+            ],
         );
         assert_eq!(
             canonicalize_sparql_json(&a).hash,
@@ -269,7 +283,9 @@ mod tests {
     fn unbound_variable_is_stable_and_distinct() {
         let bound = sparql_doc(
             &["a", "b"],
-            vec![json!({"a": {"type":"uri","value":"http://x/1"}, "b": {"type":"literal","value":"x"}})],
+            vec![
+                json!({"a": {"type":"uri","value":"http://x/1"}, "b": {"type":"literal","value":"x"}}),
+            ],
         );
         let unbound = sparql_doc(
             &["a", "b"],
@@ -295,9 +311,16 @@ mod tests {
         ]});
         let ca = canonicalize(&a);
         assert_eq!(ca.rows, 2, "two graph nodes");
-        assert_eq!(ca.hash, canonicalize(&b).hash, "node order must not affect the hash");
+        assert_eq!(
+            ca.hash,
+            canonicalize(&b).hash,
+            "node order must not affect the hash"
+        );
         // A SELECT doc still routes to the tabular canonicalizer.
-        let sel = sparql_doc(&["v"], vec![json!({"v":{"type":"uri","value":"http://x/1"}})]);
+        let sel = sparql_doc(
+            &["v"],
+            vec![json!({"v":{"type":"uri","value":"http://x/1"}})],
+        );
         assert_eq!(canonicalize(&sel).rows, 1);
     }
 

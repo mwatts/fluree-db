@@ -86,7 +86,7 @@ impl Engine {
             .enable_all()
             .build()
             .context("building multi-thread tokio runtime")?;
-        let worker_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let worker_threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         Ok(Self {
             rt,
             capture,
@@ -127,7 +127,11 @@ impl Engine {
             });
         }
         builder.build().map_err(|e| {
-            anyhow::anyhow!("opening target '{}' at {}: {e}", target.id, storage.display())
+            anyhow::anyhow!(
+                "opening target '{}' at {}: {e}",
+                target.id,
+                storage.display()
+            )
         })
     }
 
@@ -220,7 +224,11 @@ impl Engine {
                     .query()
                     .sparql(sparql)
                     .format(FormatterConfig::sparql_json());
-                let builder = if is_virtual { builder.with_r2rml() } else { builder };
+                let builder = if is_virtual {
+                    builder.with_r2rml()
+                } else {
+                    builder
+                };
                 builder.execute_formatted().await
             })
             .await
@@ -229,7 +237,10 @@ impl Engine {
         match out {
             Ok(Ok(doc)) => Ok((wall, doc)),
             Ok(Err(e)) => Err(anyhow::anyhow!("query error: {e}")),
-            Err(_) => Err(anyhow::anyhow!("probe timed out after {}s", timeout.as_secs())),
+            Err(_) => Err(anyhow::anyhow!(
+                "probe timed out after {}s",
+                timeout.as_secs()
+            )),
         }
     }
 
@@ -283,7 +294,11 @@ impl Engine {
                     .sparql(sparql)
                     .format(fmt)
                     .execution_options(exec_opts);
-                let builder = if is_virtual { builder.with_r2rml() } else { builder };
+                let builder = if is_virtual {
+                    builder.with_r2rml()
+                } else {
+                    builder
+                };
                 builder.execute_formatted().await
             };
             tokio::time::timeout(timeout + grace, fut).await
@@ -505,7 +520,10 @@ fn install_span_capture() -> BenchSpanCapture {
     use tracing_subscriber::prelude::*;
     let capture = BenchSpanCapture::new();
     let layer = capture.layer(Some(spans::SPAN_ALLOWLIST));
-    let allowlist: Vec<String> = spans::SPAN_ALLOWLIST.iter().map(|s| (*s).to_string()).collect();
+    let allowlist: Vec<String> = spans::SPAN_ALLOWLIST
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let _ = tracing_subscriber::registry()
         .with(layer.with_filter(span_name_filter(Some(allowlist))))
         .try_init();

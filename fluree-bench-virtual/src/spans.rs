@@ -84,7 +84,7 @@ pub fn spans_missing(counters: &Counters, is_virtual: bool) -> Vec<String> {
     }
     EXPECTED_FOR_VIRTUAL
         .iter()
-        .filter(|name| counters.spans.get(**name).map_or(true, |a| a.n == 0))
+        .filter(|name| counters.spans.get(**name).is_none_or(|a| a.n == 0))
         .map(|name| (*name).to_string())
         .collect()
 }
@@ -152,7 +152,10 @@ mod tests {
     fn spans_missing_flags_absent_expected_spans_for_virtual_only() {
         // Only scan_table fired; scan_plan is missing.
         let c = aggregate(&[rec("r2rml.scan_table", 10, &[])]);
-        assert_eq!(spans_missing(&c, true), vec!["iceberg.scan_plan".to_string()]);
+        assert_eq!(
+            spans_missing(&c, true),
+            vec!["iceberg.scan_plan".to_string()]
+        );
         // Native target: never flagged.
         assert!(spans_missing(&c, false).is_empty());
         // Both expected spans present: nothing missing.
