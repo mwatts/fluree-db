@@ -14,12 +14,13 @@
 //! | `iceberg.scan_plan`  | `fluree-db-iceberg/src/scan/send_planner.rs` (manifest read + file pruning) | `files_selected`, `files_pruned`, `estimated_row_count` |
 //! | `iceberg.parquet_read` | `fluree-db-api/src/graph_source/r2rml.rs` (per-file decode, in spawned tasks) | `file_size` |
 //! | `iceberg.oauth_token`  | `fluree-db-iceberg/src/auth/oauth2.rs` (OAuth token mint) | — |
+//! | `iceberg.read_footer` / `iceberg.plan_columns` / `iceberg.fetch_bytes` / `iceberg.decode` | `fluree-db-iceberg/src/io/send_parquet.rs` (per-file cost decomposition inside `iceberg.parquet_read`) | — |
 //!
 //! Engine-stage spans in `fluree-db-query` (`operator_open`, `reasoning_prep`)
 //! were considered but left out: they are generic to every query (native and
 //! virtual alike) and add no native-vs-virtual signal, and there is no stable
-//! `query_run`/`query_plan` span literal to cite. Keeping the allowlist to the
-//! six virtual-only spans keeps the counter schema minimal and stable.
+//! `query_run`/`query_plan` span literal to cite. Keeping the allowlist to
+//! virtual-only spans keeps the counter schema minimal and stable.
 
 use fluree_bench_support::tracing::SpanRecord;
 
@@ -234,6 +235,19 @@ mod tests {
                 "iceberg.oauth_token",
                 "fluree-db-iceberg/src/auth/oauth2.rs",
             ),
+            (
+                "iceberg.read_footer",
+                "fluree-db-iceberg/src/io/send_parquet.rs",
+            ),
+            (
+                "iceberg.plan_columns",
+                "fluree-db-iceberg/src/io/send_parquet.rs",
+            ),
+            (
+                "iceberg.fetch_bytes",
+                "fluree-db-iceberg/src/io/send_parquet.rs",
+            ),
+            ("iceberg.decode", "fluree-db-iceberg/src/io/send_parquet.rs"),
         ];
         // The table above must stay in lockstep with SPAN_ALLOWLIST.
         for name in SPAN_ALLOWLIST {
