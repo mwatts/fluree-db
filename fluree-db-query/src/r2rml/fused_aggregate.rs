@@ -1121,6 +1121,10 @@ impl FusedR2rmlAggregateOperator {
         if rr.unconverted_count > 0 {
             return Ok(None);
         }
+        // The single-`R2rml` shape gate below also keeps this path decline-safe
+        // against non-lowered sub-scopes (`rr.unsupported`): a surviving
+        // PropertyPath/Subquery breaks the shape, so we fall back to the normal
+        // GRAPH path, which raises the loud `unsupported_subscope_error`.
         let pattern = match rr.patterns.as_slice() {
             [Pattern::R2rml(p)] => p.clone(),
             _ => return Ok(None), // multiple scans / star not handled in slice 1
