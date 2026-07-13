@@ -186,7 +186,11 @@ struct TmStream {
     tm_iri: String,
     stream: ColumnBatchStream,
     exhausted: bool,
-    parent_lookups: HashMap<LookupCacheKey, ParentLookup>,
+    /// Parent (dimension) lookups for this TriplesMap's RefObjectMap POMs, keyed
+    /// by `(parent_table, join_cols)`. `Arc`-shared so a lookup memoized on the
+    /// operator's `parent_lookup_cache` (PR-4) is reused across child batches
+    /// without a re-scan or a clone.
+    parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>>,
     /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
     /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
     /// a given `LookupCacheKey` populates exactly one of the two maps.
@@ -284,6 +288,21 @@ pub struct R2rmlScanOperator {
     /// Only UNFILTERED scans are cached — a filtered scan may return a pruned
     /// subset, which the filter-agnostic key must never replay for another scan.
     scan_cache: HashMap<(String, Vec<String>), Arc<Vec<ColumnBatch>>>,
+    /// PR-4: cross-child-batch parent-lookup memoization. A correlated join
+    /// (OPTIONAL / ref) re-enters `build_progress` per child batch; without this
+    /// the (dimension) parent tables are re-scanned every batch (q050: DIM_SUPPLIER
+    /// ×153). Keyed like `parent_lookups` (`(parent_table, join_cols)`), which
+    /// deterministically fixes the parent projection at a stable `as_of_t`, so a
+    /// memoized lookup is valid for every later batch. Bounded: a lookup larger
+    /// than one materialize window is NOT retained (a fact-as-parent falls through
+    /// to today's per-batch build) so the cache can't OOM. Gated by
+    /// `FLUREE_R2RML_PARENT_MEMO`.
+    parent_lookup_cache: HashMap<LookupCacheKey, Arc<ParentLookup>>,
+    /// Whether cross-batch parent memoization is on for this operator. Read once
+    /// from `parent_memo_enabled()` at construction (per-operator, not a global
+    /// `OnceLock`), so a test can drive both regimes deterministically in one
+    /// process and production still honors `FLUREE_R2RML_PARENT_MEMO`.
+    parent_memo: bool,
     /// LIMIT early-termination budget: the max output rows a downstream `LIMIT`
     /// needs from this operator. `None` = unbounded. Set only when this is the
     /// topmost row-preserving scan (a scan feeding a join/FILTER never receives
@@ -370,6 +389,8 @@ impl R2rmlScanOperator {
             pending: VecDeque::new(),
             progress: None,
             scan_cache: HashMap::new(),
+            parent_lookup_cache: HashMap::new(),
+            parent_memo: parent_memo_enabled(),
             row_budget: None,
             emitted: 0,
             consumed_filter,
@@ -534,7 +555,7 @@ impl R2rmlScanOperator {
         &self,
         triples_map: &TriplesMap,
         batches: &[ColumnBatch],
-        parent_lookups: &HashMap<LookupCacheKey, ParentLookup>,
+        parent_lookups: &HashMap<LookupCacheKey, Arc<ParentLookup>>,
         ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Vec<Vec<(VarId, Binding)>>> {
@@ -847,7 +868,8 @@ impl R2rmlScanOperator {
             // Build parent lookup tables for RefObjectMap POMs that pass the
             // predicate filter. Parent (dimension) tables are small and consumed
             // whole into the lookup, so they are not streamed.
-            let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
+            let parent_memo = self.parent_memo;
+            let mut parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>> = HashMap::new();
             let mut ref_shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
             // Trusted browse crawl (`trust_fk_refs`) over the injected TRUE-wildcard
             // scan (`?s ?p ?o`): render RefObjectMap objects by templating the
@@ -861,29 +883,34 @@ impl R2rmlScanOperator {
                 && !self.has_star_members()
                 && self.pattern.predicate_filter.is_none()
                 && self.pattern.object_var.is_some();
-            let star_preds = self.pattern_predicates();
-            let filtered_poms: Vec<_> = triples_map
-                .predicate_object_maps
-                .iter()
-                .filter(|pom| {
-                    if self.has_star_members() {
-                        pom.predicate_map
-                            .as_constant()
-                            .is_some_and(|p| star_preds.contains(&p))
-                    } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
-                        pom.predicate_map.as_constant() == Some(pred_filter.as_str())
-                    } else if self.pattern.object_var.is_none() {
-                        // rdf:type / subject-only pattern: no POM is load-bearing
-                        // (the parent scans it would trigger are pure dead work, as
-                        // subject-only materialization never reads object/parent
-                        // values). The all-POMs branch below is for a TRUE wildcard
-                        // `?s ?p ?o`, where `?p`/`?o` range over every predicate.
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect();
+            // Scoped so `star_preds` (which borrows `self`) is released before the
+            // parent-lookup loop mutates `self.parent_lookup_cache` (PR-4).
+            let filtered_poms: Vec<_> = {
+                let star_preds = self.pattern_predicates();
+                triples_map
+                    .predicate_object_maps
+                    .iter()
+                    .filter(|pom| {
+                        if self.has_star_members() {
+                            pom.predicate_map
+                                .as_constant()
+                                .is_some_and(|p| star_preds.contains(&p))
+                        } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
+                            pom.predicate_map.as_constant() == Some(pred_filter.as_str())
+                        } else if self.pattern.object_var.is_none() {
+                            // rdf:type / subject-only pattern: no POM is load-bearing
+                            // (the parent scans it would trigger are pure dead work,
+                            // as subject-only materialization never reads
+                            // object/parent values). The all-POMs branch below is for
+                            // a TRUE wildcard `?s ?p ?o`, where `?p`/`?o` range over
+                            // every predicate.
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
+            };
 
             for pom in &filtered_poms {
                 // Cancellation checkpoint before each FK-parent scan: a subject
@@ -908,6 +935,20 @@ impl R2rmlScanOperator {
                         || ref_shortcuts.contains_key(&lookup_key)
                     {
                         continue;
+                    }
+
+                    // PR-4: reuse a parent lookup memoized in an earlier child batch
+                    // (skips the parent-table re-scan — the q050 fix). The key
+                    // `(parent_tm, join_cols)` fixes the projection and the lookup
+                    // content at a stable `as_of_t`, so a prior batch's lookup is
+                    // valid here. The ref-shortcut path below never populates the
+                    // cache, and the shortcut-vs-scan choice is query-stable, so a
+                    // cached scan-lookup is never mixed with a shortcut key.
+                    if parent_memo {
+                        if let Some(cached) = self.parent_lookup_cache.get(&lookup_key) {
+                            parent_lookups.insert(lookup_key, Arc::clone(cached));
+                            continue;
+                        }
                     }
 
                     let parent_tm = match mapping.get(&rom.parent_triples_map) {
@@ -975,7 +1016,16 @@ impl R2rmlScanOperator {
                         .await?;
                     let parent_batches = collect_stream(parent_stream).await?;
 
-                    let lookup = build_parent_lookup(parent_tm, &parent_join_cols, parent_batches)?;
+                    let lookup =
+                        Arc::new(build_parent_lookup(parent_tm, &parent_join_cols, parent_batches)?);
+                    // Memoize across child batches unless the lookup exceeds one
+                    // materialize window — a fact-as-parent (q015) is used for this
+                    // batch but NOT retained, falling through to today's per-batch
+                    // rebuild so the cache can't grow unbounded.
+                    if parent_memo && lookup.len() <= materialize_window_rows() {
+                        self.parent_lookup_cache
+                            .insert(lookup_key.clone(), Arc::clone(&lookup));
+                    }
                     parent_lookups.insert(lookup_key, lookup);
                 }
             }
@@ -1137,6 +1187,20 @@ async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch
 fn scan_cache_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_SCAN_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Whether PR-4 cross-batch parent-lookup memoization is enabled. Read once from
+/// `FLUREE_R2RML_PARENT_MEMO` (only `0`/`false`/`off` disable it). Off ⇒ today's
+/// per-child-batch parent-lookup rebuild.
+fn parent_memo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_PARENT_MEMO") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off"
@@ -1423,7 +1487,7 @@ fn materialize_pom_object(
     pom: &PredicateObjectMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
 ) -> Result<Option<RdfTerm>> {
     if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
@@ -1611,7 +1675,7 @@ fn materialize_batch(
     pattern: &R2rmlPattern,
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
-    parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
@@ -2138,6 +2202,7 @@ impl Operator for R2rmlScanOperator {
         self.pending.clear();
         self.progress = None;
         self.scan_cache.clear();
+        self.parent_lookup_cache.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -2566,7 +2631,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -2584,5 +2649,117 @@ mod tests {
         let obj = row.iter().find(|(v, _)| *v == VarId(2)).map(|(_, b)| iri_of(b));
         assert_eq!(pred.as_deref(), Some(fluree_vocab::rdf::TYPE), "?p = rdf:type");
         assert_eq!(obj.as_deref(), Some("http://ex/Store"), "?o = the class IRI");
+    }
+
+    // PR-4: the cross-child-batch parent-lookup memoization, CI-enforced. Drives
+    // `build_progress` N times (as a correlated join / a multi-batch child stream
+    // does) against a scan-COUNTING provider: with the memo ON the DIM parent is
+    // scanned exactly once; with it OFF the parent is re-scanned every batch
+    // (today's fan-out — the q008 DNF class). A future refactor that drops the
+    // cache (e.g. reintroduces the parent-scan-per-batch bypass) trips this.
+    #[test]
+    fn parent_lookup_memoized_across_child_batches() {
+        use crate::context::ExecutionContext;
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CountingProvider {
+            scans: Mutex<HashMap<String, usize>>,
+        }
+        fn one_row(col: &str, field_id: i32) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: col.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id,
+            }]));
+            ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap()
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for CountingProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                *self
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .entry(table_name.to_string())
+                    .or_default() += 1;
+                // The parent ("customers") is consumed to build the lookup, so it
+                // must carry its join column ID; the main ("orders") stream is only
+                // stored by build_progress, so its content is irrelevant here.
+                let batch = if table_name == "customers" {
+                    one_row("ID", 1)
+                } else {
+                    one_row("CUST_ID", 2)
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        // orders --edw:customer (RefObjectMap)--> customers.
+        let orders = TriplesMap::new("#Order", "orders")
+            .with_subject_template("http://ex/order/{ORDER_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("edw:customer"),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new("#Customer", "CUST_ID", "ID")),
+            });
+        let customers =
+            TriplesMap::new("#Customer", "customers").with_subject_template("http://ex/customer/{ID}");
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+
+        let parent_scans = |memo: bool| -> usize {
+            let provider = CountingProvider::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+
+                let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+                pattern.predicate_filter = Some("edw:customer".to_string());
+                let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+                op.mapping = Some(Arc::clone(&mapping));
+                op.parent_memo = memo;
+
+                for _ in 0..5 {
+                    futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))
+                        .expect("build_progress");
+                }
+            } // ctx (and its borrow of `provider`) dropped before reading the tally.
+            let n = provider
+                .scans
+                .lock()
+                .unwrap()
+                .get("customers")
+                .copied()
+                .unwrap_or(0);
+            n
+        };
+
+        assert_eq!(
+            parent_scans(true),
+            1,
+            "memo ON: DIM parent scanned exactly once across 5 child batches"
+        );
+        assert_eq!(
+            parent_scans(false),
+            5,
+            "memo OFF: DIM parent re-scanned every batch (today's fan-out)"
+        );
     }
 }
