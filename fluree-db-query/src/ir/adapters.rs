@@ -813,7 +813,93 @@ impl R2rmlPattern {
     }
 
     /// Variables mentioned anywhere in this pattern.
+    ///
+    /// EXHAUSTIVELY destructures `R2rmlPattern` (no `..`) so a newly added
+    /// var-bearing field breaks compilation here until it is classified — this
+    /// set feeds correlation analysis (the batched-OPTIONAL hash-join partition,
+    /// `optional.rs`) and planner var-dependency, where a silently-omitted var
+    /// would mis-partition (wrong answers). Unlike `produced_vars`, this also
+    /// includes the FILTER operands (`scan_filters`, `consumed_filter`) so it is
+    /// correct by construction rather than by their "operands ⊆ produced-vars"
+    /// invariants.
     pub fn referenced_vars(&self) -> Vec<VarId> {
-        self.produced_vars()
+        let R2rmlPattern {
+            graph_source_id: _,
+            subject_var,
+            subject_constant: _,
+            object_var,
+            predicate_var,
+            type_var,
+            triples_map_iri: _,
+            predicate_filter: _,
+            class_filter: _,
+            class_prune_hint: _,
+            scan_filters,
+            star_bindings,
+            star_constraints: _, // constant-object existence filters — no variable
+            consumed_filter,
+            object_constant: _,
+        } = self;
+        let mut vars = Vec::new();
+        for v in [subject_var, object_var, predicate_var, type_var]
+            .into_iter()
+            .flatten()
+        {
+            vars.push(*v);
+        }
+        for (_, v) in star_bindings {
+            vars.push(*v);
+        }
+        for pd in scan_filters {
+            vars.push(pd.var);
+        }
+        if let Some(expr) = consumed_filter {
+            vars.extend(expr.referenced_vars());
+        }
+        vars
+    }
+}
+
+#[cfg(test)]
+mod r2rml_pattern_var_tests {
+    use super::*;
+    use crate::ir::expression::Expression;
+    use crate::r2rml::{ScanCmpOp, ScanValue};
+
+    // PR-4b P1 precursor: `referenced_vars` must surface EVERY var-bearing field,
+    // or correlation analysis (the batched-OPTIONAL hash-join partition) could
+    // drop a shared var and mis-partition. The exhaustive destructure in
+    // `referenced_vars` makes a newly added field a compile error until it is
+    // classified; this test asserts the CURRENT var-bearing fields are all wired,
+    // including the FILTER operands (`scan_filters`, `consumed_filter`) that the
+    // old `produced_vars`-delegating impl relied on invariants to cover.
+    #[test]
+    fn referenced_vars_surfaces_every_var_bearing_field() {
+        let mut p = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)));
+        p.predicate_var = Some(VarId(3));
+        p.type_var = Some(VarId(4));
+        p.star_bindings = vec![("http://ex/p".to_string(), VarId(5))];
+        p.scan_filters = vec![ScanPushdown {
+            var: VarId(6),
+            op: ScanCmpOp::Eq,
+            value: ScanValue::Int(0),
+        }];
+        p.consumed_filter = Some(Expression::Var(VarId(7)));
+
+        let refs: std::collections::HashSet<VarId> = p.referenced_vars().into_iter().collect();
+        for v in [
+            VarId(1),
+            VarId(2),
+            VarId(3),
+            VarId(4),
+            VarId(5),
+            VarId(6),
+            VarId(7),
+        ] {
+            assert!(
+                refs.contains(&v),
+                "referenced_vars() omitted {v:?} — a var-bearing field is unwired"
+            );
+        }
     }
 }
