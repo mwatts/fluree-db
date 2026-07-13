@@ -288,7 +288,11 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
     },
     {
       "id": "q014",
