@@ -1200,6 +1200,25 @@ async fn stage_graph_mgmt(
                 clear_src,
                 silent,
             } => {
+                // B2: a reserved system graph is refused even when `from ==
+                // to` — the same-graph no-op below must not read as accepting
+                // `#config`/`#txn-meta` as a transfer target. (SILENT
+                // deliberately does not suppress the reserved-graph guards,
+                // here or below: safety over silence — the reserved graphs are
+                // Fluree-internal, not part of the W3C dataset a SILENT verb
+                // is scoped to.)
+                if from == to {
+                    if let GraphSel::Graph(iri) = from {
+                        if matches!(
+                            resolve_named_graph(&ledger, &mut ns_registry, iri),
+                            Some((g_id, _)) if g_id < FIRST_USER_GRAPH_ID
+                        ) {
+                            return Err(TransactError::ReservedGraphTarget {
+                                graph_iri: iri.clone(),
+                            });
+                        }
+                    }
+                }
                 // `from == to` is a spec no-op for ADD/COPY/MOVE.
                 if from != to {
                     // Resolve the source (existing only) and destination.
@@ -1225,7 +1244,20 @@ async fn stage_graph_mgmt(
                                 // emptied-but-registered source, which resolves to
                                 // `Some(g_id)` with zero flakes (a legitimate empty
                                 // source that proceeds). SILENT opts into the
-                                // clear-and-copy-nothing behavior.
+                                // clear-and-copy-nothing behavior — note that a
+                                // SILENT transfer from a missing source therefore
+                                // still CLEARS the destination (the spec's own
+                                // shortcut equivalence: `DROP SILENT dest;
+                                // INSERT ... WHERE source`), it is not a no-op.
+                                //
+                                // Source-EXISTENCE here deliberately uses REGISTRY
+                                // semantics (a graph exists once registered, even
+                                // when emptied) — distinct from the query
+                                // surface's D-6 flake-carried model, where
+                                // `GRAPH ?g` lists only graphs holding ≥1 flake.
+                                // Only the registry can tell a typo'd IRI from a
+                                // CLEARed graph, which is exactly the distinction
+                                // O3 needs.
                                 None if !*silent => {
                                     return Err(TransactError::SourceGraphNotFound {
                                         graph_iri: iri.clone(),

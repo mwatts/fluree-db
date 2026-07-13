@@ -129,6 +129,22 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         self
     }
 
+    /// Move all flakes from named graph `from` into named graph `to` (copy +
+    /// retract the source) — the transact-builder analog of `MOVE <from> TO
+    /// <to>`. A `from == to` move is a no-op.
+    pub fn move_graph(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::move_graph(from, to));
+        self
+    }
+
+    /// Merge all flakes from named graph `from` into named graph `to`, keeping
+    /// `to`'s prior contents — the transact-builder analog of `ADD <from> TO
+    /// <to>`. A `from == to` add is a no-op.
+    pub fn add_graph(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::add_graph(from, to));
+        self
+    }
+
     // -- Option setters --
 
     /// Set transaction options (author, context, etc.).

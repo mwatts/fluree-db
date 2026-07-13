@@ -337,6 +337,44 @@ impl Txn {
         txn
     }
 
+    /// Move all flakes from one named graph into another — copy semantics plus
+    /// retraction of the source (the non-SPARQL analog of `MOVE <from> TO
+    /// <to>`). A destination equal to the source is a no-op.
+    pub fn move_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
+        let to_iri = to.into();
+        let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+            from: GraphSel::Graph(from.into()),
+            to: GraphSel::Graph(to_iri.clone()),
+            clear_dest: true,
+            clear_src: true,
+            // Builder-API MOVE errors on a never-registered source, matching
+            // non-SILENT SPARQL MOVE (roadmap O3).
+            silent: false,
+        });
+        txn.graph_delta
+            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn
+    }
+
+    /// Merge all flakes from one named graph into another, keeping the
+    /// destination's prior contents (the non-SPARQL analog of `ADD <from> TO
+    /// <to>`). A destination equal to the source is a no-op.
+    pub fn add_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
+        let to_iri = to.into();
+        let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+            from: GraphSel::Graph(from.into()),
+            to: GraphSel::Graph(to_iri.clone()),
+            clear_dest: false,
+            clear_src: false,
+            // Builder-API ADD errors on a never-registered source, matching
+            // non-SILENT SPARQL ADD (roadmap O3).
+            silent: false,
+        });
+        txn.graph_delta
+            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn
+    }
+
     /// Create a new empty upsert transaction
     pub fn upsert() -> Self {
         Self {

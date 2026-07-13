@@ -2532,3 +2532,117 @@ async fn test_using_named_only_where_default_graph_is_empty() {
     .ledger;
     assert_eq!(count_in_default(&fluree, &ledger).await, 0);
 }
+
+/// Builder↔SPARQL parity for the two transfer verbs the builder previously
+/// lacked: `Txn::move_graph` ≡ `MOVE <from> TO <to>` (source retracted) and
+/// `Txn::add_graph` ≡ `ADD <from> TO <to>` (destination contents kept).
+#[tokio::test]
+async fn test_graph_mgmt_builder_move_add_parity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let seed = format!(
+        r#"INSERT DATA {{
+            GRAPH <{g1}> {{ <http://example.org/s1> <http://example.org/p> "in-g1" }}
+            GRAPH <{g2}> {{ <http://example.org/s2> <http://example.org/p> "in-g2" }}
+        }}"#
+    );
+
+    // --- Builder path ---
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-builder:main");
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // add_graph(g1 -> g2): g2 keeps its own triple AND gains g1's; g1 intact.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::add_graph(g1, g2))
+        .execute()
+        .await
+        .expect("Txn::add_graph")
+        .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 1, "ADD keeps source");
+    assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 2, "ADD merges into dest");
+
+    // move_graph(g1 -> g2): dest replaced by source; source gone.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::move_graph(g1, g2))
+        .execute()
+        .await
+        .expect("Txn::move_graph")
+        .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 0, "MOVE retracts source");
+    assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 1, "MOVE replaces dest");
+
+    // --- SPARQL path: identical outcomes ---
+    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-sparql:main");
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &seed).await.ledger;
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("ADD <{g1}> TO <{g2}>"))
+        .await
+        .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g1).await, 1);
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 2);
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("MOVE <{g1}> TO <{g2}>"))
+        .await
+        .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g1).await, 0);
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 1);
+}
+
+/// SPARQL 1.1 §3.2.3-3.2.5: COPY/MOVE/ADD of a graph onto itself is a no-op —
+/// "no operation will be performed and the data will be left as it was." The
+/// guard (`from == to` short-circuit in stage_graph_mgmt) is the only thing
+/// between a refactor and MOVE's clear_dest destroying the graph, so pin it
+/// for all three verbs on both the SPARQL and builder surfaces.
+#[tokio::test]
+async fn test_graph_mgmt_same_graph_transfer_is_noop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let g = "http://example.org/g";
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-same-graph:main");
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{g}> {{
+            <http://example.org/s1> <http://example.org/p> "a" .
+            <http://example.org/s2> <http://example.org/p> "b"
+        }} }}"#
+    );
+    let mut ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, g).await, 2);
+
+    for verb in ["COPY", "MOVE", "ADD"] {
+        ledger = run_sparql_update(&fluree, ledger.clone(), &format!("{verb} <{g}> TO <{g}>"))
+            .await
+            .ledger;
+        assert_eq!(
+            count_in_graph(&fluree, &ledger, g).await,
+            2,
+            "{verb} <g> TO <g> must leave the graph exactly as it was"
+        );
+    }
+
+    // Builder surface too (same Txn IR, same guard).
+    for txn in [Txn::copy_graph(g, g), Txn::move_graph(g, g), Txn::add_graph(g, g)] {
+        ledger = fluree
+            .stage_owned(ledger.clone())
+            .txn(txn)
+            .execute()
+            .await
+            .expect("same-graph builder transfer is a no-op, not an error")
+            .ledger;
+        assert_eq!(count_in_graph(&fluree, &ledger, g).await, 2);
+    }
+
+    // A reserved system graph is refused even in the same-graph shape — the
+    // no-op must not read as accepting `#config` as a transfer target.
+    let config_iri = fluree_db_core::config_graph_iri("it/graph-mgmt-same-graph:main");
+    let err = try_run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY <{config_iri}> TO <{config_iri}>"),
+    )
+    .await
+    .expect_err("same-graph COPY of a reserved graph must be refused");
+    assert!(
+        err.contains("reserved system graph"),
+        "expected the reserved-graph rejection, got: {err}"
+    );
+}
