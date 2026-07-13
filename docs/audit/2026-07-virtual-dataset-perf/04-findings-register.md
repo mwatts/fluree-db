@@ -157,6 +157,12 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 ---
 
+## F10 — Ad-hoc `run --out` JSONL parsing must skip the `meta` header *(harness-note)*
+
+`vbench run --out <file>` writes a `{"kind":"meta",...}` header as **line 1**, then one RunRecord per query. An ad-hoc single-value extraction like `jq -r .result_hash "$file"` therefore returns **two lines** (the meta record's `null` + the real hash), and a string compare against the single blessed hash **always fails** — a false MISMATCH. This produced a spurious "q008 hash mismatch" alarm during PR-4 (chased as a suspected F9/float-order divergence before it was traced to the header). `exec-one` emits a single record with no meta line, so it is unaffected, and the real `vbench compare` gate reads per-record and is unaffected. **Rule for any ad-hoc `run --out` parsing:** filter to real records first — `jq 'select(.query_id)'` (or iterate per-record and skip null `query_id`). q008 itself is deterministically correct (hash-stable, byte-identical to the native oracle across four clean runs); there is no q008 divergence.
+
+---
+
 ## Summary & routing
 
 | Finding | Class | Query | Root | Fix owner |
@@ -170,5 +176,6 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | **F7** | harness-note | (all) | `scan_plan` conditional on pushdown branch | harness (WP6 span tuning) |
 | **F8** | perf-ratio / over-scan | q001 (cold) | 6 `loadTable`s for a 1-table query — class fusion / subject-prune not firing on star-with-column-members (§2); or ref-POM parent prefetch | WP7 investigate → engine (FIXED by PR-3: 6→1) |
 | **F9** | correctness-divergence (cosmetic-lexical) | q002, q042 | predicate/type IRIs render as CURIEs on native, full IRIs on virtual — data identical after namespace-folding; residual of F3 after PR-0 fixed the row count | product decision (AJ) — not PR-3 |
+| **F10** | harness-note | (any `run --out` parse) | ad-hoc `jq .result_hash` reads the `kind:"meta"` header line → false MISMATCH; filter `jq 'select(.query_id)'`. q008 is actually deterministically correct | harness (parsing hygiene) |
 
 **The two correctness bugs (F1/F2) share one root** and are the highest priority — they deliver wrong answers as silent successes. **F3 is a second, independent correctness gap** (root-caused) on the most common inspector shape — small fix surface, high user-visible impact (missing `@type` in the solo subject inspector). **F5-q050** is the sharpest perf signal (dims-only, 377 scans). **F4 is corpus hygiene, not an engine bug** — but it must be fixed (the determinism amendment) so nondeterministic-selection queries stop masking real divergences. F1/F2/F3/F5 feed the WP7 diagnosis and WP8 roadmap; F4 feeds the corpus determinism amendment; F7 feeds back into WP6 harness tuning.
