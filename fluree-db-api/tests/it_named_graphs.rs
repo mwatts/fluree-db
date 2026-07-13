@@ -2450,3 +2450,85 @@ async fn test_graph_mgmt_missing_source_errors() {
         "COPY from a legitimately empty (registered) source clears the destination without error"
     );
 }
+
+/// Count the DEFAULT-graph triples visible to a plain (ambient) query.
+async fn count_in_default(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> usize {
+    let result = support::query_sparql(fluree, ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("default-graph count query");
+    let v = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    match v.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    }
+}
+
+/// SPARQL 1.1 §13.2.1 (via Update §3.1.3): `USING NAMED` without a plain
+/// `USING` gives the WHERE dataset an EMPTY default graph — a default-scoped
+/// WHERE pattern binds nothing. Before the fix, default-graph selection fell
+/// through to the ledger's real default graph, so
+/// `DELETE { ?s ?p ?o } USING NAMED <h> WHERE { ?s ?p ?o }` deleted the whole
+/// default graph (the same over-reach class as #1441, one clause over).
+/// (Remove the `where_default_is_empty` arm in stage.rs and the first
+/// assertion fails: the default graph is emptied.)
+#[tokio::test]
+async fn test_using_named_only_where_default_graph_is_empty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/using-named-only:main";
+    let h = "http://example.org/h";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{
+            <http://example.org/s1> <http://example.org/p> "a" .
+            <http://example.org/s2> <http://example.org/p> "b" .
+            GRAPH <{h}> {{ <http://example.org/s3> <http://example.org/p> "c" }}
+        }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    assert_eq!(count_in_default(&fluree, &ledger).await, 2);
+    assert_eq!(count_in_graph(&fluree, &ledger, h).await, 1);
+
+    // USING NAMED only + default-scoped WHERE: binds nothing, deletes nothing.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!("DELETE {{ ?s ?p ?o }} USING NAMED <{h}> WHERE {{ ?s ?p ?o }}"),
+    )
+    .await
+    .ledger;
+    assert_eq!(
+        count_in_default(&fluree, &ledger).await,
+        2,
+        "USING NAMED-only WHERE must see an EMPTY default graph, not the real one"
+    );
+    assert_eq!(count_in_graph(&fluree, &ledger, h).await, 1);
+
+    // The named set is still visible: an explicit GRAPH block over the USING
+    // NAMED graph matches and deletes from it.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "DELETE {{ GRAPH <{h}> {{ ?s ?p ?o }} }} USING NAMED <{h}> \
+             WHERE {{ GRAPH <{h}> {{ ?s ?p ?o }} }}"
+        ),
+    )
+    .await
+    .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, h).await, 0);
+    assert_eq!(count_in_default(&fluree, &ledger).await, 2);
+
+    // Control: the no-USING ambient path is untouched — a plain DELETE WHERE
+    // over the default graph still matches it.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
+    )
+    .await
+    .ledger;
+    assert_eq!(count_in_default(&fluree, &ledger).await, 0);
+}

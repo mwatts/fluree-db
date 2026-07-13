@@ -1826,7 +1826,25 @@ async fn stream_where_into_accumulator(
     let composite_graph_key =
         |iri: &str| -> String { format!("{}#{}", base_db.snapshot.ledger_id, iri) };
 
-    let mut runtime_dataset = if desired_where_default_graph_iris.len() <= 1 {
+    // SPARQL 1.1 §13.2.1 (via Update §3.1.3): when the operation carries one
+    // or more `USING NAMED` clauses but no plain `USING`, the WHERE dataset's
+    // default graph is EMPTY — "if there is no FROM clause, but there is one
+    // or more FROM NAMED, then the dataset includes an empty graph for the
+    // default graph". A `WITH` clause, if given, is likewise ignored for the
+    // WHERE clause whenever any USING/USING NAMED is present (§3.1.3). Without
+    // this, default-graph selection fell through to the ledger's REAL default
+    // graph (g_id 0), so `DELETE { ?s ?p ?o } USING NAMED <h> WHERE
+    // { ?s ?p ?o }` matched — and deleted — the entire default graph. An
+    // empty default-graph list makes default-scope scans iterate zero members
+    // (`ActiveGraphs::Many([])`) and bind nothing. Named-graph visibility is
+    // unaffected (built below from the USING NAMED set).
+    let where_default_is_empty = txn.sparql_where.as_ref().is_some_and(|w| {
+        w.using_default_graph_iris.is_empty() && !w.using_named_graph_iris.is_empty()
+    });
+
+    let mut runtime_dataset = if where_default_is_empty {
+        fluree_db_query::DataSet::new()
+    } else if desired_where_default_graph_iris.len() <= 1 {
         fluree_db_query::DataSet::new().with_default_graph(make_graph_ref(base_db.g_id))
     } else {
         let mut ds = fluree_db_query::DataSet::new();
