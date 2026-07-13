@@ -87,7 +87,8 @@ fn build_connection(pat: &str, catalog_uri: String) -> IcebergConnectionConfig {
 /// candidate IR — never persisted.
 fn provisional_ttl(namespace: &str, table: &str, key_column: &str, class_iri: &str) -> String {
     format!(
-        r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
+        r#"@base <http://mapping.fluree.dev/r2rml> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
 
 <#TM> a rr:TriplesMap ;
   rr:logicalTable [ rr:tableName "{namespace}.{table}" ] ;

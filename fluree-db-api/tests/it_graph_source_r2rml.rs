@@ -738,6 +738,9 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
 ///   FLUREE_TEST_ICEBERG_CATALOG_URI   (required — the gate)
 ///   FLUREE_TEST_ICEBERG_WAREHOUSE     (required)
 ///   FLUREE_TEST_ICEBERG_OAUTH2_SECRET (required; `client_id:client_secret`)
+///   FLUREE_TEST_ICEBERG_OAUTH2_SCOPE  (default `session:role:ICEBERG_READER` —
+///                                      the Snowflake Horizon/Polaris role scope,
+///                                      matching the it_iceberg_*_live suites)
 ///   FLUREE_TEST_ICEBERG_TABLE         (default `DW.DIM_GEOGRAPHY`)
 ///   FLUREE_TEST_ICEBERG_KEY_COLUMN    (default `GEOGRAPHY_KEY`)
 ///
@@ -789,7 +792,11 @@ async fn live_iceberg_fql_type_returns_instances() {
         .with_s3_path_style(true);
     if let Some((client_id, client_secret)) = oauth2_secret.split_once(':') {
         let token_url = format!("{catalog_uri}/v1/oauth/tokens");
-        config = config.with_auth_oauth2(&token_url, client_id, client_secret);
+        let scope = std::env::var("FLUREE_TEST_ICEBERG_OAUTH2_SCOPE")
+            .unwrap_or_else(|_| "session:role:ICEBERG_READER".to_string());
+        config = config
+            .with_auth_oauth2(&token_url, client_id, client_secret)
+            .with_oauth2_scope(scope);
     }
 
     if let Err(e) = fluree.create_r2rml_graph_source(config).await {
