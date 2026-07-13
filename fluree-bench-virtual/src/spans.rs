@@ -9,6 +9,7 @@
 //! | span | site | numeric fields |
 //! |---|---|---|
 //! | `r2rml.scan_table`   | `fluree-db-api/src/graph_source/r2rml.rs` (scan setup: loadTable + planning) | `projection_len` |
+//! | `r2rml.count_manifest` | `fluree-db-api/src/graph_source/r2rml.rs` (COUNT(*) manifest-only read; `fired` = answered vs declined-to-scan) | — |
 //! | `r2rml.load_table`   | `fluree-db-api/src/graph_source/r2rml.rs` (cold REST/OAuth catalog load) | — |
 //! | `iceberg.scan_plan`  | `fluree-db-iceberg/src/scan/send_planner.rs` (manifest read + file pruning) | `files_selected`, `files_pruned`, `estimated_row_count` |
 //! | `iceberg.parquet_read` | `fluree-db-api/src/graph_source/r2rml.rs` (per-file decode, in spawned tasks) | `file_size` |
@@ -18,7 +19,7 @@
 //! were considered but left out: they are generic to every query (native and
 //! virtual alike) and add no native-vs-virtual signal, and there is no stable
 //! `query_run`/`query_plan` span literal to cite. Keeping the allowlist to the
-//! five virtual-only spans keeps the counter schema minimal and stable.
+//! six virtual-only spans keeps the counter schema minimal and stable.
 
 use fluree_bench_support::tracing::SpanRecord;
 
@@ -28,15 +29,22 @@ use crate::schema::{Counters, SpanAgg};
 /// and `BenchSpanLayer::filter` so nothing else is captured.
 pub const SPAN_ALLOWLIST: &[&str] = &[
     "r2rml.scan_table",
+    "r2rml.count_manifest",
     "r2rml.load_table",
     "iceberg.parquet_read",
     "iceberg.scan_plan",
     "iceberg.oauth_token",
 ];
 
-/// Spans that MUST fire on any non-trivial virtual scan. A virtual execution
-/// where none of these appear either didn't hit the R2RML engine or ran with
-/// tracing mis-installed — that's what `spans_missing` flags.
+/// Span groups where AT LEAST ONE member MUST fire on any non-trivial virtual
+/// query. A virtual execution where a whole group is absent either didn't hit
+/// the R2RML engine or ran with tracing mis-installed — that's what
+/// `spans_missing` flags (as the group's names joined with `|`).
+///
+/// A group (rather than a single must-fire span) because a bare `COUNT(*)`
+/// answered by the manifest shortcut legitimately never scans: it emits
+/// `r2rml.count_manifest` and NO `r2rml.scan_table`. Either span proves the
+/// R2RML engine ran.
 ///
 /// Deliberately excludes the data-/cache-/plan-dependent spans:
 /// - `iceberg.scan_plan` — fires only when the planner takes the
@@ -48,7 +56,7 @@ pub const SPAN_ALLOWLIST: &[&str] = &[
 ///   stats without reading any Parquet.
 /// - `r2rml.load_table` / `iceberg.oauth_token` — fire only on a cold catalog /
 ///   OAuth miss; a warm cross-query cache skips them.
-pub const EXPECTED_FOR_VIRTUAL: &[&str] = &["r2rml.scan_table"];
+pub const EXPECTED_ANY_FOR_VIRTUAL: &[&[&str]] = &[&["r2rml.scan_table", "r2rml.count_manifest"]];
 
 /// Fold a rep's captured spans into per-span timing aggregates plus the summed
 /// numeric fields the Iceberg planner/reader record.
@@ -84,15 +92,20 @@ fn field_u64(record: &SpanRecord, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Expected-for-virtual spans that did not fire. Empty for native targets.
+/// Expected-for-virtual span groups where no member fired, each rendered as
+/// the group's names joined with `|`. Empty for native targets.
 pub fn spans_missing(counters: &Counters, is_virtual: bool) -> Vec<String> {
     if !is_virtual {
         return Vec::new();
     }
-    EXPECTED_FOR_VIRTUAL
+    EXPECTED_ANY_FOR_VIRTUAL
         .iter()
-        .filter(|name| counters.spans.get(**name).is_none_or(|a| a.n == 0))
-        .map(|name| (*name).to_string())
+        .filter(|group| {
+            group
+                .iter()
+                .all(|name| counters.spans.get(*name).is_none_or(|a| a.n == 0))
+        })
+        .map(|group| group.join("|"))
         .collect()
 }
 
@@ -159,11 +172,11 @@ mod tests {
 
     #[test]
     fn spans_missing_flags_absent_expected_spans_for_virtual_only() {
-        // Nothing fired: the must-fire span (scan_table) is flagged.
+        // Nothing fired: the must-fire group is flagged (joined with `|`).
         let c = aggregate(&[]);
         assert_eq!(
             spans_missing(&c, true),
-            vec!["r2rml.scan_table".to_string()]
+            vec!["r2rml.scan_table|r2rml.count_manifest".to_string()]
         );
         // Native target: never flagged.
         assert!(spans_missing(&c, false).is_empty());
@@ -172,6 +185,11 @@ mod tests {
         // a query whose plan never takes the pushdown branch (finding F7).
         let fired = aggregate(&[rec("r2rml.scan_table", 10, &[])]);
         assert!(spans_missing(&fired, true).is_empty());
+        // A COUNT(*) answered by the manifest shortcut never scans: the
+        // count_manifest span alone must satisfy the group (no false flag on
+        // the very pathway the shortcut creates).
+        let counted = aggregate(&[rec("r2rml.count_manifest", 10, &[])]);
+        assert!(spans_missing(&counted, true).is_empty());
     }
 
     /// Rename guard: every allowlisted span literal must still exist at its
@@ -185,6 +203,10 @@ mod tests {
         let sites: &[(&str, &str)] = &[
             (
                 "r2rml.scan_table",
+                "fluree-db-api/src/graph_source/r2rml.rs",
+            ),
+            (
+                "r2rml.count_manifest",
                 "fluree-db-api/src/graph_source/r2rml.rs",
             ),
             (

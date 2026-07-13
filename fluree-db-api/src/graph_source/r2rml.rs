@@ -697,9 +697,41 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         non_null_cols: &[String],
         _as_of_t: Option<i64>,
     ) -> QueryResult<Option<u64>> {
+        // Time the manifest-only read as one span (the same `.instrument` split as
+        // `scan_table` / `scan_table_inner`). `fired` records answered (true) vs
+        // declined-to-scan (false). The name is allowlisted in
+        // `fluree-bench-virtual::spans`, so the vbench pathway counters show the
+        // shortcut directly instead of inferring it from `files_selected=0` plus
+        // scan-span absence.
+        let span = tracing::debug_span!(
+            "r2rml.count_manifest",
+            graph_source_id,
+            table_name,
+            fired = tracing::field::Empty
+        );
+        self.table_row_count_inner(graph_source_id, table_name, non_null_cols, _as_of_t)
+            .instrument(span)
+            .await
+    }
+}
+
+impl FlureeR2rmlProvider<'_> {
+    /// Body of [`R2rmlTableProvider::table_row_count`], split out so the trait
+    /// method can wrap it in the `r2rml.count_manifest` timing span via
+    /// `.instrument()` (the same pattern as [`Self::scan_table_inner`]).
+    async fn table_row_count_inner(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        non_null_cols: &[String],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<u64>> {
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
-        // `as_of_t` is ignored here exactly as `scan_table` ignores it today.
+        // GREP: r2rml-as-of-t — `as_of_t` is ignored here exactly as the scan path
+        // ignores it (matching breadcrumb in `scan_table_inner`); if time-travel
+        // semantics ever land on the scan, this method MUST follow, or a COUNT and
+        // a scan in one query could answer from different snapshots.
         let (storage, metadata, _metadata_location) =
             self.load_table_context(graph_source_id, table_name).await?;
 
@@ -726,6 +758,8 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 
         let count =
             sound_manifest_row_count(schema, &data_files, has_delete_manifests, non_null_cols);
+        // Recorded on the `r2rml.count_manifest` span wrapping this body.
+        tracing::Span::current().record("fired", count.is_some());
         match count {
             Some(n) => debug!(
                 table_name = %table_name,
@@ -741,9 +775,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         }
         Ok(count)
     }
-}
 
-impl FlureeR2rmlProvider<'_> {
     /// Resolve a graph source down to its pinned Iceberg table context: the S3
     /// storage, the (metadata-location-pinned) [`TableMetadata`], and that metadata
     /// location. Shared by [`Self::scan_table_inner`] and
@@ -1091,6 +1123,10 @@ impl FlureeR2rmlProvider<'_> {
         filters: &[ScanFilter],
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
+        // GREP: r2rml-as-of-t — time-travel is not implemented for Iceberg scans;
+        // `_as_of_t` is deliberately ignored. If as-of semantics ever land here,
+        // `table_row_count_inner` MUST honor them identically (matching breadcrumb
+        // there): a COUNT and a scan in one query must read the same snapshot.
         info!(
             graph_source_id = %graph_source_id,
             table_name = %table_name,
@@ -1333,6 +1369,9 @@ fn empty_batch_stream() -> ColumnBatchStream {
 ///    zero; an absent or partially-covered stat is `None` (unknown) and a positive
 ///    count is `Some(n>0)` — both decline. An unknown null count is **never**
 ///    treated as zero. A column absent from the schema is likewise unproven.
+/// 3. the per-file `record_count`s are well-formed — a negative per-file count,
+///    or a sum that would overflow `u64` (both only possible in a corrupt
+///    manifest), declines rather than serving a wrapped/bogus "exact" count.
 ///
 /// An empty `non_null_cols` is a constant-subject mapping (a row is produced for
 /// every table row), so the count is sound with no null proof required.
@@ -1353,9 +1392,17 @@ fn sound_manifest_row_count(
             _ => return None,
         }
     }
-    // `record_count` is non-negative in real Iceberg metadata; a would-be negative
-    // total (corrupt manifest) declines rather than reporting a bogus count.
-    u64::try_from(agg.row_count).ok()
+    // `record_count` is non-negative in real Iceberg metadata; a corrupt manifest
+    // must decline rather than feed a bogus "exact" count. Re-summed here with
+    // per-file checked u64 arithmetic instead of trusting `agg.row_count`, whose
+    // plain i64 sum saturates on corrupt input and cannot distinguish a per-file
+    // negative from a smaller valid total: a negative per-file count, or a sum
+    // that would overflow `u64`, declines.
+    let mut total: u64 = 0;
+    for df in data_files {
+        total = total.checked_add(u64::try_from(df.record_count).ok()?)?;
+    }
+    Some(total)
 }
 
 #[cfg(test)]
@@ -1576,6 +1623,26 @@ mod tests {
         );
         // A delete manifest still declines, even for a constant subject.
         assert_eq!(sound_manifest_row_count(&schema, &files, true, &[]), None);
+    }
+
+    #[test]
+    fn count_shortcut_declines_corrupt_record_counts() {
+        let schema = count_schema();
+        // A negative per-file record_count (corrupt manifest) declines — even
+        // though the SUM (10 - 5 = 5) is positive and a sign check on the
+        // aggregate alone would have served it as an "exact" count.
+        let files = vec![count_data_file(10, None), count_data_file(-5, None)];
+        assert_eq!(sound_manifest_row_count(&schema, &files, false, &[]), None);
+
+        // Per-file counts whose total overflows u64 decline (three i64::MAX
+        // files: the wrapped i64 sum would land positive at ~2^63-3, so a plain
+        // sign check on the aggregate would happily pass it).
+        let files = vec![
+            count_data_file(i64::MAX, None),
+            count_data_file(i64::MAX, None),
+            count_data_file(i64::MAX, None),
+        ];
+        assert_eq!(sound_manifest_row_count(&schema, &files, false, &[]), None);
     }
 
     #[test]
