@@ -2615,3 +2615,37 @@ async fn fql_within_ledger_from_named_dataset_parity() {
         normalize_flat_results(&json!(["Carol"]))
     );
 }
+
+/// The reserved system graphs — `#txn-meta` (g_id 1) and `#config` (g_id 2) —
+/// are seeded into the graph registry, but must NOT be reachable through
+/// `FROM`/`FROM NAMED`: the plain `GRAPH <iri>` path blocks them via the
+/// `>= FIRST_USER_GRAPH_ID` filter, and the dataset path must match. Before
+/// the fix, `FROM <urn:fluree:{ledger}#config>` resolved and exposed the
+/// governance/config graph's flakes to any query.
+#[tokio::test]
+async fn sparql_from_rejects_reserved_system_graphs() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-reserved:main").await;
+    let config_iri = fluree_db_core::config_graph_iri("wl-reserved:main");
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved:main");
+
+    for (clause, iri) in [
+        ("FROM", config_iri.as_str()),
+        ("FROM", txn_meta_iri.as_str()),
+        ("FROM NAMED", config_iri.as_str()),
+        ("FROM NAMED", txn_meta_iri.as_str()),
+    ] {
+        let sparql = format!(
+            "PREFIX schema: <http://schema.org/> \
+             SELECT ?s {clause} <{iri}> WHERE {{ ?s ?p ?o }}"
+        );
+        let err = support::query_sparql(&fluree, &ledger, &sparql)
+            .await
+            .expect_err(&format!("{clause} <{iri}> must be rejected"));
+        assert!(
+            err.to_string().contains("not in this ledger"),
+            "expected the within-ledger rejection for {clause} <{iri}>, got: {err}"
+        );
+    }
+}

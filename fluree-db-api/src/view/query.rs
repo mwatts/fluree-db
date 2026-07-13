@@ -712,14 +712,26 @@ impl Fluree {
             )?));
         }
 
-        // Registered named graph in this ledger (registry, with the same
-        // binary-store fallback `select_graph` uses).
-        let known = db.snapshot.graph_registry.graph_id_for_iri(iri).is_some()
+        // Registered USER named graph in this ledger (registry, with the same
+        // binary-store fallback `select_graph` uses). The registry also seeds
+        // the reserved system graphs — `#txn-meta` (g_id 1) and `#config`
+        // (g_id 2) — which must NOT be reachable through `FROM`/`FROM NAMED`:
+        // the plain `GRAPH <iri>` path already blocks them via
+        // `single_db_user_graph_id`'s `>= FIRST_USER_GRAPH_ID` filter, so gate
+        // this path identically (a reserved IRI falls through to the
+        // "not in this ledger" rejection below).
+        let is_user_graph =
+            |g: fluree_db_core::GraphId| g >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+        let known = db
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .is_some_and(is_user_graph)
             || db
                 .binary_store
                 .as_ref()
                 .and_then(|s| s.graph_id_for_iri(iri))
-                .is_some();
+                .is_some_and(is_user_graph);
         if known {
             return Ok(Some(Self::apply_graph_selector(
                 db.clone(),
