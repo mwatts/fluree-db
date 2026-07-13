@@ -47,7 +47,7 @@ use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::r2rml::rewrite_patterns_for_r2rml;
+use crate::r2rml::{rewrite_patterns_for_r2rml, unsupported_subscope_error};
 use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -303,14 +303,10 @@ impl GraphOperator {
             // subqueries) whose bodies would evaluate against the R2RML source's
             // empty native index and silently return no rows — fail loudly.
             if !rewrite_result.unsupported.is_empty() {
-                return Err(crate::error::QueryError::InvalidQuery(format!(
-                    "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
-                     virtual dataset (an R2RML source has no native index, so these would \
-                     silently return no rows): {}. Rewrite them as basic triple patterns or move \
-                     them outside the GRAPH block.",
-                    graph_iri,
-                    rewrite_result.unsupported.join(", ")
-                )));
+                return Err(unsupported_subscope_error(
+                    &graph_iri,
+                    &rewrite_result.unsupported,
+                ));
             }
 
             std::borrow::Cow::Owned(rewrite_result.patterns)
@@ -506,14 +502,10 @@ impl GraphOperator {
         // that would silently evaluate against the R2RML source's empty native
         // index — fail loudly rather than return a wrong empty result.
         if !rewrite_result.unsupported.is_empty() {
-            return Err(crate::error::QueryError::InvalidQuery(format!(
-                "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
-                 virtual dataset (an R2RML source has no native index, so these would silently \
-                 return no rows): {}. Rewrite them as basic triple patterns or move them outside \
-                 the GRAPH block.",
-                graph_iri,
-                rewrite_result.unsupported.join(", ")
-            )));
+            return Err(unsupported_subscope_error(
+                &graph_iri,
+                &rewrite_result.unsupported,
+            ));
         }
 
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
