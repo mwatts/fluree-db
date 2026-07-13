@@ -2649,3 +2649,41 @@ async fn sparql_from_rejects_reserved_system_graphs() {
         );
     }
 }
+
+/// §13.2: the dataset default graph is a SET — `FROM <g> FROM <g>` (the same
+/// graph named twice) contributes ONE member, so solutions are not
+/// bag-duplicated. Before the build-time dedup the duplicate member doubled
+/// every row.
+#[tokio::test]
+async fn sparql_within_ledger_repeated_from_is_deduped() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-dup:main").await;
+
+    let once = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:g1> WHERE { ?s schema:name ?name } ORDER BY ?name",
+    )
+    .await
+    .expect("single FROM")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+
+    let twice = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:g1> FROM <urn:g1> WHERE { ?s schema:name ?name } ORDER BY ?name",
+    )
+    .await
+    .expect("repeated FROM")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+
+    assert_eq!(
+        twice, once,
+        "FROM <g> FROM <g> must union the graph ONCE (set semantics), not double rows"
+    );
+}

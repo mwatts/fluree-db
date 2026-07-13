@@ -112,7 +112,11 @@ impl BlankNodeCounter {
     }
 
     fn next(&mut self) -> String {
-        let label = format!("_:b{}", self.next);
+        // `[` is outside PN_CHARS, so no hand-written `_:label` can collide
+        // with a minted anonymous label (a user's `_:b0` next to a template
+        // `[]` used to fuse into one node — the same forgeability class as
+        // the query-side `_:[]{N}` scheme this matches).
+        let label = format!("_:[]{}", self.next);
         self.next += 1;
         label
     }
@@ -2376,9 +2380,9 @@ mod tests {
     #[test]
     fn test_blank_node_counter() {
         let mut counter = BlankNodeCounter::new();
-        assert_eq!(counter.next(), "_:b0");
-        assert_eq!(counter.next(), "_:b1");
-        assert_eq!(counter.next(), "_:b2");
+        assert_eq!(counter.next(), "_:[]0");
+        assert_eq!(counter.next(), "_:[]1");
+        assert_eq!(counter.next(), "_:[]2");
     }
 
     #[test]

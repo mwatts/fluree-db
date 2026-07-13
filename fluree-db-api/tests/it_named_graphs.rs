@@ -2824,3 +2824,63 @@ async fn test_create_registers_graph_as_transfer_source() {
         .await
         .expect("CREATE ; ADD must commit (registered empty source)");
 }
+
+/// O7 (transact-template twin): an anonymous `[]` in an INSERT template mints
+/// a non-lexable `_:[]{n}` label, so it can never collide with a hand-written
+/// `_:bN` in the same template. Before the fix the first anon minted `_:b0`,
+/// fusing with a user's `_:b0` into ONE node per solution.
+#[tokio::test]
+async fn test_insert_template_anon_blank_never_merges_with_labeled() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/template-anon-blanks:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = r#"INSERT DATA { <http://example.org/s> <http://example.org/handle> "h1" }"#;
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+
+    // One solution row; the template mints `[]` AND user-labeled `_:b0` —
+    // they must become TWO distinct blank nodes.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX ex: <http://example.org/>
+INSERT { [] ex:tagQ ?h . _:b0 ex:tagP ?h }
+WHERE { ?s ex:handle ?h }",
+    )
+    .await
+    .ledger;
+
+    // No single subject may carry BOTH tag predicates (the fusion signature).
+    let fused = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?b WHERE { ?b ex:tagQ ?h . ?b ex:tagP ?h }",
+    )
+    .await
+    .expect("fusion probe")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        fused.as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "anon [] and user _:b0 template blanks fused into one node: {fused}"
+    );
+
+    // And both tags landed (two distinct blank subjects exist).
+    for tag in ["tagQ", "tagP"] {
+        let rows = support::query_sparql(
+            &fluree,
+            &ledger,
+            &format!("PREFIX ex: <http://example.org/> SELECT ?b WHERE {{ ?b ex:{tag} ?h }}"),
+        )
+        .await
+        .expect("tag probe")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+        assert_eq!(
+            rows.as_array().map(Vec::len).unwrap_or(0),
+            1,
+            "expected exactly one {tag} subject: {rows}"
+        );
+    }
+}

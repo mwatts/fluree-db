@@ -675,11 +675,18 @@ impl Fluree {
         }
 
         let mut dataset = DataSetDb::new();
+        // §13.2: the dataset default graph is the RDF merge (a SET) of the
+        // FROM graphs — a repeated `FROM <g>` (or two spellings resolving to
+        // one graph) must contribute ONE member, not a bag-duplicating twin.
+        let mut seen_default: std::collections::HashSet<fluree_db_core::GraphId> =
+            std::collections::HashSet::new();
         for iri in &clause.default_graphs {
             let graph = self
                 .resolve_within_ledger_graph(db, iri)?
                 .ok_or_else(cross_ledger_dataset_error)?;
-            dataset = dataset.with_default(graph);
+            if seen_default.insert(graph.graph_id) {
+                dataset = dataset.with_default(graph);
+            }
         }
         for iri in &clause.named_graphs {
             let graph = self
@@ -1260,8 +1267,9 @@ fn cross_ledger_dataset_error() -> ApiError {
     ApiError::query(
         "SPARQL FROM/FROM NAMED references a graph that is not in this ledger. \
          A within-ledger dataset names this ledger's graphs (its default graph \
-         via the ledger alias, or a registered named graph); use \
-         query_connection_sparql for cross-ledger datasets.",
+         via the ledger alias, or a registered named graph) — check the IRI \
+         for typos against the ledger's registered graphs; for a graph in \
+         ANOTHER ledger, use query_connection_sparql (cross-ledger datasets).",
     )
 }
 
