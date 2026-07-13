@@ -1174,3 +1174,88 @@ async fn sparql_avg_poisons_on_non_numeric_member() {
         json!([["ex:g1", "2"], ["ex:g2", null]])
     );
 }
+
+// =============================================================================
+// XPath op:numeric-equal NaN semantics — NaN is never equal, including to
+// itself (`NaN = NaN` → false, `NaN != NaN` → true). numeric_cmp's bit-level
+// total order (kept for ORDER BY stability) would otherwise report two
+// identical-bit NaNs as Equal via rdf_term_equal's value fast path.
+// =============================================================================
+
+/// One node carrying a stored `"NaN"^^xsd:double`, so the stored/value path
+/// (not just constant folding) drives the NaN rule.
+async fn seed_nan(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [{ "@id": "ex:n", "ex:d": { "@value": "NaN", "@type": "xsd:double" } }]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert").ledger
+}
+
+#[tokio::test]
+async fn sparql_nan_is_never_equal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nan(&fluree, "x2/nan:sparql").await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> ";
+    // Constant form: NaN = NaN → false; NaN != NaN → true; NaN = 1.0 → false.
+    for (filter, expect) in [
+        (r#""NaN"^^xsd:double = "NaN"^^xsd:double"#, false),
+        (r#""NaN"^^xsd:double != "NaN"^^xsd:double"#, true),
+        (r#""NaN"^^xsd:double = 1.0"#, false),
+    ] {
+        let q = format!("{p} ASK {{ FILTER({filter}) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(expect),
+            "{filter}"
+        );
+    }
+    // Stored form: a bound NaN double is not `=`-equal to itself, and `!=` is
+    // true (the row survives).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:n ex:d ?v FILTER(?v = ?v) }}"),
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:n ex:d ?v FILTER(?v != ?v) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}
+
+// JSON-LD twin (shared rdf_term_equal on the IR): a stored NaN double is
+// `=`-unequal to itself and `!=`-true.
+#[tokio::test]
+async fn jsonld_nan_is_never_equal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nan(&fluree, "x2/nan:jsonld").await;
+    let q_eq = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:d": "?v" },
+            ["filter", ["=", "?v", "?v"]]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q_eq).await, json!([]));
+    let q_ne = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:d": "?v" },
+            ["filter", ["!=", "?v", "?v"]]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q_ne).await, json!([["ex:n"]]));
+}

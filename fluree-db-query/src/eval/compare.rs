@@ -520,6 +520,22 @@ fn lang_parts(v: &ComparableValue) -> Option<(&str, &str)> {
 /// operator mapping. Returns a three-valued outcome so an incomparable pair is
 /// a type error (excluding the row) rather than silently `false`/`true`.
 pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
+    // XPath op:numeric-equal (F&O §4.2.3): NaN is not equal to anything,
+    // including itself — `NaN = NaN` is false and `NaN != NaN` is true. The
+    // numeric fast path below bottoms out in `numeric_cmp`'s bit-level total
+    // order (wanted for ORDER BY stability), which reports two identical-bit
+    // NaNs as Equal, so the equality entry point must catch NaN first. Scoped
+    // to numeric-vs-numeric so NaN vs an unrecognized-datatype literal still
+    // reaches the TypeError arm below. (A NaN hidden in a string-backed
+    // `TypedLiteral` — `STRDT("NaN", xsd:double)` — still takes the coercing
+    // fast path; accepted corner.)
+    let is_nan = |v: &ComparableValue| {
+        matches!(v, ComparableValue::Double(d) if d.is_nan())
+            || matches!(v, ComparableValue::Float(f) if f.is_nan())
+    };
+    if (is_nan(a) || is_nan(b)) && eq_kind(a) == EqKind::Numeric && eq_kind(b) == EqKind::Numeric {
+        return EqOutcome::Ne;
+    }
     // Value-comparable fast path: numeric promotion, string, boolean, temporal.
     // No plain-string↔temporal coercion (equality, not ordering).
     if let Some(ord) = cmp_values_inner(a, b, false) {
@@ -649,6 +665,44 @@ mod tests {
         let string = ComparableValue::String(Arc::from("10"));
         // Type mismatch returns None
         assert_eq!(cmp_values(&long, &string), None);
+    }
+
+    // XPath op:numeric-equal: NaN is never equal, including to itself; `!=`
+    // is therefore true. numeric_cmp's bit-level total order (kept for ORDER
+    // BY) would otherwise report identical-bit NaNs as Equal.
+    #[test]
+    fn test_rdf_term_equal_nan_is_never_equal() {
+        let d_nan = ComparableValue::Double(f64::NAN);
+        let f_nan = ComparableValue::Float(f32::NAN);
+        let one = ComparableValue::Double(1.0);
+        assert_eq!(rdf_term_equal(&d_nan, &d_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&f_nan, &f_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&d_nan, &f_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&d_nan, &one), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&one, &d_nan), EqOutcome::Ne);
+        assert_eq!(
+            rdf_term_equal(&d_nan, &ComparableValue::Long(1)),
+            EqOutcome::Ne
+        );
+    }
+
+    // The NaN carve-out is equality-only: the ORDER BY total order still
+    // places identical-bit NaNs as Equal (stability), and NaN vs a
+    // non-numeric operand keeps its existing outcome (recognized pair → Ne
+    // via the kind table; unrecognized-datatype literal stays a TypeError).
+    #[test]
+    fn test_nan_scope_is_equality_only() {
+        let d_nan = ComparableValue::Double(f64::NAN);
+        assert_eq!(cmp_values(&d_nan, &d_nan), Some(Ordering::Equal));
+        let s = ComparableValue::String(Arc::from("NaN"));
+        assert_eq!(rdf_term_equal(&d_nan, &s), EqOutcome::Ne);
+        let foreign = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                Arc::from("http://example.org/dt"),
+            )),
+        };
+        assert_eq!(rdf_term_equal(&d_nan, &foreign), EqOutcome::TypeError);
     }
 
     // =========================================================================
