@@ -1257,7 +1257,10 @@ async fn jsonld_nan_is_never_equal() {
             ["filter", ["!=", "?v", "?v"]]
         ]
     });
-    assert_eq!(jsonld_rows(&fluree, &ledger, &q_ne).await, json!([["ex:n"]]));
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_ne).await,
+        json!([["ex:n"]])
+    );
 }
 
 // =============================================================================
@@ -1360,4 +1363,165 @@ async fn sparql_round_ceil_floor_pass_big_integers_through() {
             "{func}({big})"
         );
     }
+}
+
+// =============================================================================
+// Three-valued AND (§17.2) — the other half of the dominance table (OR is
+// pinned above): F && err = F (the row survives a negated conjunction), and
+// err && T = err (the row drops). Wave-2 aborted the whole expression on the
+// first operand error, failing both directions.
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_three_valued_and_dominance() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/and:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // F && err = F: `1 = 2` is false, `?n < 1` (string < number) errors —
+    // false dominates, so the negation is true and the row survives.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ?s ex:name ?n . FILTER(!((?n < 1) && (1 = 2))) }}"),
+        )
+        .await,
+        JsonValue::Bool(true),
+        "F && err must be F (not an aborted error)"
+    );
+    // err && T = err: the error survives a true conjunct → row dropped.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ?s ex:name ?n . FILTER((?n < 1) && (1 = 1)) }}"),
+        )
+        .await,
+        JsonValue::Bool(false),
+        "err && T must stay a type error (row excluded)"
+    );
+}
+
+#[tokio::test]
+async fn jsonld_three_valued_and_dominance() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/and:jsonld").await;
+    // F && err = F → not(false) = true → both rows survive.
+    let q_not = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "?s", "ex:name": "?n" },
+            ["filter", ["not", ["and", ["<", "?n", 1], ["=", 1, 2]]]]
+        ],
+        "orderBy": "?n"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_not).await,
+        json!([["Alice"], ["Bob"]])
+    );
+    // err && T = err → rows dropped.
+    let q_err = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "?s", "ex:name": "?n" },
+            ["filter", ["and", ["<", "?n", 1], ["=", 1, 1]]]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q_err).await, json!([]));
+}
+
+// =============================================================================
+// SUM poison (the commit says "aggregates" plural; only AVG was pinned) — a
+// non-numeric group member is a type error for SUM too, not a sum over the
+// numeric subset.
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_sum_poisons_on_non_numeric_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_groups(&fluree, "x2/sum:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    let q =
+        format!("{p} SELECT ?g (SUM(?p) AS ?sum) WHERE {{ ?g ex:p ?p }} GROUP BY ?g ORDER BY ?g");
+    // g1 = 1+2+3 = 6; g2 poisons on its non-numeric member → null.
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, &q).await,
+        json!([["ex:g1", 6], ["ex:g2", null]])
+    );
+}
+
+#[tokio::test]
+async fn jsonld_sum_poisons_on_non_numeric_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_groups(&fluree, "x2/sum:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?g", "(as (sum ?p) ?sum)"],
+        "where": [{ "@id": "?g", "ex:p": "?p" }],
+        "groupBy": ["?g"],
+        "orderBy": "?g"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["ex:g1", 6], ["ex:g2", null]])
+    );
+}
+
+// =============================================================================
+// Indexed twins — a reindexed, novelty-free ledger routes scans through the
+// binary store (late-materialized bindings + the indexed aggregate paths that
+// FlureeBuilder::memory() alone never exercises).
+// =============================================================================
+
+/// Insert `tx`, reindex to a binary store, and return the purely-indexed ledger
+/// (no trailing novelty) so scans late-materialize to `Binding::EncodedLit`.
+async fn seed_indexed(fluree: &MemoryFluree, ledger_id: &str, tx: &JsonValue) -> MemoryLedger {
+    use fluree_db_api::ReindexOptions;
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree.insert(ledger0, tx).await.expect("insert");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed ledger");
+    assert!(
+        indexed.snapshot.range_provider.is_some(),
+        "expected binary range provider after reindex (EncodedLit path)"
+    );
+    indexed
+}
+
+fn groups_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:g1", "ex:p": [1, 2, 3] },
+            { "@id": "ex:g2", "ex:p": [{ "@id": "ex:notanumber" }, 4] }
+        ]
+    })
+}
+
+// SUM/AVG poison on the INDEXED path: the memory-backed twins above exercise
+// only the general/streaming aggregate; a reindexed ledger routes through the
+// binary-store scan (and any indexed aggregate specialization), so this pins
+// the poison rule where production ledgers actually run.
+#[tokio::test]
+async fn sparql_sum_avg_poison_on_indexed_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/aggidx:sparql", &groups_tx()).await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    let q_sum =
+        format!("{p} SELECT ?g (SUM(?p) AS ?sum) WHERE {{ ?g ex:p ?p }} GROUP BY ?g ORDER BY ?g");
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, &q_sum).await,
+        json!([["ex:g1", 6], ["ex:g2", null]])
+    );
+    let q_avg =
+        format!("{p} SELECT ?g (AVG(?p) AS ?avg) WHERE {{ ?g ex:p ?p }} GROUP BY ?g ORDER BY ?g");
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, &q_avg).await,
+        json!([["ex:g1", "2"], ["ex:g2", null]])
+    );
 }
