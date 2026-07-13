@@ -159,10 +159,16 @@ impl SubqueryOperator {
         // every solution itself (a top-level required triple / property path);
         // seeding it only filters the output, so it can be a hash key.
         let produced = self_produced_vars(&subquery.patterns);
+        // An explicitly-pinned import (Cypher `CALL (p)` — `pinned_vars`) is
+        // seeded like a self-produced key even when the body binds it only via
+        // OPTIONAL: the import IS a per-row binding by the surface's contract,
+        // not an inferred correlation for Family-B reconciliation.
+        let pinned: std::collections::HashSet<VarId> =
+            subquery.pinned_vars.iter().copied().collect();
         let join_keys: Vec<VarId> = correlation_vars
             .iter()
             .copied()
-            .filter(|v| produced.contains(v))
+            .filter(|v| produced.contains(v) || pinned.contains(v))
             .collect();
 
         // The complementary set: correlation vars the subquery binds only
@@ -172,7 +178,7 @@ impl SubqueryOperator {
         let reconcile_vars: Vec<VarId> = correlation_vars
             .iter()
             .copied()
-            .filter(|v| !produced.contains(v))
+            .filter(|v| !produced.contains(v) && !pinned.contains(v))
             .collect();
 
         // Every NON-key correlation var must be either produced by the inner
@@ -212,7 +218,19 @@ impl SubqueryOperator {
             // seeding for a small parent (its pruning seed can be cheaper); an
             // uncorrelated (no shared key) subquery is always evaluated once
             // (per-row recomputes identically).
-            let eligible = subquery.limit.is_none() && subquery.offset.is_none() && pass_through_ok;
+            // A pinned import the body does not itself produce requires
+            // true per-row (LATERAL) evaluation: evaluate-once + hash-join on
+            // the import would drop zero-match parents (e.g. Cypher
+            // `CALL (p) { OPTIONAL MATCH … RETURN count(…) }` retaining a
+            // friendless `p` as 0).
+            let pinned_requires_per_row = subquery
+                .pinned_vars
+                .iter()
+                .any(|v| correlation_vars.contains(v) && !produced.contains(v));
+            let eligible = subquery.limit.is_none()
+                && subquery.offset.is_none()
+                && pass_through_ok
+                && !pinned_requires_per_row;
             eligible
                 && (correlation_vars.is_empty()
                     || child
