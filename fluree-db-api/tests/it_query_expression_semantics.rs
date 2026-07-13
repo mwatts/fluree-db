@@ -1259,3 +1259,105 @@ async fn jsonld_nan_is_never_equal() {
     });
     assert_eq!(jsonld_rows(&fluree, &ledger, &q_ne).await, json!([["ex:n"]]));
 }
+
+// =============================================================================
+// Unary minus coerces cast results; CONCAT reads the tag off the value;
+// ROUND/CEIL/FLOOR pass big integers through (review follow-ups).
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_negate_coerces_cast_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/negate:sparql").await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+    // A cast result is a string-backed TypedLiteral; unary minus must coerce
+    // it like binary arithmetic does (pre-fix: ?v unbound → ASK false).
+    for (expr, expect) in [
+        ("-xsd:float(\"1.5\") = -1.5", true),
+        ("datatype(-xsd:float(\"1.5\")) = xsd:float", true),
+        ("-xsd:decimal(\"2.5\") = -2.5", true),
+    ] {
+        let q = format!("{p} ASK {{ FILTER({expr}) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(expect),
+            "{expr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonld_negate_coerces_cast_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/negate:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["filter", ["=", ["negate", ["xsd:float", "1.5"]], -1.5]]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["Alice"]]));
+}
+
+// §17.4.3.5: CONCAT keeps the tag when ALL args share it — including constant
+// and computed (STRLANG) args, whose tag lives on the VALUE rather than a
+// variable binding (pre-fix these came back plain). Tags compare
+// case-insensitively (RDF 1.1); a genuine mismatch drops the tag.
+#[tokio::test]
+async fn sparql_concat_preserves_constant_lang_tags() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/concatlang:sparql").await;
+    for (expr, expect) in [
+        (r#"CONCAT("a"@en, "b"@en) = "ab"@en"#, true),
+        (r#"LANG(CONCAT("a"@en, "b"@en)) = "en""#, true),
+        (r#"CONCAT("a"@EN, "b"@en) = "ab"@en"#, true), // case-insensitive tags
+        (r#"LANG(CONCAT("a"@en, "b"@fr)) = """#, true), // mismatch → plain
+        (r#"CONCAT(STRLANG("a", "en"), "b"@en) = "ab"@en"#, true),
+    ] {
+        let q = format!("ASK {{ FILTER({expr}) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(expect),
+            "{expr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonld_concat_preserves_constant_lang_tags() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/concatlang:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["filter", ["=",
+                ["concat", ["strlang", "a", "en"], ["strlang", "b", "en"]],
+                ["strlang", "ab", "en"]]]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["Alice"]]));
+}
+
+// fn:round/fn:ceiling/fn:floor are identity on integers; an xsd:integer wider
+// than i64 (ComparableValue::BigInt) must pass through, not go unbound.
+#[tokio::test]
+async fn sparql_round_ceil_floor_pass_big_integers_through() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/bigint:sparql").await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+    let big = "99999999999999999999"; // > i64::MAX
+    for func in ["ROUND", "CEIL", "FLOOR", "ABS"] {
+        let q = format!(
+            "{p} ASK {{ FILTER({func}(\"{big}\"^^xsd:integer) = \"{big}\"^^xsd:integer) }}"
+        );
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(true),
+            "{func}({big})"
+        );
+    }
+}

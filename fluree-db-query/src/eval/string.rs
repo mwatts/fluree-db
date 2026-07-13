@@ -345,14 +345,29 @@ pub fn eval_concat<R: RowAccess>(
             } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => s.as_str(),
             _ => return Ok(None),
         };
-        let lang = extract_lang_tag(arg, row, ctx);
+        // The language tag can live on the VALUE itself (a constant `"a"@en`,
+        // a STRLANG/REPLACE result — both `TypedLiteral{LangTag}`) or only on
+        // the raw BINDING (the Var fast paths `extract_lang_tag` reads).
+        // Prefer the value's own tag, then fall back to the binding's —
+        // reading only the binding dropped the tag for constant/computed
+        // args, so `CONCAT("a"@en, "b"@en)` came back plain instead of @en.
+        let value_lang = match &val {
+            ComparableValue::TypedLiteral {
+                dtc: Some(UnresolvedDatatypeConstraint::LangTag(t)),
+                ..
+            } => Some(Arc::clone(t)),
+            _ => None,
+        };
+        let lang = value_lang.or_else(|| extract_lang_tag(arg, row, ctx));
         match &common_lang {
             None => common_lang = Some(lang),
-            Some(prev) => {
-                if *prev != lang {
-                    common_lang = Some(None); // mismatch → no tag
-                }
-            }
+            // RDF 1.1 language tags compare case-insensitively; the first
+            // argument's spelling is kept for the result.
+            Some(Some(prev)) => match &lang {
+                Some(l) if prev.eq_ignore_ascii_case(l) => {}
+                _ => common_lang = Some(None), // mismatch → no tag
+            },
+            Some(None) => {}
         }
         result.push_str(s);
     }

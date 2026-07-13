@@ -57,6 +57,9 @@ pub fn eval_round<R: RowAccess>(
         // xsd:float stays xsd:float; W3C half toward positive infinity (see the
         // Double arm) — `(f + 0.5).floor()`, not f32::round (half away from zero).
         Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float((f + 0.5).floor()))),
+        // An xsd:integer beyond i64 is already integral: identity (ABS has the
+        // matching BigInt arm; without this the catch-all returned unbound).
+        Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(n))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
@@ -77,6 +80,8 @@ pub fn eval_ceil<R: RowAccess>(
         }
         // xsd:float stays xsd:float (fn:ceiling is type-preserving).
         Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(f.ceil()))),
+        // Big integers are already integral: identity.
+        Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(n))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
@@ -97,6 +102,8 @@ pub fn eval_floor<R: RowAccess>(
         }
         // xsd:float stays xsd:float (fn:floor is type-preserving).
         Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(f.floor()))),
+        // Big integers are already integral: identity.
+        Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(n))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
