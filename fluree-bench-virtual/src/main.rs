@@ -132,6 +132,10 @@ enum Command {
         /// (the cold protocol's per-query unit). Records `cache_state = cold`.
         #[arg(long)]
         cold: bool,
+        /// Override the query's manifest `timeout_s` deadline (seconds).
+        /// A cold `run --timeout-s` forwards its override through this flag.
+        #[arg(long)]
+        timeout_s: Option<u64>,
     },
     /// Render a run.jsonl as a comparison table (or --json).
     Report {
@@ -160,6 +164,11 @@ enum Command {
         /// Baselines directory (default: <crate>/baselines).
         #[arg(long)]
         baseline_dir: Option<PathBuf>,
+        /// Allow `--expected` to overwrite a blessed oracle whose hash/rows
+        /// differ from this run. Without it a differing oracle refuses (and
+        /// prints the delta) so a native regression can't be blessed as truth.
+        #[arg(long)]
+        force: bool,
     },
     /// Compare a run against blessed baselines: expected-hash check + perf ratio
     /// vs budget. `--gate` exits nonzero on any violation (auto-reruns a perf
@@ -246,6 +255,7 @@ fn main() -> Result<()> {
             target,
             keep_heads,
             cold,
+            timeout_s,
         } => cmd_exec_one(
             &corpus_dir,
             &targets_dir,
@@ -254,6 +264,7 @@ fn main() -> Result<()> {
             &target,
             keep_heads,
             cold,
+            timeout_s,
         ),
         Command::Report { run, json } => cmd_report(&run, json),
         Command::Baseline {
@@ -262,6 +273,7 @@ fn main() -> Result<()> {
             run,
             targets,
             baseline_dir,
+            force,
         } => cmd_baseline(BaselineArgs {
             corpus_dir: &corpus_dir,
             targets_dir: &targets_dir,
@@ -271,6 +283,7 @@ fn main() -> Result<()> {
             run,
             target_ids: &targets,
             baseline_dir,
+            force,
         }),
         Command::Compare {
             run,
@@ -475,7 +488,11 @@ fn cmd_run(args: RunArgs) -> Result<()> {
                     args.targets_dir,
                     target,
                     &q.id,
-                    args.keep_heads,
+                    &exec::ColdRunOpts {
+                        keep_heads: args.keep_heads,
+                        cache_dir: args.cache_dir,
+                        timeout_s: args.timeout_s,
+                    },
                 )?
             } else {
                 let params = RunParams {
@@ -504,6 +521,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // thin CLI adapter over the Engine call
 fn cmd_exec_one(
     corpus_dir: &Path,
     targets_dir: &Path,
@@ -512,6 +530,7 @@ fn cmd_exec_one(
     target_id: &str,
     keep_heads: bool,
     cold: bool,
+    timeout_s: Option<u64>,
 ) -> Result<()> {
     let corpus = Corpus::load(corpus_dir)?;
     let q = corpus
@@ -543,7 +562,7 @@ fn cmd_exec_one(
         &target,
         &q.id,
         &sparql,
-        Duration::from_secs(q.timeout_s),
+        Duration::from_secs(timeout_s.unwrap_or(q.timeout_s)),
         keep_heads,
         expected,
         cold,
@@ -572,6 +591,7 @@ struct BaselineArgs<'a> {
     run: Option<PathBuf>,
     target_ids: &'a [String],
     baseline_dir: Option<PathBuf>,
+    force: bool,
 }
 
 fn cmd_baseline(args: BaselineArgs) -> Result<()> {
@@ -606,13 +626,16 @@ fn cmd_baseline(args: BaselineArgs) -> Result<()> {
     }
 
     if args.expected {
-        let (written, skipped) = baseline::write_expected(&meta, &records, &corpus, &baselines)?;
+        let s = baseline::write_expected(&meta, &records, &corpus, &baselines, args.force)?;
         eprintln!(
-            "baseline --expected: wrote {} oracle(s) under {}/expected; skipped {} ({:?})",
-            written.len(),
+            "baseline --expected: wrote {} oracle(s) under {}/expected \
+             ({} force-overwritten, {} unchanged); skipped {} ({:?})",
+            s.written.len(),
             baselines.display(),
-            skipped.len(),
-            skipped
+            s.overwritten.len(),
+            s.unchanged.len(),
+            s.skipped.len(),
+            s.skipped
         );
     }
     if args.perf {
@@ -722,7 +745,7 @@ fn cmd_compare(
             .cloned();
         let virt = is_virtual.get(r.target.as_str()).copied().unwrap_or(false);
         let cold = r.cache_state == "cold";
-        let budget = budgets.budget_pct(&r.query_id, virt, cold);
+        let budget = budgets.budget(&r.query_id, virt, cold);
         let hash_gate = corpus
             .get(&r.query_id)
             .map(|q| q.hash_gate)
@@ -731,13 +754,13 @@ fn cmd_compare(
             baseline::compare_one(r, expected.as_ref(), perf_entry.as_ref(), budget, hash_gate);
 
         // Live-noise discipline: auto-rerun a perf violation once before red.
-        if let (Some(p), Some(pct)) = (&outcome.perf, budget) {
+        if let (Some(p), Some(b)) = (&outcome.perf, budget) {
             if p.violated {
                 let baseline_ms = p.baseline_ms;
                 match rerun_query(&engine, &mut opened, targets_dir, cache_dir, &corpus, r) {
                     Ok(rerun_ms) => {
                         outcome.reran = true;
-                        let still = baseline::over_budget(baseline_ms, rerun_ms, pct);
+                        let still = baseline::over_budget(baseline_ms, rerun_ms, b);
                         if let Some(pc) = outcome.perf.as_mut() {
                             pc.observed_ms = rerun_ms;
                             pc.ratio = if baseline_ms == 0 {
@@ -766,7 +789,7 @@ fn cmd_compare(
         if let Some(p) = &outcome.perf {
             if p.violated {
                 violations += 1;
-                let b = p.budget_pct.unwrap_or(0.0);
+                let b = p.budget.map(|b| b.pct).unwrap_or(0.0);
                 println!(
                     "SLOW       {:<6} {:<16} blessed {}ms  observed {}ms  ratio {:.2}x  budget +{:.0}%{}",
                     r.query_id,
