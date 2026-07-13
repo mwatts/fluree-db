@@ -139,6 +139,24 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 ---
 
+## F9 — Predicate/type IRIs serialize as CURIEs on native, full IRIs on virtual *(correctness-divergence — cosmetic-lexical; CONFIRMED, root-caused)*
+
+**Queries.** q002 `SELECT ?p ?o { <edw/store/1> ?p ?o }` (bound-subject inspector, 8 rows) and q042 (three-store UNION detail, 24 rows). Both hash-MISMATCH with **equal row counts** to native.
+
+**Evidence.** Head-row diff (`exec-one --keep-heads` vs `baselines/expected/q00N.json`): after folding the namespace, **every cell is byte-identical** — the only difference is the lexical form of IRI-valued bindings. Native compacts them to CURIEs using the query's `PREFIX edw: <http://ns.fluree.dev/edw#>` — `<edw:name>`, `<edw:channel>`, `<edw:storeId>`, `<edw:storeType>`, `<edw:openDate>`, `<edw:geography>`, `<edw:regionManager>`, and the `rdf:type` object `<edw:Store>`. Virtual (R2RML) emits the **full IRI** — `<http://ns.fluree.dev/edw#name>`, …, `<http://ns.fluree.dev/edw#Store>`. The literal object values (`2023-06-27`, `Retail`, `Store 1`, `STORE-00001`, `Warehouse`) and reference IRIs (`employee/604`, `geography/3603`) are identical on both sides. It is exclusively the **projected predicate `?p`** and the **`rdf:type` object** — i.e. IRIs the engine draws from the vocabulary — that diverge, which is why every corpus query projecting only literal *object* values (q001, q022, q054) is hash-OK.
+
+**Root cause (confirmed).** A native-vs-virtual result-formatter divergence in how an IRI-valued binding is rendered: the native path CURIE-abbreviates against the in-scope query prefixes; the R2RML path renders the absolute IRI. Same data, same namespace, different lexical string ⇒ different canonical hash.
+
+**Why it surfaced now (relationship to F3).** F3 was the *row-count* half of this shape (virtual dropped the `rdf:type` row entirely: q042 21 vs 24, q002 7 vs 8). PR-0's bound-subject `rr:class` emission (`4a878e33d`/#1476) fixed the count (q042→24, q002→8) — which **unmasked** this value-level serialization divergence that the count mismatch had been hiding. So F9 is the residual of F3 after the count was repaired.
+
+**Not PR-3.** Confirmed via the `FLUREE_R2RML_STAR_TM_PRUNE` discriminator (2026-07-13): both q002 and q042 mismatch **identically with PR-3's star pruning ON and OFF**. Mechanically expected — q002 is a bound-subject wildcard (no star members, no class), so PR-3's fix (a)/(b') never engage.
+
+**Product decision (escalated to AJ, not decided here).** SPARQL 1.1 Query Results JSON serializes an `iri` binding as its **full string value** (`{"type":"uri","value":"http://…"}`) — there is no CURIE form in the spec — so on a strict reading the **virtual** side conforms and the **native** CURIE-compaction is the non-conforming one. But changing native output to full IRIs would change results every existing native user already depends on. Which side changes (or whether the harness canonicalizer namespace-folds both before hashing) is a **product/compat decision for AJ**, not an engine bug to "fix" unilaterally. **Do NOT** allowlist/mask q002/q042 in the harness — they stay honestly red until parity is decided.
+
+**Record-integrity note (low priority).** q042 was recorded as "hash-parity restored" in the PR-0 era, yet today it mismatches at **both** switch states. Either the PR-0-era bless predated the `?p`-projection serialization path, or a PR-1/PR-2-era formatter change altered it — both pre-existing to PR-3. A bisect against an older binary would settle it; offered but **not run** (out of PR-3 scope, low priority).
+
+---
+
 ## Summary & routing
 
 | Finding | Class | Query | Root | Fix owner |
@@ -150,6 +168,15 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | **F5** | perf-dnf | q050, q025, q040, q053 | H3 correlated rebuild (q050 377 scans), H1/H6/H8 | roadmap (WP8) |
 | **F6** | positive-control | q001/03/06/07/11/22/54 | correctness parity; fused-agg 1.52×; H4-date prunes 98.8% | — |
 | **F7** | harness-note | (all) | `scan_plan` conditional on pushdown branch | harness (WP6 span tuning) |
-| **F8** | perf-ratio / over-scan | q001 (cold) | 6 `loadTable`s for a 1-table query — class fusion / subject-prune not firing on star-with-column-members (§2); or ref-POM parent prefetch | WP7 investigate → engine |
+| **F8** | perf-ratio / over-scan | q001 (cold) | 6 `loadTable`s for a 1-table query — class fusion / subject-prune not firing on star-with-column-members (§2); or ref-POM parent prefetch | WP7 investigate → engine (FIXED by PR-3: 6→1) |
+| **F9** | correctness-divergence (cosmetic-lexical) | q002, q042 | predicate/type IRIs render as CURIEs on native, full IRIs on virtual — data identical after namespace-folding; residual of F3 after PR-0 fixed the row count | product decision (AJ) — not PR-3 |
 
 **The two correctness bugs (F1/F2) share one root** and are the highest priority — they deliver wrong answers as silent successes. **F3 is a second, independent correctness gap** (root-caused) on the most common inspector shape — small fix surface, high user-visible impact (missing `@type` in the solo subject inspector). **F5-q050** is the sharpest perf signal (dims-only, 377 scans). **F4 is corpus hygiene, not an engine bug** — but it must be fixed (the determinism amendment) so nondeterministic-selection queries stop masking real divergences. F1/F2/F3/F5 feed the WP7 diagnosis and WP8 roadmap; F4 feeds the corpus determinism amendment; F7 feeds back into WP6 harness tuning.
+
+## F9 — Native/virtual IRI-serialization divergence *(correctness-divergence — cosmetic-lexical; PRODUCT DECISION pending)*
+
+For identical data and an identical query, native compacts predicate/type IRIs to CURIEs using the query's PREFIX (`edw:name`, type object `edw:Store`) while the virtual (R2RML) path emits full IRIs (`http://ns.fluree.dev/edw#name`). Witnesses: q002 and q042 (bound-subject wildcards projecting `?p`); all 8 rows match 1:1 after namespace folding — every literal object and ref IRI byte-identical. Discriminator (2026-07-13): mismatch identical with `FLUREE_R2RML_STAR_TM_PRUNE` on AND off ⇒ pre-existing, PR-3-independent. Unmasked by PR-0's rdf:type row-count fix (q002 was rows-divergent 7v8 through the baseline era, so its hash never had a chance to match).
+
+- **Which side changes is a product decision (escalated to AJ):** SPARQL 1.1 results-JSON serializes IRIs as full strings — favoring aligning NATIVE to full IRIs — but that alters output existing native users may depend on; aligning virtual to CURIE-compaction preserves native behavior but bakes in the non-standard form.
+- q002/q042 stay honestly RED in the corpus gate until decided (no harness masking).
+- Record-integrity note (low priority): PR-0's gate reported q042 "hash-parity restored" (2026-07-11); today q042 mismatches at both switch states. Unexplained — a binary bisect against the PR-0-era build would settle whether that claim was wrong or something shifted since. Offered, not yet run.

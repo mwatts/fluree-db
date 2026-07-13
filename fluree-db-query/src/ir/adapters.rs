@@ -650,6 +650,18 @@ pub struct R2rmlPattern {
     /// Limits scan to TriplesMap(s) that produce this rdf:type.
     pub class_filter: Option<String>,
 
+    /// PR-3 fix (b'): a co-located `rdf:type` class that was NOT fused into this
+    /// star for materialization (`class_fusion_is_safe` refused — the class lives
+    /// in a different TriplesMap than the base predicate), but whose class-declaring
+    /// TriplesMaps are subject-template-DISJOINT from every other map that resolves
+    /// here (`wildcard_class_fusion_is_safe`). Set only in that provably-safe case,
+    /// it lets TriplesMap resolution prune the star's fan-out to class-declaring
+    /// maps WITHOUT changing materialization: the class is still enforced by its own
+    /// standalone scan joined on the subject, and disjointness guarantees the pruned
+    /// maps' subjects could never survive that join anyway. Unlike `class_filter`,
+    /// this NEVER affects rdf:type emission — resolution pruning only.
+    pub class_prune_hint: Option<String>,
+
     /// Pushed-down scan filters for Iceberg file pruning, resolved at execution
     /// from FILTER comparisons on this pattern's object variables. Conservative:
     /// the in-engine FILTER still runs, so these only skip data files.
@@ -708,6 +720,7 @@ impl R2rmlPattern {
             triples_map_iri: None,
             predicate_filter: None,
             class_filter: None,
+            class_prune_hint: None,
             star_bindings: Vec::new(),
             star_constraints: Vec::new(),
             scan_filters: Vec::new(),
@@ -735,6 +748,7 @@ impl R2rmlPattern {
             triples_map_iri: None,
             predicate_filter: None,
             class_filter: None,
+            class_prune_hint: None,
             star_bindings: Vec::new(),
             star_constraints: Vec::new(),
             scan_filters: Vec::new(),

@@ -628,6 +628,19 @@ fn fuse_class_if_safe(
         return;
     };
     if !mapping.is_some_and(|m| class_fusion_is_safe(m, &class, base_pred)) {
+        // PR-3 fix (b'): full class fusion is unsafe (the class lives in a
+        // different TriplesMap than the base predicate — the vertically
+        // partitioned shape). We must NOT fuse (that would drop the split TM and
+        // lose bindings). But if the class-declaring maps are subject-template
+        // DISJOINT from every other map (`wildcard_class_fusion_is_safe`, the same
+        // predicate the wildcard-crawl fuse reuses), we can still prune the star's
+        // resolution fan-out to class-declaring maps as a RESOLUTION-ONLY hint:
+        // the class stays its own scan joined on the subject, and disjointness
+        // guarantees a pruned map's subjects could never survive that join. Leaves
+        // `class_groups` untouched, so the standalone class scan is still emitted.
+        if mapping.is_some_and(|m| wildcard_class_fusion_is_safe(m, &class)) {
+            base.class_prune_hint = Some(class);
+        }
         return;
     }
     class_groups.remove(idx);
@@ -1293,6 +1306,61 @@ mod tests {
         assert!(class_fusion_is_safe(&mapping, CLASS, PRED));
     }
 
+    // PR-3 fix (b'): a star base pattern for `subject`, with `pred` as its base.
+    fn star_base(subject: VarId, pred: &str) -> R2rmlPattern {
+        let mut base = R2rmlPattern::new("gs", subject, Some(VarId(99)));
+        base.predicate_filter = Some(pred.to_string());
+        base
+    }
+
+    // PR-3 fix (b'): full class fusion refused (a name-map lacks the class), but the
+    // class-declaring map is subject-template DISJOINT from the other name-map, so a
+    // resolution-only `class_prune_hint` is set (prunes the fan-out; class stays its
+    // own scan). This is the q001 shared-member shape fix (a) alone can't prune.
+    #[test]
+    fn class_prune_hint_set_when_disjoint_but_not_fusable() {
+        let store = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "store_name"));
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom(PRED, "full_name"));
+        let mapping = CompiledR2rmlMapping::new(vec![store, customer]);
+        let subject = VarId(1);
+        let mut base = star_base(subject, PRED);
+        let mut class_groups = vec![(subject, vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)])];
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        // Not fused for materialization (class stays separate), but prune hint set.
+        assert_eq!(base.class_filter, None);
+        assert_eq!(base.class_prune_hint.as_deref(), Some(CLASS));
+        assert_eq!(class_groups.len(), 1, "class scan stays standalone");
+    }
+
+    // PR-3 fix (b') soundness — the vertical-partition COUNTEREXAMPLE. Class in one
+    // TM, the star's predicate in another, SAME subject template ⇒ overlapping
+    // prefixes ⇒ pruning would drop rows the class-scan join keeps. `class_prune_hint`
+    // must stay unset so the base map is not pruned.
+    #[test]
+    fn class_prune_hint_refused_under_vertical_partition() {
+        let store_attrs = TriplesMap::new("#StoreAttrs", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_predicate_object(pom(PRED, "store_name"));
+        let store_class = TriplesMap::new("#StoreClass", "dim_store_class")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class(CLASS);
+        let mapping = CompiledR2rmlMapping::new(vec![store_attrs, store_class]);
+        let subject = VarId(1);
+        let mut base = star_base(subject, PRED);
+        let mut class_groups = vec![(subject, vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)])];
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        assert_eq!(base.class_filter, None, "must not fuse");
+        assert_eq!(
+            base.class_prune_hint, None,
+            "overlapping subject templates ⇒ pruning unsound ⇒ hint refused"
+        );
+    }
+
     #[test]
     fn class_fusion_unsafe_when_split_across_triples_maps() {
         // Vertically partitioned: TM_A holds the class, TM_B holds the predicate,
@@ -1611,6 +1679,73 @@ mod tests {
             type_var_scans, 2,
             "two type-vars must NOT be merged (would drop a binding): {pats:?}"
         );
+    }
+
+    /// PR-3 fix (a) LOAD-BEARING INVARIANT: a same-subject star fuses only
+    /// REQUIRED BGP members. An OPTIONAL member recurses to its own scope
+    /// (`Pattern::Optional`, rewrite.rs:150) and must NEVER enter `star_bindings`,
+    /// because fix (a) prunes any TriplesMap lacking a star predicate — if an
+    /// OPTIONAL predicate were fused in, maps that legitimately lack it would be
+    /// dropped, silently losing rows. This test trips loudly if a future
+    /// optional-star-member feature ever violates that assumption.
+    #[test]
+    fn optional_star_member_is_not_fused_into_star() {
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let tm = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_predicate_object(pom("http://ex/name", "store_name"))
+            .with_predicate_object(pom("http://ex/storeType", "store_type"))
+            .with_predicate_object(pom("http://ex/channel", "channel"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        // Required star: name + storeType. OPTIONAL: channel.
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri("http://ex/name".into()),
+                Term::Var(VarId(1)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri("http://ex/storeType".into()),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Optional(vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri("http://ex/channel".into()),
+                Term::Var(VarId(3)),
+            ))]),
+        ];
+        let result =
+            rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, Some(&mapping), false, false);
+        // The OPTIONAL stays a separate scope.
+        assert!(
+            result
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Optional(_))),
+            "OPTIONAL must remain a separate scope: {:?}",
+            result.patterns
+        );
+        // A required star formed (name+storeType) but the OPTIONAL channel is NOT
+        // in any star's bindings/constraints/base.
+        for p in &result.patterns {
+            if let Pattern::R2rml(rp) = p {
+                let touches_channel = rp.predicate_filter.as_deref() == Some("http://ex/channel")
+                    || rp
+                        .star_bindings
+                        .iter()
+                        .any(|(pred, _)| pred == "http://ex/channel")
+                    || rp
+                        .star_constraints
+                        .iter()
+                        .any(|(pred, _)| pred == "http://ex/channel");
+                assert!(
+                    !touches_channel,
+                    "OPTIONAL member must not be fused into a star: {rp:?}"
+                );
+            }
+        }
     }
 
     /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML

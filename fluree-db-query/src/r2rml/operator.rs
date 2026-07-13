@@ -206,6 +206,56 @@ struct ScanProgress {
     window_rows: usize,
 }
 
+/// Whether PR-3 star TriplesMap-set pruning is enabled. Read once from
+/// `FLUREE_R2RML_STAR_TM_PRUNE` (only `0`/`false`/`off`/`no` disable it, matching
+/// the other R2RML switches). When on, a same-subject star resolves only
+/// TriplesMaps that supply EVERY star predicate — a provably-empty prune of the
+/// shared-base-predicate fan-out (a map missing a member produces no complete
+/// star row). Off ⇒ today's base-predicate-only resolution.
+fn star_tm_prune_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_STAR_TM_PRUNE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// PR-3 star resolution prune: whether a TriplesMap can contribute to a star,
+/// combining fix (a) and fix (b'). Both are provably-empty prunes.
+///
+/// - **(a)** every predicate in `star_required_preds` must have a PredicateObjectMap
+///   here — a same-subject star needs every member bound, and a map missing one
+///   produces no complete star row (materialization is per-map, no cross-map join
+///   for members).
+/// - **(b')** when `prune_class` is set (only when template-disjoint; see
+///   [`R2rmlPattern::class_prune_hint`]), the map must declare that class.
+///
+/// Empty `star_required_preds` + `None` `prune_class` (switch off / not a star) ⇒
+/// always `true`, i.e. today's behavior.
+fn tm_passes_star_prune(
+    tm: &TriplesMap,
+    star_required_preds: &[String],
+    prune_class: Option<&str>,
+) -> bool {
+    let has_all_preds = star_required_preds.iter().all(|p| {
+        tm.predicate_object_maps
+            .iter()
+            .any(|pom| pom.predicate_map.as_constant() == Some(p.as_str()))
+    });
+    if !has_all_preds {
+        return false;
+    }
+    if let Some(class) = prune_class {
+        if !tm.classes().iter().any(|c| c.as_str() == class) {
+            return false;
+        }
+    }
+    true
+}
+
 /// R2RML scan operator for `Pattern::R2rml`.
 ///
 /// Scans an Iceberg table through an R2RML mapping and produces RDF term bindings.
@@ -579,6 +629,28 @@ impl R2rmlScanOperator {
             .clone();
         let child_schema = self.child.schema().to_vec();
 
+        // PR-3 fix (a): a same-subject star requires every member predicate bound,
+        // so only TriplesMaps supplying ALL star predicates can contribute — prune
+        // the shared-base-predicate fan-out (a map missing a member produces no
+        // complete star row, so this is a provably-empty prune, result-preserving).
+        // Computed before the resolution closure, which borrows `self.pattern`.
+        let star_prune_on = star_tm_prune_enabled();
+        let star_required_preds: Vec<String> = if star_prune_on && self.has_star_members() {
+            self.pattern_predicates()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // PR-3 fix (b'): resolution-only class prune (template-disjoint; see
+        // `R2rmlPattern::class_prune_hint`). Gated by the same switch as fix (a).
+        let prune_class: Option<String> = if star_prune_on {
+            self.pattern.class_prune_hint.clone()
+        } else {
+            None
+        };
+
         // Resolve the TriplesMap(s) for this pattern (same for every child row).
         let triples_maps: Vec<&TriplesMap> = if let Some(ref tm_iri) = self.pattern.triples_map_iri
         {
@@ -607,6 +679,12 @@ impl R2rmlScanOperator {
                         if !has_pred {
                             return false;
                         }
+                    }
+                    // PR-3 fix (a) all-members-intersection + fix (b') class prune
+                    // (both provably-empty; see `tm_passes_star_prune`). Inputs are
+                    // empty/None when the switch is off or this is not a star.
+                    if !tm_passes_star_prune(tm, &star_required_preds, prune_class.as_deref()) {
+                        return false;
                     }
                     // subject_constant prune: a bound subject IRI can only come
                     // from a TriplesMap whose template subject can PRODUCE it, and
@@ -2073,7 +2151,63 @@ impl Operator for R2rmlScanOperator {
 mod tests {
     use super::*;
     use crate::r2rml::{ObjectConstant, ScanValue};
+    use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
     use fluree_db_r2rml::materialize::RdfTerm;
+
+    fn pom(pred: &str, col: &str) -> PredicateObjectMap {
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant(pred),
+            object_map: ObjectMap::column(col),
+        }
+    }
+
+    // PR-3 fix (a): a star resolves only TriplesMaps that supply EVERY star
+    // predicate. A map with a distinguishing member is kept; one missing it is
+    // pruned (case a); a map legitimately supplying all members is kept (case c).
+    #[test]
+    fn star_prune_requires_all_member_predicates() {
+        let store = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_predicate_object(pom("http://ex/name", "store_name"))
+            .with_predicate_object(pom("http://ex/channel", "channel"));
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom("http://ex/name", "full_name"));
+        let required = vec![
+            "http://ex/name".to_string(),
+            "http://ex/channel".to_string(),
+        ];
+        // case (c): DIM_STORE supplies name AND channel -> kept.
+        assert!(tm_passes_star_prune(&store, &required, None));
+        // case (a): DIM_CUSTOMER has name but not channel -> pruned (dead work).
+        assert!(!tm_passes_star_prune(&customer, &required, None));
+    }
+
+    // PR-3 fix (b'): with a (template-disjoint) class prune, only class-declaring
+    // maps survive resolution; the class's own scan enforces membership.
+    #[test]
+    fn star_prune_class_keeps_only_declaring_maps() {
+        let store = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(pom("http://ex/name", "store_name"));
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom("http://ex/name", "full_name"));
+        let name = vec!["http://ex/name".to_string()];
+        assert!(tm_passes_star_prune(&store, &name, Some("http://ex/Store")));
+        assert!(!tm_passes_star_prune(&customer, &name, Some("http://ex/Store")));
+    }
+
+    // PR-3 fix (d): switch off (empty inputs) reproduces today's fan-out — every
+    // map passes the prune regardless of its predicates or class.
+    #[test]
+    fn star_prune_noop_when_inputs_empty() {
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom("http://ex/name", "full_name"));
+        assert!(tm_passes_star_prune(&customer, &[], None));
+    }
 
     #[test]
     fn build_ref_shortcut_accepts_only_child_templatable_single_col() {
