@@ -64,6 +64,8 @@ The master bottleneck. Split into three tracks; ship 2a first because it is meas
 
 **DoD:** the per-file composition is **measured and documented** · fact scans land under the corpus timeout · parity hashes green on all fact queries · native/BSBM budgets unregressed · kill-switch off = old timing.
 
+**PR-2 residual — broad-projection mid-size files still pay footer-first.** Lever A's whole-fetch tier stops at `WHOLE_FILE_MAX_BYTES` (32MB): a 32–64MB file with no local cache copy and a broad (≥50%-share) projection is still fetched whole by `admit_whole_file`'s `broad` branch, but only *after* the 2-RT footer read — broadness is computed from footer metadata (projected column-chunk bytes), so covering this tier means speculatively fetching whole before the footer. Deliberately left conservative in PR-2; the leftover win is bounded to that tier.
+
 ---
 
 ## PR-3 — Typed-dim-star over-scan (F8) *(class: surgical → structural)*
