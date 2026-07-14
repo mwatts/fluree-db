@@ -1608,8 +1608,14 @@ impl FusedR2rmlAggregateOperator {
                 return Ok(None);
             };
             hops.push((
-                rom.child_columns().iter().map(|s| (*s).to_string()).collect(),
-                rom.parent_columns().iter().map(|s| (*s).to_string()).collect(),
+                rom.child_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                rom.parent_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
                 parent_tm,
             ));
             src_tm = parent_tm;
@@ -1698,6 +1704,23 @@ impl FusedR2rmlAggregateOperator {
             Some(ctx.to_t)
         };
         let gs = &fact_p.graph_source_id;
+
+        // PR-8 slice 1: warm the whole chain's catalog contexts CONCURRENTLY
+        // before the serial dim + fact scans below, so the per-table `loadTable`
+        // GETs overlap instead of summing (measured cold: q008's 3 GETs ~4.99s
+        // serial). Best-effort (see `prefetch_tables`); the dim scans here and the
+        // fact scan in `next_batch` share `self.session`, so one warm covers every
+        // scan in this operator.
+        if super::parallel_catalog_resolution_enabled() {
+            let mut chain_tables: Vec<String> = Vec::with_capacity(hops.len() + 1);
+            chain_tables.push(fact_table.clone());
+            for (_, _, dim_tm) in &hops {
+                if let Some(t) = dim_tm.table_name() {
+                    chain_tables.push(t.to_string());
+                }
+            }
+            table_provider.prefetch_tables(gs, &chain_tables).await;
+        }
 
         // Build the composed group-key resolver, scanning each small dim ONCE from
         // the terminal dim back toward the fact. A dim row is kept only when its
@@ -2021,7 +2044,10 @@ mod tests {
         let (chain, jvs) =
             FusedR2rmlAggregateOperator::order_chain(&[&dim2, &fact, &dim1]).expect("linear chain");
         assert_eq!(
-            chain.iter().map(|p| p.subject_var.unwrap()).collect::<Vec<_>>(),
+            chain
+                .iter()
+                .map(|p| p.subject_var.unwrap())
+                .collect::<Vec<_>>(),
             vec![VarId(0), VarId(1), VarId(2)]
         );
         assert_eq!(jvs, vec![VarId(1), VarId(2)], "one join var per hop");
@@ -2033,7 +2059,8 @@ mod tests {
 
         // Branch: the fact ref-joins to TWO dims → declines (not a linear chain).
         let mut branch_fact = R2rmlPattern::new("gs", VarId(0), None);
-        branch_fact.star_bindings = vec![("p1".to_string(), VarId(1)), ("p2".to_string(), VarId(2))];
+        branch_fact.star_bindings =
+            vec![("p1".to_string(), VarId(1)), ("p2".to_string(), VarId(2))];
         let d1 = R2rmlPattern::new("gs", VarId(1), None);
         let d2 = R2rmlPattern::new("gs", VarId(2), None);
         assert!(FusedR2rmlAggregateOperator::order_chain(&[&branch_fact, &d1, &d2]).is_none());
