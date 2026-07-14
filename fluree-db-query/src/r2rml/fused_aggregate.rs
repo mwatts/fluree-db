@@ -1004,6 +1004,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 &resolved.table_name,
                 &resolved.projection,
                 &[],
+                None,
                 as_of_t,
             )
             .await?;
@@ -1743,7 +1744,7 @@ impl FusedR2rmlAggregateOperator {
             std::collections::HashMap::new();
         {
             let mut s = table_provider
-                .scan_table(gs, &terminal_table, &terminal_proj, &[], as_of_t)
+                .scan_table(gs, &terminal_table, &terminal_proj, &[], None, as_of_t)
                 .await?;
             while let Some(batch) = s.next().await {
                 let batch = batch?;
@@ -1790,7 +1791,7 @@ impl FusedR2rmlAggregateOperator {
             let mut next_map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
             let mut s = table_provider
-                .scan_table(gs, &inter_table, &proj, &[], as_of_t)
+                .scan_table(gs, &inter_table, &proj, &[], None, as_of_t)
                 .await?;
             while let Some(batch) = s.next().await {
                 let batch = batch?;
