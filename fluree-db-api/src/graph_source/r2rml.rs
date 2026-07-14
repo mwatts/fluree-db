@@ -39,12 +39,16 @@ use tracing::{debug, info, warn, Instrument};
 /// `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`), so more
 /// in-flight reads is close to pure win on the thousands-of-tiny-files fact-table
 /// shape; the sweep showed wall still improving to c=32 with only mild per-file
-/// contention creep past ~c=16, hence 32 as the ceiling. The default stays
-/// bounded by `available_parallelism`, so per-host resident memory
-/// (`O(concurrency)` file decodes) never exceeds today's core-bound footprint,
-/// and raising the ceiling never lowers the previous default on any core count
-/// (`clamp(1, 32) >= clamp(1, 8)` pointwise). Env override remains the escape
-/// hatch to reach the ceiling on a low-core host.
+/// contention creep past ~c=16, hence 32 as the ceiling. Raising the ceiling
+/// never lowers the previous default on any core count (`clamp(1, 32) >=
+/// clamp(1, 8)` pointwise; a 2-core host still runs 2), but the memory trade is
+/// real: in-flight buffer bytes are `O(concurrency)` file decodes (each <=32MB
+/// whole-file / <=64MB sparse-buffer), and the default now scales with cores up
+/// to 32 where it was previously capped at 8 regardless of cores — up to 4x the
+/// prior in-flight bytes on a >=32-core host. The sweep data and the
+/// tiny-file fact-table shape justify the trade; the env override is the
+/// pressure valve in both directions — raise it to reach the ceiling on a
+/// low-core host, lower it on a memory-tight one.
 fn iceberg_scan_concurrency(num_files: usize) -> usize {
     if let Some(n) = std::env::var("FLUREE_ICEBERG_SCAN_CONCURRENCY")
         .ok()

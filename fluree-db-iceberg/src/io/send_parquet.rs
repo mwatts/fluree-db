@@ -16,7 +16,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -170,13 +170,19 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
 /// the policy fetches whole — parses its Parquet footer from those in-memory
 /// bytes instead of issuing a separate footer round-trip (measured ~190ms of two
 /// serial S3 range GETs per file, see `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`).
-/// Off (`"0"`/`"false"`, trimmed + case-insensitive per the R2RML switch
-/// convention) restores the byte-identical footer-first path.
+/// Off (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the R2RML switch
+/// family) restores the byte-identical footer-first path. Read once per process
+/// (`OnceLock`, the family idiom — e.g. `catalog_session::cache_enabled` in
+/// `fluree-db-api`): set it at startup, not per query.
 fn footer_from_cache_enabled() -> bool {
-    match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
         Err(_) => true,
-    }
+    })
 }
 
 /// Parse Parquet metadata from a whole-file byte buffer already resident in
