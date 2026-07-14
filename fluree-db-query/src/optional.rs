@@ -1433,20 +1433,14 @@ fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
     }
 }
 
-/// PR-4b kill switch: `FLUREE_R2RML_BATCHED_OPTIONAL` (default ON; `0`/`false`/
-/// `off` disable it). Off ⇒ R2RML inners are never admitted to the batched
-/// path, so a correlated OPTIONAL over R2RML falls to the per-row rebuild — the
-/// exact pre-PR-4b behavior.
+/// PR-4b kill switch: `FLUREE_R2RML_BATCHED_OPTIONAL` (default ON; family falsy
+/// spellings, [`crate::r2rml::env_switch_enabled`]). Off ⇒ R2RML inners are
+/// never admitted to the batched path, so a correlated OPTIONAL over R2RML
+/// falls to the per-row rebuild — the exact pre-PR-4b behavior.
 fn batched_optional_r2rml_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_BATCHED_OPTIONAL") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_R2RML_BATCHED_OPTIONAL"))
 }
 
 /// Whether an R2RML pattern is a subject-driven single-object LEAF scan — the
@@ -1460,6 +1454,15 @@ fn batched_optional_r2rml_enabled() -> bool {
 /// - `type_var` — multi-class cartesian;
 /// - a wildcard `predicate_var` and bound/constant subjects — not subject-driven
 ///   restrictions.
+///
+/// `consumed_filter`/`scan_filters` need NO exclusion: filter fusion only folds
+/// a FILTER whose operands are all produced by this scan
+/// (`rewrite.rs::consume_scan_local_filters` requires vars ⊆ `produced_vars`),
+/// so a fused filter reads only values carried by the produced row itself and
+/// evaluates identically whether the scan ran once (batched) or per row — no
+/// hidden correlation channel. If filter fusion ever loosens that operand rule,
+/// THIS admission is where it breaks.
+///
 /// (An object-only correlation is still sound via the seed-bound fallback — the
 /// var is simply seeded rather than subject-probed — so it needs no gate here.)
 fn r2rml_leaf_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool {
@@ -2450,8 +2453,26 @@ mod tests {
             .expect("build_batch")
             .expect("batched path admitted");
 
+        // One produced row as a schema-order-independent VALUE key over the
+        // vars the OPTIONAL side actually CONTRIBUTES. The correlation var is
+        // excluded: per-row output carries it (the seed binds it, to the
+        // required row's value by construction) while batched partition batches
+        // don't re-project it — its association is pinned by the partition row
+        // index instead, which the multiset compare keys on. A batched row
+        // partitioned to the WRONG required row therefore still fails.
+        let required_vars: std::collections::HashSet<VarId> =
+            required_schema.iter().copied().collect();
+        let row_repr = |b: &Batch, r: usize| -> Vec<String> {
+            let mut kv: Vec<String> = (0..b.schema().len())
+                .filter(|c| !required_vars.contains(&b.schema()[*c]))
+                .map(|c| format!("{:?}={:?}", b.schema()[c], b.get_by_col(r, c)))
+                .collect();
+            kv.sort();
+            kv
+        };
+
         // ---- per-row path: build + drain the inner operator for each row.
-        let per_row: Vec<Vec<Vec<Binding>>> = (0..required.len())
+        let per_row: Vec<Vec<Vec<String>>> = (0..required.len())
             .map(|row| {
                 let op = futures::executor::block_on(async {
                     let mut op = builder.build(&required, row, &ctx)?.expect("per-row op");
@@ -2459,11 +2480,7 @@ mod tests {
                     let mut rows = Vec::new();
                     while let Some(b) = op.next_batch(&ctx).await? {
                         for r in 0..b.len() {
-                            rows.push(
-                                (0..b.schema().len())
-                                    .map(|c| b.get_by_col(r, c).clone())
-                                    .collect::<Vec<_>>(),
-                            );
+                            rows.push(row_repr(&b, r));
                         }
                     }
                     op.close();
@@ -2491,6 +2508,20 @@ mod tests {
                 batched_rows,
                 per_row[*row].len(),
                 "batched != per-row optional-row count for required row {row}"
+            );
+            // Same ANSWER, not just same shape: the (row, binding) multisets
+            // must agree, so a batched path that bound ?s to the WRONG supplier
+            // IRI with the right cardinality still fails.
+            let mut batched_vals: Vec<Vec<String>> = batches
+                .iter()
+                .flat_map(|b| (0..b.len()).map(move |r| row_repr(b, r)))
+                .collect();
+            batched_vals.sort();
+            let mut per_row_vals = per_row[*row].clone();
+            per_row_vals.sort();
+            assert_eq!(
+                batched_vals, per_row_vals,
+                "batched != per-row optional binding VALUES for required row {row}"
             );
         }
         // Rows with no batched entry must be per-row misses too.

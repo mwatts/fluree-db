@@ -54,7 +54,7 @@ This is the first native-vs-virtual parity comparison on SF01. Each finding belo
 
 ## F2 — Subquery scope silently returns zero rows *(correctness-silent-empty)*
 
-**Query.** q051 `… { SELECT ?s (COUNT(?o) AS ?cnt) … } { SELECT (AVG(?c2) …) } FILTER(?cnt > ?avg)` (BI-24, stores above average order count).
+**Query.** q051 `… { SELECT ?s (COUNT(?o) AS ?cnt) … } { SELECT (AVG(?c2) …) } FILTER(?cnt > ?avg)` (BI-24, stores above average order count). **Also q013** (`products_above_avg_units`, BI-08 — same subquery shape): masked at WP6 time by its own DNF (the query never completed, so the silent-empty was unobservable) and surfaced only when the perf stack made it runnable; now `expected_status: {native: ok, virtual: error}` alongside q034/q051 (`09-stacked-rebaseline.md` §4).
 
 **Evidence.** native **247 rows** / 474 ms; virtual **0 rows** / 0 ms, `status=ok`, hashes NE, **no `r2rml.scan_table` span**. Same signature as F1: instant, scanless, silently empty.
 
@@ -180,7 +180,7 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | Finding | Class | Query | Root | Fix owner |
 |---|---|---|---|---|
 | **F1** | correctness-silent-empty | q034 | `PropertyPath` (transitive) not converted; sub-scope escapes GRAPH-error guard | engine (rewrite/graph) |
-| **F2** | correctness-silent-empty | q051 | `Subquery` not converted; same guard gap | engine (same fix as F1) |
+| **F2** | correctness-silent-empty | q051, q013 (DNF-masked until the perf stack) | `Subquery` not converted; same guard gap | engine (same fix as F1) |
 | **F3** | correctness-divergence | q042 | wildcard omits `rr:class` `rdf:type` triple | engine (R2RML materialize) |
 | **F4** | corpus-defect (nondeterministic-selection) | q005, q049 | untie-broken top-k over rating ties (q005); unordered `LIMIT` over 300K (q049) — **engine exonerated** | corpus (determinism amendment §5) |
 | **F5** | perf-dnf | q050, q025, q040, q053 | H3 correlated rebuild (q050 377 scans), H1/H6/H8 | roadmap (WP8) |
