@@ -1441,7 +1441,10 @@ fn batched_optional_r2rml_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_BATCHED_OPTIONAL") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         Err(_) => true,
     })
 }
@@ -2263,7 +2266,9 @@ mod tests {
             "subject-driven scalar/ref leaf is admitted"
         );
         // Full gate honors the shape (FLUREE_R2RML_BATCHED_OPTIONAL defaults on).
-        assert!(inner_pattern_is_hash_join_safe(&Pattern::R2rml(leaf.clone())));
+        assert!(inner_pattern_is_hash_join_safe(&Pattern::R2rml(
+            leaf.clone()
+        )));
 
         let mut star = leaf.clone();
         star.star_bindings = vec![("http://ex/p2".to_string(), VarId(2))];
@@ -2274,7 +2279,10 @@ mod tests {
             "http://ex/p3".to_string(),
             crate::r2rml::ObjectConstant::Iri("http://ex/c".to_string()),
         )];
-        assert!(!r2rml_leaf_is_hash_join_safe(&star_c), "star-constraint excluded");
+        assert!(
+            !r2rml_leaf_is_hash_join_safe(&star_c),
+            "star-constraint excluded"
+        );
 
         let mut tv = leaf.clone();
         tv.type_var = Some(VarId(3));
@@ -2282,16 +2290,25 @@ mod tests {
 
         let mut wild = leaf.clone();
         wild.predicate_var = Some(VarId(4));
-        assert!(!r2rml_leaf_is_hash_join_safe(&wild), "wildcard predicate excluded");
+        assert!(
+            !r2rml_leaf_is_hash_join_safe(&wild),
+            "wildcard predicate excluded"
+        );
 
         let mut bound = leaf.clone();
         bound.subject_var = None;
         bound.subject_constant = Some("http://ex/s/1".to_string());
-        assert!(!r2rml_leaf_is_hash_join_safe(&bound), "bound subject excluded");
+        assert!(
+            !r2rml_leaf_is_hash_join_safe(&bound),
+            "bound subject excluded"
+        );
 
         let mut no_obj = leaf.clone();
         no_obj.object_var = None;
-        assert!(!r2rml_leaf_is_hash_join_safe(&no_obj), "no object var excluded");
+        assert!(
+            !r2rml_leaf_is_hash_join_safe(&no_obj),
+            "no object var excluded"
+        );
     }
 
     // PR-4b (B): the hermetic differential — the batched hash-left-join and the
@@ -2322,7 +2339,9 @@ mod tests {
                 .with_predicate_object(PredicateObjectMap {
                     predicate_map: PredicateMap::constant("http://ex/supplier"),
                     object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
-                        "#Supplier", "SUP_FK", "SID",
+                        "#Supplier",
+                        "SUP_FK",
+                        "SID",
                     )),
                 }),
             TriplesMap::new("#Supplier", "suppliers")
@@ -2435,9 +2454,7 @@ mod tests {
         let per_row: Vec<Vec<Vec<Binding>>> = (0..required.len())
             .map(|row| {
                 let op = futures::executor::block_on(async {
-                    let mut op = builder
-                        .build(&required, row, &ctx)?
-                        .expect("per-row op");
+                    let mut op = builder.build(&required, row, &ctx)?.expect("per-row op");
                     op.open(&ctx).await?;
                     let mut rows = Vec::new();
                     while let Some(b) = op.next_batch(&ctx).await? {
@@ -2461,7 +2478,12 @@ mod tests {
         // Assert the per-row path produced exactly one binding for row 0 and none
         // for row 1, and that the batched path agrees row-for-row.
         assert_eq!(per_row[0].len(), 1, "matched FK binds ?s: {:?}", per_row[0]);
-        assert_eq!(per_row[1].len(), 0, "dangling FK is a miss: {:?}", per_row[1]);
+        assert_eq!(
+            per_row[1].len(),
+            0,
+            "dangling FK is a miss: {:?}",
+            per_row[1]
+        );
 
         for (row, batches) in &batched {
             let batched_rows: usize = batches.iter().map(|b| b.len()).sum();
