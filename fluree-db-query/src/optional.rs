@@ -2486,7 +2486,7 @@ mod tests {
         );
 
         for (row, batches) in &batched {
-            let batched_rows: usize = batches.iter().map(|b| b.len()).sum();
+            let batched_rows: usize = batches.iter().map(Batch::len).sum();
             assert_eq!(
                 batched_rows,
                 per_row[*row].len(),
