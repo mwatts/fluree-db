@@ -1010,8 +1010,11 @@ impl R2rmlScanOperator {
                         .await?;
                     let parent_batches = collect_stream(parent_stream).await?;
 
-                    let lookup =
-                        Arc::new(build_parent_lookup(parent_tm, &parent_join_cols, parent_batches)?);
+                    let lookup = Arc::new(build_parent_lookup(
+                        parent_tm,
+                        &parent_join_cols,
+                        parent_batches,
+                    )?);
                     // Memoize across child batches unless the lookup exceeds one
                     // materialize window — a fact-as-parent (q015) is used for this
                     // batch but NOT retained, falling through to today's per-batch
@@ -2868,10 +2871,14 @@ mod tests {
             .with_subject_template("http://ex/order/{ORDER_KEY}")
             .with_predicate_object(PredicateObjectMap {
                 predicate_map: PredicateMap::constant("edw:customer"),
-                object_map: ObjectMap::RefObjectMap(RefObjectMap::new("#Customer", "CUST_ID", "ID")),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                    "#Customer",
+                    "CUST_ID",
+                    "ID",
+                )),
             });
-        let customers =
-            TriplesMap::new("#Customer", "customers").with_subject_template("http://ex/customer/{ID}");
+        let customers = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://ex/customer/{ID}");
         let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]));
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let vars = VarRegistry::new();
