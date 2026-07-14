@@ -183,9 +183,9 @@ struct TmStream {
     stream: ColumnBatchStream,
     exhausted: bool,
     /// Parent (dimension) lookups for this TriplesMap's RefObjectMap POMs, keyed
-    /// by `(parent_table, join_cols)`. `Arc`-shared so a lookup memoized on the
-    /// operator's `parent_lookup_cache` (PR-4) is reused across child batches
-    /// without a re-scan or a clone.
+    /// by `(parent TriplesMap IRI, join_cols)` ([`LookupCacheKey`]). `Arc`-shared
+    /// so a lookup memoized on the operator's `parent_lookup_cache` (PR-4) is
+    /// reused across child batches without a re-scan or a clone.
     parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>>,
     /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
     /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
@@ -284,13 +284,19 @@ pub struct R2rmlScanOperator {
     scan_cache: HashMap<(String, Vec<String>), Arc<Vec<ColumnBatch>>>,
     /// PR-4: cross-child-batch parent-lookup memoization. A correlated join
     /// (OPTIONAL / ref) re-enters `build_progress` per child batch; without this
-    /// the (dimension) parent tables are re-scanned every batch (q050: DIM_SUPPLIER
-    /// ×153). Keyed like `parent_lookups` (`(parent_table, join_cols)`), which
-    /// deterministically fixes the parent projection at a stable `as_of_t`, so a
-    /// memoized lookup is valid for every later batch. Bounded: a lookup larger
-    /// than one materialize window is NOT retained (a fact-as-parent falls through
-    /// to today's per-batch build) so the cache can't OOM. Gated by
-    /// `FLUREE_R2RML_PARENT_MEMO`.
+    /// the (dimension) parent tables are re-scanned every batch (q008: 123+
+    /// parent scans, DNF → 8 scans with the memo). Keyed like `parent_lookups`:
+    /// `(parent TriplesMap IRI, join_cols)` — the TM IRI, NOT the parent table
+    /// name. Two parent TMs over one table can render different subject IRIs
+    /// from the same join key (different subject templates), so a table-name
+    /// key would replay the wrong lookup; don't "simplify" the key. The key
+    /// deterministically fixes the parent projection at a stable `as_of_t`, so
+    /// a memoized lookup is valid for every later batch. Bounded: a lookup
+    /// larger than one materialize window is NOT retained (a fact-as-parent
+    /// falls through to today's per-batch build) so the cache can't OOM. Gated
+    /// by `FLUREE_R2RML_PARENT_MEMO`. (q050 is NOT fixed by this: its
+    /// correlated OPTIONAL rebuilds the whole operator per row, resetting any
+    /// operator-scoped cache — that's PR-4b.)
     parent_lookup_cache: HashMap<LookupCacheKey, Arc<ParentLookup>>,
     /// Whether cross-batch parent memoization is on for this operator. Read once
     /// from `parent_memo_enabled()` at construction (per-operator, not a global
@@ -932,7 +938,7 @@ impl R2rmlScanOperator {
                     }
 
                     // PR-4: reuse a parent lookup memoized in an earlier child batch
-                    // (skips the parent-table re-scan — the q050 fix). The key
+                    // (skips the parent-table re-scan — the q008 fix). The key
                     // `(parent_tm, join_cols)` fixes the projection and the lookup
                     // content at a stable `as_of_t`, so a prior batch's lookup is
                     // valid here. The ref-shortcut path below never populates the
@@ -1018,7 +1024,11 @@ impl R2rmlScanOperator {
                     // Memoize across child batches unless the lookup exceeds one
                     // materialize window — a fact-as-parent (q015) is used for this
                     // batch but NOT retained, falling through to today's per-batch
-                    // rebuild so the cache can't grow unbounded.
+                    // rebuild so the cache can't grow unbounded. The window is
+                    // env-tunable (`FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS`), so
+                    // raising it also raises what each memo key may retain —
+                    // intentional (both bound the same working-set notion), but a
+                    // window bump knowingly buys a bigger cache.
                     if parent_memo && lookup.len() <= materialize_window_rows() {
                         self.parent_lookup_cache
                             .insert(lookup_key.clone(), Arc::clone(&lookup));
@@ -1188,17 +1198,12 @@ fn scan_cache_enabled() -> bool {
 }
 
 /// Whether PR-4 cross-batch parent-lookup memoization is enabled. Read once from
-/// `FLUREE_R2RML_PARENT_MEMO` (only `0`/`false`/`off` disable it). Off ⇒ today's
-/// per-child-batch parent-lookup rebuild.
+/// `FLUREE_R2RML_PARENT_MEMO` (family falsy spellings,
+/// [`super::env_switch_enabled`]). Off ⇒ today's per-child-batch parent-lookup
+/// rebuild.
 fn parent_memo_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_PARENT_MEMO") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_PARENT_MEMO"))
 }
 
 /// Outcome of trying to fully collect an inner scan for caching.
@@ -2694,7 +2699,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -2783,7 +2788,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -2883,7 +2888,8 @@ mod tests {
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let vars = VarRegistry::new();
 
-        let parent_scans = |memo: bool| -> usize {
+        // Returns (parent "customers" scans, child "orders" scans).
+        let table_scans = |memo: bool| -> (usize, usize) {
             let provider = CountingProvider::default();
             {
                 let mut ctx = ExecutionContext::new(&snapshot, &vars);
@@ -2900,25 +2906,32 @@ mod tests {
                         .expect("build_progress");
                 }
             } // ctx (and its borrow of `provider`) dropped before reading the tally.
-            let n = provider
-                .scans
-                .lock()
-                .unwrap()
-                .get("customers")
-                .copied()
-                .unwrap_or(0);
-            n
+            let scans = provider.scans.lock().unwrap();
+            let count = |table: &str| scans.get(table).copied().unwrap_or(0);
+            (count("customers"), count("orders"))
         };
 
+        let (parent_on, child_on) = table_scans(true);
+        let (parent_off, child_off) = table_scans(false);
         assert_eq!(
-            parent_scans(true),
-            1,
+            parent_on, 1,
             "memo ON: DIM parent scanned exactly once across 5 child batches"
         );
         assert_eq!(
-            parent_scans(false),
-            5,
+            parent_off, 5,
             "memo OFF: DIM parent re-scanned every batch (today's fan-out)"
+        );
+        // The memo must change PARENT behavior only. The child ("orders") scan
+        // is already deduped across batches by the pre-existing `scan_cache`
+        // (unfiltered inner scans, `FLUREE_R2RML_SCAN_CACHE`), so it is 1 in
+        // BOTH regimes — the parent memo neither helps nor hurts the child path.
+        assert_eq!(
+            child_on, 1,
+            "memo ON: child scanned once total (scan_cache, not the parent memo)"
+        );
+        assert_eq!(
+            child_off, child_on,
+            "memo OFF: identical child scan count — the memo affects parents only"
         );
     }
 }
