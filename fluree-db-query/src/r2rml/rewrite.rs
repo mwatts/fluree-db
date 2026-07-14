@@ -248,6 +248,13 @@ pub fn rewrite_patterns_for_r2rml(
     // A same-subject `rdf:type` is fused into the base by setting its
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
+    //
+    // Fusing is unconditional, which assumes some single TriplesMap covers all
+    // members: required members split across template-sharing maps yield zero
+    // star rows (materialization is per-map — no cross-map member join), where
+    // a per-member plan would subject-join them. Recorded as F10 in
+    // `04-findings-register.md`; the fix is to refuse to fuse when no map
+    // covers every member.
     for (subject, members) in star_groups {
         // Split into object-var members (produce bindings) and constant-object
         // members (equality existence constraints fused into the same scan).
@@ -373,17 +380,12 @@ pub fn rewrite_patterns_for_r2rml(
 }
 
 /// Whether scan-local FILTER consumption is enabled. Read once from
-/// `FLUREE_R2RML_FILTER_CONSUMPTION` (only `0`/`false`/`off` disable it). The
-/// kill switch keeps the FILTER in the plan (no LIMIT flow) for A/B validation.
+/// `FLUREE_R2RML_FILTER_CONSUMPTION` (family falsy spellings,
+/// [`super::env_switch_enabled`]). The kill switch keeps the FILTER in the plan
+/// (no LIMIT flow) for A/B validation.
 fn filter_consumption_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_FILTER_CONSUMPTION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_FILTER_CONSUMPTION"))
 }
 
 /// Move scan-local top-level FILTERs into the single R2RML scan's
@@ -701,20 +703,16 @@ fn class_fusion_is_safe(
 }
 
 /// Whether wildcard→class fusion is enabled. Read once from
-/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (only `0`/`false`/`off`/`no` disable it).
+/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (family falsy spellings,
+/// [`super::env_switch_enabled`]; `fluree-db-api`'s `crawl::env_flag_enabled`
+/// parses this same variable and must keep the same spellings).
 /// The master crawl kill-switch (`crawl::crawl_expand_enabled`) is COUPLED to
 /// this: expand-on + fusion-off would route a browse through the UNFUSED crawl
 /// (a 16-table fan-out + shared-catalog 429 storm — worse than today's fast
 /// empty result), so disabling fusion also disables crawl expansion there.
 fn wildcard_class_fusion_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_CRAWL_CLASS_FUSION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_CRAWL_CLASS_FUSION"))
 }
 
 /// A standalone variable-predicate wildcard scan (`?s ?p ?o`) on `subject`:

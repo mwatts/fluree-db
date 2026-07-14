@@ -145,17 +145,12 @@ fn materialize_window_rows() -> usize {
 }
 
 /// Whether LIMIT early-termination (row-budget) pushdown into the scan is
-/// enabled. Read once from `FLUREE_R2RML_LIMIT_PUSHDOWN` (only `0`/`false`/`off`
-/// disable it); disabling restores full-window materialization under a LIMIT.
+/// enabled. Read once from `FLUREE_R2RML_LIMIT_PUSHDOWN` (family falsy
+/// spellings, [`super::env_switch_enabled`]); disabling restores full-window
+/// materialization under a LIMIT.
 fn limit_pushdown_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_LIMIT_PUSHDOWN") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_LIMIT_PUSHDOWN"))
 }
 
 /// How a window of produced rows is combined with the buffered child rows.
@@ -208,20 +203,14 @@ struct ScanProgress {
 }
 
 /// Whether PR-3 star TriplesMap-set pruning is enabled. Read once from
-/// `FLUREE_R2RML_STAR_TM_PRUNE` (only `0`/`false`/`off`/`no` disable it, matching
-/// the other R2RML switches). When on, a same-subject star resolves only
+/// `FLUREE_R2RML_STAR_TM_PRUNE` (family falsy spellings,
+/// [`super::env_switch_enabled`]). When on, a same-subject star resolves only
 /// TriplesMaps that supply EVERY star predicate — a provably-empty prune of the
 /// shared-base-predicate fan-out (a map missing a member produces no complete
 /// star row). Off ⇒ today's base-predicate-only resolution.
 fn star_tm_prune_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_STAR_TM_PRUNE") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_STAR_TM_PRUNE"))
 }
 
 /// PR-3 star resolution prune: whether a TriplesMap can contribute to a star,
@@ -230,7 +219,11 @@ fn star_tm_prune_enabled() -> bool {
 /// - **(a)** every predicate in `star_required_preds` must have a PredicateObjectMap
 ///   here — a same-subject star needs every member bound, and a map missing one
 ///   produces no complete star row (materialization is per-map, no cross-map join
-///   for members).
+///   for members). This prune preserves the pre-existing star-*formation* gap
+///   (F10 in `04-findings-register.md`): required members split across
+///   template-sharing maps already produce zero star rows, so pruning every map
+///   is result-identical; the future fix lives in the rewrite (refuse to fuse
+///   when no single map covers all members).
 /// - **(b')** when `prune_class` is set (only when template-disjoint; see
 ///   [`R2rmlPattern::class_prune_hint`]), the map must declare that class.
 ///
@@ -1133,17 +1126,12 @@ async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch
 }
 
 /// Whether the correlated inner-scan cache is enabled. Read once from
-/// `FLUREE_R2RML_SCAN_CACHE` (only `0`/`false`/`off` disable it); disabling
-/// restores the per-child-batch re-scan behavior.
+/// `FLUREE_R2RML_SCAN_CACHE` (family falsy spellings,
+/// [`super::env_switch_enabled`]); disabling restores the per-child-batch
+/// re-scan behavior.
 fn scan_cache_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_SCAN_CACHE") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_SCAN_CACHE"))
 }
 
 /// Outcome of trying to fully collect an inner scan for caching.

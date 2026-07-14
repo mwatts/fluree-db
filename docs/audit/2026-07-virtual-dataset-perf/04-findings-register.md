@@ -157,6 +157,18 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 ---
 
+## F10 — Split-member same-subject star yields zero rows under vertical partitioning *(correctness-silent-empty; PRE-EXISTING, recorded 2026-07-13 from the PR-3 review)*
+
+**Shape.** A same-subject star whose required members are split across TriplesMaps sharing a subject template — the data-data analog of PR-3's (b') vertical-partition counterexample (ROADMAP §PR-3): `TM_A` (subj `store:{k}`, carries `edw:name`) + `TM_B` (subj `store:{k}`, carries `edw:channel`); query `?s edw:name ?n ; edw:channel ?ch`. No corpus query exercises it (the SF01 emitter mapping is one-TriplesMap-per-table with no shared subject template across data TMs), so it is synthetic today — but hand-written multi-TM-per-subject mappings hit it directly.
+
+**Behavior.** Virtual returns **zero rows** as a silent success; native answers the same data via a subject join. Mechanism: the rewrite fuses same-subject members into one star **unconditionally** (`rewrite.rs` star loop) and materialization is per-map — no cross-map member join (`operator.rs` `tm_passes_star_prune` doc) — so when no single map supplies every member, no map produces a complete star row.
+
+**Pre-existing, and preserved (not caused) by PR-3.** Pre-PR-3, base-predicate resolution scanned every base-predicate-bearing map, but each map still lacked some member ⇒ zero star rows. PR-3's intersection prune (fix (a)) empties the resolution set instead ⇒ identically zero rows. The prune is provably result-preserving *given* this formation behavior; the gap lives in star **formation**, not resolution. (Independently re-derived by the PR-3 reviewer; recorded here so it is a registered residual rather than folklore.)
+
+**Fix owner (future, rewrite — not PR-3).** Refuse to fuse a star when no TriplesMap covers all members, falling back to per-member scans joined on subject (the always-correct pre-fusion path). Once formation refuses that shape, fix (a)'s "provably empty" argument holds unconditionally rather than relative to formation behavior.
+
+---
+
 ## Summary & routing
 
 | Finding | Class | Query | Root | Fix owner |
@@ -170,5 +182,6 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | **F7** | harness-note | (all) | `scan_plan` conditional on pushdown branch | harness (WP6 span tuning) |
 | **F8** | perf-ratio / over-scan | q001 (cold) | 6 `loadTable`s for a 1-table query — class fusion / subject-prune not firing on star-with-column-members (§2); or ref-POM parent prefetch | WP7 investigate → engine (FIXED by PR-3: 6→1) |
 | **F9** | correctness-divergence (cosmetic-lexical) | q002, q042 | predicate/type IRIs render as CURIEs on native, full IRIs on virtual — data identical after namespace-folding; residual of F3 after PR-0 fixed the row count | product decision (AJ) — not PR-3 |
+| **F10** | correctness-silent-empty (pre-existing) | (synthetic — no corpus query) | same-subject star members split across template-sharing TMs → zero star rows; formation fuses unconditionally, materialization is per-map | engine (rewrite: refuse to fuse when no TM covers all members) — future, not PR-3 |
 
 **The two correctness bugs (F1/F2) share one root** and are the highest priority — they deliver wrong answers as silent successes. **F3 is a second, independent correctness gap** (root-caused) on the most common inspector shape — small fix surface, high user-visible impact (missing `@type` in the solo subject inspector). **F5-q050** is the sharpest perf signal (dims-only, 377 scans). **F4 is corpus hygiene, not an engine bug** — but it must be fixed (the determinism amendment) so nondeterministic-selection queries stop masking real divergences. F1/F2/F3/F5 feed the WP7 diagnosis and WP8 roadmap; F4 feeds the corpus determinism amendment; F7 feeds back into WP6 harness tuning.

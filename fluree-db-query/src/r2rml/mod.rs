@@ -36,3 +36,21 @@ pub use rewrite::{
     convert_triple_to_r2rml, rewrite_patterns_for_r2rml, unsupported_subscope_error,
     R2rmlRewriteResult,
 };
+
+/// Read an on/off environment switch that defaults to **on**. Only `0`, `false`,
+/// `off`, or `no` (trimmed, case-insensitive) disable it — the single falsy
+/// spelling set for the whole R2RML switch family, so individual switches can't
+/// drift. (`env_flag_enabled` in `fluree-db-api`'s `graph_source::crawl` and the
+/// `FLUREE_ICEBERG_FOOTER_FROM_CACHE` switch in `fluree-db-iceberg` mirror these
+/// spellings; they can't share this symbol across the crate boundary.) Call
+/// sites cache the result in a per-switch `OnceLock` — set switches at process
+/// startup, not per query.
+pub(crate) fn env_switch_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
