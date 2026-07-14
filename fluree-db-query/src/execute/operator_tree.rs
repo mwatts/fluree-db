@@ -2486,6 +2486,15 @@ fn build_operator_tree_inner(
             let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
                 plan, fallback,
             ));
+            // PR-6: HAVING filters the grouped rows before ORDER BY (SPARQL order:
+            // WHERE → GROUP → HAVING → ORDER → LIMIT). The fused op emits exactly
+            // the projected group + aggregate vars (detect's projection check
+            // rejects any HAVING referencing an unprojected aggregate), so the
+            // HAVING expression sees only variables in the fused output — no
+            // output trim is needed.
+            if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
+                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+            }
             // The fused operator emits the final grouped result; apply ORDER BY /
             // OFFSET / LIMIT on top with the engine's own operators (exact
             // semantics on the small grouped output).
