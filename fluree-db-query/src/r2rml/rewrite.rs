@@ -46,12 +46,37 @@ pub struct R2rmlRewriteResult {
     /// Non-lowered sub-scope patterns that would evaluate against the R2RML
     /// graph source's (empty) native index and **silently return no rows** —
     /// property paths, shortest paths, and subqueries, whose bodies traverse or
-    /// scan the enclosing graph. The caller MUST error when this is non-empty
-    /// rather than hand back a silently-wrong empty result. Holds each SPARQL
-    /// kind name for the error message. Deliberately excludes the search
-    /// patterns (index/vector/geo/s2): they carry their own `graph_source_id`
-    /// and route independently of this scope.
+    /// scan the enclosing graph. The caller MUST error (via
+    /// [`unsupported_subscope_error`]) when this is non-empty rather than hand
+    /// back a silently-wrong empty result. Holds each SPARQL kind name for the
+    /// error message. Deliberately excludes the search patterns
+    /// (index/vector/geo/s2): they carry their own `graph_source_id` and route
+    /// independently of this scope.
     pub unsupported: Vec<&'static str>,
+}
+
+/// Build the loud-refuse error for [`R2rmlRewriteResult::unsupported`].
+///
+/// Shared by every GRAPH execution path that consumes a rewrite result (the
+/// seeded and batched operators in `graph.rs`) so the user-facing message
+/// cannot drift between them. Kind names are deduplicated preserving first
+/// occurrence: two property paths in one scope read "property path", not
+/// "property path, property path".
+pub fn unsupported_subscope_error(graph_iri: &str, kinds: &[&str]) -> crate::error::QueryError {
+    let mut unique: Vec<&str> = Vec::with_capacity(kinds.len());
+    for &kind in kinds {
+        if !unique.contains(&kind) {
+            unique.push(kind);
+        }
+    }
+    crate::error::QueryError::InvalidQuery(format!(
+        "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
+         virtual dataset (an R2RML source has no native index, so these would silently \
+         return no rows): {}. Rewrite them as basic triple patterns or move them outside \
+         the GRAPH block.",
+        graph_iri,
+        unique.join(", ")
+    ))
 }
 
 /// Rewrite patterns for an R2RML graph source.
@@ -223,6 +248,13 @@ pub fn rewrite_patterns_for_r2rml(
     // A same-subject `rdf:type` is fused into the base by setting its
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
+    //
+    // Fusing is unconditional, which assumes some single TriplesMap covers all
+    // members: required members split across template-sharing maps yield zero
+    // star rows (materialization is per-map — no cross-map member join), where
+    // a per-member plan would subject-join them. Recorded as F10 in
+    // `04-findings-register.md`; the fix is to refuse to fuse when no map
+    // covers every member.
     for (subject, members) in star_groups {
         // Split into object-var members (produce bindings) and constant-object
         // members (equality existence constraints fused into the same scan).
@@ -348,17 +380,12 @@ pub fn rewrite_patterns_for_r2rml(
 }
 
 /// Whether scan-local FILTER consumption is enabled. Read once from
-/// `FLUREE_R2RML_FILTER_CONSUMPTION` (only `0`/`false`/`off` disable it). The
-/// kill switch keeps the FILTER in the plan (no LIMIT flow) for A/B validation.
+/// `FLUREE_R2RML_FILTER_CONSUMPTION` (family falsy spellings,
+/// [`super::env_switch_enabled`]). The kill switch keeps the FILTER in the plan
+/// (no LIMIT flow) for A/B validation.
 fn filter_consumption_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_FILTER_CONSUMPTION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_FILTER_CONSUMPTION"))
 }
 
 /// Move scan-local top-level FILTERs into the single R2RML scan's
@@ -676,20 +703,16 @@ fn class_fusion_is_safe(
 }
 
 /// Whether wildcard→class fusion is enabled. Read once from
-/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (only `0`/`false`/`off`/`no` disable it).
+/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (family falsy spellings,
+/// [`super::env_switch_enabled`]; `fluree-db-api`'s `crawl::env_flag_enabled`
+/// parses this same variable and must keep the same spellings).
 /// The master crawl kill-switch (`crawl::crawl_expand_enabled`) is COUPLED to
 /// this: expand-on + fusion-off would route a browse through the UNFUSED crawl
 /// (a 16-table fan-out + shared-catalog 429 storm — worse than today's fast
 /// empty result), so disabling fusion also disables crawl expansion there.
 fn wildcard_class_fusion_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_CRAWL_CLASS_FUSION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_CRAWL_CLASS_FUSION"))
 }
 
 /// A standalone variable-predicate wildcard scan (`?s ?p ?o`) on `subject`:
@@ -911,10 +934,10 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(v) => (Some(*v), None),
         Ref::Iri(iri) => (None, Some(iri.to_string())),
         // A bound SID subject we cannot decode to an IRI is left unconverted.
-        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
-            Some(iri) => (None, Some(iri)),
-            None => return None,
-        },
+        Ref::Sid(sid) => {
+            let iri = snapshot.decode_sid(sid)?;
+            (None, Some(iri))
+        }
     };
 
     // Build a pattern for `object_var`, carrying either the subject variable or
@@ -1329,7 +1352,10 @@ mod tests {
         let mapping = CompiledR2rmlMapping::new(vec![store, customer]);
         let subject = VarId(1);
         let mut base = star_base(subject, PRED);
-        let mut class_groups = vec![(subject, vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)])];
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
+        )];
         fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
         // Not fused for materialization (class stays separate), but prune hint set.
         assert_eq!(base.class_filter, None);
@@ -1352,7 +1378,10 @@ mod tests {
         let mapping = CompiledR2rmlMapping::new(vec![store_attrs, store_class]);
         let subject = VarId(1);
         let mut base = star_base(subject, PRED);
-        let mut class_groups = vec![(subject, vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)])];
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
+        )];
         fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
         assert_eq!(base.class_filter, None, "must not fuse");
         assert_eq!(
@@ -1716,8 +1745,14 @@ mod tests {
                 Term::Var(VarId(3)),
             ))]),
         ];
-        let result =
-            rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, Some(&mapping), false, false);
+        let result = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            false,
+        );
         // The OPTIONAL stays a separate scope.
         assert!(
             result
@@ -1806,7 +1841,31 @@ mod tests {
             )),
         ];
         let r = rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, None, false, false);
-        assert!(r.unsupported.is_empty(), "VALUES must not be flagged unsupported");
+        assert!(
+            r.unsupported.is_empty(),
+            "VALUES must not be flagged unsupported"
+        );
         assert_eq!(r.converted_count, 1, "the wildcard triple still converts");
+    }
+
+    /// PR-0/0a (review follow-up): repeated kind names collapse in the
+    /// user-facing message — two property paths in one scope read
+    /// "property path", not "property path, property path" — and first-seen
+    /// order is preserved.
+    #[test]
+    fn unsupported_subscope_error_dedups_kinds() {
+        let err =
+            unsupported_subscope_error("gs:main", &["property path", "property path", "subquery"]);
+        let msg = err.to_string();
+        assert_eq!(
+            msg.matches("property path").count(),
+            1,
+            "repeated kinds must collapse to one mention: {msg}"
+        );
+        assert!(
+            msg.contains("property path, subquery"),
+            "first-seen order must be preserved: {msg}"
+        );
+        assert!(msg.contains("gs:main"), "names the graph source: {msg}");
     }
 }
