@@ -1081,8 +1081,10 @@ impl FlureeR2rmlProvider<'_> {
             })?
         };
 
-        // Resolve metadata location and create storage based on catalog mode
-        let (load_response, storage) = match &iceberg_config.catalog {
+        // Resolve metadata location and create storage based on catalog mode.
+        // `mut` so we can move the REST catalog's inline metadata out of the
+        // response below (see the metadata resolution) without cloning it.
+        let (mut load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
                 warehouse,
@@ -1336,65 +1338,25 @@ impl FlureeR2rmlProvider<'_> {
             }
         };
 
-        // Check cache for table metadata
-        let cache = self.fluree.r2rml_cache();
-        let metadata_location = &load_response.metadata_location;
-
-        let metadata = if let Some(cached) = cache.get_metadata(metadata_location).await {
-            debug!(metadata_location = %metadata_location, "Table metadata cache hit");
-            cached
-        } else {
-            debug!(metadata_location = %metadata_location, "Table metadata cache miss");
-
-            // PR-8 slice 2: on the in-memory miss, try the persistent disk catalog
-            // cache before hitting S3. `metadata_location` is content-addressed, so
-            // a hit is always current for that snapshot. A cold process with a warm
-            // catalog dir serves the parsed metadata from local disk (no S3 GET,
-            // no `r2rml.read_metadata` span).
-            let catalog_cache = self.catalog_disk_cache();
-            let metadata = if let Some(disk) = catalog_cache.get_metadata(metadata_location) {
-                debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
-                disk
-            } else {
-                // Measurement sub-span (PR-8 cold decomposition): isolate the
-                // metadata-JSON S3 GET + parse — the `load_table_context` component
-                // between the loadTable REST GET (`r2rml.load_table`) and the
-                // manifest read (`iceberg.scan_plan` / `r2rml.count_manifest_read`).
-                // Allowlisted in `fluree-bench-virtual::spans`.
-                let metadata = async {
-                    let metadata_bytes =
-                        storage
-                            .as_ref()
-                            .read(metadata_location)
-                            .await
-                            .map_err(|e| {
-                                QueryError::Internal(format!("Failed to read table metadata: {e}"))
-                            })?;
-                    let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
-                        QueryError::Internal(format!("Failed to parse table metadata: {e}"))
-                    })?;
-                    Ok::<_, QueryError>(Arc::new(parsed))
-                }
-                .instrument(tracing::debug_span!(
-                    "r2rml.read_metadata",
-                    metadata_location = %metadata_location,
-                ))
-                .await?;
-                catalog_cache.put_metadata(metadata_location, metadata.as_ref());
-                metadata
-            };
-            cache
-                .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
-                .await;
-
-            info!(
-                metadata_location = %metadata_location,
-                format_version = metadata.format_version,
-                "Loaded and cached table metadata"
-            );
-
-            metadata
-        };
+        // Resolve the table metadata from the cheapest available source: the
+        // in-memory cache, the REST catalog's inline `metadata`, the disk catalog
+        // cache, then a fresh S3 GET. Extracted into `resolve_table_metadata` so
+        // the resolution order — in particular that an inline `loadTable` copy
+        // short-circuits the disk/S3 fetch and its `r2rml.read_metadata` span — is
+        // unit-testable against a storage stub. The inline metadata is moved out of
+        // `load_response` (never cloned — it replaces an S3 GET) and is `None` for
+        // Direct mode and cache-reconstructed responses (per-query pin / cross-query
+        // cache), which is precisely why the disk/S3 fallback in the helper must
+        // stay intact.
+        let inline_metadata = load_response.metadata.take();
+        let metadata = resolve_table_metadata(
+            self.fluree.r2rml_cache(),
+            storage.as_ref(),
+            &load_response.metadata_location,
+            inline_metadata,
+            || self.catalog_disk_cache(),
+        )
+        .await?;
         Ok((storage, metadata, load_response.metadata_location.clone()))
     }
 
@@ -1888,6 +1850,98 @@ fn sound_manifest_row_count(
     Some(total)
 }
 
+/// Resolve a table's [`TableMetadata`] from the cheapest available source.
+///
+/// Order, cheapest first:
+/// 1. the in-memory moka cache (`cache`);
+/// 2. `inline_metadata` — the parsed `metadata` a real REST `loadTable` already
+///    handed us in `LoadTableResponse` (populated in `catalog/rest.rs`). It is
+///    `None` for Direct mode and for cache-reconstructed responses (per-query pin
+///    / cross-query cache), which carry only a metadata location;
+/// 3. the persistent disk catalog cache, built lazily via `disk_cache` so its
+///    cheap-but-non-zero dir setup is paid only when the S3 fallback is reached
+///    (never on an in-memory or inline hit);
+/// 4. a fresh S3 GET of the metadata JSON, timed under the `r2rml.read_metadata`
+///    span.
+///
+/// The inline short-circuit is §1 of fluree/db#1500: a REST catalog that vends
+/// metadata inline never re-fetches it from S3. The inline result still seeds the
+/// in-memory cache — so later cache-reconstructed loads of the same table (which
+/// carry `metadata: None`) hit it — but deliberately NOT the disk layer (that
+/// exists for processes never handed the bytes) and it emits NO
+/// `r2rml.read_metadata` span (that span must fire only on a real S3 read; the
+/// live gate asserts n=0 for inline-vending REST catalogs).
+async fn resolve_table_metadata<S: SendIcebergStorage>(
+    cache: &R2rmlCache,
+    storage: &S,
+    metadata_location: &str,
+    inline_metadata: Option<TableMetadata>,
+    disk_cache: impl FnOnce() -> super::disk_catalog_cache::DiskCatalogCache,
+) -> QueryResult<Arc<TableMetadata>> {
+    if let Some(cached) = cache.get_metadata(metadata_location).await {
+        debug!(metadata_location = %metadata_location, "Table metadata cache hit");
+        return Ok(cached);
+    }
+
+    if let Some(inline) = inline_metadata {
+        debug!(
+            metadata_location = %metadata_location,
+            "Table metadata used inline from loadTable response (no S3 fetch)"
+        );
+        let metadata = Arc::new(inline);
+        cache
+            .put_metadata(metadata_location.to_string(), Arc::clone(&metadata))
+            .await;
+        return Ok(metadata);
+    }
+
+    debug!(metadata_location = %metadata_location, "Table metadata cache miss");
+
+    // PR-8 slice 2: on the in-memory miss, try the persistent disk catalog cache
+    // before hitting S3. `metadata_location` is content-addressed, so a hit is
+    // always current for that snapshot. A cold process with a warm catalog dir
+    // serves the parsed metadata from local disk (no S3 GET, no
+    // `r2rml.read_metadata` span).
+    let catalog_cache = disk_cache();
+    let metadata = if let Some(disk) = catalog_cache.get_metadata(metadata_location) {
+        debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
+        disk
+    } else {
+        // Measurement sub-span (PR-8 cold decomposition): isolate the metadata-JSON
+        // S3 GET + parse — the `load_table_context` component between the loadTable
+        // REST GET (`r2rml.load_table`) and the manifest read (`iceberg.scan_plan` /
+        // `r2rml.count_manifest_read`). Allowlisted in `fluree-bench-virtual::spans`.
+        let metadata = async {
+            let metadata_bytes = storage
+                .read(metadata_location)
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
+            let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+            })?;
+            Ok::<_, QueryError>(Arc::new(parsed))
+        }
+        .instrument(tracing::debug_span!(
+            "r2rml.read_metadata",
+            metadata_location = %metadata_location,
+        ))
+        .await?;
+        catalog_cache.put_metadata(metadata_location, metadata.as_ref());
+        metadata
+    };
+    cache
+        .put_metadata(metadata_location.to_string(), Arc::clone(&metadata))
+        .await;
+
+    info!(
+        metadata_location = %metadata_location,
+        format_version = metadata.format_version,
+        "Loaded and cached table metadata"
+    );
+
+    Ok(metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2241,5 +2295,145 @@ mod tests {
             sound_manifest_row_count(&schema, &files, false, &["NOPE".to_string()]),
             None
         );
+    }
+
+    // ---- §1 (fluree/db#1500): inline loadTable metadata short-circuits S3 ----
+
+    use crate::graph_source::disk_catalog_cache::DiskCatalogCache;
+    use fluree_db_iceberg::error::Result as IcebergResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal valid Iceberg table metadata JSON (only the non-defaulted fields),
+    /// so tests build `TableMetadata` through the real `from_json` path.
+    fn sample_metadata_json(location: &str) -> String {
+        serde_json::json!({
+            "format-version": 2,
+            "location": location,
+            "last-updated-ms": 0,
+            "last-column-id": 0,
+        })
+        .to_string()
+    }
+
+    fn sample_metadata(location: &str) -> TableMetadata {
+        TableMetadata::from_json(sample_metadata_json(location).as_bytes())
+            .expect("sample metadata JSON parses")
+    }
+
+    /// Storage stub that panics on any access: the inline-metadata path must never
+    /// touch storage, so any read here fails the test loudly.
+    #[derive(Debug)]
+    struct NeverReadStorage;
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for NeverReadStorage {
+        async fn read(&self, path: &str) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read must not be called on the inline-metadata path (path={path})");
+        }
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read_range must not be called on the inline-metadata path");
+        }
+        async fn file_size(&self, _path: &str) -> IcebergResult<u64> {
+            panic!("storage.file_size must not be called on the inline-metadata path");
+        }
+    }
+
+    /// Storage stub that serves a fixed metadata JSON and counts reads, for the
+    /// fallback-intact test (no inline metadata => a real object read must happen).
+    #[derive(Debug)]
+    struct CountingStorage {
+        body: bytes::Bytes,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for CountingStorage {
+        async fn read(&self, _path: &str) -> IcebergResult<bytes::Bytes> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.body.clone())
+        }
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            unreachable!("resolve_table_metadata reads whole objects, not ranges")
+        }
+        async fn file_size(&self, _path: &str) -> IcebergResult<u64> {
+            unreachable!("resolve_table_metadata does not stat")
+        }
+    }
+
+    /// Disk-cache factory that fails the test if invoked: `resolve_table_metadata`
+    /// must not even build the disk cache on the in-memory or inline hit paths.
+    fn disk_cache_must_not_build() -> DiskCatalogCache {
+        panic!("disk catalog cache must not be built on the inline-metadata path");
+    }
+
+    #[tokio::test]
+    async fn inline_metadata_short_circuits_disk_and_s3() {
+        let cache = R2rmlCache::new(4, 4);
+        let loc = "s3://bucket/warehouse/t/metadata/v3.metadata.json";
+        let inline = sample_metadata("s3://bucket/warehouse/t");
+
+        // In-memory cache empty (miss); inline metadata present. The storage stub
+        // and the disk-cache factory both panic if touched, so a green result
+        // proves neither the disk layer nor S3 was consulted. Without §1's inline
+        // branch this call would fall through to `disk_cache()` (and then a storage
+        // read), both of which panic here.
+        let out = resolve_table_metadata(
+            &cache,
+            &NeverReadStorage,
+            loc,
+            Some(inline),
+            disk_cache_must_not_build,
+        )
+        .await
+        .expect("inline metadata resolves without any storage read");
+        assert_eq!(out.location, "s3://bucket/warehouse/t");
+
+        // The inline result seeds the in-memory cache so a later cache-reconstructed
+        // load (which carries `metadata: None`) hits it instead of re-fetching.
+        assert!(
+            cache.get_metadata(loc).await.is_some(),
+            "inline metadata must be cached in-memory for later loads"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_inline_metadata_falls_back_to_storage_read() {
+        let cache = R2rmlCache::new(4, 4);
+        let loc = "s3://bucket/warehouse/u/metadata/v1.metadata.json";
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage = CountingStorage {
+            body: bytes::Bytes::from(sample_metadata_json("s3://bucket/warehouse/u")),
+            reads: Arc::clone(&reads),
+        };
+
+        // No inline metadata and an empty in-memory cache: resolution must reach
+        // storage. A unique temp dir keeps the disk cache a guaranteed miss (or a
+        // no-op when disk caching is disabled), so the resolution proceeds to the
+        // object read regardless of the ambient disk-cache setting.
+        let dir = std::env::temp_dir().join(format!(
+            "fluree-r2rml-md-test-{}-{}",
+            std::process::id(),
+            loc.len()
+        ));
+        let out = resolve_table_metadata(&cache, &storage, loc, None, || {
+            DiskCatalogCache::for_dir(&dir)
+        })
+        .await
+        .expect("fallback resolves via the storage read");
+        assert_eq!(out.location, "s3://bucket/warehouse/u");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "fallback path must perform exactly one storage read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
