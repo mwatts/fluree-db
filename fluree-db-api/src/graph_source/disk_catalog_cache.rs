@@ -15,7 +15,6 @@
 //! benchmark protocol can clear the data artifact cache while KEEPING catalog
 //! persistence — that "cold-data / warm-catalog" state is slice 2's DoD gate.
 
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -115,8 +114,18 @@ struct PersistedCountStats {
 /// field added to [`DataFile`] (or these persisted structs) could silently
 /// misread an old entry (a defaulted field) instead of refetching. **BUMP THIS
 /// whenever any persisted payload type changes** — an entry whose stored version
-/// differs is dropped and refetched.
-const CACHE_FORMAT_VERSION: u32 = 1;
+/// differs is dropped and refetched (see [`DiskCatalogCache::read`]).
+///
+/// **v2** re-keyed the on-disk FILENAMES: the key hash moved from `std`'s
+/// `DefaultHasher` (algorithm not guaranteed stable across toolchains — see
+/// [`stable_key_hash`]) to a spec-defined stable hash, and a [`CACHE_SCOPE`]
+/// segment was added. Because the filenames changed, a v2 process never opens a
+/// v1 file, so the version check above never fires on real v1 entries; they are
+/// harmless ORPHANS, evicted oldest-first by the [`MAX_CACHE_BYTES`] mtime prune
+/// exactly like a superseded `metadata_location`'s entries already are (a table
+/// commit orphans its old key the same way — no new leak class). The version
+/// field remains as defense for any future v2-named/old-payload entry.
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Versioned on-disk envelope. The version is checked before the payload is
 /// trusted; a mismatch (or any deserialize failure) is a miss, never an error.
@@ -131,6 +140,42 @@ struct Envelope<T> {
 /// `~/.fluree` would eventually be a support ticket. Pruned oldest-first at
 /// process startup (see [`DiskCatalogCache::for_dir`]).
 const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Stable 64-bit hash of a cache key, used to build the on-disk filename stem.
+///
+/// **Cross-toolchain stability is load-bearing.** The returned value IS the
+/// filename, so the same input must hash to the same value on every platform and
+/// every Rust release, forever. `std`'s `DefaultHasher` does NOT guarantee this —
+/// its algorithm may change between compiler releases — so keying on it means a
+/// routine toolchain bump would silently re-name (and thus re-key) the ENTIRE
+/// cache dir: a one-time full miss that [`CACHE_FORMAT_VERSION`] cannot detect
+/// (nothing is misread; the new names simply never collide with the old files).
+/// xxHash-64 is a published, spec-defined algorithm with fixed output, already a
+/// dependency of this crate (`xxhash-rust`, `xxh64` feature enabled at the
+/// workspace root). The `stable_key_hash_is_pinned` golden test pins a known
+/// input→output pair so any accidental algorithm/seed drift fails loudly in CI.
+fn stable_key_hash(key: &str) -> u64 {
+    // Seed 0 is part of the on-disk contract; changing it re-keys every entry.
+    xxhash_rust::xxh64::xxh64(key.as_bytes(), 0)
+}
+
+/// Cache-scope discriminant embedded in every entry filename (see
+/// [`DiskCatalogCache::path`]). CONSTANT today: every graph source in a process
+/// currently reads S3 under the SAME identity, so a single shared scope is
+/// correct by construction and a shared key is safe.
+///
+/// **Load-bearing design rule for mechanism B (per-graph-source
+/// `sts:AssumeRole`).** When per-graph-source role assumption lands, this
+/// constant MUST be replaced by a per-entry scope value that is a STABLE
+/// FINGERPRINT of the graph source's catalog-auth scope — the same identity
+/// `rest_clients` is keyed on. It MUST NEVER be the vended credential itself:
+/// vended credentials rotate on every `loadTable`, so keying on the credential
+/// would yield a 0% hit rate under the default configuration. Conceptually the
+/// scope discriminates the STORAGE-gated layers (`scanfiles` / `countstats`); the
+/// `metadata` layer is catalog-gated. Keeping the scope a constant embedded in
+/// the existing filename slot makes that future change a localized edit (thread a
+/// `scope: &str` into [`DiskCatalogCache::path`]) rather than a format migration.
+const CACHE_SCOPE: &str = "shared";
 
 /// Content-addressed on-disk catalog cache. A pure optimization: any I/O, parse,
 /// or version failure degrades to a miss (the caller reads from S3), never an
@@ -159,12 +204,17 @@ impl DiskCatalogCache {
         }
     }
 
-    /// File path for `metadata_location`'s `suffix` entry. The location is an
-    /// `s3://…` path; hash it to a filesystem-safe, fixed-length stem.
+    /// File path for `metadata_location`'s `suffix` entry, under [`CACHE_SCOPE`].
+    /// The location is an `s3://…` path; hash it — STABLY, see
+    /// [`stable_key_hash`] — to a filesystem-safe, fixed-length stem. The middle
+    /// `scope` segment is a discriminant for future per-graph-source identity
+    /// (see [`CACHE_SCOPE`]); it is a constant today, so this shape already leaves
+    /// room to make the scope a per-call argument without changing the filename
+    /// layout. Shape: `{hash:016x}.{scope}.{suffix}.json`.
     fn path(&self, metadata_location: &str, suffix: &str) -> PathBuf {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        metadata_location.hash(&mut h);
-        self.dir.join(format!("{:016x}.{suffix}.json", h.finish()))
+        let hash = stable_key_hash(metadata_location);
+        self.dir
+            .join(format!("{hash:016x}.{CACHE_SCOPE}.{suffix}.json"))
     }
 
     /// Read + version-check an entry. A deserialize failure (corrupt, truncated by
@@ -389,5 +439,69 @@ mod tests {
         let cache = DiskCatalogCache::for_dir(&file.join("child"));
         cache.put_count_stats("s3://b/m.json", &[data_file("s3://b/f.parquet", 1)], false);
         assert!(cache.get_count_stats("s3://b/m.json").is_none());
+    }
+
+    /// GOLDEN: pins the stable key hash so cross-toolchain stability is enforced,
+    /// not merely intended. If this fails after a toolchain / `xxhash-rust` bump,
+    /// the on-disk cache would silently re-key (a one-time full miss) — treat a
+    /// change here as a format break (bump `CACHE_FORMAT_VERSION`), never a
+    /// rubber-stamp constant update. The input is a fixed, arbitrary test vector.
+    #[test]
+    fn stable_key_hash_is_pinned() {
+        assert_eq!(
+            stable_key_hash("s3://fluree-golden/warehouse/t/metadata/00001.metadata.json"),
+            0xa577_4957_4046_c156,
+            "stable_key_hash(xxh64, seed 0) must be deterministic across toolchains"
+        );
+        // A different input yields a different value (sanity, not a golden).
+        assert_ne!(
+            stable_key_hash("s3://fluree-golden/warehouse/t/metadata/00002.metadata.json"),
+            stable_key_hash("s3://fluree-golden/warehouse/t/metadata/00001.metadata.json"),
+        );
+    }
+
+    /// The on-disk filename carries the `{hash}.{scope}.{suffix}.json` shape, so
+    /// the scope discriminant slot exists today (constant) for mechanism B later.
+    #[test]
+    fn path_includes_scope_segment() {
+        let cache = DiskCatalogCache::for_dir(&tmp_dir("scope"));
+        let p = cache.path("s3://b/m.json", "metadata");
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(
+            name.ends_with(&format!(".{CACHE_SCOPE}.metadata.json")),
+            "filename must carry the scope discriminant + suffix: {name}"
+        );
+        let stem = name.split('.').next().unwrap();
+        assert_eq!(stem.len(), 16, "hash stem is a fixed 16 hex chars: {name}");
+        assert!(
+            stem.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash stem is lowercase hex: {name}"
+        );
+    }
+
+    /// A v1 payload sharing a v2 filename is a miss AND is deleted, so it stops
+    /// occupying the size cap. (Real v1 orphans keep their old names and are never
+    /// opened; they are pruned oldest-first by the mtime cap instead — see the
+    /// `CACHE_FORMAT_VERSION` doc.)
+    #[test]
+    fn v1_entry_is_a_miss_and_deleted() {
+        let dir = tmp_dir("v1drop");
+        let cache = DiskCatalogCache::for_dir(&dir);
+        let loc = "s3://b/m.json";
+        cache.put_count_stats(loc, &[data_file("s3://b/f.parquet", 1)], false);
+        let path = only_entry(&dir);
+        // Downgrade the envelope version in place, payload untouched.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v["format_version"] = serde_json::json!(1u32);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(
+            cache.get_count_stats(loc).is_none(),
+            "a v1-versioned entry is a miss under CACHE_FORMAT_VERSION = 2"
+        );
+        assert!(
+            !path.exists(),
+            "a version-mismatched entry is deleted so it stops occupying the cap"
+        );
     }
 }
